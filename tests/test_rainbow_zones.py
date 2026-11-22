@@ -3486,7 +3486,7 @@ console.log(JSON.stringify({{
 
         _, _, _, a_nan = _parse_rgba(js_out["colMissing"])
         r_lo, g_lo, b_lo, a_lo = _parse_rgba(js_out["colLowPole"])
-        r_bm, g_bm, b_bm, a_bm = _parse_rgba(js_out["colBelowMed"])
+        r_bm, _g_bm, _b_bm, a_bm = _parse_rgba(js_out["colBelowMed"])
         r_md, g_md, b_md, a_md = _parse_rgba(js_out["colMedGold"])
         r_wm, g_wm, b_wm, a_wm = _parse_rgba(js_out["colWarmMid"])
         r_hi, g_hi, b_hi, a_hi = _parse_rgba(js_out["colFlameHi"])
@@ -10186,6 +10186,263 @@ setTimeout(() => {{
         assert "arccos" in js_out["pillTooltip"]
 
 
+def test_divergent_quantile_isigi_colorscale_and_signed_mtz(tmp_path) -> None:
+    """Verify warm quantile-normalized divergent I/σ & .mtz I/σ colorscale, center-bulk IQR placement, outlier fencing, and signed MTZ overlay."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.rainbow_zones import (
+        apply_mtz_to_payload,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    cell_vals = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
+    b_mat = np.asarray(gemmi.UnitCell(*cell_vals).frac.mat.tolist(), dtype=float).T
+    solve_h5 = tmp_path / "solve_isigi.h5"
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/space_group"] = "I 1 2 1"
+        hf["sample/cell"] = np.array(cell_vals, dtype=float)
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = b_mat
+        hf["goniometer/R"] = np.eye(3)[None, :, :]
+        hf["goniometer/angles"] = np.zeros((1, 1), dtype=float)
+        hf["instrument/wavelength"] = np.array([2.0, 4.5], dtype=float)
+
+    base = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        instrument="CG4D",
+        space_group="I 1 2 1",
+        wavelength_range=(2.0, 4.5),
+        d_min=2.0,
+        frame_index=0,
+        include_panel_images=False,
+    )
+    assert len(base["predicted_peaks"]) >= 2
+
+    # 1. Signed negative & positive .mtz I/σ preserved through _overlay_mtz_columns
+    h0 = [int(x) for x in base["predicted_peaks"][0]["hkl"]]
+    h1 = [int(x) for x in base["predicted_peaks"][1]["hkl"]]
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = gemmi.find_spacegroup_by_name(base["space_group"])
+    mtz.set_cell_for_all(gemmi.UnitCell(*base["cell"]))
+    mtz.add_dataset("unmerged_signed")
+    mtz.add_column("I", "J")
+    mtz.add_column("SIGI", "Q")
+    mtz.set_data(
+        np.asarray(
+            [
+                [h0[0], h0[1], h0[2], -25.0, 10.0],
+                [h1[0], h1[1], h1[2], 84.0, 12.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    mtz_path = tmp_path / "signed_unmerged.mtz"
+    mtz.write_to_file(str(mtz_path))
+    overlaid = apply_mtz_to_payload(
+        base, str(mtz_path), {"name": "signed_unmerged.mtz"}
+    )
+    by_hkl = {
+        tuple(int(x) for x in p["hkl"]): p
+        for p in overlaid["predicted_peaks"]
+        if p.get("mtz_isigi") is not None
+    }
+    assert abs(float(by_hkl[tuple(h0)]["mtz_isigi"]) - (-2.5)) < 1e-3
+    assert abs(float(by_hkl[tuple(h1)]["mtz_isigi"]) - 7.0) < 1e-3
+
+    if not shutil.which("node"):
+        return
+
+    ui_html = render_rainbow_html(overlaid)
+    inline_js = re.findall(r"<script>([\s\S]*?)</script>", ui_html)[-1]
+    fn_names = [
+        "getColorCrossover",
+        "applyCrossoverCurve",
+        "peakUnscaledIsigi",
+        "peakMtzIsigi",
+        "computeQuantileScaleBounds",
+        "getPeakDataAvailability",
+        "residualToColor",
+        "isigiToColor",
+        "buildColorscaleGradientSpec",
+    ]
+    extracted = []
+    for fn_name in fn_names:
+        m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+        assert m is not None, f"Missing JS function {fn_name}"
+        start = m.start()
+        depth = 0
+        in_str = None
+        esc = False
+        i = m.end() - 1
+        while i < len(inline_js):
+            ch = inline_js[i]
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif in_str:
+                if ch == in_str:
+                    in_str = None
+            elif ch in ("'", '"', "`"):
+                in_str = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    extracted.append(inline_js[start : i + 1])
+                    break
+            i += 1
+
+    # 2. Realistic skewed + signed I/σ distribution with extreme outliers AND top-k biased SAMPLE_PEAKS:
+    #    - Active-frame PEAKS (n=200): signed background-dominated + Bragg reflections + [-999, +76e6] outliers
+    #    - SAMPLE_PEAKS: artificially inflated top-k pool (SNR ~ 500..4000) that must NOT skew frame I/σ bounds!
+    rng = np.random.default_rng(12345)
+    core_snr = np.concatenate(
+        [
+            rng.normal(0.6, 1.4, size=140),
+            rng.lognormal(mean=1.5, sigma=0.7, size=58),
+            np.array([-999.0, 76_682_336.0]),
+        ]
+    )
+    peaks_js = [
+        {
+            "id": idx + 1,
+            "intensity": float(val * 10.0),
+            "sigma": 10.0,
+            "mtz_i": float((val - 0.5) * 8.0),
+            "mtz_sigi": 8.0,
+            "careless_residual": float(np.clip(val * 0.4, -4.0, 4.0)),
+        }
+        for idx, val in enumerate(core_snr)
+    ]
+    inflated_sample_js = [
+        {
+            "id": 1000 + idx,
+            "intensity": float((600.0 + idx * 25.0) * 10.0),
+            "sigma": 10.0,
+            "mtz_i": float(val * 8.0),
+            "mtz_sigi": 8.0,
+        }
+        for idx, val in enumerate(core_snr[:80])
+    ]
+
+    js_probe = f"""
+const DEFAULT_COLOR_CROSSOVER = 0.38;
+const ORBIT_PALETTE = ["#ff38b4", "#00e5ff"];
+const state = {{
+  colorCrossover: 0.38,
+  peakSource: "integrated",
+  wulffColorMode: "isigi",
+  lamMin: 1.0,
+  lamMax: 4.5,
+}};
+const DATA = {{ mtz_overlay_name: "signed_unmerged.mtz" }};
+let _dynPredEpoch = 0;
+let _peakDataAvailabilitySig = "";
+let _peakDataAvailability = {{}};
+const PEAKS = {json.dumps(peaks_js)};
+const SAMPLE_PEAKS = {json.dumps(inflated_sample_js)};
+function scaleToColor() {{ return "rgba(0,0,0,1)"; }}
+function hexToRgba() {{ return "rgba(0,0,0,1)"; }}
+function wavelengthToColor() {{ return "rgba(0,0,0,1)"; }}
+{"\n".join(extracted)}
+
+const avail = getPeakDataAvailability();
+const b = avail.isigiBounds;
+const colLo = isigiToColor(b.min, 1.0, b);
+const colQ25 = isigiToColor(b.q25, 1.0, b);
+const colMed = isigiToColor(b.median, 1.0, b);
+const colQ75 = isigiToColor(b.q75, 1.0, b);
+const colHi = isigiToColor(b.max, 1.0, b);
+const colExtremePos = isigiToColor(76682336.0, 1.0, b);
+const colExtremeNeg = isigiToColor(-999.0, 1.0, b);
+const resLo = residualToColor(avail.resMin, 1.0, avail);
+const resMed = residualToColor(avail.resMedian, 1.0, avail);
+const resHi = residualToColor(avail.resMax, 1.0, avail);
+const specIsigi = buildColorscaleGradientSpec("isigi", 0.38);
+
+// Also check truncated positive-only frame I/σ >= 2.5 (e.g. single-frame peak finder threshold)
+const truncBounds = computeQuantileScaleBounds(
+  Array.from({{ length: 120 }}, (_, k) => 2.5 + Math.pow(k / 119, 2.4) * 28.0)
+);
+const truncQ25Col = isigiToColor(truncBounds.q25, 1.0, truncBounds);
+const truncMedCol = isigiToColor(truncBounds.median, 1.0, truncBounds);
+const truncQ75Col = isigiToColor(truncBounds.q75, 1.0, truncBounds);
+
+console.log(JSON.stringify({{
+  signedNegPeak: peakUnscaledIsigi({{ intensity: -32.0, sigma: 8.0 }}),
+  signedNegMtz: peakMtzIsigi({{ mtz_i: -18.0, mtz_sigi: 6.0 }}),
+  bounds: b,
+  colLo, colQ25, colMed, colQ75, colHi, colExtremePos, colExtremeNeg,
+  resLo, resMed, resHi,
+  specIsigi,
+  truncBounds, truncQ25Col, truncMedCol, truncQ75Col,
+}}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", js_probe], check=True, capture_output=True, text=True
+    )
+    out = json.loads(proc.stdout.strip())
+
+    def _rgb(s: str) -> tuple[int, int, int]:
+        nums = [int(x) for x in re.findall(r"\d+", s)[:3]]
+        return nums[0], nums[1], nums[2]
+
+    def _dist(c1: tuple[int, int, int], c2: tuple[int, int, int]) -> float:
+        return float(np.hypot(np.hypot(c1[0] - c2[0], c1[1] - c2[1]), c1[2] - c2[2]))
+
+    # Signed negative I/σ preserved without clamping at 0
+    assert abs(out["signedNegPeak"] - (-4.0)) < 1e-6
+    assert abs(out["signedNegMtz"] - (-3.0)) < 1e-6
+
+    b = out["bounds"]
+    # Unbiased PEAKS median (~0.8..2.0) used instead of top-k SAMPLE_PEAKS (>600), and [-999, +76M] outliers fenced!
+    assert -15.0 < b["min"] < 0.0
+    assert 0.0 < b["median"] < 4.0
+    assert 6.0 < b["max"] < 30.0
+    assert out["colExtremePos"] == out["colHi"] == "rgba(232, 56, 24, 1.000)"
+    assert out["colExtremeNeg"] == out["colLo"] == "rgba(20, 184, 166, 1.000)"
+    assert out["colMed"] == "rgba(254, 232, 170, 1.000)"
+
+    # Central 50% bulk [Q25, Q75] sits much closer to warm Champagne-Gold center than to either extreme pole!
+    c_lo = _rgb(out["colLo"])
+    c_q25 = _rgb(out["colQ25"])
+    c_med = _rgb(out["colMed"])
+    c_q75 = _rgb(out["colQ75"])
+    c_hi = _rgb(out["colHi"])
+    assert _dist(c_q25, c_med) < _dist(c_q25, c_lo)
+    assert _dist(c_q75, c_med) < _dist(c_q75, c_hi)
+
+    # Same center-bulk guarantee holds even on lower-truncated I/σ >= 2.5 frame distributions!
+    ct_q25 = _rgb(out["truncQ25Col"])
+    ct_med = _rgb(out["truncMedCol"])
+    ct_q75 = _rgb(out["truncQ75Col"])
+    assert ct_med == (254, 232, 170)
+    assert _dist(ct_q25, ct_med) < _dist(ct_q25, c_lo)
+    assert _dist(ct_q75, ct_med) < _dist(ct_q75, c_hi)
+
+    # Distinct from ΔI/σ (Blue-White-Rose) at lower pole, midpoint (warmer gold vs cool white), and upper pole
+    assert _dist(c_lo, _rgb(out["resLo"])) > 50.0
+    assert _dist(c_med, _rgb(out["resMed"])) > 70.0
+    assert c_med[0] > c_med[1] > c_med[2]  # warm sunlit gold midpoint
+    assert _dist(c_hi, _rgb(out["resHi"])) > 65.0
+
+    assert "·" in out["specIsigi"]["label"]
+    assert "76682" not in out["specIsigi"]["label"]
+    assert "quantile-normalized range" in out["specIsigi"]["tooltip"]
+    assert "bulk IQR" in out["specIsigi"]["tooltip"]
+
+
 def test_nova_app_tof_route_and_fast_frame_switch(tmp_path):
     """Verify MainApp POST /api/tof_delta_theta (no 405) and fast frame_only=1 switching parity."""
     import asyncio
@@ -10586,260 +10843,3 @@ setTimeout(() => {{
         assert js_out["peaksRows"] == [132.0, 144.0]
         assert js_out["hasMergeMetrics"] is True
         assert js_out["hasPixelMaskBits"] is True
-
-
-def test_divergent_quantile_isigi_colorscale_and_signed_mtz(tmp_path) -> None:
-    """Verify warm quantile-normalized divergent I/σ & .mtz I/σ colorscale, center-bulk IQR placement, outlier fencing, and signed MTZ overlay."""
-    import json
-    import re
-    import shutil
-    import subprocess
-
-    import gemmi
-    import h5py
-    import numpy as np
-
-    from subhkl.viz.rainbow_zones import (
-        apply_mtz_to_payload,
-        build_rainbow_zone_payload,
-        render_rainbow_html,
-    )
-
-    cell_vals = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
-    b_mat = np.asarray(gemmi.UnitCell(*cell_vals).frac.mat.tolist(), dtype=float).T
-    solve_h5 = tmp_path / "solve_isigi.h5"
-    with h5py.File(solve_h5, "w") as hf:
-        hf.attrs["instrument"] = "CG4D"
-        hf["sample/space_group"] = "I 1 2 1"
-        hf["sample/cell"] = np.array(cell_vals, dtype=float)
-        hf["sample/U"] = np.eye(3)
-        hf["sample/B"] = b_mat
-        hf["goniometer/R"] = np.eye(3)[None, :, :]
-        hf["goniometer/angles"] = np.zeros((1, 1), dtype=float)
-        hf["instrument/wavelength"] = np.array([2.0, 4.5], dtype=float)
-
-    base = build_rainbow_zone_payload(
-        replay_h5=solve_h5,
-        instrument="CG4D",
-        space_group="I 1 2 1",
-        wavelength_range=(2.0, 4.5),
-        d_min=2.0,
-        frame_index=0,
-        include_panel_images=False,
-    )
-    assert len(base["predicted_peaks"]) >= 2
-
-    # 1. Signed negative & positive .mtz I/σ preserved through _overlay_mtz_columns
-    h0 = [int(x) for x in base["predicted_peaks"][0]["hkl"]]
-    h1 = [int(x) for x in base["predicted_peaks"][1]["hkl"]]
-    mtz = gemmi.Mtz(with_base=True)
-    mtz.spacegroup = gemmi.find_spacegroup_by_name(base["space_group"])
-    mtz.set_cell_for_all(gemmi.UnitCell(*base["cell"]))
-    mtz.add_dataset("unmerged_signed")
-    mtz.add_column("I", "J")
-    mtz.add_column("SIGI", "Q")
-    mtz.set_data(
-        np.asarray(
-            [
-                [h0[0], h0[1], h0[2], -25.0, 10.0],
-                [h1[0], h1[1], h1[2], 84.0, 12.0],
-            ],
-            dtype=np.float32,
-        )
-    )
-    mtz_path = tmp_path / "signed_unmerged.mtz"
-    mtz.write_to_file(str(mtz_path))
-    overlaid = apply_mtz_to_payload(
-        base, str(mtz_path), {"name": "signed_unmerged.mtz"}
-    )
-    by_hkl = {
-        tuple(int(x) for x in p["hkl"]): p
-        for p in overlaid["predicted_peaks"]
-        if p.get("mtz_isigi") is not None
-    }
-    assert abs(float(by_hkl[tuple(h0)]["mtz_isigi"]) - (-2.5)) < 1e-3
-    assert abs(float(by_hkl[tuple(h1)]["mtz_isigi"]) - 7.0) < 1e-3
-
-    if not shutil.which("node"):
-        return
-
-    ui_html = render_rainbow_html(overlaid)
-    inline_js = re.findall(r"<script>([\s\S]*?)</script>", ui_html)[-1]
-    fn_names = [
-        "getColorCrossover",
-        "applyCrossoverCurve",
-        "peakUnscaledIsigi",
-        "peakMtzIsigi",
-        "computeQuantileScaleBounds",
-        "getPeakDataAvailability",
-        "residualToColor",
-        "isigiToColor",
-        "buildColorscaleGradientSpec",
-    ]
-    extracted = []
-    for fn_name in fn_names:
-        m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
-        assert m is not None, f"Missing JS function {fn_name}"
-        start = m.start()
-        depth = 0
-        in_str = None
-        esc = False
-        i = m.end() - 1
-        while i < len(inline_js):
-            ch = inline_js[i]
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif in_str:
-                if ch == in_str:
-                    in_str = None
-            elif ch in ("'", '"', "`"):
-                in_str = ch
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    extracted.append(inline_js[start : i + 1])
-                    break
-            i += 1
-
-    # 2. Realistic skewed + signed I/σ distribution with extreme outliers AND top-k biased SAMPLE_PEAKS:
-    #    - Active-frame PEAKS (n=200): signed background-dominated + Bragg reflections + [-999, +76e6] outliers
-    #    - SAMPLE_PEAKS: artificially inflated top-k pool (SNR ~ 500..4000) that must NOT skew frame I/σ bounds!
-    rng = np.random.default_rng(12345)
-    core_snr = np.concatenate(
-        [
-            rng.normal(0.6, 1.4, size=140),
-            rng.lognormal(mean=1.5, sigma=0.7, size=58),
-            np.array([-999.0, 76_682_336.0]),
-        ]
-    )
-    peaks_js = [
-        {
-            "id": idx + 1,
-            "intensity": float(val * 10.0),
-            "sigma": 10.0,
-            "mtz_i": float((val - 0.5) * 8.0),
-            "mtz_sigi": 8.0,
-            "careless_residual": float(np.clip(val * 0.4, -4.0, 4.0)),
-        }
-        for idx, val in enumerate(core_snr)
-    ]
-    inflated_sample_js = [
-        {
-            "id": 1000 + idx,
-            "intensity": float((600.0 + idx * 25.0) * 10.0),
-            "sigma": 10.0,
-            "mtz_i": float(val * 8.0),
-            "mtz_sigi": 8.0,
-        }
-        for idx, val in enumerate(core_snr[:80])
-    ]
-
-    js_probe = f"""
-const DEFAULT_COLOR_CROSSOVER = 0.38;
-const ORBIT_PALETTE = ["#ff38b4", "#00e5ff"];
-const state = {{
-  colorCrossover: 0.38,
-  peakSource: "integrated",
-  wulffColorMode: "isigi",
-  lamMin: 1.0,
-  lamMax: 4.5,
-}};
-const DATA = {{ mtz_overlay_name: "signed_unmerged.mtz" }};
-let _dynPredEpoch = 0;
-let _peakDataAvailabilitySig = "";
-let _peakDataAvailability = {{}};
-const PEAKS = {json.dumps(peaks_js)};
-const SAMPLE_PEAKS = {json.dumps(inflated_sample_js)};
-function scaleToColor() {{ return "rgba(0,0,0,1)"; }}
-function hexToRgba() {{ return "rgba(0,0,0,1)"; }}
-function wavelengthToColor() {{ return "rgba(0,0,0,1)"; }}
-{"\n".join(extracted)}
-
-const avail = getPeakDataAvailability();
-const b = avail.isigiBounds;
-const colLo = isigiToColor(b.min, 1.0, b);
-const colQ25 = isigiToColor(b.q25, 1.0, b);
-const colMed = isigiToColor(b.median, 1.0, b);
-const colQ75 = isigiToColor(b.q75, 1.0, b);
-const colHi = isigiToColor(b.max, 1.0, b);
-const colExtremePos = isigiToColor(76682336.0, 1.0, b);
-const colExtremeNeg = isigiToColor(-999.0, 1.0, b);
-const resLo = residualToColor(avail.resMin, 1.0, avail);
-const resMed = residualToColor(avail.resMedian, 1.0, avail);
-const resHi = residualToColor(avail.resMax, 1.0, avail);
-const specIsigi = buildColorscaleGradientSpec("isigi", 0.38);
-
-// Also check truncated positive-only frame I/σ >= 2.5 (e.g. single-frame peak finder threshold)
-const truncBounds = computeQuantileScaleBounds(
-  Array.from({{ length: 120 }}, (_, k) => 2.5 + Math.pow(k / 119, 2.4) * 28.0)
-);
-const truncQ25Col = isigiToColor(truncBounds.q25, 1.0, truncBounds);
-const truncMedCol = isigiToColor(truncBounds.median, 1.0, truncBounds);
-const truncQ75Col = isigiToColor(truncBounds.q75, 1.0, truncBounds);
-
-console.log(JSON.stringify({{
-  signedNegPeak: peakUnscaledIsigi({{ intensity: -32.0, sigma: 8.0 }}),
-  signedNegMtz: peakMtzIsigi({{ mtz_i: -18.0, mtz_sigi: 6.0 }}),
-  bounds: b,
-  colLo, colQ25, colMed, colQ75, colHi, colExtremePos, colExtremeNeg,
-  resLo, resMed, resHi,
-  specIsigi,
-  truncBounds, truncQ25Col, truncMedCol, truncQ75Col,
-}}));
-"""
-    proc = subprocess.run(
-        ["node", "-e", js_probe], check=True, capture_output=True, text=True
-    )
-    out = json.loads(proc.stdout.strip())
-
-    def _rgb(s: str) -> tuple[int, int, int]:
-        nums = [int(x) for x in re.findall(r"\d+", s)[:3]]
-        return nums[0], nums[1], nums[2]
-
-    def _dist(c1: tuple[int, int, int], c2: tuple[int, int, int]) -> float:
-        return float(np.hypot(np.hypot(c1[0] - c2[0], c1[1] - c2[1]), c1[2] - c2[2]))
-
-    # Signed negative I/σ preserved without clamping at 0
-    assert abs(out["signedNegPeak"] - (-4.0)) < 1e-6
-    assert abs(out["signedNegMtz"] - (-3.0)) < 1e-6
-
-    b = out["bounds"]
-    # Unbiased PEAKS median (~0.8..2.0) used instead of top-k SAMPLE_PEAKS (>600), and [-999, +76M] outliers fenced!
-    assert -15.0 < b["min"] < 0.0
-    assert 0.0 < b["median"] < 4.0
-    assert 6.0 < b["max"] < 30.0
-    assert out["colExtremePos"] == out["colHi"] == "rgba(232, 56, 24, 1.000)"
-    assert out["colExtremeNeg"] == out["colLo"] == "rgba(20, 184, 166, 1.000)"
-    assert out["colMed"] == "rgba(254, 232, 170, 1.000)"
-
-    # Central 50% bulk [Q25, Q75] sits much closer to warm Champagne-Gold center than to either extreme pole!
-    c_lo = _rgb(out["colLo"])
-    c_q25 = _rgb(out["colQ25"])
-    c_med = _rgb(out["colMed"])
-    c_q75 = _rgb(out["colQ75"])
-    c_hi = _rgb(out["colHi"])
-    assert _dist(c_q25, c_med) < _dist(c_q25, c_lo)
-    assert _dist(c_q75, c_med) < _dist(c_q75, c_hi)
-
-    # Same center-bulk guarantee holds even on lower-truncated I/σ >= 2.5 frame distributions!
-    ct_q25 = _rgb(out["truncQ25Col"])
-    ct_med = _rgb(out["truncMedCol"])
-    ct_q75 = _rgb(out["truncQ75Col"])
-    assert ct_med == (254, 232, 170)
-    assert _dist(ct_q25, ct_med) < _dist(ct_q25, c_lo)
-    assert _dist(ct_q75, ct_med) < _dist(ct_q75, c_hi)
-
-    # Distinct from ΔI/σ (Blue-White-Rose) at lower pole, midpoint (warmer gold vs cool white), and upper pole
-    assert _dist(c_lo, _rgb(out["resLo"])) > 50.0
-    assert _dist(c_med, _rgb(out["resMed"])) > 70.0
-    assert c_med[0] > c_med[1] > c_med[2]  # warm sunlit gold midpoint
-    assert _dist(c_hi, _rgb(out["resHi"])) > 65.0
-
-    assert "·" in out["specIsigi"]["label"]
-    assert "76682" not in out["specIsigi"]["label"]
-    assert "quantile-normalized range" in out["specIsigi"]["tooltip"]
-    assert "bulk IQR" in out["specIsigi"]["tooltip"]
