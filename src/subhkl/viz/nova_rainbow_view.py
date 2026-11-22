@@ -21,6 +21,7 @@ import http.client
 import http.server
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -4721,7 +4722,14 @@ class NovaGalaxyPipelineRunner:
                     }
                     mI = mcols.get("I", mcols.get("I(+)", np.zeros(mtz_m.nreflections)))
                     mS = mcols.get(
-                        "SigI", mcols.get("SigI(+)", np.ones(mtz_m.nreflections))
+                        "SIGI",
+                        mcols.get(
+                            "SigI",
+                            mcols.get(
+                                "SIGI(+)",
+                                mcols.get("SigI(+)", np.ones(mtz_m.nreflections)),
+                            ),
+                        ),
                     )
                     for j in range(mtz_m.nreflections):
                         mkey = (
@@ -4730,6 +4738,26 @@ class NovaGalaxyPipelineRunner:
                             int(mcols["L"][j]),
                         )
                         merged_map[mkey] = (float(mI[j]), float(mS[j]))
+                    # Persist full merged ASU lookup (including Bayesian-extrapolated
+                    # harmonics when d_min < d_{min,integrated}) under /careless.
+                    if merged_map:
+                        asu_keys_arr = np.asarray(
+                            list(merged_map.keys()), dtype=np.int32
+                        )
+                        asu_i_arr = np.asarray(
+                            [v[0] for v in merged_map.values()], dtype=np.float64
+                        )
+                        asu_sigi_arr = np.asarray(
+                            [v[1] for v in merged_map.values()], dtype=np.float64
+                        )
+                        for c_ds_name, c_arr in (
+                            ("asu_hkl", asu_keys_arr),
+                            ("merged_i", asu_i_arr),
+                            ("merged_sigi", asu_sigi_arr),
+                        ):
+                            if c_ds_name in cgrp:
+                                del cgrp[c_ds_name]
+                            cgrp.create_dataset(c_ds_name, data=c_arr)
 
                 residuals = np.full(n_peaks, np.nan, dtype=np.float64)
                 scales = np.full(n_peaks, np.nan, dtype=np.float64)
@@ -5679,6 +5707,12 @@ class NovaGalaxyPipelineRunner:
                     "mergeHalfDatasets": True,
                     "anomalous": bool(params.get("anomalous", False)),
                 }
+                raw_dmin_gx = params.get("d_min")
+                if raw_dmin_gx not in (None, "", "auto", "default"):
+                    with contextlib.suppress(TypeError, ValueError):
+                        dmin_gx_f = float(raw_dmin_gx)
+                        if math.isfinite(dmin_gx_f) and dmin_gx_f > 0.0:
+                            tool_inputs["dmin"] = round(dmin_gx_f, 4)
                 if not _legacy_merge_tool and _merge_ver:
                     raw_wpb = params.get("wilson_prior_b")
                     if raw_wpb not in (None, "", "auto", "default"):
@@ -7949,6 +7983,13 @@ class NovaGalaxyPipelineRunner:
                             exp.write_mtz(mtz_dest)
             careless_iters = int(params.get("iterations") or 10000)
             studentt_dof = float(params.get("studentt_dof") or 4.0)
+            raw_dmin = params.get("d_min")
+            careless_dmin: float | None = None
+            if raw_dmin not in (None, "", "auto", "default"):
+                with contextlib.suppress(TypeError, ValueError):
+                    dmin_cand = float(raw_dmin)
+                    if math.isfinite(dmin_cand) and dmin_cand > 0.0:
+                        careless_dmin = round(dmin_cand, 4)
             raw_wilson_b = params.get("wilson_prior_b")
             wilson_b = (
                 float(raw_wilson_b)
@@ -7973,7 +8014,7 @@ class NovaGalaxyPipelineRunner:
             xval_mtz_out = os.path.join(work_dir, "xval.mtz")
             metrics_json_out = os.path.join(work_dir, "careless_metrics.json")
             prep_py = (
-                "import gemmi, numpy as np, reciprocalspaceship as rs\n"
+                "import sys, gemmi, numpy as np, reciprocalspaceship as rs\n"
                 f"mtz = gemmi.read_mtz_file({mtz_dest!r})\n"
                 "c = mtz.cell\n"
                 "na = 90.0 if abs(c.alpha - 90) < 0.2 else (120.0 if abs(c.alpha - 120) < 0.2 else c.alpha)\n"
@@ -7989,6 +8030,20 @@ class NovaGalaxyPipelineRunner:
                 "    ds['RUN'] = rs.DataSeries((ds['BATCH'].to_numpy().astype(int) // 1000).astype(np.float32), index=ds.index, dtype='R')\n"
                 "if not ds.get_m_isym_keys():\n"
                 "    ds = ds.hkl_to_asu()\n"
+                f"_req_dmin = {careless_dmin!r}\n"
+                f"_mode = {merge_mode!r}\n"
+                "if _req_dmin is not None and len(ds) > 0:\n"
+                "    _d_chk = ds.compute_dHKL()['dHKL'].to_numpy(dtype=np.float64)\n"
+                "    if _mode == 'poly':\n"
+                "        _hkls = ds.get_hkls()\n"
+                "        _gcd = np.maximum(1, np.gcd.reduce(np.abs(_hkls), axis=-1))\n"
+                "        _d0_max = float(np.nanmax(_d_chk * _gcd)) if len(_d_chk) else 0.0\n"
+                "        if _d0_max < float(_req_dmin):\n"
+                "            sys.exit(f'No integrated reflections satisfy d_min <= {_req_dmin:.3f} A (max fundamental d = {_d0_max:.3f} A).')\n"
+                "    else:\n"
+                "        _d_max = float(np.nanmax(_d_chk)) if len(_d_chk) else 0.0\n"
+                "        if _d_max < float(_req_dmin):\n"
+                "            sys.exit(f'No integrated reflections satisfy d >= {_req_dmin:.3f} A (max d = {_d_max:.3f} A).')\n"
                 "ds.merged = False\n"
                 f"ds.write_mtz({unmerged_mtz!r})\n"
                 "# Restrict neural-scaler metadata strictly to physical beam/detector/run\n"
@@ -8009,6 +8064,8 @@ class NovaGalaxyPipelineRunner:
                 f"if os.path.exists({(out_prefix + '_xval_0.mtz')!r}):\n"
                 f"    shutil.copy2({(out_prefix + '_xval_0.mtz')!r}, {xval_mtz_out!r})\n"
                 f"summary = {{'status': 'ok', 'mode': {merge_mode!r}}}\n"
+                f"if {careless_dmin!r} is not None:\n"
+                f"    summary['requested_d_min'] = float({careless_dmin!r})\n"
                 f"mtz = gemmi.read_mtz_file({merged_mtz_out!r})\n"
                 "cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}\n"
                 "I = cols.get('I', cols.get('I(+)', np.array([])))\n"
@@ -8076,6 +8133,8 @@ class NovaGalaxyPipelineRunner:
             careless_extra_flags = [
                 "--disable-image-scales",
             ]
+            if careless_dmin is not None:
+                careless_extra_flags.append(f"--dmin={careless_dmin:.6g}")
             if wilson_b is not None:
                 careless_extra_flags.append(f"--wilson-prior-b={wilson_b}")
             if spectral_file and os.path.isfile(spectral_file):

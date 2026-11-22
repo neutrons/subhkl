@@ -368,13 +368,16 @@ class SubhklGalaxyModel:
             from subhkl.viz.rainbow_zones import _h5_has_tof_data
 
             has_tof = _h5_has_tof_data(self.data.peaks_file, self.data.images_file)
-            return {
+            merge_params: dict[str, Any] = {
                 "mode": "mono" if has_tof else "poly",
                 "iterations": 10000,
                 "studenttDof": 4.0,
                 "mergeHalfDatasets": True,
                 "anomalous": False,
             }
+            if self.data.d_min and float(self.data.d_min) > 0.0:
+                merge_params["dmin"] = round(float(self.data.d_min), 4)
+            return merge_params
         return {
             "instrument": self.data.instrument.value,
             "space_group": self.data.space_group,

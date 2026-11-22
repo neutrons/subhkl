@@ -5672,7 +5672,8 @@ slDminEl.dispatchEvent({{ type: "change", target: slDminEl }});
 const clampedBelowFloor = state.dMin;
 
 // Reset back to integrated mode + isigi colorscale at d_min = 3.20 A, then drag #slider-dmin down to 2.15 A:
-// must auto-switch from 'integrated' -> 'predicted' AND 'isigi' -> 'wavelength' so unintegrated outer shells are visible!
+// must PRESERVE 'integrated' mode + 'isigi' colorscale without inventing unintegrated peaks;
+// then explicitly switching to 'predicted' shows all dynamically predicted 2.15 A reflections!
 slDminEl.value = "3.20";
 slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
 applyPeakSource("integrated", false);
@@ -5682,6 +5683,11 @@ const colorModeBeforeDrag = state.wulffColorMode;
 
 slDminEl.value = "2.15";
 slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+const sourceAfterDragBelowInteg = state.peakSource;
+const colorModeAfterDragBelowInteg = state.wulffColorMode;
+const integCountAfterDragBelowInteg = PEAKS.length;
+
+applyPeakSource("predicted", false);
 if (_dynMultiRunTimer) {{
   clearTimeout(_dynMultiRunTimer);
   _dynMultiRunTimer = null;
@@ -5689,8 +5695,7 @@ if (_dynMultiRunTimer) {{
 }} else {{
   repredictPeaksDynamic({{ forceSampleImmediate: true }});
 }}
-const sourceAfterDragBelowInteg = state.peakSource;
-const colorModeAfterDragBelowInteg = state.wulffColorMode;
+const sourceAfterExplicitPred = state.peakSource;
 const pred215 = PEAKS.map(p => ({{
   bank: p.bank,
   hkl: p.hkl,
@@ -5950,6 +5955,8 @@ require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
   sourceAfterDragBelowInteg,
   colorModeBeforeDrag,
   colorModeAfterDragBelowInteg,
+  integCountAfterDragBelowInteg,
+  sourceAfterExplicitPred,
   pred215,
   sampleRunsAt215,
   sampleCountAt215,
@@ -6131,14 +6138,16 @@ process.exit(0);
     assert az_cursor_diff < 1e-4
     assert out["maxZoomOutAzDrift"] < 1e-5
 
-    # B. Verify auto-switch from 'integrated' -> 'predicted' when dragging d_min below integrated cutoff
+    # B. Verify 'integrated' mode is preserved when dragging d_min below integrated cutoff (no auto-switch!)
     assert out["initialPeakSource"] == "integrated"
     assert out["initialIntegCount"] == 6
     assert out["initialPredCount"] == len(payload["predicted_peaks"])
     assert out["sourceBeforeDrag"] == "integrated"
-    assert out["sourceAfterDragBelowInteg"] == "predicted"
+    assert out["sourceAfterDragBelowInteg"] == "integrated"
+    assert out["integCountAfterDragBelowInteg"] == 6
     assert out["colorModeBeforeDrag"] == "isigi"
-    assert out["colorModeAfterDragBelowInteg"] == "wavelength"
+    assert out["colorModeAfterDragBelowInteg"] == "isigi"
+    assert out["sourceAfterExplicitPred"] == "predicted"
 
     # C. Verify exact 1:1 HKL + pixel + Gemmi ASU/Bijvoet parity on curved cylindrical CG4D at d_min = 2.15 A
     py_by_hkl = {
@@ -12013,3 +12022,619 @@ setTimeout(() => {{
         assert js_out["peaksRows"] == [132.0, 144.0]
         assert js_out["hasMergeMetrics"] is True
         assert js_out["hasPixelMaskBits"] is True
+
+
+def test_post_integration_wulff_dmin_filter_preserves_integ_and_all_runs(
+    tmp_path,
+) -> None:
+    """Verify changing d_min after integration preserves Integ/Pred mode and filters all runs on the Wulff map without collapsing to 1 frame or inventing unintegrated peaks."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import (
+        cartesian_matrix_metric_tensor,
+        generate_reflections,
+    )
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.rainbow_zones import (
+        _raycast_hkl_on_detectors,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    cell = [42.0, 48.0, 56.0, 90.0, 90.0, 90.0]
+    B_raw, _ = cartesian_matrix_metric_tensor(*cell[:3], *np.deg2rad(cell[3:]))
+    B_mat = np.asarray(B_raw, dtype=float)
+    U_mat = Rotation.from_euler("zyx", [14.0, -23.0, 31.0], degrees=True).as_matrix()
+    active_bks = [1, 20]
+    dets = {bk: Detector(dict(beamlines["MANDI"][str(bk)])) for bk in active_bks}
+    H, W = int(dets[1].n), int(dets[1].m)
+    wl_range = (2.0, 4.2)
+    d_integ_cut = 2.0
+
+    # Build 3 distinct goniometer orientations (runs 0, 1, 2), 2 banks per run = 6 images.
+    # Intentionally omit `file_offsets` on `integrated.h5` so standalone run inference from
+    # `(peaks/run_index, peaks/image_index)` is also verified!
+    run_angles_deg = [0.0, 35.0, 70.0]
+    R_runs = [
+        Rotation.from_euler("y", ang, degrees=True).as_matrix()
+        for ang in run_angles_deg
+    ]
+    R_per_image = np.stack([R_r for R_r in R_runs for _ in active_bks], axis=0)
+    angles_per_image = np.array(
+        [[ang, 0.0, 0.0] for ang in run_angles_deg for _ in active_bks],
+        dtype=np.float64,
+    )
+    bank_ids_per_image = np.array(active_bks * len(run_angles_deg), dtype=np.int32)
+
+    hkls_int = np.stack(
+        generate_reflections(*cell, space_group="P 21 21 21", d_min=d_integ_cut),
+        axis=1,
+    ).astype(int)
+
+    all_xyz, all_r, all_c, all_img, all_run = [], [], [], [], []
+    all_h, all_k, all_l, all_wl, all_I, all_sig = [], [], [], [], [], []
+    bw = int(0.06 * min(H, W))
+    for r_idx, R_r in enumerate(R_runs):
+        cast_r = _raycast_hkl_on_detectors(
+            hkls_int,
+            U_mat,
+            B_mat,
+            R_r,
+            dets,
+            wl_range,
+            active_bids=set(active_bks),
+            margin_frac=0.0,
+        )
+        assert len(cast_r["bank"]) >= 12
+        for j in range(len(cast_r["bank"])):
+            pr_j = float(cast_r["pixel_r"][j])
+            pc_j = float(cast_r["pixel_c"][j])
+            if pr_j < bw or pr_j >= (H - 1 - bw) or pc_j < bw or pc_j >= (W - 1 - bw):
+                continue
+            bk = int(cast_r["bank"][j])
+            local_b = active_bks.index(bk)
+            img_idx = r_idx * len(active_bks) + local_b
+            all_xyz.append(cast_r["peaks_xyz"][j])
+            all_r.append(pr_j)
+            all_c.append(pc_j)
+            all_img.append(img_idx)
+            all_run.append(r_idx)
+            all_h.append(int(cast_r["hkl"][j, 0]))
+            all_k.append(int(cast_r["hkl"][j, 1]))
+            all_l.append(int(cast_r["hkl"][j, 2]))
+            all_wl.append(float(cast_r["wavelength"][j]))
+            all_I.append(120.0)
+            all_sig.append(8.0)  # I/sigma = 15.0 >= 2.5 SNR cut
+
+    integ_h5 = tmp_path / "standalone_multirun_integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.create_dataset("bank_ids", data=bank_ids_per_image)
+        hf.create_dataset(
+            "files",
+            data=np.array(
+                [f"MANDI_run_{i}.nxs.h5" for i in range(len(run_angles_deg))],
+                dtype="S32",
+            ),
+        )
+        gon = hf.create_group("goniometer")
+        gon.create_dataset("R", data=R_per_image)
+        gon.create_dataset("angles", data=angles_per_image)
+        gon.create_dataset(
+            "axes",
+            data=np.array([[0, 1, 0, 1], [0, 0, 1, 1], [0, 1, 0, 1]], dtype=np.float64),
+        )
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array(wl_range, dtype=np.float64)
+        )
+        smp = hf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 21 21 21")
+        smp.create_dataset("cell", data=np.array(cell, dtype=np.float64))
+        for k_c, v_c in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
+            smp.create_dataset(k_c, data=float(v_c))
+        smp.create_dataset("U", data=U_mat)
+        smp.create_dataset("B", data=B_mat)
+        pgrp = hf.create_group("peaks")
+        pgrp.create_dataset("xyz", data=np.asarray(all_xyz, dtype=np.float64))
+        pgrp.create_dataset("pixel_r", data=np.asarray(all_r, dtype=np.float64))
+        pgrp.create_dataset("pixel_c", data=np.asarray(all_c, dtype=np.float64))
+        pgrp.create_dataset("image_index", data=np.asarray(all_img, dtype=np.int32))
+        pgrp.create_dataset("run_index", data=np.asarray(all_run, dtype=np.int32))
+        pgrp.create_dataset("h", data=np.asarray(all_h, dtype=np.int32))
+        pgrp.create_dataset("k", data=np.asarray(all_k, dtype=np.int32))
+        pgrp.create_dataset("l", data=np.asarray(all_l, dtype=np.int32))
+        pgrp.create_dataset("wavelength", data=np.asarray(all_wl, dtype=np.float64))
+        pgrp.create_dataset("intensity", data=np.asarray(all_I, dtype=np.float64))
+        pgrp.create_dataset("sigma", data=np.asarray(all_sig, dtype=np.float64))
+        n_tot = len(all_h)
+        pgrp.create_dataset("var_u", data=np.full(n_tot, 2.5, dtype=np.float64))
+        pgrp.create_dataset("var_v", data=np.full(n_tot, 2.5, dtype=np.float64))
+        pgrp.create_dataset("cov_uv", data=np.zeros(n_tot, dtype=np.float64))
+
+    payload = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        instrument="MANDI",
+        d_min=d_integ_cut,
+        wavelength_range=wl_range,
+        frame_index=0,
+        include_panel_images=False,
+    )
+    assert payload["default_peak_source"] == "integrated"
+    assert len(payload["frames"]) == 3
+    assert {int(p["run_index"]) for p in payload["integrated_sample_peaks"]} == {
+        0,
+        1,
+        2,
+    }
+    assert {int(p["run_index"]) for p in payload["predicted_sample_peaks"]} == {0, 1, 2}
+    assert all(
+        float(p["d_spacing"]) >= d_integ_cut - 1e-3
+        for p in payload["integrated_sample_peaks"]
+    )
+
+    # Frame-only payload for run 1 (mirrors /api/payload?frame=1&frame_only=1)
+    payload_f1 = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        instrument="MANDI",
+        d_min=d_integ_cut,
+        wavelength_range=wl_range,
+        frame_index=1,
+        include_panel_images=True,
+        include_all_runs_peaks=False,
+    )
+    payload_f1["frame_only"] = True
+    assert payload_f1["integrated_sample_peaks"] == []
+    assert payload_f1["predicted_sample_peaks"] == []
+
+    if not shutil.which("node"):
+        return
+
+    html_doc = render_rainbow_html(payload)
+    js_src = re.findall(r"<script>([\s\S]*?)</script>", html_doc)[-1]
+    iife_end = js_src.rfind("})();")
+    assert iife_end > 0
+
+    js_harness = """
+const elems = new Map();
+function makeEl(id = "") {
+  const listeners = {};
+  return {
+    id, tagName: "DIV", value: "", min: "0.25", max: "6.50", step: "0.05",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: 800, height: 520, clientWidth: 800, clientHeight: 520,
+    scrollWidth: 800, scrollHeight: 520, scrollTop: 0, offsetWidth: 800, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null, dataset: {},
+    style: new Proxy({}, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: { add() {}, remove() {}, toggle() { return false; }, contains() { return false; } },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) { (listeners[evObj.type] || []).forEach(fn => fn(evObj)); },
+    appendChild(c) { return c; }, insertBefore(c) { return c; }, replaceChildren() {},
+    setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
+    getBoundingClientRect() { return { left: 0, top: 0, right: 800, bottom: 520, width: 800, height: 520 }; },
+    getContext() {
+      return {
+        fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+        textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+        setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+        transform() {}, clearRect() {}, fillRect() {}, strokeRect() {},
+        beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, arc() {}, ellipse() {},
+        quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+        stroke() {}, fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+        fillText() {}, strokeText() {}, drawImage() {},
+        measureText(t) { return { width: String(t).length * 6 }; },
+        createLinearGradient() { return { addColorStop() {} }; },
+        createRadialGradient() { return { addColorStop() {} }; },
+        getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+        putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+      };
+    },
+    querySelector() { return makeEl(); }, querySelectorAll() { return []; }, closest() { return null; },
+  };
+}
+function getEl(id) { if (!elems.has(id)) elems.set(id, makeEl(id)); return elems.get(id); }
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.requestAnimationFrame = () => 1;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.Image = class { set src(_v) {} };
+globalThis.document = {
+  body: makeEl("body"), documentElement: makeEl("html"),
+  getElementById: (id) => getEl(id),
+  createElement: (tag) => makeEl(tag),
+  querySelector: () => makeEl(), querySelectorAll: () => [],
+  addEventListener() {}, removeEventListener() {},
+};
+"""
+    js_probe = f"""
+const slDminEl = getEl("slider-dmin");
+state.wulffScope = "all_runs";
+applyPeakSource("integrated", false);
+const initVis = getActiveWulffPeaks();
+const initState = {{
+  peakSource: state.peakSource,
+  wulffScope: state.wulffScope,
+  count: initVis.length,
+  runs: Array.from(new Set(initVis.map(p => p.run_index))).sort(),
+  minD: initVis.reduce((m, p) => Math.min(m, p.d_spacing), Infinity),
+}};
+
+// 1. Raise d_min above integrated cutoff (2.00 -> 2.80 A) in Integ + All-Runs:
+// must stay in 'integrated' + 'all_runs', filter all runs to d >= 2.80 A, and keep all 3 runs!
+slDminEl.value = "2.80";
+slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+const highDVis = getActiveWulffPeaks();
+const highDState = {{
+  peakSource: state.peakSource,
+  wulffScope: state.wulffScope,
+  count: highDVis.length,
+  runs: Array.from(new Set(highDVis.map(p => p.run_index))).sort(),
+  minD: highDVis.reduce((m, p) => Math.min(m, p.d_spacing), Infinity),
+}};
+
+// 2. Lower d_min below integrated cutoff (2.80 -> 1.45 A) in Integ + All-Runs:
+// must NEVER switch to 'predicted', must NEVER add unintegrated (< 2.0 A) peaks, and must keep all 3 runs!
+slDminEl.value = "1.45";
+slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+if (_dynMultiRunTimer) {{
+  clearTimeout(_dynMultiRunTimer);
+  _dynMultiRunTimer = null;
+  if (typeof _dynPendingMultiRunFn === "function") _dynPendingMultiRunFn();
+}}
+const lowDIntegVis = getActiveWulffPeaks();
+const lowDIntegState = {{
+  peakSource: state.peakSource,
+  wulffScope: state.wulffScope,
+  count: lowDIntegVis.length,
+  runs: Array.from(new Set(lowDIntegVis.map(p => p.run_index))).sort(),
+  minD: lowDIntegVis.reduce((m, p) => Math.min(m, p.d_spacing), Infinity),
+}};
+
+// 3. Switch active detector frame via frame_only payload (empty sample arrays) and re-filter d_min:
+// must preserve multi-run INTEGRATED_SAMPLE_PEAKS & PREDICTED_SAMPLE_PEAKS across all 3 runs!
+const frameOnlyPayload = {json.dumps(payload_f1)};
+recomputeBoundsAndReload(frameOnlyPayload, {{ preserveViewState: true }});
+slDminEl.value = "2.40";
+slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+const afterFrameSwitchIntegVis = getActiveWulffPeaks();
+const afterFrameSwitchInteg = {{
+  peakSource: state.peakSource,
+  wulffScope: state.wulffScope,
+  count: afterFrameSwitchIntegVis.length,
+  runs: Array.from(new Set(afterFrameSwitchIntegVis.map(p => p.run_index))).sort(),
+  minD: afterFrameSwitchIntegVis.reduce((m, p) => Math.min(m, p.d_spacing), Infinity),
+}};
+
+// 4. Explicitly switch to Pred + All-Runs at d_min = 1.45 A:
+// must dynamically predict outer reflections (< 2.0 A) across ALL 3 runs without active frame starving others!
+slDminEl.value = "1.45";
+slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+applyPeakSource("predicted", false);
+if (_dynMultiRunTimer) {{
+  clearTimeout(_dynMultiRunTimer);
+  _dynMultiRunTimer = null;
+  if (typeof _dynPendingMultiRunFn === "function") _dynPendingMultiRunFn();
+}}
+const predAllRunsVis = getActiveWulffPeaks();
+const predAllRunsState = {{
+  peakSource: state.peakSource,
+  wulffScope: state.wulffScope,
+  count: predAllRunsVis.length,
+  runs: Array.from(new Set(predAllRunsVis.map(p => p.run_index))).sort(),
+  minD: predAllRunsVis.reduce((m, p) => Math.min(m, p.d_spacing), Infinity),
+}};
+
+// Also verify Pred + All-Runs filters cleanly when raising d_min to 2.80 A
+slDminEl.value = "2.80";
+slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+if (_dynMultiRunTimer) {{
+  clearTimeout(_dynMultiRunTimer);
+  _dynMultiRunTimer = null;
+  if (typeof _dynPendingMultiRunFn === "function") _dynPendingMultiRunFn();
+}}
+const predHighDVis = getActiveWulffPeaks();
+const predHighDState = {{
+  peakSource: state.peakSource,
+  count: predHighDVis.length,
+  runs: Array.from(new Set(predHighDVis.map(p => p.run_index))).sort(),
+  minD: predHighDVis.reduce((m, p) => Math.min(m, p.d_spacing), Infinity),
+}};
+
+console.log(JSON.stringify({{
+  initState,
+  highDState,
+  lowDIntegState,
+  afterFrameSwitchInteg,
+  predAllRunsState,
+  predHighDState,
+}}));
+}})();
+"""
+    js_path = tmp_path / "post_integ_wulff_dmin_test.js"
+    js_path.write_text(
+        js_harness + "\n" + js_src[:iife_end] + "\n" + js_probe, encoding="utf-8"
+    )
+    proc = subprocess.run(
+        ["node", str(js_path)], check=True, capture_output=True, text=True
+    )
+    out = json.loads(proc.stdout.strip())
+
+    assert out["initState"]["peakSource"] == "integrated"
+    assert out["initState"]["runs"] == [0, 1, 2]
+    assert out["initState"]["minD"] >= 2.0 - 1e-3
+
+    assert out["highDState"]["peakSource"] == "integrated"
+    assert out["highDState"]["wulffScope"] == "all_runs"
+    assert out["highDState"]["runs"] == [0, 1, 2]
+    assert 0 < out["highDState"]["count"] < out["initState"]["count"]
+    assert out["highDState"]["minD"] >= 2.80 - 1e-3
+
+    assert out["lowDIntegState"]["peakSource"] == "integrated"
+    assert out["lowDIntegState"]["wulffScope"] == "all_runs"
+    assert out["lowDIntegState"]["runs"] == [0, 1, 2]
+    assert out["lowDIntegState"]["count"] == out["initState"]["count"]
+    assert out["lowDIntegState"]["minD"] >= 2.0 - 1e-3
+
+    assert out["afterFrameSwitchInteg"]["peakSource"] == "integrated"
+    assert out["afterFrameSwitchInteg"]["runs"] == [0, 1, 2]
+    assert out["afterFrameSwitchInteg"]["minD"] >= 2.40 - 1e-3
+    assert (
+        out["highDState"]["count"]
+        < out["afterFrameSwitchInteg"]["count"]
+        < out["initState"]["count"]
+    )
+
+    assert out["predAllRunsState"]["peakSource"] == "predicted"
+    assert out["predAllRunsState"]["runs"] == [0, 1, 2]
+    assert out["predAllRunsState"]["count"] > out["initState"]["count"]
+    assert out["predAllRunsState"]["minD"] < 1.65
+
+    assert out["predHighDState"]["peakSource"] == "predicted"
+    assert out["predHighDState"]["runs"] == [0, 1, 2]
+    assert out["predHighDState"]["minD"] >= 2.80 - 1e-3
+
+
+def test_careless_merge_respects_dmin_and_stamps_extrapolated_asu_lookup(
+    tmp_path, monkeypatch
+) -> None:
+    """Verify Careless merge forwards d_min (subset & Bayesian harmonic extrapolation) in container + Galaxy modes and stamps full merged.mtz ASU lookup."""
+    import json
+    from unittest.mock import MagicMock, patch
+
+    import gemmi
+
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import build_rainbow_zone_payload
+
+    cell = [20.0, 24.0, 28.0, 90.0, 90.0, 90.0]
+    B_raw, _ = cartesian_matrix_metric_tensor(*cell[:3], *np.deg2rad(cell[3:]))
+    B_mat = np.asarray(B_raw, dtype=float)
+
+    merged_h5 = tmp_path / "merged.h5"
+    integ_h5 = tmp_path / "integrated.h5"
+    with h5py.File(merged_h5, "w") as mf:
+        mf.attrs["instrument"] = "CG4D"
+        mf.create_dataset("bank_ids", data=np.array([1], dtype=np.int32))
+        mf.create_group("goniometer").create_dataset("R", data=np.eye(3)[None, :, :])
+        mf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([1.0, 4.5], dtype=np.float64)
+        )
+
+    # Fundamental (2, 0, 0) has d = 10.0 A; harmonic (4, 0, 0) has d = 5.0 A (not in /peaks/*)
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf.create_dataset("bank_ids", data=np.array([1], dtype=np.int32))
+        hf.create_group("goniometer").create_dataset("R", data=np.eye(3)[None, :, :])
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([1.0, 4.5], dtype=np.float64)
+        )
+        smp = hf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 21 21 21")
+        smp.create_dataset("cell", data=np.array(cell, dtype=np.float64))
+        for k_c, v_c in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
+            smp.create_dataset(k_c, data=float(v_c))
+        smp.create_dataset("U", data=np.eye(3, dtype=np.float64))
+        smp.create_dataset("B", data=B_mat)
+        pgrp = hf.create_group("peaks")
+        pgrp.create_dataset(
+            "xyz", data=np.array([[-0.35, 0.0, 0.25]], dtype=np.float64)
+        )
+        pgrp.create_dataset("pixel_r", data=np.array([128.0], dtype=np.float64))
+        pgrp.create_dataset("pixel_c", data=np.array([128.0], dtype=np.float64))
+        pgrp.create_dataset("image_index", data=np.array([0], dtype=np.int32))
+        pgrp.create_dataset("run_index", data=np.array([0], dtype=np.int32))
+        pgrp.create_dataset("h", data=np.array([2], dtype=np.int32))
+        pgrp.create_dataset("k", data=np.array([0], dtype=np.int32))
+        pgrp.create_dataset("l", data=np.array([0], dtype=np.int32))
+        pgrp.create_dataset("wavelength", data=np.array([3.2], dtype=np.float64))
+        pgrp.create_dataset("intensity", data=np.array([240.0], dtype=np.float64))
+        pgrp.create_dataset("sigma", data=np.array([12.0], dtype=np.float64))
+        pgrp.create_dataset("var_u", data=np.array([2.0], dtype=np.float64))
+        pgrp.create_dataset("var_v", data=np.array([2.0], dtype=np.float64))
+        pgrp.create_dataset("cov_uv", data=np.array([0.0], dtype=np.float64))
+
+    # Write a minimal unmerged.mtz so merge stage skips Exporter
+    mtz_in = gemmi.Mtz(with_base=True)
+    mtz_in.spacegroup = gemmi.find_spacegroup_by_name("P 21 21 21")
+    mtz_in.set_cell_for_all(gemmi.UnitCell(*cell))
+    mtz_in.add_dataset("unmerged")
+    mtz_in.add_column("M/ISYM", "Y")
+    mtz_in.add_column("BATCH", "B")
+    mtz_in.add_column("I", "J")
+    mtz_in.add_column("SIGI", "Q")
+    mtz_in.add_column("WAVEL", "W")
+    mtz_in.set_data(np.array([[2, 0, 0, 1, 1000, 240.0, 12.0, 3.2]], dtype=np.float32))
+    mtz_in.write_to_file(str(tmp_path / "integrated.mtz"))
+
+    # 1. Local Podman container stage: verify --dmin=<val> for both subset (d_min=2.8) and extrapolation (d_min=1.45)
+    mtz_in.write_to_file(str(tmp_path / "reflections.mtz"))
+    for dmin_val in (2.8, 1.45):
+        runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+        runner._local_work_dir = str(tmp_path)
+        rec = {"cancel_requested": True}
+        runner._submit_local_subhkl_stage(
+            "merge",
+            {
+                "images_file": str(merged_h5),
+                "peaks_file": str(integ_h5),
+                "d_min": dmin_val,
+            },
+            existing_job_record=rec,
+        )
+        assert f"--dmin={dmin_val:g}" in rec["command_line"]
+        prep_src = (tmp_path / "careless_work" / "prep_merge.py").read_text()
+        post_src = (tmp_path / "careless_work" / "post_merge.py").read_text()
+        assert f"_req_dmin = {dmin_val!r}" in prep_src
+        assert "requested_d_min" in post_src
+
+    # 2. SubhklGalaxyModel + Galaxy imaginex_subhkl_merge tool_inputs["dmin"] forwarding
+    m_sub = SubhklGalaxyModel()
+    m_sub.data.peaks_file = str(integ_h5)
+    m_sub.data.images_file = str(merged_h5)
+    m_sub.data.d_min = 1.45
+    assert m_sub.build_tool_parameters("merge")["dmin"] == 1.45
+
+    shared_dir = tmp_path / "shared_dir"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("SUBHKL_SHARED_DIR", str(shared_dir))
+    monkeypatch.setenv("SUBHKL_EXEC_MODE", "galaxy")
+    gx_runner = NovaGalaxyPipelineRunner(
+        galaxy_url="http://localhost:8080", galaxy_api_key="fake-key"
+    )
+    captured_gx: list[tuple[str, dict]] = []
+    fake_store = MagicMock()
+    fake_store.history_id = "hist_dmin"
+    fake_store.nova_connection.galaxy_instance.histories.show_history.return_value = []
+    fake_store.nova_connection.galaxy_instance.tools.run_tool.side_effect = (
+        lambda history_id, tool_id, tool_inputs: (
+            captured_gx.append((tool_id, dict(tool_inputs)))
+            or {"jobs": [{"id": "gx_1"}], "outputs": []}
+        )
+    )
+    mtz_in.write_to_file(str(tmp_path / "reflections.mtz"))
+    gx_job_rec = {
+        "job_id": "j_dmin",
+        "stage_id": "merge",
+        "state": "queued",
+        "stdout": "",
+    }
+    with (
+        patch.object(gx_runner, "get_datastore", return_value=fake_store),
+        patch.object(gx_runner, "_has_tool_on_galaxy", return_value=True),
+        patch.object(
+            gx_runner, "_upload_compact_ndip_artifact", return_value="hda_mtz"
+        ),
+        patch.object(gx_runner, "_ensure_galaxy_h5_dataset", return_value="hda_mtz"),
+        patch.object(gx_runner, "_get_tool_version", return_value="0.1.3"),
+        patch.object(gx_runner, "_poll_galaxy_job", return_value=None),
+        patch.object(gx_runner, "_submit_local_subhkl_stage", return_value=None),
+    ):
+        gx_runner._dispatch_nova_galaxy_thread(
+            "merge",
+            {
+                "images_file": str(merged_h5),
+                "peaks_file": str(integ_h5),
+                "d_min": 1.45,
+            },
+            gx_job_rec,
+            None,
+        )
+    assert len(captured_gx) == 1, f"Galaxy dispatch state: {gx_job_rec}"
+    assert captured_gx[0][0] == "imaginex_subhkl_merge"
+    assert captured_gx[0][1]["dmin"] == 1.45
+
+    # 3. _stamp_careless_merge_into_h5 stamps uppercase SIGI + Bayesian-extrapolated outer harmonic (4, 0, 0)
+    stamp_dir = tmp_path / "stamp_extrap"
+    stamp_dir.mkdir()
+    mtz_merged = gemmi.Mtz(with_base=True)
+    mtz_merged.spacegroup = gemmi.find_spacegroup_by_name("P 21 21 21")
+    mtz_merged.set_cell_for_all(gemmi.UnitCell(*cell))
+    mtz_merged.add_dataset("merged")
+    mtz_merged.add_column("I", "J")
+    mtz_merged.add_column("SIGI", "Q")
+    mtz_merged.add_column("N", "I")
+    mtz_merged.set_data(
+        np.array(
+            [
+                [2, 0, 0, 100.0, 5.0, 4.0],  # I/SIGI = 20.0
+                [4, 0, 0, 36.0, 6.0, 2.0],  # Extrapolated harmonic: I/SIGI = 6.0
+            ],
+            dtype=np.float32,
+        )
+    )
+    mtz_merged.write_to_file(str(stamp_dir / "merged.mtz"))
+
+    mtz_pred = gemmi.Mtz(with_base=True)
+    mtz_pred.spacegroup = gemmi.find_spacegroup_by_name("P 21 21 21")
+    mtz_pred.set_cell_for_all(gemmi.UnitCell(*cell))
+    mtz_pred.add_dataset("predictions")
+    for cname, ctype in (
+        ("Iobs", "J"),
+        ("SigIobs", "Q"),
+        ("Ipred", "J"),
+        ("SigIpred", "Q"),
+        ("Scale", "R"),
+    ):
+        mtz_pred.add_column(cname, ctype)
+    mtz_pred.set_data(
+        np.array([[2, 0, 0, 240.0, 12.0, 235.0, 8.0, 2.35]], dtype=np.float32)
+    )
+    mtz_pred.write_to_file(str(stamp_dir / "predictions.mtz"))
+    (stamp_dir / "careless_metrics.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "mode": "poly",
+                "requested_d_min": 4.5,
+                "n_merged_asu": 2,
+                "n_observations": 1,
+                "mean_isigi": 13.0,
+                "mean_multiplicity": 3.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runner_stamp = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner_stamp._stamp_careless_merge_into_h5(str(integ_h5), str(stamp_dir), {})
+
+    merged_payload = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        instrument="CG4D",
+        d_min=4.5,
+        wavelength_range=(1.0, 4.5),
+        include_panel_images=False,
+    )
+    assert merged_payload["artifact_kind"] == "merged_careless"
+    assert merged_payload["mtz_asu_lookup"]["2,0,0"] == [100.0, 5.0]
+    assert merged_payload["mtz_asu_lookup"]["4,0,0"] == [36.0, 6.0]
+    # Real SIGI=5.0 used (mtz_isigi = 100 / 5 = 20.0, not fallback SIGI=1.0 -> 100.0!)
+    assert abs(float(merged_payload["integrated_peaks"][0]["mtz_isigi"]) - 20.0) < 1e-3
+    extrap_hits = [
+        p for p in merged_payload["predicted_peaks"] if p.get("asu_orbit_id") == "4,0,0"
+    ]
+    for p_ex in extrap_hits:
+        assert abs(float(p_ex["mtz_isigi"]) - 6.0) < 1e-3

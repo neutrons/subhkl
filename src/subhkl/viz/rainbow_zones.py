@@ -3022,6 +3022,37 @@ def _extract_from_h5(
         ):
             if n_frames_total == 0:
                 n_frames_total = len(gonio_angles_nom)
+            if offsets is None and "peaks/run_index" in f:
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ):
+                    r_probe = np.asarray(f["peaks/run_index"][()], dtype=int).ravel()
+                    if len(r_probe) > 0 and int(np.min(r_probe)) >= 0:
+                        n_r_probe = int(np.max(r_probe)) + 1
+                        n_tot_g = len(gonio_angles_nom)
+                        if 1 <= n_r_probe < n_tot_g:
+                            if n_tot_g % n_r_probe == 0:
+                                stride_g = n_tot_g // n_r_probe
+                                blk = gonio_angles_nom.reshape(n_r_probe, stride_g, -1)
+                                if float(np.max(np.ptp(blk, axis=1))) <= 1e-5:
+                                    offsets = np.arange(0, n_tot_g, stride_g, dtype=int)
+                            if offsets is None and "peaks/image_index" in f:
+                                img_probe = np.asarray(
+                                    f["peaks/image_index"][()], dtype=int
+                                ).ravel()
+                                if (
+                                    len(img_probe) == len(r_probe)
+                                    and int(np.max(img_probe)) < n_tot_g
+                                ):
+                                    inferred_offs: list[int] = []
+                                    last_off = 0
+                                    for r_k in range(n_r_probe):
+                                        m_rk = r_probe == r_k
+                                        if np.any(m_rk):
+                                            last_off = int(np.min(img_probe[m_rk]))
+                                        inferred_offs.append(last_off)
+                                    if np.all(np.diff(inferred_offs) >= 0):
+                                        offsets = np.asarray(inferred_offs, dtype=int)
             if offsets is None:
                 offsets = np.arange(len(gonio_angles_nom), dtype=int)
 
@@ -4095,17 +4126,36 @@ def _extract_from_h5(
                 elif np.any(sigma > 0):
                     mask_all_snr = sigma > 0
             idx_all = np.flatnonzero(mask_all_snr)
-            if len(idx_all) > 12000:
+            max_all_runs_peaks = 36000
+            if len(idx_all) > max_all_runs_peaks:
                 active_keep = np.array([], dtype=int)
                 if run_index is not None and len(run_index) == len(peaks_xyz):
                     active_keep = np.flatnonzero(
                         mask_all_snr & (run_index == active_frame)
                     )
-                if intensity is not None and len(intensity) == len(peaks_xyz):
-                    top_k = np.argsort(-intensity[idx_all])[:12000]
-                    idx_all = np.sort(idx_all[top_k])
-                else:
-                    idx_all = idx_all[:12000]
+                # Preserve at least the strongest observation per unique (h, k, l) across
+                # all runs so outer high-resolution shells are never starved by bright
+                # inner-shell reflections when filtering by d_min on the Wulff net.
+                score_all = (
+                    intensity[idx_all]
+                    if intensity is not None and len(intensity) == len(peaks_xyz)
+                    else np.zeros(len(idx_all), dtype=float)
+                )
+                order_desc = np.argsort(-score_all)
+                idx_desc = idx_all[order_desc]
+                hkl_desc = np.ascontiguousarray(hkl[idx_desc], dtype=np.int32)
+                hkl_void = hkl_desc.view(
+                    np.dtype((np.void, hkl_desc.dtype.itemsize * 3))
+                ).ravel()
+                _, uniq_pos = np.unique(hkl_void, return_index=True)
+                uniq_pos_sorted = np.sort(uniq_pos)[:max_all_runs_peaks]
+                chosen = idx_desc[uniq_pos_sorted]
+                if len(chosen) < max_all_runs_peaks:
+                    used_mask = np.zeros(len(idx_desc), dtype=bool)
+                    used_mask[uniq_pos_sorted] = True
+                    rem = idx_desc[~used_mask][: max_all_runs_peaks - len(chosen)]
+                    chosen = np.concatenate([chosen, rem])
+                idx_all = np.sort(chosen)
                 if len(active_keep) > 0:
                     idx_all = np.unique(np.concatenate([idx_all, active_keep]))
             r_idx_all = (
@@ -4140,6 +4190,12 @@ def _extract_from_h5(
                 else None,
                 "careless_scale": careless_scale[idx_all]
                 if careless_scale is not None and len(careless_scale) == len(peaks_xyz)
+                else None,
+                "merged_i": merged_i[idx_all]
+                if merged_i is not None and len(merged_i) == len(peaks_xyz)
+                else None,
+                "merged_sigi": merged_sigi[idx_all]
+                if merged_sigi is not None and len(merged_sigi) == len(peaks_xyz)
                 else None,
                 "R_per_run": R_per_run,
                 "s_lab_per_run": s_lab_per_run_all,
@@ -8508,6 +8564,7 @@ def _serialize_sample_peaks(
     wavelength_range: tuple[float, float],
     space_group: str,
     cell: list[float] | None,
+    ub_matrix: np.ndarray | None = None,
     merged_i_arr: np.ndarray | None = None,
     merged_sigi_arr: np.ndarray | None = None,
     peak_source: str = "predicted",
@@ -8531,6 +8588,20 @@ def _serialize_sample_peaks(
     bnk_all = all_runs_data.get("bank")
     res_all = all_runs_data.get("careless_residual")
     scl_all = all_runs_data.get("careless_scale")
+    m_i_all = all_runs_data.get("merged_i")
+    m_sigi_all = all_runs_data.get("merged_sigi")
+    if (
+        m_i_all is None
+        and merged_i_arr is not None
+        and len(merged_i_arr) == len(pts_all)
+    ):
+        m_i_all = merged_i_arr
+    if (
+        m_sigi_all is None
+        and merged_sigi_arr is not None
+        and len(merged_sigi_arr) == len(pts_all)
+    ):
+        m_sigi_all = merged_sigi_arr
     R_per_run = all_runs_data.get("R_per_run") or {}
     s_per_run = all_runs_data.get("s_lab_per_run") or {}
     s_default = (
@@ -8563,12 +8634,30 @@ def _serialize_sample_peaks(
     wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
 
     st_all = np.clip(0.5 * qn_all[:, 0], 1e-4, 0.9999)
-    lam_vec = (
-        np.asarray(lam_all, dtype=float)
-        if lam_all is not None and len(lam_all) == len(pts_all)
-        else np.full(len(pts_all), 0.5 * (wl_min + wl_max), dtype=float)
-    )
-    d_vec = lam_vec / np.maximum(2.0 * st_all, 1e-4)
+    if ub_matrix is not None:
+        G_cryst_all = hkl_all @ np.asarray(ub_matrix, dtype=float).T
+        G_norm_all = np.linalg.norm(G_cryst_all, axis=1)
+        valid_hkl_all = G_norm_all > 1e-8
+        if lam_all is not None and len(lam_all) == len(pts_all):
+            lam_vec = np.asarray(lam_all, dtype=float)
+        else:
+            lam_vec = np.where(
+                valid_hkl_all,
+                2.0 * st_all / np.maximum(G_norm_all, 1e-8),
+                0.5 * (wl_min + wl_max),
+            )
+        d_vec = np.where(
+            valid_hkl_all,
+            1.0 / np.maximum(G_norm_all, 1e-8),
+            lam_vec / np.maximum(2.0 * st_all, 1e-4),
+        )
+    else:
+        lam_vec = (
+            np.asarray(lam_all, dtype=float)
+            if lam_all is not None and len(lam_all) == len(pts_all)
+            else np.full(len(pts_all), 0.5 * (wl_min + wl_max), dtype=float)
+        )
+        d_vec = lam_vec / np.maximum(2.0 * st_all, 1e-4)
     d_min_eff = (
         float(d_min)
         if d_min and float(d_min) > 0.0
@@ -8665,18 +8754,14 @@ def _serialize_sample_peaks(
             sp_item["careless_residual"] = round(float(res_all[j]), 3)
         if scl_all is not None and j < len(scl_all) and np.isfinite(scl_all[j]):
             sp_item["careless_scale"] = round(float(scl_all[j]), 4)
+        if m_i_all is not None and j < len(m_i_all) and np.isfinite(m_i_all[j]):
+            sp_item["merged_i"] = round(float(m_i_all[j]), 2)
         if (
-            merged_i_arr is not None
-            and j < len(merged_i_arr)
-            and np.isfinite(merged_i_arr[j])
+            m_sigi_all is not None
+            and j < len(m_sigi_all)
+            and np.isfinite(m_sigi_all[j])
         ):
-            sp_item["merged_i"] = round(float(merged_i_arr[j]), 2)
-        if (
-            merged_sigi_arr is not None
-            and j < len(merged_sigi_arr)
-            and np.isfinite(merged_sigi_arr[j])
-        ):
-            sp_item["merged_sigi"] = round(float(merged_sigi_arr[j]), 2)
+            sp_item["merged_sigi"] = round(float(m_sigi_all[j]), 2)
         sample_peaks.append(sp_item)
     return sample_peaks
 
@@ -9004,6 +9089,7 @@ def build_rainbow_zone_payload(
             wavelength_range=(wl_min, wl_max),
             space_group=space_group,
             cell=cell,
+            ub_matrix=ub_matrix,
             merged_i_arr=merged_i_arr,
             merged_sigi_arr=merged_sigi_arr,
             peak_source=primary_source,
@@ -9168,9 +9254,9 @@ def build_rainbow_zone_payload(
                             lam_pa = np.concatenate(all_lam_p, axis=0)
                             bnk_pa = np.concatenate(all_bnk_p, axis=0)
                             run_pa = np.concatenate(all_run_p, axis=0)
-                            if len(pts_pa) > 12000:
+                            if len(pts_pa) > 36000:
                                 sub_i = np.linspace(
-                                    0, len(pts_pa) - 1, 12000, dtype=int
+                                    0, len(pts_pa) - 1, 36000, dtype=int
                                 )
                                 pts_pa = pts_pa[sub_i]
                                 hkl_pa = hkl_pa[sub_i]
@@ -9276,6 +9362,7 @@ def build_rainbow_zone_payload(
                     wavelength_range=(wl_min, wl_max),
                     space_group=space_group,
                     cell=cell,
+                    ub_matrix=ub_matrix,
                     peak_source="predicted",
                     d_min=d_min_use,
                     sample_offset_lab=s_lab_single,
@@ -9631,7 +9718,41 @@ def build_rainbow_zone_payload(
                     inst_entries[str(bk)] = b_entry
             beamline_detectors[_inst_k] = inst_entries
 
-    return {
+    careless_mtz_asu_lookup: dict[str, list[float]] | None = None
+    if (
+        include_all_runs_peaks
+        and replay_h5 is not None
+        and artifact_kind == "merged_careless"
+        and os.path.exists(replay_h5)
+    ):
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, TypeError, KeyError),
+            h5py.File(replay_h5, "r") as cf_lu,
+        ):
+            if (
+                "careless/asu_hkl" in cf_lu
+                and "careless/merged_i" in cf_lu
+                and "careless/merged_sigi" in cf_lu
+            ):
+                c_asu = np.asarray(cf_lu["careless/asu_hkl"][()], dtype=int)
+                c_mi = np.asarray(cf_lu["careless/merged_i"][()], dtype=float)
+                c_ms = np.asarray(cf_lu["careless/merged_sigi"][()], dtype=float)
+                if (
+                    c_asu.ndim == 2
+                    and c_asu.shape[1] == 3
+                    and len(c_asu) == len(c_mi) == len(c_ms)
+                    and 0 < len(c_asu) <= 120000
+                ):
+                    careless_mtz_asu_lookup = {
+                        f"{int(c_asu[j, 0])},{int(c_asu[j, 1])},{int(c_asu[j, 2])}": [
+                            round(float(c_mi[j]), 2),
+                            round(float(c_ms[j]), 2),
+                        ]
+                        for j in range(len(c_asu))
+                        if np.isfinite(c_mi[j]) and np.isfinite(c_ms[j])
+                    }
+
+    out_payload: dict[str, Any] = {
         "subhkl_version": get_subhkl_version(),
         "instrument": str(instrument),
         "default_projection": resolved_proj,
@@ -9698,6 +9819,29 @@ def build_rainbow_zone_payload(
         "ladder_steps": ladder_steps,
         "pipeline_stages": pipeline_stages,
     }
+    if careless_mtz_asu_lookup:
+        out_payload["mtz_asu_lookup"] = careless_mtz_asu_lookup
+        for _pk_bucket in (
+            peaks_list,
+            sample_peaks,
+            predicted_peaks,
+            predicted_sample_peaks,
+            integrated_peaks,
+            integrated_sample_peaks,
+        ):
+            for _pk in _pk_bucket:
+                if not isinstance(_pk, dict) or _pk.get("mtz_isigi") is not None:
+                    continue
+                _orb = _pk.get("asu_orbit_id")
+                _pair = careless_mtz_asu_lookup.get(_orb) if _orb else None
+                if _pair is not None and len(_pair) >= 2:
+                    _mi, _ms = float(_pair[0]), float(_pair[1])
+                    _pk["mtz_i"] = _mi
+                    _pk["mtz_sigi"] = _ms
+                    if _ms > 0.0 and np.isfinite(_mi / _ms):
+                        _pk["mtz_isigi"] = round(float(_mi / _ms), 2)
+        out_payload["mtz_overlay_name"] = "merged.mtz"
+    return out_payload
 
 
 def merge_frame_only_payload(
@@ -11761,7 +11905,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const predPeaks = Array.isArray(pObj.predicted_peaks)
       ? [...pObj.predicted_peaks]
       : (isIntegPayload ? [] : [...basePeaks]);
-    const predSample = Array.isArray(pObj.predicted_sample_peaks)
+    const hasNonEmptyPredSample = Array.isArray(pObj.predicted_sample_peaks) &&
+      (!isFrameOnly || pObj.predicted_sample_peaks.length > 0);
+    const predSample = hasNonEmptyPredSample
       ? [...pObj.predicted_sample_peaks]
       : (isFrameOnly && typeof PREDICTED_SAMPLE_PEAKS !== "undefined" && Array.isArray(PREDICTED_SAMPLE_PEAKS) && PREDICTED_SAMPLE_PEAKS.length > 0
         ? PREDICTED_SAMPLE_PEAKS
@@ -11769,7 +11915,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const integPeaks = Array.isArray(pObj.integrated_peaks)
       ? [...pObj.integrated_peaks]
       : (isIntegPayload ? [...basePeaks] : []);
-    const integSample = Array.isArray(pObj.integrated_sample_peaks)
+    const hasNonEmptyIntegSample = Array.isArray(pObj.integrated_sample_peaks) &&
+      (!isFrameOnly || pObj.integrated_sample_peaks.length > 0);
+    const integSample = hasNonEmptyIntegSample
       ? [...pObj.integrated_sample_peaks]
       : (isFrameOnly && typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" && Array.isArray(INTEGRATED_SAMPLE_PEAKS) && INTEGRATED_SAMPLE_PEAKS.length > 0
         ? INTEGRATED_SAMPLE_PEAKS
@@ -11843,7 +11991,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const MAX_EWALD_SHELL_EVALS = 45000000;
   const MAX_DYNAMIC_FRAME_PEAKS = 36000;
   const MAX_VIEWPORT_PATCH_PEAKS = 20000;
-  const MAX_DYNAMIC_SAMPLE_PEAKS = 36000;
+  const MAX_DYNAMIC_SAMPLE_PEAKS = 72000;
   let _dynPredEpoch = 0;
   let _dynHklPool = null;
   let _dynEwaldTruncated = false;
@@ -13484,8 +13632,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const defSLab = Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0];
     const perRunCap = Math.max(120, Math.ceil(MAX_DYNAMIC_SAMPLE_PEAKS / Math.max(1, runKeys.length)));
     const allPeaks = [];
-    for (let i = 0; i < activeFramePeaks.length && allPeaks.length < MAX_DYNAMIC_SAMPLE_PEAKS; i++) {{
-      allPeaks.push(activeFramePeaks[i]);
+    const activeSliceLen = Math.min(activeFramePeaks.length, perRunCap, MAX_DYNAMIC_SAMPLE_PEAKS);
+    if (activeFramePeaks.length <= activeSliceLen) {{
+      for (let i = 0; i < activeSliceLen; i++) {{
+        allPeaks.push(activeFramePeaks[i]);
+      }}
+    }} else {{
+      const step = activeFramePeaks.length / activeSliceLen;
+      for (let i = 0; i < activeSliceLen; i++) {{
+        allPeaks.push(activeFramePeaks[Math.min(activeFramePeaks.length - 1, Math.floor(i * step))]);
+      }}
     }}
     let cachedPanels0 = null;
     for (let r = 0; r < runKeys.length; r++) {{
@@ -13589,21 +13745,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     PREDICTED_PEAKS = framePeaks;
 
-    // Refresh zone peak counts and live per-zone RMS so sidebar badges reflect dynamic shells
-    refreshZonesAngularStatsJS(framePeaks);
-
-    const userAdjusted = Boolean(opts && opts.userAdjusted);
-    const preserveSource = Boolean(opts && opts.preserveSource);
-    const pushedBeyondInteg = (
-      state.peakSource === "integrated" &&
-      userAdjusted &&
-      !preserveSource &&
-      (
-        (Number.isFinite(_baselineMeasCache.minIntegD) && dMinEff < _baselineMeasCache.minIntegD - 0.03) ||
-        wlMin < _payloadBaseParams.lamMin - 0.03 ||
-        wlMax > _payloadBaseParams.lamMax + 0.03
-      )
-    );
+    // Refresh zone peak counts and live per-zone RMS for whichever peak source is active
+    const zoneStatsPeaks = state.peakSource === "integrated"
+      ? INTEGRATED_PEAKS.filter(isPeakVisible)
+      : framePeaks;
+    refreshZonesAngularStatsJS(zoneStatsPeaks);
 
     const rMap = DATA.goniometer_R_per_run && typeof DATA.goniometer_R_per_run === "object"
       ? DATA.goniometer_R_per_run
@@ -13615,35 +13761,46 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     _dynPendingMultiRunFn = null;
-    if (nRuns <= 1 || (pool && nActive * nRuns <= 250000)) {{
+    const prevMultiRunSample = (
+      Array.isArray(PREDICTED_SAMPLE_PEAKS) &&
+      PREDICTED_SAMPLE_PEAKS.length > 0 &&
+      PREDICTED_SAMPLE_PEAKS !== PREDICTED_PEAKS
+    ) ? PREDICTED_SAMPLE_PEAKS : null;
+    if (nRuns <= 1 || (pool && nActive * nRuns <= 600000 && (state.wulffScope === "all_runs" || state.peakSource === "predicted"))) {{
       repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
-    }} else if (!pool && state.wulffScope !== "all_runs") {{
-      // In direct Ewald-shell mode on 1-Frame view, defer multi-run shell sweeps until All-Runs is toggled
-      PREDICTED_SAMPLE_PEAKS = framePeaks;
+    }} else if (state.peakSource === "integrated" || state.wulffScope !== "all_runs") {{
+      // Defer multi-run predicted raycast while viewing Integrated peaks or 1-Frame scope;
+      // flush on demand as soon as the user switches to Predicted + All-Runs.
+      if (!prevMultiRunSample) PREDICTED_SAMPLE_PEAKS = framePeaks;
       _dynPendingMultiRunFn = () => {{
         _dynPendingMultiRunFn = null;
-        repredictMultiRunSamplePeaks(null, 0, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
+        repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
       }};
     }} else {{
-      // Keep interactive dragging 60fps on large multi-run protein scans; complete All-Runs raycast right as drag settles
-      if (PREDICTED_SAMPLE_PEAKS.length === 0) PREDICTED_SAMPLE_PEAKS = framePeaks;
+      // Keep interactive dragging 60fps on very large multi-run scans without collapsing
+      // existing multi-run Wulff spots to a single frame; complete All-Runs raycast on settle.
+      if (!prevMultiRunSample) PREDICTED_SAMPLE_PEAKS = framePeaks;
+      _dynPendingMultiRunFn = () => {{
+        if (_dynMultiRunTimer) {{
+          clearTimeout(_dynMultiRunTimer);
+          _dynMultiRunTimer = null;
+        }}
+        _dynPendingMultiRunFn = null;
+        repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
+      }};
       _dynMultiRunTimer = setTimeout(() => {{
         _dynMultiRunTimer = null;
+        _dynPendingMultiRunFn = null;
         repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
       }}, pool ? 90 : 140);
     }}
 
     _dynPredEpoch++;
-    if (pushedBeyondInteg) {{
-      if (
-        state.wulffColorMode === "isigi" ||
-        state.wulffColorMode === "residual" ||
-        state.wulffColorMode === "scale"
-      ) {{
-        state.wulffColorMode = "wavelength";
-      }}
-      applyPeakSource("predicted", false);
-    }} else if (state.peakSource === "predicted") {{
+    // Never auto-switch peakSource when changing d_min or wavelength:
+    // - In Integrated ("integrated") mode, filter existing integrated peaks (1-Frame and All-Runs)
+    //   via isPeakVisible without inventing unintegrated peaks.
+    // - In Predicted ("predicted") mode, update PEAKS and SAMPLE_PEAKS across runs.
+    if (state.peakSource === "predicted") {{
       if (
         opts && opts.userAdjusted &&
         (
@@ -13657,7 +13814,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           state.wulffColorMode === "scale"
         )
       ) {{
-        state.wulffColorMode = "wavelength";
+        state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
       }}
       PEAKS.length = 0;
       for (let i = 0; i < PREDICTED_PEAKS.length; i++) PEAKS.push(PREDICTED_PEAKS[i]);
@@ -13666,6 +13823,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       for (let i = 0; i < srcSample.length; i++) SAMPLE_PEAKS.push(srcSample[i]);
       syncPeakSourceButtons();
     }} else {{
+      // Ensure PEAKS / SAMPLE_PEAKS remain bound to full integrated buckets (filtered live by isPeakVisible)
+      PEAKS.length = 0;
+      for (let i = 0; i < INTEGRATED_PEAKS.length; i++) PEAKS.push(INTEGRATED_PEAKS[i]);
+      const srcIntegSample = INTEGRATED_SAMPLE_PEAKS && INTEGRATED_SAMPLE_PEAKS.length > 0 ? INTEGRATED_SAMPLE_PEAKS : INTEGRATED_PEAKS;
+      SAMPLE_PEAKS.length = 0;
+      for (let i = 0; i < srcIntegSample.length; i++) SAMPLE_PEAKS.push(srcIntegSample[i]);
       syncPeakSourceButtons();
     }}
 
@@ -15657,7 +15820,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const rs0 = s0 && typeof s0.careless_residual === "number" && Number.isFinite(s0.careless_residual) ? s0.careless_residual.toFixed(3) : "";
     const i0 = p0 && Number.isFinite(peakUnscaledIsigi(p0)) ? peakUnscaledIsigi(p0).toFixed(3) : "";
     const m0 = p0 && Number.isFinite(peakMtzIsigi(p0)) ? peakMtzIsigi(p0).toFixed(3) : "";
-    const sig = `${{dynEp}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}|${{i0}}|${{m0}}`;
+    const dSig = `${{Number(state.dMin || 0).toFixed(3)}},${{Number(state.lamMin || 0).toFixed(3)}},${{Number(state.lamMax || 0).toFixed(3)}}`;
+    const sig = `${{dynEp}}|${{dSig}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}|${{i0}}|${{m0}}`;
     if (
       _peakDataAvailabilitySig === sig &&
       _peakDataAvailability._p0 === p0 &&
@@ -15666,39 +15830,55 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return _peakDataAvailability;
     }}
     let hasIsigi = false, hasMtz = false, hasRes = false, hasScl = false;
-    const peaksIsigiSamples = [];
-    const sampleIsigiSamples = [];
-    const peaksMtzSamples = [];
-    const sampleMtzSamples = [];
-    const peaksResSamples = [];
-    const sampleResSamples = [];
+    const peaksIsigiSamples = [], allPeaksIsigiSamples = [];
+    const sampleIsigiSamples = [], allSampleIsigiSamples = [];
+    const peaksMtzSamples = [], allPeaksMtzSamples = [];
+    const sampleMtzSamples = [], allSampleMtzSamples = [];
+    const peaksResSamples = [], allPeaksResSamples = [];
+    const sampleResSamples = [], allSampleResSamples = [];
     const scanArr = (arr, isSamplePool) => {{
       if (!Array.isArray(arr)) return;
       const sampleStep = arr.length > 16384 ? Math.ceil(arr.length / 16384) : 1;
       for (let i = 0; i < arr.length; i++) {{
         const p = arr[i];
         if (!p) continue;
+        const vis = typeof isPeakVisible === "function" ? isPeakVisible(p) : true;
         const iv = peakUnscaledIsigi(p);
         if (Number.isFinite(iv)) {{
           hasIsigi = true;
           if (i % sampleStep === 0) {{
-            if (isSamplePool) sampleIsigiSamples.push(iv);
-            else peaksIsigiSamples.push(iv);
+            if (isSamplePool) {{
+              allSampleIsigiSamples.push(iv);
+              if (vis) sampleIsigiSamples.push(iv);
+            }} else {{
+              allPeaksIsigiSamples.push(iv);
+              if (vis) peaksIsigiSamples.push(iv);
+            }}
           }}
         }}
         const mv = peakMtzIsigi(p);
         if (Number.isFinite(mv)) {{
           hasMtz = true;
           if (i % sampleStep === 0) {{
-            if (isSamplePool) sampleMtzSamples.push(mv);
-            else peaksMtzSamples.push(mv);
+            if (isSamplePool) {{
+              allSampleMtzSamples.push(mv);
+              if (vis) sampleMtzSamples.push(mv);
+            }} else {{
+              allPeaksMtzSamples.push(mv);
+              if (vis) peaksMtzSamples.push(mv);
+            }}
           }}
         }}
         if (typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)) {{
           hasRes = true;
           if (i % sampleStep === 0) {{
-            if (isSamplePool) sampleResSamples.push(p.careless_residual);
-            else peaksResSamples.push(p.careless_residual);
+            if (isSamplePool) {{
+              allSampleResSamples.push(p.careless_residual);
+              if (vis) sampleResSamples.push(p.careless_residual);
+            }} else {{
+              allPeaksResSamples.push(p.careless_residual);
+              if (vis) peaksResSamples.push(p.careless_residual);
+            }}
           }}
         }}
         if (!hasScl && typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale)) hasScl = true;
@@ -15716,7 +15896,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return sorted[base] + rest * (next - sorted[base]);
     }};
     let resMin = -3.0, resMax = 3.0, resMedian = 0.0;
-    const resVals = sampleResSamples.length > 0 ? sampleResSamples : peaksResSamples;
+    const visResVals = sampleResSamples.length > 0 ? sampleResSamples : peaksResSamples;
+    const fallbackResVals = allSampleResSamples.length > 0 ? allSampleResSamples : allPeaksResSamples;
+    const resVals = visResVals.length > 0 ? visResVals : fallbackResVals;
     if (hasRes && resVals.length > 0) {{
       resVals.sort((a, b) => a - b);
       resMedian = quantileSorted(resVals, 0.5);
@@ -15739,13 +15921,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         resMax = resMedian + 1.0;
       }}
     }}
-    // Prefer unbiased active-frame PEAKS for I/σ when >=20 peaks exist (all-runs SAMPLE_PEAKS is top-k by intensity)
-    const isigiVals = peaksIsigiSamples.length >= 20
+    // Prefer visible active-frame PEAKS for I/σ when >=20 visible peaks exist, else visible SAMPLE_PEAKS, else unfiltered
+    const visIsigiVals = peaksIsigiSamples.length >= 20
       ? peaksIsigiSamples
       : (sampleIsigiSamples.length > peaksIsigiSamples.length ? sampleIsigiSamples : peaksIsigiSamples);
-    const mtzVals = sampleMtzSamples.length >= peaksMtzSamples.length && sampleMtzSamples.length > 0
+    const fallbackIsigiVals = allPeaksIsigiSamples.length >= 20
+      ? allPeaksIsigiSamples
+      : (allSampleIsigiSamples.length > allPeaksIsigiSamples.length ? allSampleIsigiSamples : allPeaksIsigiSamples);
+    const isigiVals = visIsigiVals.length > 0 ? visIsigiVals : fallbackIsigiVals;
+    const visMtzVals = sampleMtzSamples.length >= peaksMtzSamples.length && sampleMtzSamples.length > 0
       ? sampleMtzSamples
       : peaksMtzSamples;
+    const fallbackMtzVals = allSampleMtzSamples.length >= allPeaksMtzSamples.length && allSampleMtzSamples.length > 0
+      ? allSampleMtzSamples
+      : allPeaksMtzSamples;
+    const mtzVals = visMtzVals.length > 0 ? visMtzVals : fallbackMtzVals;
     const isigiBounds = computeQuantileScaleBounds(isigiVals, -3.0, 3.0, 20.0);
     const mtzIsigiBounds = computeQuantileScaleBounds(mtzVals, -3.0, 3.0, 20.0);
     _peakDataAvailabilitySig = sig;
@@ -17480,8 +17670,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function resolveAvailablePeakSource(preferredSource) {{
-    const hasPred = Array.isArray(PREDICTED_PEAKS) && PREDICTED_PEAKS.length > 0;
-    const hasInteg = Array.isArray(INTEGRATED_PEAKS) && INTEGRATED_PEAKS.length > 0;
+    const hasPred = (typeof PREDICTED_PEAKS !== "undefined" && Array.isArray(PREDICTED_PEAKS) && PREDICTED_PEAKS.length > 0) ||
+      (typeof PREDICTED_SAMPLE_PEAKS !== "undefined" && Array.isArray(PREDICTED_SAMPLE_PEAKS) && PREDICTED_SAMPLE_PEAKS.length > 0) ||
+      (typeof canRepredictDynamic === "function" && canRepredictDynamic());
+    const hasInteg = (typeof INTEGRATED_PEAKS !== "undefined" && Array.isArray(INTEGRATED_PEAKS) && INTEGRATED_PEAKS.length > 0) ||
+      (typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" && Array.isArray(INTEGRATED_SAMPLE_PEAKS) && INTEGRATED_SAMPLE_PEAKS.length > 0);
     const req = String(preferredSource || "").toLowerCase();
     if (req === "integrated" && hasInteg) return "integrated";
     if (req === "predicted" && hasPred) return "predicted";
@@ -17496,11 +17689,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function syncPeakSourceButtons() {{
     const btnPred = document.getElementById("btn-peaks-pred");
     const btnInteg = document.getElementById("btn-peaks-integ");
-    const nPred = Array.isArray(PREDICTED_PEAKS) ? PREDICTED_PEAKS.length : 0;
-    const nInteg = Array.isArray(INTEGRATED_PEAKS) ? INTEGRATED_PEAKS.length : 0;
+    const nPred = typeof PREDICTED_PEAKS !== "undefined" && Array.isArray(PREDICTED_PEAKS) ? PREDICTED_PEAKS.length : 0;
+    const nInteg = typeof INTEGRATED_PEAKS !== "undefined" && Array.isArray(INTEGRATED_PEAKS) ? INTEGRATED_PEAKS.length : 0;
+    const nIntegSample = typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" && Array.isArray(INTEGRATED_SAMPLE_PEAKS) ? INTEGRATED_SAMPLE_PEAKS.length : 0;
     const art = String(DATA.artifact_kind || "").toLowerCase();
-    const hasPred = nPred > 0 || (nInteg === 0 && art !== "integrator" && art !== "merged_careless");
-    const hasInteg = nInteg > 0 || (nPred === 0 && (art === "integrator" || art === "merged_careless"));
+    const canDyn = typeof canRepredictDynamic === "function" && canRepredictDynamic();
+    const hasPred = nPred > 0 || canDyn || (nInteg === 0 && art !== "integrator" && art !== "merged_careless");
+    const hasInteg = nInteg > 0 || nIntegSample > 0 || (nPred === 0 && (art === "integrator" || art === "merged_careless"));
     if (btnPred) {{
       btnPred.disabled = !hasPred;
       btnPred.classList.toggle("active-btn", state.peakSource === "predicted");
@@ -17530,13 +17725,44 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const resolved = resolveAvailablePeakSource(preferredSource);
     const prevSource = state.peakSource;
     state.peakSource = resolved;
-    const srcPeaks = resolved === "integrated" ? INTEGRATED_PEAKS : PREDICTED_PEAKS;
-    const srcSample = resolved === "integrated" ? INTEGRATED_SAMPLE_PEAKS : PREDICTED_SAMPLE_PEAKS;
+    if (resolved === "predicted") {{
+      if (
+        (typeof PREDICTED_PEAKS === "undefined" || !Array.isArray(PREDICTED_PEAKS) || PREDICTED_PEAKS.length === 0) &&
+        typeof canRepredictDynamic === "function" &&
+        canRepredictDynamic() &&
+        typeof repredictPeaksDynamic === "function"
+      ) {{
+        repredictPeaksDynamic({{ preserveSource: true }});
+      }}
+      if (state.wulffScope === "all_runs" && typeof _dynPendingMultiRunFn === "function") {{
+        _dynPendingMultiRunFn();
+      }}
+    }}
+    const srcPeaks = resolved === "integrated"
+      ? (typeof INTEGRATED_PEAKS !== "undefined" ? INTEGRATED_PEAKS : [])
+      : (typeof PREDICTED_PEAKS !== "undefined" ? PREDICTED_PEAKS : []);
+    const srcSample = resolved === "integrated"
+      ? (typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" ? INTEGRATED_SAMPLE_PEAKS : [])
+      : (typeof PREDICTED_SAMPLE_PEAKS !== "undefined" ? PREDICTED_SAMPLE_PEAKS : []);
     PEAKS.length = 0;
     (srcPeaks || []).forEach(p => PEAKS.push(p));
     SAMPLE_PEAKS.length = 0;
     (srcSample && srcSample.length > 0 ? srcSample : PEAKS).forEach(p => SAMPLE_PEAKS.push(p));
-    _peakDataAvailabilitySig = "";
+    if (typeof refreshZonesAngularStatsJS === "function") {{
+      const visSrc = typeof isPeakVisible === "function"
+        ? (srcPeaks || []).filter(isPeakVisible)
+        : (srcPeaks || []);
+      refreshZonesAngularStatsJS(visSrc);
+    }}
+    if (typeof _peakDataAvailabilitySig !== "undefined") _peakDataAvailabilitySig = "";
+    if (typeof _detVisiblePeaksSig !== "undefined") _detVisiblePeaksSig = "";
+    if (typeof _detBvhCache !== "undefined" && _detBvhCache) _detBvhCache.sig = "";
+    if (typeof _detLodCache !== "undefined" && _detLodCache) _detLodCache.sig = "";
+    if (typeof _wulffPoolCache !== "undefined" && _wulffPoolCache) _wulffPoolCache.sig = "";
+    if (typeof _wulffBvhCache !== "undefined" && _wulffBvhCache) _wulffBvhCache.sig = "";
+    if (typeof _wulffLodCache !== "undefined" && _wulffLodCache) _wulffLodCache.sig = "";
+    if (typeof _lastDetRenderSig !== "undefined") _lastDetRenderSig = "";
+    if (typeof _lastWulffRenderSig !== "undefined") _lastWulffRenderSig = "";
     if (prevSource !== resolved) {{
       state.hoveredPeakId = null;
       state.hoveredPeakObj = null;
@@ -22909,10 +23135,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (
       keepUserParams &&
       (
-        state.dMin < _payloadBaseParams.dMin - 0.01 ||
-        state.lamMin < _payloadBaseParams.lamMin - 0.01 ||
-        state.lamMax > _payloadBaseParams.lamMax + 0.01 ||
-        ((Boolean(DATA.has_tof_events) || DATA.angular_error_mode === "tof_3d") && shellDiffersFromBase)
+        shellDiffersFromBase ||
+        (state.peakSource === "predicted" && PREDICTED_PEAKS.length === 0 && canRepredictDynamic())
       )
     ) {{
       repredictPeaksDynamic({{ preserveSource: true }});
