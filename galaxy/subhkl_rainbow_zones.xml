@@ -1,7 +1,7 @@
-<tool id="nova_subhkl_diffraction_parallax_prototype" tool_type="interactive" name="IMAGINE-X subhkl Diffraction Parallax (NOVA Interactive)" profile="22.05" version="0.1.0">
+<tool id="nova-subhkl-rainbow-zones" tool_type="interactive" name="IMAGINE-X subhkl Diffraction Parallax (NOVA Interactive)" profile="22.05" version="1.7.0">
   <description>Interactive Laue diffraction parallax &amp; NDIP workflow dashboard for IMAGINE / MANDI</description>
   <requirements>
-    <container type="docker" shell="/bin/bash">ghcr.io/neutrons/subhkl:1.4.0</container>
+    <container type="docker" shell="/bin/bash">ghcr.io/neutrons/subhkl:1.7.0</container>
   </requirements>
   <entry_points>
     <entry_point name="SubHKL Diffraction Parallax" label="app_entry" requires_domain="False" requires_path_in_url="True">
