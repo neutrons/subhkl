@@ -734,6 +734,9 @@ def integrate_peaks_rbf_ssn(
     tof_gate_coverage: float = 0.95,
     tof_gate_search: float = 0.05,
     tof_sideband_factor: float = 4.0,
+    tof_sideband_measure: str = "spectrum",
+    tof_max_variance_inflation: float | None = 1000.0,
+    tof_amplitude_ridge: str = "fixed",
     tof_band: tuple[float, float] | None = None,
 ):
     """
@@ -1317,9 +1320,17 @@ def integrate_peaks_rbf_ssn(
                 else f" (images file says {images_band[0]:g}-{images_band[1]:g})"
             )
             print(f"  > Wavelength band: {band_min:.3f}-{band_max:.3f} A{note}")
+
+        def _frame_event_reader(f):
+            return event_reader(frame_img_keys[f])
+
+        if getattr(event_reader, "event_store", None) is not None:
+            _frame_event_reader.event_store = event_reader.event_store
+            _frame_event_reader.frame_img_keys = frame_img_keys
+
         integrated_results, tof_info = integrate_reflections_tof_gated(
             images_batch,
-            lambda f: event_reader(frame_img_keys[f]),
+            _frame_event_reader,
             frames,
             all_rs,
             all_cs,
@@ -1333,6 +1344,9 @@ def integrate_peaks_rbf_ssn(
             gate_coverage=tof_gate_coverage,
             gate_search=tof_gate_search,
             sideband_factor=tof_sideband_factor,
+            sideband_measure=tof_sideband_measure,
+            max_variance_inflation=tof_max_variance_inflation,
+            amplitude_ridge=tof_amplitude_ridge,
             static_valid=static_valid,
             profile=matrix_free_profile,
             fp_target=matrix_free_fp_target,

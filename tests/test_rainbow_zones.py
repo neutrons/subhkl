@@ -2120,9 +2120,10 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert 'id="inp-lmax"' not in html_doc
     assert 'id="inp-dmin"' not in html_doc
     assert 'id="slider-dmin"' in html_doc
+    assert 'id="slider-dmin" min="0.50" max="5.00" step="0.05"' in html_doc
     assert 'id="sel-spot-color"' in html_doc
-    assert '<option value="isigi">Color: I/σ (Log)</option>' in html_doc
-    assert '<option value="mtz_isigi">Color: .mtz I/σ (Log)</option>' in html_doc
+    assert '<option value="isigi">Color: I/σ</option>' in html_doc
+    assert '<option value="mtz_isigi">Color: .mtz I/σ</option>' in html_doc
     assert 'id="slider-color-emphasis"' in html_doc
     assert 'id="slider-parallax"' not in html_doc
     assert 'id="btn-peaks-mtz"' not in html_doc
@@ -2260,6 +2261,24 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert sym_rhomb["linked_lengths"] == {"b": "a", "c": "a"}
     assert sym_rhomb["linked_angles"] == {"beta": "alpha", "gamma": "alpha"}
     assert sym_rhomb["fixed_angles"] == {}
+
+    sym_trig_h = resolve_space_group_symmetry("R -3 m")
+    assert sym_trig_h["setting"] == "trigonal"
+    assert sym_trig_h["linked_lengths"] == {"b": "a"}
+    assert sym_trig_h["fixed_angles"] == {
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 120.0,
+    }
+    from subhkl.viz.rainbow_zones import _build_space_group_symmetry_lookup_json
+
+    sg_groups = json.loads(_build_space_group_symmetry_lookup_json())
+    assert "r3" in sg_groups["trigonal"]
+    assert "r-3m" in sg_groups["trigonal"]
+    assert "r3" not in sg_groups["trigonal_r"]
+    assert "r-3m" not in sg_groups["trigonal_r"]
+    assert "r3:r" in sg_groups["trigonal_r"]
+    assert "r-3m:r" in sg_groups["trigonal_r"]
 
     sym_ortho = resolve_space_group_symmetry("P 21 21 21")
     assert sym_ortho["crystal_system"] == "orthorhombic"
@@ -3168,16 +3187,16 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
 
     # 4. Execute rendered HTML/JS helpers in Node.js to verify:
     #    - Exact θ (k_f - k_i) vs 2θ (k_f) Wulff azimuth alignment & right-handed SO(3) camera.
-    #    - Transparent (alpha=0) -> Solar Gold crossover (alpha=0.5) -> Opaque Electric-Lime (alpha=1)
-    #      isigiToColor scale + Photoshop-checkerboard live gradient crossover slider (#slider-color-emphasis).
+    #    - Warm Geyser-inspired quantile-normalized divergent isigiToColor scale
+    #      (Sea-Teal -> Champagne-Gold median -> Tangerine -> Flame-Vermilion) + live gradient slider.
     #    - Two-source peak toggle ('predicted' | 'integrated') with .mtz I/σ data-column coloring.
     html_doc = render_rainbow_html(payload_mtz)
     assert 'accept=".h5,.hdf5,.nxs,.mtz"' in html_doc
     assert 'id="peak-source-group"' in html_doc
     assert 'id="btn-peaks-mtz"' not in html_doc
     assert 'id="btn-wulff-friedel"' in html_doc
-    assert "Color: I/σ (Log)" in html_doc
-    assert "Color: .mtz I/σ (Log)" in html_doc
+    assert "Color: I/σ</option>" in html_doc
+    assert "Color: .mtz I/σ</option>" in html_doc
     assert 'id="slider-color-emphasis"' in html_doc
     assert "repeating-conic-gradient" in html_doc  # Photoshop transparency checkerboard
     assert "--cs-gradient" in html_doc
@@ -3197,6 +3216,7 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
         "getColorCrossover",
         "applyCrossoverCurve",
         "wavelengthToColor",
+        "computeQuantileScaleBounds",
         "getPeakDataAvailability",
         "peakUnscaledIsigi",
         "peakMtzIsigi",
@@ -3350,21 +3370,23 @@ syncWulffYawFromDetector();
 const gNeg10 = gForChiElDeg(-10.0, 0.0);
 const friedelNeg10AtPos10 = projectToWulff([-gNeg10[0], -gNeg10[1], -gNeg10[2]], 100, 100, 80);
 
-// Transparent (alpha=0) -> Solar Gold crossover (t=0.5, alpha=0.5) -> Fully Opaque Electric Lime (alpha=1)
+// Warm Geyser-inspired quantile-normalized divergent I/σ scale:
+// Sea-Teal (-3.0) -> Champagne-Gold median (+3.0) -> Solar Tangerine -> Flame-Vermilion (+40.0)
 state.colorCrossover = 0.38;
-const exactCrossSnr = Math.pow(1.0 + 40.0, 0.38) - 1.0;
-const colNeg = isigiToColor(-2.0, 1.0, 40.0);
-const colZero = isigiToColor(0.0, 1.0, 40.0);
-const colWeak = isigiToColor(0.4, 1.0, 40.0);
-const colCrossover = isigiToColor(exactCrossSnr, 1.0, 40.0);
-const colGold = isigiToColor(14.0, 1.0, 40.0);
-const colLime = isigiToColor(150.0, 1.0, 40.0);
+const testBounds = {{ min: -3.0, q25: 0.5, median: 3.0, q75: 9.0, max: 40.0, pNeg: 1.0, pPos: 0.72 }};
+const colMissing = isigiToColor(NaN, 1.0, testBounds);
+const colLowPole = isigiToColor(-3.0, 1.0, testBounds);
+const colBelowMed = isigiToColor(0.0, 1.0, testBounds);
+const colMedGold = isigiToColor(3.0, 1.0, testBounds);
+const colWarmMid = isigiToColor(14.0, 1.0, testBounds);
+const colFlameHi = isigiToColor(150.0, 1.0, testBounds);
 
-// Crossover knob: moving right (0.84) makes moderate 4σ peaks nearly transparent; moving left (0.12) makes them opaque
+// Crossover knob: dragging right (0.84) widens the warm center band so moderate +8σ stays closer to Champagne-Gold;
+// dragging left (0.12) sharpens contrast around median so +8σ shifts strongly toward Tangerine/Flame-Vermilion
 state.colorCrossover = 0.84;
-const colMidRightKnob = isigiToColor(4.0, 1.0, 40.0);
+const colMidRightKnob = isigiToColor(8.0, 1.0, testBounds);
 state.colorCrossover = 0.12;
-const colMidLeftKnob = isigiToColor(4.0, 1.0, 40.0);
+const colMidLeftKnob = isigiToColor(8.0, 1.0, testBounds);
 state.colorCrossover = 0.38;
 
 const gradIsigi = buildColorscaleGradientSpec("isigi", 0.38);
@@ -3386,8 +3408,8 @@ const parRelSpanY = fgParY - bgParY;
 state.parallaxX = 0.0;
 state.parallaxY = 0.0;
 
-// Peak source toggle ('predicted' <-> 'integrated') switches BOTH shape (circle <-> ellipse)
-// AND intensity-related highlight colorscale (Electric Cyan for Pred <-> Gold-to-Lime for Integ)
+// Peak source toggle ('predicted' <-> 'integrated') switches shape (circle <-> ellipse)
+// while sharing the unified warm divergent I/σ colorscale (and distinct scaleToColor per source)
 applyPeakSource("predicted", false);
 const nPredFrame = PEAKS.length;
 const nPredWulff = getActiveWulffPeaks().length;
@@ -3395,10 +3417,8 @@ const predShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.
 const hasMtzCol = hasMtzIsigi();
 const hasPredCrossLinkedIsigi = hasIntegratedIsigi();
 const mtzColStrokePred = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzIsigi(p))), 1.0);
-const colPredCross = isigiToColor(exactCrossSnr, 1.0, 40.0);
-const colPredTop = isigiToColor(150.0, 1.0, 40.0);
 const scalePredTop = scaleToColor(10.0, 1.0);
-const gradIsigiPred = buildColorscaleGradientSpec("isigi", 0.38);
+const gradMtzIsigi = buildColorscaleGradientSpec("mtz_isigi", 0.38);
 
 applyPeakSource("integrated", false);
 const nIntegFrame = PEAKS.length;
@@ -3410,8 +3430,8 @@ const scaleIntegTop = scaleToColor(10.0, 1.0);
 console.log(JSON.stringify({{
   chiChecks,
   friedelNeg10AtPos10,
-  colNeg, colZero, colWeak, colCrossover, colGold, colLime,
-  colPredCross, colPredTop, scalePredTop, scaleIntegTop, gradIsigiPred,
+  colMissing, colLowPole, colBelowMed, colMedGold, colWarmMid, colFlameHi,
+  scalePredTop, scaleIntegTop, gradMtzIsigi,
   colMidRightKnob, colMidLeftKnob,
   gradIsigi, gradWl,
   parIdle, parMouseBtn, parMouseBtnWithCtrl, parCtrl, parShift, parRelSpanX, parRelSpanY,
@@ -3464,28 +3484,35 @@ console.log(JSON.stringify({{
                 float(m_rgba.group(4)),
             )
 
-        _rn, _gn, _bn, an = _parse_rgba(js_out["colNeg"])
-        _rz, _gz, _bz, az = _parse_rgba(js_out["colZero"])
-        _rw, _gw, _bw, aw = _parse_rgba(js_out["colWeak"])
-        rc, gc, bc, ac = _parse_rgba(js_out["colCrossover"])
-        rg, gg, bg, ag = _parse_rgba(js_out["colGold"])
-        rl, gl, bl, al = _parse_rgba(js_out["colLime"])
-        _, _, _, a_right_knob = _parse_rgba(js_out["colMidRightKnob"])
-        _, _, _, a_left_knob = _parse_rgba(js_out["colMidLeftKnob"])
+        _, _, _, a_nan = _parse_rgba(js_out["colMissing"])
+        r_lo, g_lo, b_lo, a_lo = _parse_rgba(js_out["colLowPole"])
+        r_bm, _g_bm, _b_bm, a_bm = _parse_rgba(js_out["colBelowMed"])
+        r_md, g_md, b_md, a_md = _parse_rgba(js_out["colMedGold"])
+        r_wm, g_wm, b_wm, a_wm = _parse_rgba(js_out["colWarmMid"])
+        r_hi, g_hi, b_hi, a_hi = _parse_rgba(js_out["colFlameHi"])
+        _, g_right_knob, b_right_knob, _ = _parse_rgba(js_out["colMidRightKnob"])
+        _, g_left_knob, b_left_knob, _ = _parse_rgba(js_out["colMidLeftKnob"])
 
-        # Transparent (alpha=0) -> Solar Gold at exact knob crossover (alpha=0.5) -> Opaque Electric Lime (alpha=1)
-        assert an == 0.0 and az == 0.0
-        assert 0.0 < aw < ac < ag < al
-        assert (rc, gc, bc) == (250, 204, 21) and abs(ac - 0.5) < 0.005
-        assert rg > 185 and gg > 205 and bg < 60
-        assert (rl, gl, bl) == (163, 242, 44) and al == 1.0
-        # Moving crossover knob right isolates strong peaks; moving left reveals weaker peaks
-        assert a_right_knob < 0.12 and a_left_knob > 0.72
-        # Live gradient CSS stops + physical crossover readouts
+        # Missing I/σ is transparent; all finite I/σ values render opaque along warm Sea-Teal -> Champagne-Gold -> Flame-Vermilion
+        assert a_nan == 0.0
+        assert (
+            a_lo == 1.0 and a_bm == 1.0 and a_md == 1.0 and a_wm == 1.0 and a_hi == 1.0
+        )
+        assert (r_lo, g_lo, b_lo) == (20, 184, 166)
+        assert r_lo < r_bm < r_md
+        assert (r_md, g_md, b_md) == (254, 232, 170)
+        assert r_wm > 235 and g_hi < g_wm < g_md and b_hi < b_wm < b_md
+        assert (r_hi, g_hi, b_hi) == (232, 56, 24)
+        # Dragging crossover knob right keeps moderate +8σ closer to warm Champagne-Gold (higher green/blue);
+        # dragging left shifts +8σ more strongly toward Tangerine/Flame-Vermilion (lower green/blue)
+        assert g_right_knob > g_left_knob + 25 and b_right_knob > b_left_knob + 25
+        # Live gradient CSS stops + lo · mid · hi quantile readouts
         assert js_out["gradIsigi"]["gradient"].startswith("linear-gradient(90deg,")
-        assert "0.000) 0.0%" in js_out["gradIsigi"]["gradient"]
-        assert "1.000) 100.0%" in js_out["gradIsigi"]["gradient"]
-        assert js_out["gradIsigi"]["label"].startswith("I/σ ~")
+        assert "rgba(20, 184, 166, 1.000) 0.0%" in js_out["gradIsigi"]["gradient"]
+        assert "rgba(254, 232, 170, 1.000) 50.0%" in js_out["gradIsigi"]["gradient"]
+        assert "rgba(232, 56, 24, 1.000) 100.0%" in js_out["gradIsigi"]["gradient"]
+        assert "·" in js_out["gradIsigi"]["label"]
+        assert "·" in js_out["gradMtzIsigi"]["label"]
         assert js_out["gradWl"]["label"].startswith("λ ~")
 
         # Parallax gated strictly on keyboard modifier (never mouse button / drag) with softer rubber-band span
@@ -3500,13 +3527,8 @@ console.log(JSON.stringify({{
         assert js_out["hasMtzCol"] is True
         assert js_out["hasPredCrossLinkedIsigi"] is True
         assert js_out["mtzColStroke"].startswith("rgba(")
-        assert js_out["mtzColStroke"] != js_out["mtzColStrokeInteg"]
-        rpc, gpc, bpc, apc = _parse_rgba(js_out["colPredCross"])
-        rpt, gpt, bpt, apt = _parse_rgba(js_out["colPredTop"])
-        assert (rpc, gpc, bpc) == (56, 189, 248) and abs(apc - 0.5) < 0.005
-        assert (rpt, gpt, bpt) == (0, 240, 255) and apt == 1.0
+        assert js_out["mtzColStrokeInteg"].startswith("rgba(")
         assert js_out["scalePredTop"] != js_out["scaleIntegTop"]
-        assert js_out["gradIsigiPred"]["gradient"] != js_out["gradIsigi"]["gradient"]
         assert js_out["nPredFrame"] == len(payload_mtz["predicted_peaks"])
         assert js_out["nPredWulff"] == len(samp_with_mtz)
         assert js_out["predShape"] == "circle"
@@ -3980,13 +4002,16 @@ def test_wulff_zoom_dspacing_lod_and_dirty_skip(tmp_path):
 
     fn_names = [
         "getColorCrossover",
+        "peakMtzIsigi",
         "isSameReflection",
         "isPeakHighlightedTarget",
         "isPeakVisible",
         "isWulffSnrCutActive",
         "getActiveWulffPeaks",
         "_peakSnrScore",
+        "_computePeakLodPriority",
         "getWulffPoolCache",
+        "buildWulffSphericalBVH",
         "getWulffLodState",
         "projectToWulff",
         "findNearestPeakWulff",
@@ -4031,6 +4056,17 @@ const _wulffPoolCache = {{
   observedHklSet: new Set(),
   sortedD: [],
 }};
+const _wulffBvhCache = {{
+  sig: "",
+  firstRef: null,
+  bvh: null,
+}};
+const _wulffLodCache = {{
+  sig: "",
+  firstRef: null,
+  value: null,
+}};
+let _wulffPrevRenderedPeaks = [];
 let _lastWulffRenderSig = "";
 
 // Create 1,200 All-Runs predicted reflections spanning d in [1.4, 8.0] A, plus duplicate run_index hits for HKL [9999,1,1]
@@ -4068,6 +4104,28 @@ for (const rIdx of [0, 2, 4]) {{
     q_hat_sample: [0.1, 0.2, 0.974679],
     q_hat_cryst: [0.1, 0.2, 0.974679],
     run_index: rIdx,
+  }});
+}}
+// Add a tight 12-peak high-resolution cluster inside one octant near the front pole (0.08, 0.08, 0.9936)
+// so 1x BVH merges it into 1-2 landmarks, 3.5x splits partially, and 14.5x resolves all 12 pop-free!
+for (let k = 0; k < 12; k++) {{
+  const ang = (k / 12.0) * 2.0 * Math.PI;
+  const rad = 0.003 + 0.012 * ((k % 4) / 3.0);
+  const qx = 0.08 + rad * Math.cos(ang), qy = 0.08 + rad * Math.sin(ang);
+  const qz = Math.sqrt(1.0 - qx * qx - qy * qy);
+  const q = [qx, qy, qz];
+  SAMPLE_PEAKS.push({{
+    id: 6000 + k,
+    hkl: [8000 + k, 2, 1],
+    asu_hkl: [8000 + k, 2, 1],
+    d_spacing: 1.45 + 0.25 * k,
+    wavelength: 2.4,
+    intensity: 12.0,
+    sigma: 2.0,
+    q_hat: q,
+    q_hat_sample: q,
+    q_hat_cryst: q,
+    run_index: 2,
   }});
 }}
 
@@ -4151,10 +4209,18 @@ function isPeakCapturedByActiveZone() {{ return false; }}
 const rawActive = getActiveWulffPeaks();
 const pool1 = getWulffPoolCache();
 const dupMatches = pool1.uniquePeaks.filter(p => p.hkl[0] === 9999);
+
+// Verify lowering dMin monotonically populates more Wulff cells at 1x zoom
+state.dMin = 4.2;
+const dMin42Count = getWulffLodState(false).visiblePeaks.length;
+state.dMin = 2.6;
+const dMin26Count = getWulffLodState(false).visiblePeaks.length;
+state.dMin = 1.4;
 const lodZoom1 = getWulffLodState(false);
 
-// High-resolution hovered peak (d < 1.5A) must ALWAYS survive zoom-out LOD thinning
-const hiResTarget = pool1.uniquePeaks.find(p => p.d_spacing < 1.5);
+// High-resolution BVH-suppressed peak (d < 2.0A) must ALWAYS survive zoom-out LOD thinning when hovered
+const shownZoom1Ids = new Set(lodZoom1.visiblePeaks.map(p => p.id));
+const hiResTarget = pool1.uniquePeaks.find(p => !shownZoom1Ids.has(p.id) && p.d_spacing < 2.0);
 state.hoveredPeakId = hiResTarget.id;
 state.hoveredPeakObj = hiResTarget;
 const lodWithHover = getWulffLodState(false);
@@ -4162,7 +4228,7 @@ const hoverKept = lodWithHover.visiblePeaks.some(p => isSameReflection(p, hiResT
 state.hoveredPeakId = null;
 state.hoveredPeakObj = null;
 
-// Render at wulffZoom=1.0 -> draws & emits d >= badge AFTER restore(); immediate 2nd renderStereoInset() skips redraw
+// Render at wulffZoom=1.0 -> draws & emits zoom+ badge AFTER restore(); immediate 2nd renderStereoInset() skips redraw
 ops.length = 0;
 renderStereoInset();
 const firstDrawOps = ops.length;
@@ -4173,23 +4239,36 @@ ops.length = 0;
 renderStereoInset();
 const secondIdleOps = ops.length;
 
-// Zoom in to 2.5x and 8.0x -> progressively reveals higher-resolution shells
-state.wulffZoom = 2.5;
+// Zoom in to 3.5x and 14.5x on the front-pole cluster (yaw=0, pitch=0) -> pop-free subdivision + full resolution
+const coreAt = (peaks) => new Set(
+  peaks.filter(p => p.id >= 6000 && p.id < 6012).map(p => p.id)
+);
+const coreZ1 = coreAt(lodZoom1.visiblePeaks);
+state.wulffZoom = 3.5;
 const lodZoom25 = getWulffLodState(false);
-state.wulffZoom = 8.0;
-const lodZoom80 = getWulffLodState(false);
+const coreZ25 = coreAt(lodZoom25.visiblePeaks);
+state.wulffZoom = 14.5;
+const lodZoom15 = getWulffLodState(false);
+const coreZ15 = coreAt(lodZoom15.visiblePeaks);
+let polarPopped = 0;
+for (const id of coreZ1) if (!coreZ25.has(id)) polarPopped++;
+for (const id of coreZ25) if (!coreZ15.has(id)) polarPopped++;
 
 console.log(JSON.stringify({{
   rawActiveLen: rawActive.length,
   poolDedupLen: pool1.uniquePeaks.length,
   dupCount: dupMatches.length,
   dupPrefersActiveFrame: dupMatches.length === 1 && dupMatches[0].run_index === 2,
+  dMin42Count,
+  dMin26Count,
   zoom1Count: lodZoom1.visiblePeaks.length,
   zoom1Thinned: lodZoom1.totalUnique - lodZoom1.visiblePeaks.length,
   zoom1Dcut: lodZoom1.lodDcut,
-  zoom25Count: lodZoom25.visiblePeaks.length,
-  zoom80Count: lodZoom80.visiblePeaks.length,
-  zoom80Thinned: lodZoom80.totalUnique - lodZoom80.visiblePeaks.length,
+  zoom25CoreCount: coreZ25.size,
+  zoom1CoreCount: coreZ1.size,
+  zoom15CoreCount: coreZ15.size,
+  zoom15Unthinned: !lodZoom15.isLodThinned && lodZoom15.visiblePeaks.length === lodZoom15.inCapCount && lodZoom15.inCapCount > 0,
+  polarPopped,
   hoverKept,
   firstDrawOps,
   secondIdleOps,
@@ -4206,15 +4285,18 @@ console.log(JSON.stringify({{
         text=True,
     )
     out = json.loads(res.stdout.strip())
-    assert out["rawActiveLen"] == 1203
-    assert out["poolDedupLen"] == 1201
+    assert out["rawActiveLen"] == 1215
+    assert out["poolDedupLen"] == 1213
     assert out["dupCount"] == 1
     assert out["dupPrefersActiveFrame"] is True
+    assert out["dMin42Count"] < out["dMin26Count"] <= out["zoom1Count"]
     assert out["zoom1Thinned"] > 400
     assert out["zoom1Count"] < out["poolDedupLen"]
-    assert out["zoom25Count"] > out["zoom1Count"]
-    assert out["zoom80Count"] == out["poolDedupLen"]
-    assert out["zoom80Thinned"] == 0
+    assert 1 <= out["zoom1CoreCount"] <= 4
+    assert out["zoom1CoreCount"] < out["zoom25CoreCount"] < out["zoom15CoreCount"]
+    assert out["zoom15CoreCount"] == 12
+    assert out["zoom15Unthinned"] is True
+    assert out["polarPopped"] == 0
     assert out["hoverKept"] is True
     assert out["firstDrawOps"] > 20
     assert out["secondIdleOps"] == 0
@@ -4559,7 +4641,13 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
     mtz_foreign.add_column("SIGI", "Q")
     chosen_hkls: list[tuple[int, int, int]] = []
     expected_r1: dict[tuple[int, int, int], tuple[float, float, float]] = {}
-    for i_pk in range(min(5, len(h1))):
+    bw_mandi = int(0.06 * min(int(cal_cfg["n"]), int(cal_cfg["m"])))
+    for i_pk in range(len(h1)):
+        if not (
+            bw_mandi <= float(pr1[i_pk]) < int(cal_cfg["n"]) - 1 - bw_mandi
+            and bw_mandi <= float(pc1[i_pk]) < int(cal_cfg["m"]) - 1 - bw_mandi
+        ):
+            continue
         key_h = (int(h1[i_pk]), int(k1[i_pk]), int(l1[i_pk]))
         if key_h not in expected_r1:
             expected_r1[key_h] = (
@@ -4568,6 +4656,8 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
                 float(lam1[i_pk]),
             )
             chosen_hkls.append(key_h)
+            if len(chosen_hkls) >= 5:
+                break
     # Also include HKLs that would strike OTHER uninstalled MANDI banks (e.g. bank 22)
     # to prove .mtz reflections ONLY project onto panels where predicted peaks project (bank 19)!
     uninstalled_det = Detector(dict(beamlines["MANDI"]["22"]))
@@ -5215,6 +5305,7 @@ def test_dynamic_dmin_wavelength_reprediction_and_detector_zoom_lod(
             imagine_dets,
             (2.8, 4.5),
             active_bids={first_bk},
+            margin_frac=0.03,
         ),
         b_prot,
     )
@@ -5227,6 +5318,7 @@ def test_dynamic_dmin_wavelength_reprediction_and_detector_zoom_lod(
             imagine_dets,
             (2.8, 4.5),
             active_bids={first_bk},
+            margin_frac=0.03,
         ),
         b_prot,
     )
@@ -5239,6 +5331,7 @@ def test_dynamic_dmin_wavelength_reprediction_and_detector_zoom_lod(
             imagine_dets,
             (2.0, 4.5),
             active_bids={first_bk},
+            margin_frac=0.03,
         ),
         b_prot,
     )
@@ -5401,10 +5494,38 @@ def test_dynamic_dmin_wavelength_reprediction_and_detector_zoom_lod(
             mandi_dets,
             (2.5, 4.0),
             active_bids=mandi_active_bids,
+            margin_frac=0.06,
         ),
         b_big,
     )
     assert len(py_mandi_380) >= 15
+
+    # Also build a genuine P 61 2 2 payload (79.91 x 79.91 x 238.0 A, gamma=120, V=1.32M A^3)
+    # on MANDI with wavelength [0.65, 3.0] A to test direct Ewald-shell rod prediction down to d_min = 0.50 A!
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+
+    p6122_cell = [79.91, 79.91, 238.0, 90.0, 90.0, 120.0]
+    b_p6122, _ = cartesian_matrix_metric_tensor(
+        79.91, 79.91, 238.0, *np.deg2rad([90.0, 90.0, 120.0])
+    )
+    p6122_solve_h5 = tmp_path / "mandi_p6122.h5"
+    with h5py.File(p6122_solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["sample/space_group"] = "P 61 2 2"
+        hf["sample/cell"] = np.array(p6122_cell, dtype=float)
+        hf["sample/U"] = u_prot
+        hf["sample/B"] = b_p6122
+        hf["instrument/wavelength"] = np.array([0.65, 3.0], dtype=float)
+    p6122_payload = build_rainbow_zone_payload(
+        replay_h5=p6122_solve_h5,
+        instrument="MANDI",
+        d_min=3.50,
+        wavelength_range=(0.65, 3.0),
+        include_panel_images=False,
+    )
+    p6122_payload["panels"] = [
+        pn for pn in p6122_payload["panels"] if int(pn["bank"]) in mandi_active_bids
+    ]
 
     out_json_path = tmp_path / "dyn_dmin_and_det_lod_out.json"
     js_file = tmp_path / "dyn_dmin_and_det_lod_test.js"
@@ -5537,8 +5658,9 @@ const detCanvasEl = getEl("canvas-detector");
 detCanvasEl.getContext("2d");
 const detLog = ctxLogs.get("canvas-detector");
 
-// 1. Finite unit-cell-volume-aware d_min floor for V ~ 296,000 A^3
+// 1. Unlocked 0.50 A d_min floor + 2M full-sphere pool crossover for V ~ 296,000 A^3
 const protFloor = getDynamicDminFloor();
+const protPoolFloor = getFullSpherePoolDminFloor();
 const sliderMinAttr = Number(slDminEl.min);
 const initialPeakSource = state.peakSource;
 const initialIntegCount = INTEGRATED_PEAKS.length;
@@ -5585,7 +5707,7 @@ const pred215 = PEAKS.map(p => ({{
 const sampleRunsAt215 = Array.from(new Set(PREDICTED_SAMPLE_PEAKS.map(p => p.run_index))).sort();
 const sampleCountAt215 = PREDICTED_SAMPLE_PEAKS.length;
 
-// 2. Detector zoom-coupled d-spacing LOD at d_min = 2.15 A (> 800 reflections on 800x520 canvas)
+// 2. Detector gameplay Spherical BVH screen-density LOD at d_min = 2.15 A (> 800 reflections on 800x520 canvas)
 state.detZoom = 1.0;
 state.hoveredPeakId = null;
 state.selectedPeakId = null;
@@ -5596,8 +5718,9 @@ detLog.texts.length = 0;
 renderDetectorCanvas(true);
 const hudTextsZ1 = [...detLog.texts];
 
-// Pick a reflection finer than lodZ1.lodDcut: must NOT be hit-tested at detZoom=1.0 unless pinned!
-const hiddenOuterPeak = allVisZ1.find(p => p.d_spacing < lodZ1.lodDcut - 0.08);
+// Pick a BVH-suppressed reflection at detZoom=1.0: must NOT be hit-tested when unpinned, and MUST be hit-tested when pinned!
+const shownSetZ1 = new Set(lodZ1.visiblePeaks.map(p => p.id));
+const hiddenOuterPeak = allVisZ1.find(p => !shownSetZ1.has(p.id));
 const hiddenOuterPeakId = hiddenOuterPeak ? hiddenOuterPeak.id : null;
 let hitHiddenUnpinned = null;
 let hitHiddenWhenPinned = null;
@@ -5619,6 +5742,8 @@ state.detZoom = 2.0;
 const lodZ2 = {{ ...getDetectorLodState(800, 520) }};
 state.detZoom = 6.0;
 const lodZ6 = {{ ...getDetectorLodState(800, 520) }};
+state.detZoom = 24.0;
+const lodZ24 = {{ ...getDetectorLodState(800, 520) }};
 state.detZoom = 1.0;
 
 // 3. Widening wavelength #slider-wl-min ([ knob) from 2.8 -> 2.0 A dynamically adds shorter-lambda spots,
@@ -5659,6 +5784,7 @@ slWlMinEl.dispatchEvent({{ type: "input", target: slWlMinEl }});
 const mandiPayload = {json.dumps(mandi_payload)};
 recomputeBoundsAndReload(mandiPayload, {{ resetSelectedFrame: true }});
 const hugeCellFloor = getDynamicDminFloor();
+const hugeCellPoolFloor = getFullSpherePoolDminFloor();
 slDminEl.value = "3.80";
 slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
 const mandiPred380 = PEAKS.map(p => ({{
@@ -5668,21 +5794,130 @@ const mandiPred380 = PEAKS.map(p => ({{
   col: p.col,
 }}));
 
-// 5. Verify P 6_1 22 (a=b=79.91, c=238.0) hexagonal symmetry + relaxed ~15% d_min floor (~1.41 A vs old 1.67 A)
+// 5. Verify P 6_1 22 (a=b=79.91, c=238.0) hexagonal symmetry + unlocked 0.50 A Ewald-shell rod predictor!
+const p6122Payload = {json.dumps(p6122_payload)};
+recomputeBoundsAndReload(p6122Payload, {{ resetSelectedFrame: true }});
 const inpSgNode = getEl("inp-sg");
 const inpANode = getEl("inp-a");
 const inpCNode = getEl("inp-c");
 inpSgNode.value = "P 6_1 22";
 inpSgNode.dispatchEvent({{ type: "change", target: inpSgNode }});
-inpANode.value = "79.91";
-inpANode.dispatchEvent({{ type: "input", target: inpANode }});
-inpCNode.value = "238.0";
-inpCNode.dispatchEvent({{ type: "change", target: inpCNode }});
 const p6122Floor = getDynamicDminFloor();
+const p6122PoolFloor = getFullSpherePoolDminFloor();
 const p6122Gamma = parseFloat(getEl("inp-gamma").value);
 slDminEl.value = "1.45";
 slDminEl.dispatchEvent({{ type: "change", target: slDminEl }});
 const p6122Allowed145 = state.dMin;
+
+// Push P 6_1 22 all the way down to d_min = 0.50 A (44.2M full-sphere lattice points!).
+// (a) Short-wavelength slice [0.74, 0.79] A (~18k reflections down to ~0.58 A): verify exact 1:1 Python/JS Ewald-shell parity.
+const slWlMinNode = getEl("slider-wl-min");
+const slWlMaxNode = getEl("slider-wl-max");
+state.lamMin = 0.74;
+state.lamMax = 0.79;
+updateWavelengthLabels();
+slDminEl.value = "0.50";
+slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+const p6122Allowed050 = state.dMin;
+const p6122PoolAt050IsNull = ensureDynamicHklPool(0.50) === null;
+const p6122Pred050 = PEAKS.map(p => ({{
+  bank: p.bank,
+  hkl: p.hkl,
+  row: p.row,
+  col: p.col,
+  d: p.d_spacing,
+  wl: p.wavelength,
+  det_x: p.det_x,
+  det_y: p.det_y,
+}}));
+
+// (b) Wide white-beam [0.65, 3.00] A at d_min = 0.50 A (>150k hits on 2 banks!):
+// Verify Tier-1 1x overview LOD (~300 spots) AND Tier-2 36x zoomed viewport-frustum streaming (<0.58 A spots!).
+state.lamMin = 0.65;
+state.lamMax = 3.00;
+updateWavelengthLabels();
+const t0Ewald = Date.now();
+repredictPeaksDynamic({{ userAdjusted: true }});
+const p6122EwaldMs = Date.now() - t0Ewald;
+state.detZoom = 1.0;
+state.detPanX = 0.0;
+state.detPanY = 0.0;
+const p6122LodZ1 = {{ ...getDetectorLodState(800, 520) }};
+const p6122Tier1MinD = PEAKS.reduce((m, p) => Math.min(m, p.d_spacing || 99.0), 99.0);
+const refBankPk = PEAKS.find(p => p.bank === 1) || PEAKS[0];
+state.detZoom = 36.0;
+if (refBankPk) {{
+  setDetectorCenterAzimuthDeg(refBankPk.det_x);
+  const bAct = getActiveBounds();
+  const bxAct = getDetectorPlotBox(800, 520);
+  const pyRef = getPeakVert(refBankPk);
+  const y0Ref = bxAct.originY + (1.0 - (pyRef - bAct.minY) / Math.max(1e-6, bAct.maxY - bAct.minY)) * bxAct.plotH;
+  state.detPanY = 260.0 - (260.0 + (y0Ref - 260.0) * state.detZoom);
+}}
+const p6122LodZ12Raw = getDetectorLodState(800, 520);
+const p6122LodZ12 = {{
+  isLodThinned: p6122LodZ12Raw.isLodThinned,
+  visiblePeaks: p6122LodZ12Raw.visiblePeaks,
+  inViewCount: p6122LodZ12Raw.inViewCount,
+  totalCount: p6122LodZ12Raw.totalCount,
+  minVisD: p6122LodZ12Raw.visiblePeaks.reduce((m, p) => Math.min(m, p.d_spacing || 99), 99),
+}};
+
+// Verify detector wheel zoom-in (cursor-anchored) and zoom-out (zero sideways azimuth drift!)
+state.detZoom = 1.0;
+setDetectorCenterAzimuthDeg(112.5);
+state.detPanY = 0.0;
+const azBeforeZoomIn = getCenteredDetectorAzimuthDeg();
+// Cursor zoom-in at off-center point (mx=620, my=190): world point under cursor must stay pinned
+const [wxBefore, wyBefore] = [620, 190];
+const boxDet = getDetectorPlotBox(800, 520);
+const boundsDet = getActiveBounds();
+function screenXToWorldAz(sx) {{
+  const x0 = 400 + (sx - 400 - state.detPanX) / state.detZoom;
+  const u = (x0 - boxDet.originX) / boxDet.plotW;
+  return boundsDet.minX + u * (boundsDet.maxX - boundsDet.minX);
+}}
+const cursorWorldAzBefore = screenXToWorldAz(wxBefore);
+for (let step = 0; step < 8; step++) {{
+  detCanvasEl.dispatchEvent({{
+    type: "wheel",
+    deltaMode: 0,
+    deltaY: -45,
+    ctrlKey: false,
+    clientX: wxBefore,
+    clientY: wyBefore,
+    preventDefault() {{}},
+  }});
+}}
+const zoomAfterIn = state.detZoom;
+const cursorWorldAzAfterIn = screenXToWorldAz(wxBefore);
+// Now zoom all the way out from zoomAfterIn -> 0.7x with cursor way off on the left (clientX = 95):
+// centered detector azimuth MUST NOT drift sideways at any step!
+const azAtPeakZoom = getCenteredDetectorAzimuthDeg();
+let maxZoomOutAzDrift = 0.0;
+for (let step = 0; step < 30; step++) {{
+  detCanvasEl.dispatchEvent({{
+    type: "wheel",
+    deltaMode: 0,
+    deltaY: 45,
+    ctrlKey: false,
+    clientX: 95,
+    clientY: 410,
+    preventDefault() {{}},
+  }});
+  const curAz = getCenteredDetectorAzimuthDeg();
+  let diff = Math.abs(curAz - azAtPeakZoom);
+  if (diff > 180.0) diff = 360.0 - diff;
+  if (diff > maxZoomOutAzDrift) maxZoomOutAzDrift = diff;
+}}
+const zoomAfterOut = state.detZoom;
+state.detZoom = 1.0;
+state.detPanX = 0.0;
+state.detPanY = 0.0;
+
+// Restore d_min = 1.45 for workflow param check below
+slDminEl.value = "1.45";
+slDminEl.dispatchEvent({{ type: "change", target: slDminEl }});
 
 // 6. Verify #inp-binning & slider-driven wavelength/d_min in collectWorkflowParams()
 slWlMinEl.value = "2.25";
@@ -5705,6 +5940,7 @@ const paramsBin4 = collectWorkflowParams().binning;
 
 require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
   protFloor,
+  protPoolFloor,
   sliderMinAttr,
   clampedBelowFloor,
   initialPeakSource,
@@ -5721,31 +5957,66 @@ require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
     lodActive: lodZ1.isLodThinned,
     lodDMin: lodZ1.lodDcut,
     shownCount: lodZ1.visiblePeaks.length,
+    inViewCount: lodZ1.inViewCount,
     totalCount: lodZ1.totalCount,
   }},
   lodZ2: {{
     lodActive: lodZ2.isLodThinned,
     lodDMin: lodZ2.lodDcut,
     shownCount: lodZ2.visiblePeaks.length,
+    inViewCount: lodZ2.inViewCount,
     totalCount: lodZ2.totalCount,
   }},
   lodZ6: {{
     lodActive: lodZ6.isLodThinned,
     lodDMin: lodZ6.lodDcut,
     shownCount: lodZ6.visiblePeaks.length,
+    inViewCount: lodZ6.inViewCount,
     totalCount: lodZ6.totalCount,
   }},
-  hudHasLodPill: hudTextsZ1.some(t => t.includes("LOD d ≥") && t.includes("zoom+")),
+  lodZ24: {{
+    lodActive: lodZ24.isLodThinned,
+    lodDMin: lodZ24.lodDcut,
+    shownCount: lodZ24.visiblePeaks.length,
+    inViewCount: lodZ24.inViewCount,
+    totalCount: lodZ24.totalCount,
+  }},
+  hudHasLodPill: hudTextsZ1.some(t => t.includes("LOD ") && t.includes("d ≥") && t.includes("zoom+ to resolve")),
   hiddenOuterPeakId,
   hitHiddenUnpinned,
   hitHiddenWhenPinned,
   pred215WideWlCount,
   minWlObserved,
   hugeCellFloor,
+  hugeCellPoolFloor,
   mandiPred380,
   p6122Floor,
+  p6122PoolFloor,
   p6122Gamma,
   p6122Allowed145,
+  p6122Allowed050,
+  p6122PoolAt050IsNull,
+  p6122EwaldMs,
+  p6122Tier1MinD,
+  p6122Pred050,
+  p6122LodZ1: {{
+    lodActive: p6122LodZ1.isLodThinned,
+    shownCount: p6122LodZ1.visiblePeaks.length,
+    totalCount: p6122LodZ1.totalCount,
+  }},
+  p6122LodZ12: {{
+    lodActive: p6122LodZ12.isLodThinned,
+    shownCount: p6122LodZ12.visiblePeaks.length,
+    inViewCount: p6122LodZ12.inViewCount,
+    totalCount: p6122LodZ12.totalCount,
+    minVisD: p6122LodZ12.minVisD,
+  }},
+  azBeforeZoomIn,
+  cursorWorldAzBefore,
+  cursorWorldAzAfterIn,
+  zoomAfterIn,
+  zoomAfterOut,
+  maxZoomOutAzDrift,
   paramsAutoBin,
   paramsBin16,
   paramsBin8,
@@ -5760,19 +6031,105 @@ process.exit(0);
     subprocess.run(["node", str(js_file)], capture_output=True, text=True, check=True)
     out = json.loads(out_json_path.read_text(encoding="utf-8"))
 
-    # A. Verify finite unit-cell-volume-aware d_min safety floor scaling (relaxed ~15%)
-    assert 0.75 <= out["protFloor"] <= 1.05
-    assert abs(out["sliderMinAttr"] - out["protFloor"]) < 1e-6
-    assert abs(out["clampedBelowFloor"] - out["protFloor"]) < 1e-6
-    assert out["hugeCellFloor"] > out["protFloor"] + 1.0
-    assert 1.95 <= out["hugeCellFloor"] <= 2.40
+    # A. Verify unlocked 0.50 A d_min floor across all unit cells + 2M full-sphere pool crossover
+    assert abs(out["protFloor"] - 0.50) < 1e-6
+    assert 0.75 <= out["protPoolFloor"] <= 1.05
+    assert abs(out["sliderMinAttr"] - 0.50) < 1e-6
+    assert abs(out["clampedBelowFloor"] - 0.50) < 1e-6
+    assert abs(out["hugeCellFloor"] - 0.50) < 1e-6
+    assert 1.95 <= out["hugeCellPoolFloor"] <= 2.40
     assert out["p6122Gamma"] == 120.0
-    assert 1.40 <= out["p6122Floor"] <= 1.43
+    assert abs(out["p6122Floor"] - 0.50) < 1e-6
+    assert 1.40 <= out["p6122PoolFloor"] <= 1.43
     assert abs(out["p6122Allowed145"] - 1.45) < 1e-6
+    assert abs(out["p6122Allowed050"] - 0.50) < 1e-6
+    assert out["p6122PoolAt050IsNull"] is True
     assert out["paramsAutoBin"] is None
     assert out["paramsBin16"] == 16
     assert out["paramsBin8"] == 8
     assert out["paramsBin4"] == 4
+
+    # Verify P6122 (79.91 x 79.91 x 238.0 A, gamma=120) direct Ewald-shell 1:1 parity at d_min = 0.50 A!
+    from subhkl.core.crystallography import (
+        cartesian_matrix_metric_tensor,
+        generate_ewald_reflections,
+        generate_reflections,
+    )
+
+    p6122_cell = [79.91, 79.91, 238.0, 90.0, 90.0, 120.0]
+    u_p6122 = np.asarray(p6122_payload["u_matrix"], dtype=float)
+    b_p6122, _ = cartesian_matrix_metric_tensor(
+        79.91, 79.91, 238.0, *np.deg2rad([90.0, 90.0, 120.0])
+    )
+    ub_p6122 = u_p6122 @ b_p6122
+    he, ke, le = generate_ewald_reflections(
+        *p6122_cell,
+        space_group="P 61 2 2",
+        d_min=0.50,
+        UB=ub_p6122,
+        R_runs=[r0],
+        ki=(0.0, 0.0, 1.0),
+        wavelength_range=(0.74, 0.79),
+    )
+    py_p6122_050 = _cast_to_tuples(
+        _raycast_hkl_on_detectors(
+            np.column_stack([he, ke, le]),
+            u_p6122,
+            b_p6122,
+            r0,
+            mandi_dets,
+            (0.74, 0.79),
+            active_bids=mandi_active_bids,
+            margin_frac=0.06,
+        ),
+        b_p6122,
+    )
+    assert len(py_p6122_050) > 1500
+    assert min(ht[7] for ht in py_p6122_050) < 0.64
+    py_p6122_keys = {
+        (int(ht[0]), int(ht[3]), int(ht[4]), int(ht[5])): ht for ht in py_p6122_050
+    }
+    js_p6122_keys = {
+        (int(p["bank"]), int(p["hkl"][0]), int(p["hkl"][1]), int(p["hkl"][2])): p
+        for p in out["p6122Pred050"]
+    }
+    # Allow at most sub-1e-3 pixel float-rounding graze at exact [0, 256) edge
+    sym_diff = set(js_p6122_keys.keys()) ^ set(py_p6122_keys.keys())
+    assert len(sym_diff) <= 2
+    common_keys = set(js_p6122_keys.keys()) & set(py_p6122_keys.keys())
+    max_p6122_px_err = max(
+        max(
+            abs(js_p6122_keys[k]["row"] - py_p6122_keys[k][1]),
+            abs(js_p6122_keys[k]["col"] - py_p6122_keys[k][2]),
+        )
+        for k in common_keys
+    )
+    assert max_p6122_px_err < 0.06
+    assert out["p6122LodZ1"]["lodActive"] is True
+    assert out["p6122LodZ1"]["shownCount"] <= 1200
+    assert out["p6122LodZ1"]["totalCount"] > 100000
+    assert out["p6122Tier1MinD"] < 0.70
+    assert out["p6122LodZ12"]["inViewCount"] < out["p6122LodZ12"]["totalCount"]
+    assert out["p6122LodZ12"]["shownCount"] > 50
+    assert out["p6122LodZ12"]["shownCount"] == out["p6122LodZ12"]["inViewCount"]
+    assert out["p6122LodZ12"]["minVisD"] < 0.66
+
+    # Verify slabbed generate_reflections bit-for-bit parity when box_count > 1_000_000
+    h_sl, k_sl, l_sl = generate_reflections(
+        55.0, 80.0, 88.0, 90.0, 96.0, 90.0, space_group="I 2", d_min=1.35
+    )
+    assert len(h_sl) > 150_000
+    assert np.all((h_sl + k_sl + l_sl) % 2 == 0)
+
+    # Verify detector wheel zoom-in anchors under cursor and zoom-out has zero sideways azimuth drift!
+    assert out["zoomAfterIn"] > 1.7
+    assert out["zoomAfterOut"] == 0.7
+    az_cursor_diff = abs(
+        (out["cursorWorldAzAfterIn"] - out["cursorWorldAzBefore"] + 180.0) % 360.0
+        - 180.0
+    )
+    assert az_cursor_diff < 1e-4
+    assert out["maxZoomOutAzDrift"] < 1e-5
 
     # B. Verify auto-switch from 'integrated' -> 'predicted' when dragging d_min below integrated cutoff
     assert out["initialPeakSource"] == "integrated"
@@ -5824,19 +6181,24 @@ process.exit(0);
     assert out["pred215WideWlCount"] == len(py_cast_215_wide_wl)
     assert 2.0 <= out["minWlObserved"] < 2.2
 
-    # E. Verify Detector zoom-coupled d-spacing LOD thinning, progressive zoom unlocking, HUD pill, and hit-testing
-    lod1, lod2, lod6 = out["lodZ1"], out["lodZ2"], out["lodZ6"]
+    # E. Verify Detector Spherical BVH screen-density LOD thinning, zoom subdivision, HUD pill, and hit-testing
+    lod1, lod2, lod6, lod24 = (
+        out["lodZ1"],
+        out["lodZ2"],
+        out["lodZ6"],
+        out["lodZ24"],
+    )
     assert lod1["totalCount"] == len(py_cast_215)
     assert lod1["lodActive"] is True
     assert lod1["shownCount"] < lod1["totalCount"]
-    assert lod1["shownCount"] <= 500
-    assert lod1["lodDMin"] > 2.25
-    assert out["hudHasLodPill"] is True
+    assert lod1["shownCount"] <= 950
+    assert lod1["lodDMin"] < 2.25
     assert lod2["shownCount"] > lod1["shownCount"]
-    assert lod2["lodDMin"] <= lod1["lodDMin"]
-    assert lod6["lodActive"] is False
-    assert lod6["shownCount"] == lod6["totalCount"]
-    assert abs(lod6["lodDMin"] - 2.15) < 1e-3
+    assert out["hudHasLodPill"] is True
+    assert lod6["inViewCount"] < lod6["totalCount"]
+    assert lod24["lodActive"] is False
+    assert lod24["inViewCount"] < lod24["totalCount"]
+    assert lod24["shownCount"] == lod24["inViewCount"]
     assert out["hiddenOuterPeakId"] is not None
     assert out["hitHiddenUnpinned"] != out["hiddenOuterPeakId"]
     assert out["hitHiddenWhenPinned"] is True
@@ -6063,15 +6425,10 @@ def test_textures_only_fast_path_and_vectorized_flat_raycast(tmp_path):
         hit_m, rows, cols = det.reflections_mask(
             kf_hat[:, 0], kf_hat[:, 1], kf_hat[:, 2], sample_offset=sample_off
         )
-        r_span = max(float(det.n - 1), 1.0)
-        c_span = max(float(det.m - 1), 1.0)
-        hit_m = (
-            hit_m
-            & (rows >= margin * r_span)
-            & (rows <= (1.0 - margin) * r_span)
-            & (cols >= margin * c_span)
-            & (cols <= (1.0 - margin) * c_span)
-        )
+        bw = int(margin * min(int(det.n), int(det.m)))
+        hi_r = int(det.n) - 1 - bw if bw > 0 else int(det.n)
+        hi_c = int(det.m) - 1 - bw if bw > 0 else int(det.m)
+        hit_m = hit_m & (rows >= bw) & (rows < hi_r) & (cols >= bw) & (cols < hi_c)
         for loc in np.flatnonzero(hit_m):
             gi = int(cand_idx[loc])
             r_px = float(rows[loc])
@@ -6945,7 +7302,7 @@ def test_solve_binning_param_drawer_and_cli_forwarding(tmp_path):
 
 
 def test_careless_mono_mode_auto_selected_for_tof_without_ui_selector(
-    tmp_path,
+    tmp_path, monkeypatch
 ) -> None:
     """Verify UI has no mono/poly selector and automatically selects careless mono (without --wavelength-key, keeping WAVEL in metadata) whenever TOF data is available."""
     import json
@@ -7160,6 +7517,7 @@ console.log(JSON.stringify({{ pPoly, pMono }}));
     assert "'mode': 'mono'" in post_mono_src
 
     # 6. Verify Galaxy imaginex_subhkl_merge tool_inputs passes mode="mono" for TOF and mode="poly" for non-TOF
+    monkeypatch.setenv("SUBHKL_SHARED_DIR", str(tmp_path / "shared_dir"))
     gx_runner = NovaGalaxyPipelineRunner(
         galaxy_url="http://localhost:8080", galaxy_api_key="fake-key"
     )
@@ -7344,46 +7702,25 @@ def test_wilson_prior_default_mean_calibrated_residual_colorbar_and_single_table
     assert 'id="btn-hist-open-table"' in ui_html
     assert 'data-merge-action="open-table"' not in ui_html
 
-    # 3. Residual colorbar spans observed [min, max] with White midpoint at dataset mean
+    # 3. Residual colorbar spans outlier-robust [resMin, resMax] with White midpoint at dataset median
     if shutil.which("node"):
         script_blocks = re.findall(r"<script>([\s\S]*?)</script>", ui_html)
         inline_js = script_blocks[-1]
         fn_names = [
             "getColorCrossover",
             "applyCrossoverCurve",
+            "peakUnscaledIsigi",
             "peakMtzIsigi",
+            "computeQuantileScaleBounds",
             "getPeakDataAvailability",
             "residualToColor",
             "buildColorscaleGradientSpec",
         ]
         extracted = []
         for fn_name in fn_names:
-            m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+            m = re.search(rf"(?m)^  function {fn_name}\b[\s\S]*?^  \}}", inline_js)
             assert m is not None, f"Missing JS function {fn_name}"
-            start = m.start()
-            depth = 0
-            in_str = None
-            esc = False
-            i = m.end() - 1
-            while i < len(inline_js):
-                ch = inline_js[i]
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif in_str:
-                    if ch == in_str:
-                        in_str = None
-                elif ch in ("'", '"', "`"):
-                    in_str = ch
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        extracted.append(inline_js[start : i + 1])
-                        break
-                i += 1
+            extracted.append(m.group(0))
 
         js_harness = f"""
 const DEFAULT_COLOR_CROSSOVER = 0.38;
@@ -7394,14 +7731,17 @@ let _dynPredEpoch = 0;
 let _peakDataAvailabilitySig = "";
 let _peakDataAvailability = {{
   hasIsigi: false, hasMtzIsigi: false, hasResiduals: false, hasScales: false,
-  isigiTop: 40.0, mtzIsigiTop: 40.0, resMin: -3.0, resMax: 3.0, resMean: 0.0,
+  isigiTop: 40.0, mtzIsigiTop: 40.0, resMin: -3.0, resMax: 3.0, resMedian: 0.0, resMean: 0.0,
 }};
+// Include a massive positive outlier (+590000.0) that previously blew up mean (μ=98341.0) and resMax!
 const SAMPLE_PEAKS = [
-  {{ id: 1, careless_residual: -1.0 }},
-  {{ id: 2, careless_residual: 7.0 }},
-  {{ id: 3, careless_residual: 15.0 }},
-  {{ id: 4, careless_residual: 59.0 }},
-]; // min = -1.0, max = 59.0, mean = 20.0
+  {{ id: 1, careless_residual: -2.0 }},
+  {{ id: 2, careless_residual: 4.0 }},
+  {{ id: 3, careless_residual: 8.0 }},
+  {{ id: 4, careless_residual: 12.0 }},
+  {{ id: 5, careless_residual: 16.0 }},
+  {{ id: 6, careless_residual: 590000.0 }},
+]; // sorted: [-2, 4, 8, 12, 16, 590000] -> median = 10.0, outlier fenced far below 590000
 const PEAKS = [SAMPLE_PEAKS[0], SAMPLE_PEAKS[2]];
 function isigiToColor() {{ return "rgba(0,0,0,1)"; }}
 function scaleToColor() {{ return "rgba(0,0,0,1)"; }}
@@ -7411,12 +7751,12 @@ function wavelengthToColor() {{ return "rgba(0,0,0,1)"; }}
 const avail = getPeakDataAvailability();
 const spec = buildColorscaleGradientSpec("residual", 0.38);
 console.log(JSON.stringify({{
-  avail: {{ resMin: avail.resMin, resMax: avail.resMax, resMean: avail.resMean }},
-  colMin: residualToColor(-1.0, 1.0),
-  colBelowMean: residualToColor(7.0, 1.0),
-  colMean: residualToColor(20.0, 1.0),
-  colAboveMean: residualToColor(40.0, 1.0),
-  colMax: residualToColor(59.0, 1.0),
+  avail: {{ resMin: avail.resMin, resMax: avail.resMax, resMedian: avail.resMedian, resMean: avail.resMean }},
+  colMin: residualToColor(avail.resMin, 1.0),
+  colBelowMed: residualToColor(4.0, 1.0),
+  colMed: residualToColor(10.0, 1.0),
+  colAboveMed: residualToColor(16.0, 1.0),
+  colOutlier: residualToColor(590000.0, 1.0),
   spec,
 }}));
 """
@@ -7424,17 +7764,23 @@ console.log(JSON.stringify({{
             ["node", "-e", js_harness], check=True, capture_output=True, text=True
         )
         out = json.loads(proc.stdout.strip())
-        assert out["avail"] == {"resMin": -1.0, "resMax": 59.0, "resMean": 20.0}
+        assert out["avail"]["resMedian"] == 10.0
+        assert out["avail"]["resMean"] == 10.0
+        assert out["avail"]["resMin"] == -2.0
+        # Extreme +590000 outlier is fenced instead of stretching colorbar to 590000
+        assert 16.0 <= out["avail"]["resMax"] < 100.0
         assert out["colMin"] == "rgba(30, 170, 255, 1.000)"
-        assert out["colMean"] == "rgba(248, 250, 252, 1.000)"
-        assert out["colMax"] == "rgba(244, 63, 94, 1.000)"
-        # Positive residual +7.0 is below dataset mean (+20.0), so it tints toward blue (b > r)
-        r_lo, _, b_lo = [int(x) for x in re.findall(r"\d+", out["colBelowMean"])[:3]]
+        assert out["colMed"] == "rgba(248, 250, 252, 1.000)"
+        assert out["colOutlier"] == "rgba(244, 63, 94, 1.000)"
+        # Positive residual +4.0 is below dataset median (+10.0), so it tints toward blue (b > r)
+        r_lo, _, b_lo = [int(x) for x in re.findall(r"\d+", out["colBelowMed"])[:3]]
         assert b_lo > r_lo
-        # Residual +40.0 is above dataset mean (+20.0), so it tints toward red (r > b)
-        r_hi, _, b_hi = [int(x) for x in re.findall(r"\d+", out["colAboveMean"])[:3]]
+        # Residual +16.0 is above dataset median (+10.0), so it tints toward red (r > b)
+        r_hi, _, b_hi = [int(x) for x in re.findall(r"\d+", out["colAboveMed"])[:3]]
         assert r_hi > b_hi
-        assert "-1.0 · μ=20.0 · 59.0" == out["spec"]["label"]
+        assert "μ=" not in out["spec"]["label"]
+        assert " · 10.0 · " in out["spec"]["label"]
+        assert "median 10.0σ" in out["spec"]["tooltip"]
         assert "rgba(248, 250, 252, 1.000) 50.0%" in out["spec"]["gradient"]
 
 
@@ -7465,7 +7811,7 @@ def test_live_solve_dtheta_diagnostic_topbar_tooltips_and_controls_cleanup(
     mandi_dets = {
         int(bk): Detector(dict(cfg)) for bk, cfg in beamlines["MANDI"].items()
     }
-    active_bks = sorted(mandi_dets)[:8]
+    active_bks = sorted(mandi_dets)[:12]
     sub_dets = {bk: mandi_dets[bk] for bk in active_bks}
     first_det = mandi_dets[active_bks[0]]
     H, W = int(first_det.n), int(first_det.m)
@@ -7476,7 +7822,14 @@ def test_live_solve_dtheta_diagnostic_topbar_tooltips_and_controls_cleanup(
     grid = np.mgrid[-6:7, -6:7, -6:7].reshape(3, -1).T
     grid = grid[np.any(grid != 0, axis=1)]
     cast_true = _raycast_hkl_on_detectors(
-        grid, U_true, B_mat, R_run, sub_dets, (1.0, 3.0), active_bids=set(active_bks)
+        grid,
+        U_true,
+        B_mat,
+        R_run,
+        sub_dets,
+        (1.0, 3.0),
+        active_bids=set(active_bks),
+        margin_frac=0.06,
     )
     assert len(cast_true["peaks_xyz"]) >= 10
 
@@ -8829,3 +9182,2834 @@ def test_multiframe_bank_ids_delta_theta_voronoi_and_live_js_recalc(tmp_path) ->
     if shutil.which("node"):
         script = re.findall(r"<script>([\s\S]*?)</script>", html_doc)[-1]
         assert "predsByBank" in script
+
+
+def test_stratified_spherical_subsample_and_canonical_bvh_pop_free(tmp_path):
+    """Server solid-angle stratification preserves back-scattering banks, and client canonical dyadic BVHs are 100% pop-free across d_min and zoom."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import h5py
+    import numpy as np
+
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+    from subhkl.viz.rainbow_zones import (
+        _stratified_spherical_subsample,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # 1) Server-side _stratified_spherical_subsample: 5,000 forward high-d reflections in 4 narrow patches
+    #    must NOT starve 200 back-scattering lower-d reflections at |az| > 150 deg when capping to 400.
+    rng = np.random.default_rng(42)
+    n_fwd, n_back = 5000, 200
+    fwd_az = rng.uniform(-12.0, 12.0, size=n_fwd)
+    fwd_el = rng.uniform(-8.0, 8.0, size=n_fwd)
+    back_az = rng.choice([-168.0, 168.0], size=n_back) + rng.uniform(
+        -10.0, 10.0, size=n_back
+    )
+    back_el = rng.uniform(-35.0, 35.0, size=n_back)
+    az_deg = np.concatenate([fwd_az, back_az])
+    el_deg = np.concatenate([fwd_el, back_el])
+    az_r = np.deg2rad(az_deg)
+    el_r = np.deg2rad(el_deg)
+    kf = np.column_stack(
+        [np.cos(el_r) * np.sin(az_r), np.sin(el_r), np.cos(el_r) * np.cos(az_r)]
+    )
+    scores = np.concatenate(
+        [rng.uniform(4.0, 12.0, size=n_fwd), rng.uniform(1.0, 2.2, size=n_back)]
+    )
+    sel = _stratified_spherical_subsample(kf, 400, scores)
+    assert len(sel) == 400
+    assert int(np.sum(sel >= n_fwd)) >= 80
+
+    if not shutil.which("node"):
+        return
+
+    # 2) Client-side 41-bank MANDI P 61 2 2: verify d_min monotonicity at 1x, back-scattering bank coverage,
+    #    and 100% pop-free zoom from 1x -> 2x -> 4x (Tier-2 handoff) -> 8x -> 16x -> 26x!
+    h5p = tmp_path / "mandi_p6122_bvh.h5"
+    b_mat, _ = cartesian_matrix_metric_tensor(
+        79.91, 79.91, 238.0, *np.deg2rad([90.0, 90.0, 120.0])
+    )
+    with h5py.File(h5p, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["sample/space_group"] = "P 61 2 2"
+        hf["sample/cell"] = np.array(
+            [79.91, 79.91, 238.0, 90.0, 90.0, 120.0], dtype=float
+        )
+        hf["sample/U"] = np.eye(3, dtype=float)
+        hf["sample/B"] = b_mat
+        hf["instrument/wavelength"] = np.array([2.0, 4.0], dtype=float)
+
+    payload = build_rainbow_zone_payload(
+        replay_h5=str(h5p),
+        instrument="MANDI",
+        d_min=3.20,
+        wavelength_range=(2.0, 4.0),
+        include_panel_images=False,
+    )
+    html = render_rainbow_html(payload)
+    js_code = re.findall(r"<script[^>]*>(.*?)</script>", html, flags=re.DOTALL)[-1]
+    idx_end = js_code.rfind("})();")
+
+    harness = r"""
+const stubCtx = new Proxy({
+  measureText: (t) => ({ width: String(t).length * 6 }),
+  createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4) }),
+  createLinearGradient: () => ({ addColorStop: () => {} }),
+  createRadialGradient: () => ({ addColorStop: () => {} }),
+  getImageData: () => ({ data: new Uint8ClampedArray(4) }),
+}, { get: (t, p) => (p in t ? t[p] : () => {}) });
+function makeElem(w = 900, h = 520) {
+  return {
+    width: w, height: h, clientWidth: w, clientHeight: h, scrollWidth: w,
+    options: [], children: [],
+    style: { setProperty(){}, removeProperty(){} },
+    classList: { add(){}, remove(){}, toggle(){}, contains(){ return false; } },
+    dataset: {}, value: "", checked: false, textContent: "", innerHTML: "",
+    getContext: () => stubCtx,
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: w, height: h }),
+    addEventListener: () => {}, removeEventListener: () => {},
+    querySelectorAll: () => [], querySelector: () => null,
+    appendChild: () => {}, setAttribute: () => {}, getAttribute: () => null,
+  };
+}
+const elemCache = new Map();
+globalThis.window = { devicePixelRatio: 1, addEventListener: () => {}, innerWidth: 1280, innerHeight: 800 };
+globalThis.requestAnimationFrame = () => 0;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.ResizeObserver = class { observe(){} disconnect(){} };
+globalThis.OffscreenCanvas = undefined;
+globalThis.document = {
+  documentElement: makeElem(1280, 800),
+  getElementById: (id) => {
+    if (!elemCache.has(id)) {
+      const isStereo = id.includes("stereo");
+      elemCache.set(id, makeElem(isStereo ? 220 : 900, isStereo ? 220 : 520));
+    }
+    return elemCache.get(id);
+  },
+  createElement: () => makeElem(256, 256),
+  querySelectorAll: () => [],
+  querySelector: () => makeElem(),
+  addEventListener: () => {},
+  body: makeElem(1280, 800),
+};
+"""
+    probe = r"""
+state.peakSource = "predicted";
+state.detZoom = 1.0; state.detPanX = 0; state.detPanY = 0;
+state.wulffZoom = 1.0; state.wulffYawDeg = 0; state.wulffPitchDeg = 0;
+
+const dSteps = [3.2, 2.2, 1.4, 1.0];
+const detCounts = [];
+const wulffCounts = [];
+let backCount10 = 0;
+for (const dm of dSteps) {
+  state.dMin = dm;
+  repredictPeaksDynamic({ userAdjusted: true });
+  const dl = getDetectorLodState(900, 520);
+  const wl = getWulffLodState(false);
+  detCounts.push(dl.visiblePeaks.length);
+  wulffCounts.push(wl.visiblePeaks.length);
+  if (dm === 1.0) {
+    backCount10 = dl.visiblePeaks.filter(p => Math.abs(p.det_x) > 130.0).length;
+  }
+}
+
+state.projection = "spherical";
+const bp = PEAKS.filter(p => p.bank === 20);
+let sSin = 0, sCos = 0, sEl = 0;
+for (const p of bp) {
+  const r = p.det_x * Math.PI / 180.0;
+  sSin += Math.sin(r); sCos += Math.cos(r); sEl += p.det_el;
+}
+const cAz = Math.atan2(sSin, sCos) * 180.0 / Math.PI;
+const meanEl = sEl / bp.length;
+let prevCore = null;
+let poppedTotal = 0;
+const bankCounts = [];
+for (const z of [1.0, 2.0, 4.0, 8.0, 16.0, 26.0]) {
+  state.detZoom = z;
+  setDetectorCenterAzimuthDeg(cAz);
+  const bAct = getActiveBounds();
+  const bxAct = getDetectorPlotBox(900, 520);
+  const y0Ref = bxAct.originY + (1.0 - (meanEl - bAct.minY) / (bAct.maxY - bAct.minY)) * bxAct.plotH;
+  state.detPanY = -(y0Ref - 260.0) * z;
+  const lod = getDetectorLodState(900, 520);
+  const onBank = lod.visiblePeaks.filter(p => p.bank === 20);
+  bankCounts.push(onBank.length);
+  const core = new Set(
+    onBank
+      .filter(p => Math.abs(p.det_x - cAz) < 2.0 && Math.abs(p.det_el - meanEl) < 2.0)
+      .map(p => `${p.bank}|${p.hkl.join(",")}`)
+  );
+  if (prevCore) {
+    for (const k of prevCore) if (!core.has(k)) poppedTotal++;
+  }
+  prevCore = core;
+}
+console.log(JSON.stringify({ detCounts, wulffCounts, backCount10, poppedTotal, bankCounts, rawTotal: _dynEwaldRawTotal }));
+})();
+"""
+    js_path = tmp_path / "mandi_bvh_test.js"
+    js_path.write_text(
+        harness + "\n" + js_code[:idx_end] + "\n" + probe, encoding="utf-8"
+    )
+    res = subprocess.run(
+        ["node", str(js_path)], check=True, capture_output=True, text=True
+    )
+    out = json.loads(res.stdout.strip())
+    assert out["rawTotal"] > 150000
+    assert (
+        out["detCounts"][0]
+        < out["detCounts"][1]
+        < out["detCounts"][2]
+        <= out["detCounts"][3]
+    )
+    assert out["detCounts"][3] <= 1400
+    assert (
+        out["wulffCounts"][0]
+        < out["wulffCounts"][1]
+        < out["wulffCounts"][2]
+        <= out["wulffCounts"][3]
+    )
+    assert out["backCount10"] >= 60
+    assert out["poppedTotal"] == 0
+    assert out["bankCounts"][0] < out["bankCounts"][2] < out["bankCounts"][3]
+
+
+def test_predictor_and_rainbow_zones_honor_edge_and_pixel_masks(tmp_path) -> None:
+    """Verify peak-predictor and Rainbow Zones (server + client JS pool/Ewald raycasters) honor edge borders and per-pixel masks."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.commands import run_peak_predictor
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import (
+        cartesian_matrix_metric_tensor,
+        generate_reflections,
+    )
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.rainbow_zones import (
+        _raycast_hkl_on_detectors,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    cell = [68.0, 74.0, 92.0, 90.0, 90.0, 90.0]
+    B_raw, _ = cartesian_matrix_metric_tensor(*cell[:3], *np.deg2rad(cell[3:]))
+    B_mat = np.asarray(B_raw, dtype=float)
+    U_mat = Rotation.from_euler("zyx", [19.0, -31.0, 44.0], degrees=True).as_matrix()
+    R_mat = np.eye(3, dtype=float)
+    active_bks = [1, 20]
+    dets = {bk: Detector(dict(beamlines["MANDI"][str(bk)])) for bk in active_bks}
+    H, W = int(dets[1].n), int(dets[1].m)
+    bw = int(0.06 * min(H, W))  # 15 px on 256x256 MANDI panel
+
+    hkls = np.stack(
+        generate_reflections(*cell, space_group="P 21 21 21", d_min=1.8), axis=1
+    ).astype(int)
+    raw_cast = _raycast_hkl_on_detectors(
+        hkls,
+        U_mat,
+        B_mat,
+        R_mat,
+        dets,
+        (2.0, 4.0),
+        active_bids=set(active_bks),
+        margin_frac=0.0,
+    )
+    assert len(raw_cast["peaks_xyz"]) > 80
+
+    # Confirm there are genuine edge peaks (< bw or >= 255 - bw) AND interior peaks we will mask!
+    in_edge = (
+        (raw_cast["pixel_r"] < bw)
+        | (raw_cast["pixel_r"] >= (H - 1 - bw))
+        | (raw_cast["pixel_c"] < bw)
+        | (raw_cast["pixel_c"] >= (W - 1 - bw))
+    )
+    assert int(np.sum(in_edge)) >= 5
+    interior_idx = np.flatnonzero(~in_edge)
+    assert len(interior_idx) >= 15
+
+    # Mask a 40x40 central patch on bank 1 covering known interior reflections
+    b1_int = [
+        idx
+        for idx in interior_idx
+        if int(raw_cast["bank"][idx]) == 1
+        and 40 <= raw_cast["pixel_r"][idx] <= 210
+        and 40 <= raw_cast["pixel_c"][idx] <= 210
+    ]
+    assert len(b1_int) >= 1
+    target_i = b1_int[0]
+    tr = round(float(raw_cast["pixel_r"][target_i]))
+    tc = round(float(raw_cast["pixel_c"][target_i]))
+    r_lo, r_hi = max(bw + 1, tr - 18), min(H - 2 - bw, tr + 19)
+    c_lo, c_hi = max(bw + 1, tc - 18), min(W - 2 - bw, tc + 19)
+
+    cls_masks = np.zeros((2, H, W), dtype=np.uint8)
+    cls_masks[0, r_lo:r_hi, c_lo:c_hi] = 1  # dark/shadowed patch on bank 1
+    cls_masks[0, max(bw + 1, r_hi) : min(H - 2 - bw, r_hi + 6), c_lo:c_hi] = (
+        2  # static-bright strip
+    )
+
+    merged_h5 = tmp_path / "mandi_mask_merged.h5"
+    with h5py.File(merged_h5, "w") as mf:
+        mf.attrs["instrument"] = "MANDI"
+        mf.create_dataset("images", data=np.ones((2, H, W), dtype=np.float32) * 5.0)
+        mf.create_dataset("bank_ids", data=np.array(active_bks, dtype=np.int32))
+        mf.create_dataset("file_offsets", data=np.array([0], dtype=np.int32))
+        mf.create_dataset(
+            "files", data=np.array(["MANDI_mask_test.nxs.h5"], dtype="S32")
+        )
+        gon_m = mf.create_group("goniometer")
+        gon_m.create_dataset("R", data=R_mat[None, :, :])
+        gon_m.create_dataset("angles", data=np.zeros((2, 3), dtype=np.float64))
+        gon_m.create_dataset(
+            "axes",
+            data=np.array([[0, 1, 0, 1], [0, 0, 1, 1], [0, 1, 0, 1]], dtype=np.float64),
+        )
+        mf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.0, 4.0], dtype=np.float64)
+        )
+
+    solve_h5 = tmp_path / "mandi_mask_solve.h5"
+    with h5py.File(solve_h5, "w") as sf:
+        sf.attrs["instrument"] = "MANDI"
+        sf.attrs["source"] = str(merged_h5)
+        smp = sf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 21 21 21")
+        smp.create_dataset("cell", data=np.array(cell, dtype=float))
+        for k_c, v_c in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
+            smp.create_dataset(k_c, data=float(v_c))
+        smp.create_dataset("U", data=U_mat)
+        smp.create_dataset("B", data=B_mat)
+        sf.create_group("goniometer").create_dataset("R", data=R_mat[None, :, :])
+        sf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.0, 4.0], dtype=np.float64)
+        )
+        det_grp = sf.create_group("detector")
+        det_grp.create_dataset("pixel_mask", data=(cls_masks == 0).astype(np.uint8))
+        det_grp.create_dataset("pixel_class", data=cls_masks)
+        det_grp.create_dataset(
+            "mask_bank_ids", data=np.array(active_bks, dtype=np.int32)
+        )
+
+    # Also create an external static-mask HDF5 blocking an extra patch on bank 20
+    static_mask_h5 = tmp_path / "static_mask.h5"
+    valid_ext = np.ones((2, H, W), dtype=np.uint8)
+    valid_ext[1, 60:140, 60:140] = 0
+    with h5py.File(static_mask_h5, "w") as smf:
+        smf.attrs["kind"] = "static-mask"
+        smf.create_dataset("images", data=valid_ext)
+        smf.create_dataset("bank_ids", data=np.array(active_bks, dtype=np.int32))
+
+    # 1. Verify run_peak_predictor honors BOTH rel_border_width AND detector/pixel_mask + static_mask_file
+    pred_no_border_h5 = tmp_path / "pred_no_border.h5"
+    pred_masked_h5 = tmp_path / "pred_masked.h5"
+    run_peak_predictor(
+        str(merged_h5),
+        "MANDI",
+        str(solve_h5),
+        str(pred_no_border_h5),
+        d_min=1.8,
+        wavel_min=2.0,
+        wavel_max=4.0,
+        space_group="P 21 21 21",
+        rel_border_width=0.0,
+    )
+    run_peak_predictor(
+        str(merged_h5),
+        "MANDI",
+        str(solve_h5),
+        str(pred_masked_h5),
+        d_min=1.8,
+        wavel_min=2.0,
+        wavel_max=4.0,
+        space_group="P 21 21 21",
+        rel_border_width=0.06,
+        static_mask_file=str(static_mask_h5),
+    )
+    with (
+        h5py.File(pred_no_border_h5, "r") as f0,
+        h5py.File(pred_masked_h5, "r") as f1,
+    ):
+        n0 = sum(len(f0["banks"][k]["i"]) for k in f0["banks"])
+        n1 = sum(len(f1["banks"][k]["i"]) for k in f1["banks"])
+        assert n1 < n0
+        for img_k, bk_id in enumerate(active_bks):
+            if str(img_k) not in f1["banks"]:
+                continue
+            ri = np.asarray(f1["banks"][str(img_k)]["i"][()], dtype=float)
+            ci = np.asarray(f1["banks"][str(img_k)]["j"][()], dtype=float)
+            assert np.all((ri >= bw) & (ri < H - 1 - bw))
+            assert np.all((ci >= bw) & (ci < W - 1 - bw))
+            r_int = np.round(ri).astype(int)
+            c_int = np.round(ci).astype(int)
+            assert np.all(cls_masks[img_k, r_int, c_int] == 0)
+            if bk_id == 20:
+                assert np.all(valid_ext[1, r_int, c_int] == 1)
+
+    # 2. Verify Rainbow Zones server payload + client JS live re-prediction honor edge & per-pixel masks
+    payload = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        d_min=1.8,
+        wavelength_range=(2.0, 4.0),
+        include_panel_images=True,
+    )
+    assert payload["rel_border_width"] == 0.06
+    assert isinstance(payload.get("pixel_mask_bits"), dict)
+    assert "1" in payload["pixel_mask_bits"]
+    for pk in payload["predicted_peaks"]:
+        r_pk, c_pk = float(pk["row"]), float(pk["col"])
+        assert bw <= r_pk < (H - 1 - bw)
+        assert bw <= c_pk < (W - 1 - bw)
+        if int(pk["bank"]) == 1:
+            assert cls_masks[0, round(r_pk), round(c_pk)] == 0
+
+    if shutil.which("node"):
+        html_doc = render_rainbow_html(payload)
+        scripts = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        js_src = scripts[-1]
+        iife_end = js_src.rfind("})();")
+        assert iife_end > 0
+        js_harness = """
+const elems = new Map();
+function makeEl(id = "") {
+  const listeners = {};
+  return {
+    id, tagName: "DIV", value: "", min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: 800, height: 520, clientWidth: 800, clientHeight: 520,
+    scrollWidth: 800, scrollHeight: 520, scrollTop: 0, offsetWidth: 800, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null, dataset: {},
+    style: new Proxy({}, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: { add() {}, remove() {}, toggle() { return false; }, contains() { return false; } },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) { (listeners[evObj.type] || []).forEach(fn => fn(evObj)); },
+    appendChild(c) { return c; }, insertBefore(c) { return c; }, replaceChildren() {},
+    setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
+    getBoundingClientRect() { return { left: 0, top: 0, right: 800, bottom: 520, width: 800, height: 520 }; },
+    getContext() {
+      return {
+        fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+        textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+        setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+        transform() {}, clearRect() {}, fillRect() {}, strokeRect() {},
+        beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, arc() {}, ellipse() {},
+        quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+        stroke() {}, fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+        fillText() {}, strokeText() {}, drawImage() {},
+        measureText(t) { return { width: String(t).length * 6 }; },
+        createLinearGradient() { return { addColorStop() {} }; },
+        createRadialGradient() { return { addColorStop() {} }; },
+        getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+        putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+      };
+    },
+    querySelector() { return makeEl(); }, querySelectorAll() { return []; }, closest() { return null; },
+  };
+}
+function getEl(id) { if (!elems.has(id)) elems.set(id, makeEl(id)); return elems.get(id); }
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.requestAnimationFrame = () => 1;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.Image = class { set src(_v) {} };
+globalThis.document = {
+  body: makeEl("body"), documentElement: makeEl("html"),
+  getElementById: (id) => getEl(id),
+  createElement: (tag) => makeEl(tag),
+  querySelector: () => makeEl(), querySelectorAll: () => [],
+  addEventListener() {}, removeEventListener() {},
+};
+getEl("inp-border").value = "0.06";
+"""
+        js_probe = """
+// 1. Trigger dynamic pool reprediction at d_min = 1.80 with border = 0.06
+state.dMin = 1.80;
+repredictPeaksDynamic({ preserveSource: true });
+const poolPeaks06 = PEAKS.map(p => ({ bank: p.bank, hkl: p.hkl, row: p.row, col: p.col }));
+
+// 2. Increase live #inp-border to 0.15 -> strictly fewer peaks, all within [38, 217)
+const bInput = getEl("inp-border");
+bInput.value = "0.15";
+bInput.dispatchEvent({ type: "change", target: bInput });
+const poolPeaks15 = PEAKS.map(p => ({ bank: p.bank, hkl: p.hkl, row: p.row, col: p.col }));
+
+// 3. Trigger direct Ewald-shell rod mode at d_min = 0.60 with border = 0.06 -> still honors border & pixel_mask_bits!
+bInput.value = "0.06";
+state.dMin = 0.60;
+repredictPeaksDynamic({ preserveSource: true });
+const ewaldPeaks06 = PEAKS.map(p => ({ bank: p.bank, row: p.row, col: p.col }));
+
+console.log(JSON.stringify({ poolPeaks06, poolPeaks15, ewaldCount: ewaldPeaks06.length, ewaldPeaks06 }));
+})();
+"""
+        js_path = tmp_path / "mask_parity_test.js"
+        js_path.write_text(
+            js_harness + "\n" + js_src[:iife_end] + "\n" + js_probe, encoding="utf-8"
+        )
+        proc = subprocess.run(
+            ["node", str(js_path)], check=True, capture_output=True, text=True
+        )
+        js_out = json.loads(proc.stdout.strip())
+        py_keys_06 = {
+            (int(p["bank"]), int(p["hkl"][0]), int(p["hkl"][1]), int(p["hkl"][2]))
+            for p in payload["predicted_peaks"]
+        }
+        js_keys_06 = {
+            (int(p["bank"]), int(p["hkl"][0]), int(p["hkl"][1]), int(p["hkl"][2]))
+            for p in js_out["poolPeaks06"]
+        }
+        assert js_keys_06 == py_keys_06
+        assert len(js_out["poolPeaks15"]) < len(js_out["poolPeaks06"])
+        bw15 = int(0.15 * min(H, W))
+        for p15 in js_out["poolPeaks15"]:
+            assert bw15 <= p15["row"] < (H - 1 - bw15)
+            assert bw15 <= p15["col"] < (W - 1 - bw15)
+        assert js_out["ewaldCount"] > 500
+        for pe in js_out["ewaldPeaks06"]:
+            assert bw <= pe["row"] < (H - 1 - bw)
+            assert bw <= pe["col"] < (W - 1 - bw)
+            if int(pe["bank"]) == 1:
+                assert cls_masks[0, round(pe["row"]), round(pe["col"])] == 0
+
+
+def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
+    """Verify 3D ToF-gated peak placement, full 3D q-space angle, L1+L2 sensitivity, 3D Voronoi ownership, and live UI sync."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import gemmi
+    import h5py
+
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    from subhkl.io.events import ANGSTROM_M_PER_US, write_events
+    from subhkl.viz.rainbow_zones import (
+        _estimate_image_spot_angular_errors_deg,
+        _estimate_tof_gated_spot_angular_errors_deg,
+        build_rainbow_zone_payload,
+        compute_live_tof_delta_theta_payload,
+        render_rainbow_html,
+    )
+
+    det32 = Detector(dict(beamlines["MANDI"]["32"]))
+    H, W = int(det32.n), int(det32.m)
+    l1_true = 30.0
+    ki_hat = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    # Geometry at center pixel (128, 128) on MANDI bank 32
+    xyz_c = np.asarray(det32.pixel_to_lab(128.0, 128.0), dtype=float).ravel()
+    l2_c = float(np.linalg.norm(xyz_c))
+    kf_c = xyz_c / l2_c
+    q_dir = kf_c - ki_hat
+    q_unit_norm = float(np.linalg.norm(q_dir))  # 2 * sin(theta)
+    q_hat = q_dir / q_unit_norm
+
+    # Align cubic c* along q_hat so (0, 0, 2) and (0, 0, 3) land on the EXACT SAME pixel (128, 128)
+    # at two distinct wavelengths: lam_2 = 3.60 A, lam_3 = 2.40 A!
+    lam_2 = 3.60
+    d_002 = lam_2 / q_unit_norm
+    a_cell = 2.0 * d_002
+    cell_c = [a_cell, a_cell, a_cell, 90.0, 90.0, 90.0]
+    uc = gemmi.UnitCell(*cell_c)
+    b_mat = np.asarray(uc.frac.mat.tolist(), dtype=float).T
+
+    z_ax = np.array([0.0, 0.0, 1.0])
+    v_cr = np.cross(z_ax, q_hat)
+    s_cr = float(np.linalg.norm(v_cr))
+    c_cr = float(np.dot(z_ax, q_hat))
+    vx = np.array(
+        [[0.0, -v_cr[2], v_cr[1]], [v_cr[2], 0.0, -v_cr[0]], [-v_cr[1], v_cr[0], 0.0]]
+    )
+    u_mat = np.eye(3) + vx + (vx @ vx) * ((1.0 - c_cr) / max(s_cr**2, 1e-12))
+    ub_mat = u_mat @ b_mat
+
+    lam_3 = (2.0 / 3.0) * lam_2  # 2.40 A
+    t_pred_2 = lam_2 * (l1_true + l2_c) / ANGSTROM_M_PER_US
+    t_pred_3 = lam_3 * (l1_true + l2_c) / ANGSTROM_M_PER_US
+
+    # Synthesize sparse CSR event table on bank 32 (plus an empty/background bank 19):
+    # - Uniform broadband Poisson-like background across [14000, 38000] us
+    # - Spot A for (0,0,2): exact pixel (128, 128), +0.6% radial ToF shift (moderator tail!) -> directional arccos(q_hat . G_hat) ~ 0.0 deg!
+    # - Spot B for (0,0,3): shifted +4 px spatially to (132, 128) at t_pred_3 -> directional angle ~ 0.20 deg!
+    #   In 2D broadband images, Spot A and Spot B overlap in the same patch around (128, 128) and cannot be resolved independently.
+    rng = np.random.default_rng(12345)
+    tof_lists_32: list[list[float]] = []
+    for _p_idx in range(H * W):
+        bg_ev = rng.uniform(14000.0, 38000.0, size=2).astype(np.float32).tolist()
+        tof_lists_32.append(bg_ev)
+
+    rel_shift_2 = 0.006  # +0.6% radial ToF shift within gate, zero pixel shift
+    row_shift_3 = 4  # +4 px spatial offset on overlapping harmonic (0, 0, 3)
+    xyz_b = np.asarray(
+        det32.pixel_to_lab(128.0 + row_shift_3, 128.0), dtype=float
+    ).ravel()
+    kf_b = xyz_b / float(np.linalg.norm(xyz_b))
+    q_hat_b = (kf_b - ki_hat) / float(np.linalg.norm(kf_b - ki_hat))
+    expected_dir_deg_3 = float(
+        np.rad2deg(np.arccos(np.clip(np.dot(q_hat_b, q_hat), -1.0, 1.0)))
+    )
+
+    for dr in range(-2, 3):
+        for dc in range(-2, 3):
+            w_sp = np.exp(-0.5 * (dr * dr + dc * dc) / (0.85**2))
+            n_ev2 = round(65.0 * w_sp)
+            n_ev3 = round(85.0 * w_sp)
+            if n_ev2 > 0:
+                p_flat_a = (128 + dr) * W + (128 + dc)
+                ev2 = rng.normal(
+                    t_pred_2 * (1.0 + rel_shift_2),
+                    t_pred_2 * 0.0006,
+                    size=n_ev2,
+                ).astype(np.float32)
+                tof_lists_32[p_flat_a].extend(ev2.tolist())
+            if n_ev3 > 0:
+                p_flat_b = (128 + row_shift_3 + dr) * W + (128 + dc)
+                ev3 = rng.normal(
+                    t_pred_3,
+                    t_pred_3 * 0.0006,
+                    size=n_ev3,
+                ).astype(np.float32)
+                tof_lists_32[p_flat_b].extend(ev3.tolist())
+
+    img_19 = np.zeros((H, W), dtype=np.float32)
+    tof_19 = np.zeros(0, dtype=np.float32)
+    img_32 = np.zeros(H * W, dtype=np.float32)
+    flat_32: list[float] = []
+    for idx_p, ev_l in enumerate(tof_lists_32):
+        if ev_l:
+            ev_s = sorted(ev_l)
+            flat_32.extend(ev_s)
+            img_32[idx_p] = float(len(ev_s))
+    tof_32 = np.asarray(flat_32, dtype=np.float32)
+    imgs_2 = np.stack([img_19, img_32.reshape(H, W)], axis=0)
+
+    merged_h5 = tmp_path / "mandi_tof_3d_merged.h5"
+    with h5py.File(merged_h5, "w") as mf:
+        mf.attrs["instrument"] = "MANDI"
+        mf.create_dataset("images", data=imgs_2)
+        mf.create_dataset("bank_ids", data=np.array([19, 32], dtype=np.int32))
+        mf.create_dataset("file_offsets", data=np.array([0], dtype=np.int32))
+        mf.create_dataset("files", data=np.array(["MANDI_tof3d.nxs.h5"], dtype="S32"))
+        mf.create_group("goniometer").create_dataset(
+            "R", data=np.repeat(np.eye(3)[None], 2, axis=0)
+        )
+        inst_g = mf.create_group("instrument")
+        inst_g.create_dataset("wavelength", data=np.array([1.8, 4.2], dtype=float))
+        write_events(mf, [tof_19, tof_32], l1=l1_true)
+
+    # 1. Compare 2D image vs 3D ToF on the two same-ray harmonics (0,0,2) and (0,0,3):
+    hkl_pair = np.array([[0, 0, 2], [0, 0, 3]], dtype=np.int32)
+    bank_pair = np.array([32, 32], dtype=np.int32)
+    pr_pair = np.array([128.0, 128.0], dtype=np.float64)
+    pc_pair = np.array([128.0, 128.0], dtype=np.float64)
+    lam_pair = np.array([lam_2, lam_3], dtype=np.float64)
+
+    err_2d, ok_2d = _estimate_image_spot_angular_errors_deg(
+        images_h5=str(merged_h5),
+        frame_slice=(0, 2),
+        hkl_arr=hkl_pair,
+        bank_arr=bank_pair,
+        pixel_r_arr=pr_pair,
+        pixel_c_arr=pc_pair,
+        ub_matrix=ub_mat,
+        R_run=np.eye(3),
+        detectors={32: det32},
+        ki_hat=ki_hat,
+    )
+    assert ok_2d is True
+    assert err_2d is not None
+    # In 2D broadband image, Spot A (128,128) and Spot B (132,128) blend into one composite centroid (> 0.08 deg error on (0,0,2)!)
+    assert float(err_2d[0]) > 0.08
+
+    solve_h5 = tmp_path / "mandi_tof_3d_solve.h5"
+    with h5py.File(solve_h5, "w") as sf:
+        sf.attrs["instrument"] = "MANDI"
+        sf.attrs["source"] = str(merged_h5)
+        smp = sf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 1")
+        smp.create_dataset("cell", data=np.array(cell_c, dtype=float))
+        for k_n, v_n in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell_c):
+            smp.create_dataset(k_n, data=float(v_n))
+        smp.create_dataset("U", data=u_mat)
+        smp.create_dataset("B", data=b_mat)
+        sf.create_group("goniometer").create_dataset("R", data=np.eye(3)[None])
+        ig = sf.create_group("instrument")
+        ig.create_dataset("wavelength", data=np.array([1.8, 4.2], dtype=float))
+        ig.create_dataset("L1", data=float(l1_true))
+
+    err_3d, ok_3d, gate_meta = _estimate_tof_gated_spot_angular_errors_deg(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_slice=(0, 2),
+        hkl_arr=hkl_pair,
+        bank_arr=bank_pair,
+        pixel_r_arr=pr_pair,
+        pixel_c_arr=pc_pair,
+        lam_arr=lam_pair,
+        ub_matrix=ub_mat,
+        R_run=np.eye(3),
+        detectors={32: det32},
+        ki_hat=ki_hat,
+        instrument="MANDI",
+        tof_l1=l1_true,
+        wavelength_range=(1.8, 4.2),
+    )
+    assert ok_3d is True
+    assert err_3d is not None
+    assert gate_meta is not None
+    # Both overlapping harmonics are resolved independently in 3D ToF!
+    assert np.all(np.isfinite(err_3d))
+    # (0, 0, 2) has +0.6% pure radial ToF shift and 0 spatial shift -> directional arccos(q_hat . G_hat) ~ 0.0 deg!
+    assert float(err_3d[0]) < 0.04
+    # (0, 0, 3) is captured 4 px off-center inside the full circular patch with exact directional unit-vector angle!
+    assert abs(float(err_3d[1]) - expected_dir_deg_3) < 0.04
+
+    # 2. Verify L1 + L2 flight-path sensitivity in 3D ToF gating: shifting L1 by +2.5 m (~8%) moves t_pred outside Spot A's gate!
+    err_3d_bad_l1, ok_bad_l1, _ = _estimate_tof_gated_spot_angular_errors_deg(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_slice=(0, 2),
+        hkl_arr=hkl_pair,
+        bank_arr=bank_pair,
+        pixel_r_arr=pr_pair,
+        pixel_c_arr=pc_pair,
+        lam_arr=lam_pair,
+        ub_matrix=ub_mat,
+        R_run=np.eye(3),
+        detectors={32: det32},
+        ki_hat=ki_hat,
+        instrument="MANDI",
+        tof_l1=l1_true + 2.50,
+        wavelength_range=(1.8, 4.2),
+    )
+    assert ok_bad_l1 is True and err_3d_bad_l1 is not None
+    assert np.isnan(err_3d_bad_l1[0]) and np.isnan(err_3d_bad_l1[1])
+
+    # 3. Verify 3D Voronoi ownership & d_min convergence:
+    #    Place a higher-index reflection [1, 0, 3] right on Spot B's 3D q_obs = q_hat_b * (q_unit_norm / lam_3)!
+    #    When [1, 0, 3] enters the predicted shell (fine d_min), (0, 0, 3) loses its 4-px off-center false match (NaN)
+    #    and [1, 0, 3] claims Spot B with ~0.0 deg directional error!
+    q_obs_b_cryst = q_hat_b * (q_unit_norm / lam_3)
+    ub_crowd = ub_mat.copy()
+    ub_crowd[:, 0] = q_obs_b_cryst - 3.0 * ub_mat[:, 2]
+    hkl_crowd = np.array([[0, 0, 2], [0, 0, 3], [1, 0, 3]], dtype=np.int32)
+    err_crowd, ok_crowd, _ = _estimate_tof_gated_spot_angular_errors_deg(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_slice=(0, 2),
+        hkl_arr=hkl_crowd,
+        bank_arr=np.array([32, 32, 32], dtype=np.int32),
+        pixel_r_arr=np.array([128.0, 128.0, 128.0 + row_shift_3], dtype=np.float64),
+        pixel_c_arr=np.array([128.0, 128.0, 128.0], dtype=np.float64),
+        lam_arr=np.array([lam_2, lam_3, lam_3], dtype=np.float64),
+        ub_matrix=ub_crowd,
+        R_run=np.eye(3),
+        detectors={32: det32},
+        ki_hat=ki_hat,
+        instrument="MANDI",
+        tof_l1=l1_true,
+        wavelength_range=(1.8, 4.2),
+    )
+    assert ok_crowd is True and err_crowd is not None
+    assert np.isfinite(err_crowd[0]) and float(err_crowd[0]) < 0.04
+    assert np.isnan(
+        err_crowd[1]
+    )  # false 4-px match evicted in 3D q-space Voronoi by [1, 0, 3]!
+    assert np.isfinite(err_crowd[2]) and float(err_crowd[2]) < 0.04
+
+    # 4. End-to-end payload + live API helper + client JS sync & 2D/3D guard
+    d_cut_coarse = d_002 * 0.95  # admits (0,0,2) only
+    d_cut_fine = (a_cell / 3.0) * 0.95  # admits both (0,0,2) and (0,0,3)
+    payload_tof = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        wavelength_range=(1.8, 4.2),
+        d_min=d_cut_coarse,
+        include_panel_images=False,
+    )
+    assert payload_tof["has_tof_events"] is True
+    assert payload_tof["angular_error_mode"] == "tof_3d"
+    assert abs(float(payload_tof["tof_l1"]) - l1_true) < 1e-6
+    assert isinstance(payload_tof["tof_gate"], dict)
+
+    live_coarse = compute_live_tof_delta_theta_payload(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_index=0,
+        d_min=d_cut_coarse,
+        wavelength_range=(1.8, 4.2),
+        ub_matrix=payload_tof["ub_matrix"],
+        R_run=payload_tof["goniometer_R"],
+        sample_offset_lab=payload_tof["sample_offset_lab"],
+        ki=payload_tof["ki"],
+        instrument="MANDI",
+        space_group=payload_tof["space_group"],
+        cell=payload_tof["cell"],
+        detector_configs=payload_tof["detector_configs"],
+        tof_l1=l1_true,
+    )
+    live_fine = compute_live_tof_delta_theta_payload(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_index=0,
+        d_min=d_cut_fine,
+        wavelength_range=(1.8, 4.2),
+        ub_matrix=payload_tof["ub_matrix"],
+        R_run=payload_tof["goniometer_R"],
+        sample_offset_lab=payload_tof["sample_offset_lab"],
+        ki=payload_tof["ki"],
+        instrument="MANDI",
+        space_group=payload_tof["space_group"],
+        cell=payload_tof["cell"],
+        detector_configs=payload_tof["detector_configs"],
+        tof_l1=l1_true,
+    )
+    assert live_coarse["ok"] is True and live_fine["ok"] is True
+    assert "32|0,0,2" in live_coarse["errors"]
+    assert "32|0,0,3" not in live_coarse["errors"]
+    assert "32|0,0,2" in live_fine["errors"] and "32|0,0,3" in live_fine["errors"]
+
+    # Shifting detector bank 32 laterally by +2.4 mm (~4 px) via live detector_configs aligns (0,0,3) onto Spot B and shifts (0,0,2) by ~0.20 deg!
+    shifted_cfgs = json.loads(json.dumps(payload_tof["detector_configs"]))
+    v_hat_32 = np.asarray(shifted_cfgs["32"]["vhat"], dtype=float)
+    px_h = float(shifted_cfgs["32"]["height"]) / float(shifted_cfgs["32"]["n"])
+    shifted_cfgs["32"]["center"] = (
+        np.asarray(shifted_cfgs["32"]["center"], dtype=float)
+        + row_shift_3 * px_h * v_hat_32
+    ).tolist()
+    live_shifted_det = compute_live_tof_delta_theta_payload(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_index=0,
+        d_min=d_cut_fine,
+        wavelength_range=(1.8, 4.2),
+        ub_matrix=payload_tof["ub_matrix"],
+        R_run=payload_tof["goniometer_R"],
+        sample_offset_lab=payload_tof["sample_offset_lab"],
+        ki=payload_tof["ki"],
+        instrument="MANDI",
+        space_group=payload_tof["space_group"],
+        cell=payload_tof["cell"],
+        detector_configs=shifted_cfgs,
+        tof_l1=l1_true,
+    )
+    assert (
+        live_shifted_det["errors"]["32|0,0,2"]
+        > live_coarse["errors"]["32|0,0,2"] + 0.12
+    )
+
+    if shutil.which("node"):
+        html_doc = render_rainbow_html(payload_tof)
+        scripts = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        js_src = scripts[-1]
+        iife_end = js_src.rfind("})();")
+        assert iife_end > 0
+        live_fine_json = json.dumps(live_fine)
+        live_coarse_json = json.dumps(live_coarse)
+        js_harness = """
+const elems = new Map();
+function makeEl(id = "") {
+  const listeners = {};
+  return {
+    id, tagName: "DIV", value: "", min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: 800, height: 520, clientWidth: 800, clientHeight: 520,
+    scrollWidth: 800, scrollHeight: 520, scrollTop: 0, offsetWidth: 800, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null, dataset: {},
+    style: new Proxy({}, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: { add() {}, remove() {}, toggle() { return false; }, contains() { return false; } },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) { (listeners[evObj.type] || []).forEach(fn => fn(evObj)); },
+    appendChild(c) { return c; }, insertBefore(c) { return c; }, replaceChildren() {},
+    setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
+    getBoundingClientRect() { return { left: 0, top: 0, right: 800, bottom: 520, width: 800, height: 520 }; },
+    getContext() {
+      return {
+        fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+        textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+        setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+        transform() {}, clearRect() {}, fillRect() {}, strokeRect() {},
+        beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, arc() {}, ellipse() {},
+        quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+        stroke() {}, fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+        fillText() {}, strokeText() {}, drawImage() {},
+        measureText(t) { return { width: String(t).length * 6 }; },
+        createLinearGradient() { return { addColorStop() {} }; },
+        createRadialGradient() { return { addColorStop() {} }; },
+        getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+        putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+      };
+    },
+    querySelector() { return makeEl(); }, querySelectorAll() { return []; }, closest() { return null; },
+  };
+}
+function getEl(id) { if (!elems.has(id)) elems.set(id, makeEl(id)); return elems.get(id); }
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.requestAnimationFrame = () => 1;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.Image = class { set src(_v) {} };
+globalThis.document = {
+  body: makeEl("body"), documentElement: makeEl("html"),
+  getElementById: (id) => getEl(id),
+  createElement: (tag) => makeEl(tag),
+  querySelector: () => makeEl(), querySelectorAll: () => [],
+  addEventListener() {}, removeEventListener() {},
+};
+"""
+        js_probe = f"""
+// 1. Verify 2D estimateActiveFrameAngularErrorsJS is strictly guarded in tof_3d mode!
+const guardCount = estimateActiveFrameAngularErrorsJS(PEAKS, true);
+
+// 2. Verify live fetch round-trip when sliding dMin down to d_cut_fine AND back to d_cut_coarse!
+const fetchCalls = [];
+globalThis.fetch = (url, opts) => {{
+  const body = JSON.parse(opts.body);
+  fetchCalls.push(body.d_min);
+  const respObj = Math.abs(body.d_min - {d_cut_fine:.6f}) < 1e-3 ? {live_fine_json} : {live_coarse_json};
+  return Promise.resolve({{ ok: true, json: () => Promise.resolve(respObj) }});
+}};
+
+state.dMin = {d_cut_fine:.6f};
+repredictPeaksDynamic({{ preserveSource: true }});
+scheduleLiveTofDeltaThetaSync(true);
+
+setTimeout(() => {{
+  const p002 = PEAKS.find(p => p.bank === 32 && p.hkl[0] === 0 && p.hkl[1] === 0 && p.hkl[2] === 2);
+  const p003 = PEAKS.find(p => p.bank === 32 && p.hkl[0] === 0 && p.hkl[1] === 0 && p.hkl[2] === 3);
+  const pillTooltip = getEl("hud-rms-pill").title || getEl("hud-rms-pill").dataset.uiTip || "";
+
+  // Slide back to initial payload dMin and ensure it ALSO triggers a fresh sync!
+  state.dMin = {d_cut_coarse:.6f};
+  repredictPeaksDynamic({{ preserveSource: true }});
+  scheduleLiveTofDeltaThetaSync(true);
+
+  setTimeout(() => {{
+    console.log(JSON.stringify({{
+      guardCount,
+      fetchCalls,
+      err002: p002 ? p002.angular_error_deg : null,
+      err003: p003 ? p003.angular_error_deg : null,
+      pillTooltip,
+    }}));
+  }}, 15);
+}}, 15);
+}})();
+"""
+        js_path = tmp_path / "tof_3d_ui_test.js"
+        js_path.write_text(
+            js_harness + "\n" + js_src[:iife_end] + "\n" + js_probe, encoding="utf-8"
+        )
+        proc = subprocess.run(
+            ["node", str(js_path)], check=True, capture_output=True, text=True
+        )
+        js_out = json.loads(proc.stdout.strip())
+        assert js_out["guardCount"] == 0
+        assert len(js_out["fetchCalls"]) == 2
+        assert js_out["err002"] is not None and float(js_out["err002"]) < 0.05
+        assert (
+            js_out["err003"] is not None
+            and abs(float(js_out["err003"]) - expected_dir_deg_3) < 0.05
+        )
+        assert "3D ToF" in js_out["pillTooltip"]
+        assert "arccos" in js_out["pillTooltip"]
+
+
+def test_divergent_quantile_isigi_colorscale_and_signed_mtz(tmp_path) -> None:
+    """Verify warm quantile-normalized divergent I/σ & .mtz I/σ colorscale, center-bulk IQR placement, outlier fencing, and signed MTZ overlay."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.rainbow_zones import (
+        apply_mtz_to_payload,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    cell_vals = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
+    b_mat = np.asarray(gemmi.UnitCell(*cell_vals).frac.mat.tolist(), dtype=float).T
+    solve_h5 = tmp_path / "solve_isigi.h5"
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/space_group"] = "I 1 2 1"
+        hf["sample/cell"] = np.array(cell_vals, dtype=float)
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = b_mat
+        hf["goniometer/R"] = np.eye(3)[None, :, :]
+        hf["goniometer/angles"] = np.zeros((1, 1), dtype=float)
+        hf["instrument/wavelength"] = np.array([2.0, 4.5], dtype=float)
+
+    base = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        instrument="CG4D",
+        space_group="I 1 2 1",
+        wavelength_range=(2.0, 4.5),
+        d_min=2.0,
+        frame_index=0,
+        include_panel_images=False,
+    )
+    assert len(base["predicted_peaks"]) >= 2
+
+    # 1. Signed negative & positive .mtz I/σ preserved through _overlay_mtz_columns
+    h0 = [int(x) for x in base["predicted_peaks"][0]["hkl"]]
+    h1 = [int(x) for x in base["predicted_peaks"][1]["hkl"]]
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = gemmi.find_spacegroup_by_name(base["space_group"])
+    mtz.set_cell_for_all(gemmi.UnitCell(*base["cell"]))
+    mtz.add_dataset("unmerged_signed")
+    mtz.add_column("I", "J")
+    mtz.add_column("SIGI", "Q")
+    mtz.set_data(
+        np.asarray(
+            [
+                [h0[0], h0[1], h0[2], -25.0, 10.0],
+                [h1[0], h1[1], h1[2], 84.0, 12.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    mtz_path = tmp_path / "signed_unmerged.mtz"
+    mtz.write_to_file(str(mtz_path))
+    overlaid = apply_mtz_to_payload(
+        base, str(mtz_path), {"name": "signed_unmerged.mtz"}
+    )
+    by_hkl = {
+        tuple(int(x) for x in p["hkl"]): p
+        for p in overlaid["predicted_peaks"]
+        if p.get("mtz_isigi") is not None
+    }
+    assert abs(float(by_hkl[tuple(h0)]["mtz_isigi"]) - (-2.5)) < 1e-3
+    assert abs(float(by_hkl[tuple(h1)]["mtz_isigi"]) - 7.0) < 1e-3
+
+    if not shutil.which("node"):
+        return
+
+    ui_html = render_rainbow_html(overlaid)
+    inline_js = re.findall(r"<script>([\s\S]*?)</script>", ui_html)[-1]
+    fn_names = [
+        "getColorCrossover",
+        "applyCrossoverCurve",
+        "peakUnscaledIsigi",
+        "peakMtzIsigi",
+        "computeQuantileScaleBounds",
+        "getPeakDataAvailability",
+        "residualToColor",
+        "isigiToColor",
+        "buildColorscaleGradientSpec",
+    ]
+    extracted = []
+    for fn_name in fn_names:
+        m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+        assert m is not None, f"Missing JS function {fn_name}"
+        start = m.start()
+        depth = 0
+        in_str = None
+        esc = False
+        i = m.end() - 1
+        while i < len(inline_js):
+            ch = inline_js[i]
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif in_str:
+                if ch == in_str:
+                    in_str = None
+            elif ch in ("'", '"', "`"):
+                in_str = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    extracted.append(inline_js[start : i + 1])
+                    break
+            i += 1
+
+    # 2. Realistic skewed + signed I/σ distribution with extreme outliers AND top-k biased SAMPLE_PEAKS:
+    #    - Active-frame PEAKS (n=200): signed background-dominated + Bragg reflections + [-999, +76e6] outliers
+    #    - SAMPLE_PEAKS: artificially inflated top-k pool (SNR ~ 500..4000) that must NOT skew frame I/σ bounds!
+    rng = np.random.default_rng(12345)
+    core_snr = np.concatenate(
+        [
+            rng.normal(0.6, 1.4, size=140),
+            rng.lognormal(mean=1.5, sigma=0.7, size=58),
+            np.array([-999.0, 76_682_336.0]),
+        ]
+    )
+    peaks_js = [
+        {
+            "id": idx + 1,
+            "intensity": float(val * 10.0),
+            "sigma": 10.0,
+            "mtz_i": float((val - 0.5) * 8.0),
+            "mtz_sigi": 8.0,
+            "careless_residual": float(np.clip(val * 0.4, -4.0, 4.0)),
+        }
+        for idx, val in enumerate(core_snr)
+    ]
+    inflated_sample_js = [
+        {
+            "id": 1000 + idx,
+            "intensity": float((600.0 + idx * 25.0) * 10.0),
+            "sigma": 10.0,
+            "mtz_i": float(val * 8.0),
+            "mtz_sigi": 8.0,
+        }
+        for idx, val in enumerate(core_snr[:80])
+    ]
+
+    js_probe = f"""
+const DEFAULT_COLOR_CROSSOVER = 0.38;
+const ORBIT_PALETTE = ["#ff38b4", "#00e5ff"];
+const state = {{
+  colorCrossover: 0.38,
+  peakSource: "integrated",
+  wulffColorMode: "isigi",
+  lamMin: 1.0,
+  lamMax: 4.5,
+}};
+const DATA = {{ mtz_overlay_name: "signed_unmerged.mtz" }};
+let _dynPredEpoch = 0;
+let _peakDataAvailabilitySig = "";
+let _peakDataAvailability = {{}};
+const PEAKS = {json.dumps(peaks_js)};
+const SAMPLE_PEAKS = {json.dumps(inflated_sample_js)};
+function scaleToColor() {{ return "rgba(0,0,0,1)"; }}
+function hexToRgba() {{ return "rgba(0,0,0,1)"; }}
+function wavelengthToColor() {{ return "rgba(0,0,0,1)"; }}
+{"\n".join(extracted)}
+
+const avail = getPeakDataAvailability();
+const b = avail.isigiBounds;
+const colLo = isigiToColor(b.min, 1.0, b);
+const colQ25 = isigiToColor(b.q25, 1.0, b);
+const colMed = isigiToColor(b.median, 1.0, b);
+const colQ75 = isigiToColor(b.q75, 1.0, b);
+const colHi = isigiToColor(b.max, 1.0, b);
+const colExtremePos = isigiToColor(76682336.0, 1.0, b);
+const colExtremeNeg = isigiToColor(-999.0, 1.0, b);
+const resLo = residualToColor(avail.resMin, 1.0, avail);
+const resMed = residualToColor(avail.resMedian, 1.0, avail);
+const resHi = residualToColor(avail.resMax, 1.0, avail);
+const specIsigi = buildColorscaleGradientSpec("isigi", 0.38);
+
+// Also check truncated positive-only frame I/σ >= 2.5 (e.g. single-frame peak finder threshold)
+const truncBounds = computeQuantileScaleBounds(
+  Array.from({{ length: 120 }}, (_, k) => 2.5 + Math.pow(k / 119, 2.4) * 28.0)
+);
+const truncQ25Col = isigiToColor(truncBounds.q25, 1.0, truncBounds);
+const truncMedCol = isigiToColor(truncBounds.median, 1.0, truncBounds);
+const truncQ75Col = isigiToColor(truncBounds.q75, 1.0, truncBounds);
+
+console.log(JSON.stringify({{
+  signedNegPeak: peakUnscaledIsigi({{ intensity: -32.0, sigma: 8.0 }}),
+  signedNegMtz: peakMtzIsigi({{ mtz_i: -18.0, mtz_sigi: 6.0 }}),
+  bounds: b,
+  colLo, colQ25, colMed, colQ75, colHi, colExtremePos, colExtremeNeg,
+  resLo, resMed, resHi,
+  specIsigi,
+  truncBounds, truncQ25Col, truncMedCol, truncQ75Col,
+}}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", js_probe], check=True, capture_output=True, text=True
+    )
+    out = json.loads(proc.stdout.strip())
+
+    def _rgb(s: str) -> tuple[int, int, int]:
+        nums = [int(x) for x in re.findall(r"\d+", s)[:3]]
+        return nums[0], nums[1], nums[2]
+
+    def _dist(c1: tuple[int, int, int], c2: tuple[int, int, int]) -> float:
+        return float(np.hypot(np.hypot(c1[0] - c2[0], c1[1] - c2[1]), c1[2] - c2[2]))
+
+    # Signed negative I/σ preserved without clamping at 0
+    assert abs(out["signedNegPeak"] - (-4.0)) < 1e-6
+    assert abs(out["signedNegMtz"] - (-3.0)) < 1e-6
+
+    b = out["bounds"]
+    # Unbiased PEAKS median (~0.8..2.0) used instead of top-k SAMPLE_PEAKS (>600), and [-999, +76M] outliers fenced!
+    assert -15.0 < b["min"] < 0.0
+    assert 0.0 < b["median"] < 4.0
+    assert 6.0 < b["max"] < 30.0
+    assert out["colExtremePos"] == out["colHi"] == "rgba(232, 56, 24, 1.000)"
+    assert out["colExtremeNeg"] == out["colLo"] == "rgba(20, 184, 166, 1.000)"
+    assert out["colMed"] == "rgba(254, 232, 170, 1.000)"
+
+    # Central 50% bulk [Q25, Q75] sits much closer to warm Champagne-Gold center than to either extreme pole!
+    c_lo = _rgb(out["colLo"])
+    c_q25 = _rgb(out["colQ25"])
+    c_med = _rgb(out["colMed"])
+    c_q75 = _rgb(out["colQ75"])
+    c_hi = _rgb(out["colHi"])
+    assert _dist(c_q25, c_med) < _dist(c_q25, c_lo)
+    assert _dist(c_q75, c_med) < _dist(c_q75, c_hi)
+
+    # Same center-bulk guarantee holds even on lower-truncated I/σ >= 2.5 frame distributions!
+    ct_q25 = _rgb(out["truncQ25Col"])
+    ct_med = _rgb(out["truncMedCol"])
+    ct_q75 = _rgb(out["truncQ75Col"])
+    assert ct_med == (254, 232, 170)
+    assert _dist(ct_q25, ct_med) < _dist(ct_q25, c_lo)
+    assert _dist(ct_q75, ct_med) < _dist(ct_q75, c_hi)
+
+    # Distinct from ΔI/σ (Blue-White-Rose) at lower pole, midpoint (warmer gold vs cool white), and upper pole
+    assert _dist(c_lo, _rgb(out["resLo"])) > 50.0
+    assert _dist(c_med, _rgb(out["resMed"])) > 70.0
+    assert c_med[0] > c_med[1] > c_med[2]  # warm sunlit gold midpoint
+    assert _dist(c_hi, _rgb(out["resHi"])) > 65.0
+
+    assert "·" in out["specIsigi"]["label"]
+    assert "76682" not in out["specIsigi"]["label"]
+    assert "quantile-normalized range" in out["specIsigi"]["tooltip"]
+    assert "bulk IQR" in out["specIsigi"]["tooltip"]
+
+
+def test_slider_direct_numerical_input_integ_button_and_stationary_scope_btn(
+    tmp_path,
+) -> None:
+    """Verify click-to-edit λ_min/λ_max & d_min numerical inputs, warm I/σ Integ button styling, and stationary 1-Frame/All-Runs button."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    cell_vals = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
+    b_mat = np.asarray(gemmi.UnitCell(*cell_vals).frac.mat.tolist(), dtype=float).T
+    solve_h5 = tmp_path / "solve_ui_polish.h5"
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/space_group"] = "I 1 2 1"
+        hf["sample/cell"] = np.array(cell_vals, dtype=float)
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = b_mat
+        hf["goniometer/R"] = np.eye(3)[None, :, :]
+        hf["goniometer/angles"] = np.zeros((1, 1), dtype=float)
+        hf["instrument/wavelength"] = np.array([2.0, 4.5], dtype=float)
+
+    payload = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        instrument="CG4D",
+        space_group="I 1 2 1",
+        wavelength_range=(2.0, 4.5),
+        d_min=2.0,
+        frame_index=0,
+        include_panel_images=False,
+    )
+    html = render_rainbow_html(payload)
+
+    # 1. HTML/CSS assertions: clickable λ_min/λ_max & d_min spans, static LOD-gold Integ button, fixed-width 1-Frame/All-Runs & corner caret button
+    assert 'id="wl-val-min"' in html and 'id="wl-val-max"' in html
+    assert 'id="lbl-dmin-val" class="editable-slider-val"' in html
+    assert "#bef264" not in html
+    assert "#a3f22c" not in html
+    assert "rgba(163, 242, 44" not in html
+    assert (
+        re.search(
+            r'\.seg-toggle button\[data-peak-src="integrated"\]\.active-btn\s*\{[^}]*color:\s*#fbbf24',
+            html,
+        )
+        is not None
+    )
+    assert re.search(r"#btn-wulff-scope\s*\{[^}]*width:\s*54px", html) is not None
+    assert re.search(r"#stereo-title\s*\{[^}]*flex:\s*1\s+1\s+0", html) is not None
+    assert (
+        re.search(r"\.stereo-win-controls\s*\{[^}]*margin-left:\s*auto", html)
+        is not None
+    )
+    assert 'class="stereo-win-controls"' in html
+    assert 'id="btn-wulff-expand" type="button" data-caret="up"' in html
+
+    if not shutil.which("node"):
+        return
+
+    inline_js = re.findall(r"<script>([\s\S]*?)</script>", html)[-1]
+    fn_names = [
+        "getDefaultWavelengthForInstrument",
+        "getColorCrossover",
+        "applyCrossoverCurve",
+        "getDynamicDminFloor",
+        "getWavelengthSliderBounds",
+        "updateWavelengthLabels",
+        "syncWavelengthControls",
+        "syncDminControls",
+        "updateColorscaleSliderGradient",
+        "syncPeakSourceButtons",
+        "syncWulffUI",
+        "applyDirectWavelengthInput",
+        "applyDirectDminInput",
+        "openWavelengthDirectInput",
+        "openDminDirectInput",
+    ]
+    extracted = []
+    for fn_name in fn_names:
+        m = re.search(rf"(?m)^  function {fn_name}\b[\s\S]*?^  \}}", inline_js)
+        assert m is not None, f"Missing JS function {fn_name}"
+        extracted.append(m.group(0))
+
+    js_probe = f"""
+const MIN_WL_SPAN = 0.05;
+const ABS_DMIN_FLOOR = 0.25;
+const DYNAMIC_DMIN_HARD_FLOOR = 0.25;
+const DEFAULT_COLOR_CROSSOVER = 0.38;
+const WULFF_ALL_RUNS_MIN_ISIGI = 2.5;
+const INSTRUMENT_WAVELENGTH_DEFAULTS = {{ CG4D: [2.0, 4.5] }};
+const _payloadBaseParams = {{ lamMin: 2.0, lamMax: 4.5, dMin: 2.0 }};
+const DATA = {{
+  wavelength_range: [2.0, 4.5],
+  d_min: 2.0,
+  artifact_kind: "integrator",
+  mtz_overlay_name: "mandi_lysozyme_very_long_name.mtz",
+}};
+const state = {{
+  lamMin: 2.0,
+  lamMax: 4.5,
+  dMin: 2.0,
+  dMinUserSeq: 0,
+  colorCrossover: 0.38,
+  wulffColorMode: "isigi",
+  peakSource: "integrated",
+  showStereo: true,
+  wulffExpanded: true,
+  wulffScope: "single_frame",
+  showWulffFriedel: true,
+}};
+const PREDICTED_PEAKS = [{{ id: 1 }}];
+const INTEGRATED_PEAKS = [{{ id: 1, intensity: 100, sigma: 10 }}];
+let repredictCount = 0;
+function handleDynamicPredictionControlChange() {{ repredictCount += 1; updateColorscaleSliderGradient(); }}
+function buildColorscaleGradientSpec(_mode, c) {{ return {{ gradient: `grad(${{c}})`, label: "0 · 3 · 15", tooltip: "tip" }}; }}
+function hasIntegratedIsigi() {{ return true; }}
+function hasMtzIsigi() {{ return true; }}
+function hasCarelessResiduals() {{ return false; }}
+function hasCarelessScales() {{ return false; }}
+function isWulffSnrCutActive() {{ return state.wulffScope === "all_runs"; }}
+function updateMergeScoreboard() {{}}
+
+function makeEl(id, tag = "SPAN", initText = "") {{
+  const listeners = {{}};
+  const props = {{}};
+  const cls = new Set();
+  const children = [];
+  let _text = initText;
+  const el = {{
+    id,
+    tagName: tag,
+    value: "",
+    min: "0.20",
+    max: "6.50",
+    title: "",
+    disabled: false,
+    options: [
+      {{ value: "wavelength", textContent: "Color: λ/Zone", style: {{}} }},
+      {{ value: "isigi", textContent: "Color: I/σ", style: {{}} }},
+      {{ value: "mtz_isigi", textContent: "Color: .mtz I/σ", style: {{}} }},
+      {{ value: "residual", textContent: "Color: ΔI/σ Residual", style: {{}} }},
+      {{ value: "scale", textContent: "Color: Scale", style: {{}} }},
+    ],
+    style: {{
+      left: "",
+      width: "",
+      height: "",
+      borderColor: "",
+      setProperty(k, v) {{ props[k] = v; }},
+      getPropertyValue(k) {{ return props[k] || ""; }},
+    }},
+    classList: {{
+      toggle(c, on) {{ if (on) cls.add(c); else cls.delete(c); }},
+      contains(c) {{ return cls.has(c); }},
+    }},
+    get textContent() {{
+      if (children.length > 0) return children.map((c) => c.textContent ?? "").join("");
+      return _text;
+    }},
+    set textContent(v) {{
+      children.length = 0;
+      _text = String(v);
+    }},
+    appendChild(child) {{ children.push(child); return child; }},
+    querySelector(sel) {{
+      if (sel.startsWith("input")) return children.find((c) => c.tagName === "INPUT") || null;
+      return null;
+    }},
+    setAttribute(k, v) {{ el[k] = v; }},
+    addEventListener(type, fn) {{ (listeners[type] = listeners[type] || []).push(fn); }},
+    dispatch(type, ev = {{}}) {{
+      const eventObj = Object.assign({{
+        preventDefault() {{}},
+        stopPropagation() {{}},
+      }}, ev);
+      (listeners[type] || []).slice().forEach((fn) => fn(eventObj));
+    }},
+    focus() {{}},
+    select() {{}},
+    _children: children,
+  }};
+  return el;
+}}
+
+const els = {{
+  "wl-readout": makeEl("wl-readout", "SPAN"),
+  "wl-val-min": makeEl("wl-val-min", "SPAN", "2.00"),
+  "wl-val-max": makeEl("wl-val-max", "SPAN", "4.50"),
+  "lbl-dmin-val": makeEl("lbl-dmin-val", "SPAN", "2.00 Å"),
+  "slider-wl-min": makeEl("slider-wl-min", "INPUT"),
+  "slider-wl-max": makeEl("slider-wl-max", "INPUT"),
+  "slider-dmin": makeEl("slider-dmin", "INPUT"),
+  "wl-track-fill": makeEl("wl-track-fill", "DIV"),
+  "wl-knob-min": makeEl("wl-knob-min", "BUTTON"),
+  "wl-knob-max": makeEl("wl-knob-max", "BUTTON"),
+  "slider-color-emphasis": makeEl("slider-color-emphasis", "INPUT"),
+  "lbl-color-emphasis": makeEl("lbl-color-emphasis", "SPAN"),
+  "btn-peaks-pred": makeEl("btn-peaks-pred", "BUTTON"),
+  "btn-peaks-integ": makeEl("btn-peaks-integ", "BUTTON"),
+  "legend-peak-shape-icon": makeEl("legend-peak-shape-icon", "SPAN"),
+  "legend-peak-shape-label": makeEl("legend-peak-shape-label", "SPAN"),
+  "stereo-inset": makeEl("stereo-inset", "DIV"),
+  "btn-stereo-toggle": makeEl("btn-stereo-toggle", "BUTTON"),
+  "btn-wulff-scope": makeEl("btn-wulff-scope", "BUTTON", "1-Frame"),
+  "btn-wulff-friedel": makeEl("btn-wulff-friedel", "BUTTON"),
+  "btn-wulff-expand": makeEl("btn-wulff-expand", "BUTTON"),
+  "sel-wulff-color": makeEl("sel-wulff-color", "SELECT"),
+  "sel-spot-color": makeEl("sel-spot-color", "SELECT"),
+  "stereo-title": makeEl("stereo-title", "SPAN"),
+}};
+els["wl-readout"].appendChild({{ textContent: "[" }});
+els["wl-readout"].appendChild(els["wl-val-min"]);
+els["wl-readout"].appendChild({{ textContent: ", " }});
+els["wl-readout"].appendChild(els["wl-val-max"]);
+els["wl-readout"].appendChild({{ textContent: "] Å" }});
+
+const slWlMin = els["slider-wl-min"];
+const slWlMax = els["slider-wl-max"];
+const slDmin = els["slider-dmin"];
+const wlTrackFill = els["wl-track-fill"];
+const wlKnobMin = els["wl-knob-min"];
+const wlKnobMax = els["wl-knob-max"];
+const slColorEmphasis = els["slider-color-emphasis"];
+let _cachedPlotBox = null;
+let _cachedPlotBoxKey = "";
+
+const document = {{
+  getElementById(id) {{ return els[id] || null; }},
+  createElement(tag) {{ return makeEl("", String(tag).toUpperCase()); }},
+  createTextNode(txt) {{ return {{ textContent: String(txt) }}; }},
+}};
+
+{"\n".join(extracted)}
+
+// A. Click λ_min -> type 1.35 -> Tab jumps directly to λ_max -> type 8.25 (beyond initial 6.50 slider max!) -> Enter
+openWavelengthDirectInput("min");
+const inpMin = els["wl-val-min"].querySelector("input.inline-slider-input");
+inpMin.value = "1.35";
+inpMin.dispatch("keydown", {{ key: "Tab", shiftKey: false }});
+const inpMax = els["wl-val-max"].querySelector("input.inline-slider-input");
+const tabOpenedMax = Boolean(inpMax);
+inpMax.value = "8.25";
+inpMax.dispatch("keydown", {{ key: "Enter" }});
+
+const afterWl = {{
+  lamMin: state.lamMin,
+  lamMax: state.lamMax,
+  readout: els["wl-readout"].textContent,
+  slMaxBound: parseFloat(slWlMax.max),
+  slMinVal: slWlMin.value,
+  slMaxVal: slWlMax.value,
+}};
+
+// Escape cancels without modifying λ_min
+openWavelengthDirectInput("min");
+const inpEsc = els["wl-val-min"].querySelector("input.inline-slider-input");
+inpEsc.value = "3.99";
+inpEsc.dispatch("keydown", {{ key: "Escape" }});
+const lamMinAfterEsc = state.lamMin;
+
+// B. Click d_min -> type 1.12 -> Enter updates d_min in 0.01 A steps; dragging slider snaps to 0.05 A steps; typing 0.02 clamps to dynamic floor
+openDminDirectInput();
+const inpD = els["lbl-dmin-val"].querySelector("input.inline-slider-input");
+inpD.value = "1.12";
+inpD.dispatch("keydown", {{ key: "Enter" }});
+const dMinAfterCommit = state.dMin;
+const lblDAfterCommit = els["lbl-dmin-val"].textContent;
+const slDValAfterCommit = slDmin.value;
+const slDStepAttr = slDmin.step;
+
+slDmin.value = "1.73";
+syncDminControls(slDmin.value, slDmin);
+const dMinAfterSliderSnap = state.dMin;
+const lblDAfterSliderSnap = els["lbl-dmin-val"].textContent;
+
+openDminDirectInput();
+const inpDFloor = els["lbl-dmin-val"].querySelector("input.inline-slider-input");
+inpDFloor.value = "0.02";
+inpDFloor.dispatch("keydown", {{ key: "Enter" }});
+const dFloorExpected = getDynamicDminFloor();
+const dMinAfterFloor = state.dMin;
+
+// C. Static LOD-gold (#fbbf24) Integ button & legend ellipse icon
+syncPeakSourceButtons();
+const legBorderInteg = els["legend-peak-shape-icon"].style.borderColor;
+const btnIntegActive = els["btn-peaks-integ"].classList.contains("active-btn");
+
+// D. Wulff scope button label stays concise ("1-Frame" vs "All-Runs") & corner expand button switches ^ (up) <-> v (down) caret
+state.wulffExpanded = false;
+state.wulffScope = "single_frame";
+syncWulffUI();
+const scopeSingleLbl = els["btn-wulff-scope"].textContent;
+const expandCornerCaret = els["btn-wulff-expand"]["data-caret"];
+const expandCornerHtml = els["btn-wulff-expand"].innerHTML;
+const expandCornerTip = els["btn-wulff-expand"].title;
+
+state.wulffExpanded = true;
+state.wulffScope = "all_runs";
+syncWulffUI();
+const scopeAllLbl = els["btn-wulff-scope"].textContent;
+const scopeAllTip = els["btn-wulff-scope"].title;
+const stereoTitleAll = els["stereo-title"].textContent;
+const expandSplitCaret = els["btn-wulff-expand"]["data-caret"];
+const expandSplitHtml = els["btn-wulff-expand"].innerHTML;
+const expandSplitTip = els["btn-wulff-expand"].title;
+
+console.log(JSON.stringify({{
+  tabOpenedMax,
+  afterWl,
+  lamMinAfterEsc,
+  dMinAfterCommit,
+  lblDAfterCommit,
+  slDValAfterCommit,
+  dFloorExpected,
+  dMinAfterFloor,
+  repredictCount,
+  slDStepAttr,
+  dMinAfterSliderSnap,
+  lblDAfterSliderSnap,
+  legBorderInteg,
+  btnIntegActive,
+  scopeSingleLbl,
+  scopeAllLbl,
+  scopeAllTip,
+  stereoTitleAll,
+  expandCornerCaret,
+  expandCornerHtml,
+  expandCornerTip,
+  expandSplitCaret,
+  expandSplitHtml,
+  expandSplitTip,
+}}));
+"""
+    js_file = tmp_path / "ui_polish_probe.js"
+    js_file.write_text(js_probe, encoding="utf-8")
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip())
+
+    assert out["tabOpenedMax"] is True
+    assert abs(out["afterWl"]["lamMin"] - 1.35) < 1e-6
+    assert abs(out["afterWl"]["lamMax"] - 8.25) < 1e-6
+    assert out["afterWl"]["readout"] == "[1.35, 8.25] Å"
+    assert out["afterWl"]["slMaxBound"] >= 8.25
+    assert out["afterWl"]["slMinVal"] == "1.35"
+    assert out["afterWl"]["slMaxVal"] == "8.25"
+    assert abs(out["lamMinAfterEsc"] - 1.35) < 1e-6
+
+    assert abs(out["dMinAfterCommit"] - 1.12) < 1e-6
+    assert out["lblDAfterCommit"] == "1.12 Å"
+    assert out["slDValAfterCommit"] == "1.12"
+    assert out["slDStepAttr"] == "0.05"
+    assert abs(out["dMinAfterSliderSnap"] - 1.75) < 1e-6
+    assert out["lblDAfterSliderSnap"] == "1.75 Å"
+    assert abs(out["dMinAfterFloor"] - out["dFloorExpected"]) < 0.02
+    assert out["repredictCount"] >= 4
+
+    assert out["btnIntegActive"] is True
+    assert out["legBorderInteg"] == "#fbbf24"
+
+    assert out["scopeSingleLbl"] == "1-Frame"
+    assert out["scopeAllLbl"] == "All-Runs"
+    assert "I/σ ≥ 2.5" in out["scopeAllTip"]
+    assert "ALL-RUNS · I/σ ≥ 2.5" in out["stereoTitleAll"]
+
+    assert out["expandCornerCaret"] == "up"
+    assert "3.5 10.5 8 6 12.5 10.5" in out["expandCornerHtml"]
+    assert "Magnify" in out["expandCornerTip"]
+    assert out["expandSplitCaret"] == "down"
+    assert "3.5 6 8 10.5 12.5 6" in out["expandSplitHtml"]
+    assert "Reduce" in out["expandSplitTip"]
+
+
+def test_nodal_points_gap_bridge_zone_arc_hover_and_holz(tmp_path) -> None:
+    """Verify {a*, b*, c*} + intersection nodal bull's-eyes, inter-panel gap overlap & hover badge, [uvw] arc hover badge, and ±1/±2 HOLZ."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import h5py
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    assert shutil.which("node"), "Node.js required for nodal/HOLZ behavioral test"
+
+    # Align cubic [111] along +Z so (-1,0,0), (0,-1,0), (0,0,-1) all scatter into forward 2theta = 70.53 deg,
+    # 120 deg apart around the beam:
+    # - Bank 1 & Bank 2 straddle a* with a 5-deg azimuthal gap right across a* (onPanel == False!)
+    # - Bank 3 covers b* directly (onPanel == True)
+    # - Bank 4 covers c* directly (onPanel == True)
+    v_from = np.array([1.0, 1.0, 1.0], dtype=float) / np.sqrt(3.0)
+    v_to = np.array([0.0, 0.0, 1.0], dtype=float)
+    rot_axis = np.cross(v_from, v_to)
+    rot_axis /= np.linalg.norm(rot_axis)
+    rot_ang = float(np.arccos(np.clip(np.dot(v_from, v_to), -1.0, 1.0)))
+    u_mat = Rotation.from_rotvec(rot_axis * rot_ang).as_matrix()
+    a_cell = 12.0
+    b_mat = np.eye(3, dtype=float) / a_cell
+    ub_mat = u_mat @ b_mat
+    ki = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    def _kf_for_hkl(hkl_vec: list[int]) -> np.ndarray:
+        g = ub_mat @ np.asarray(hkl_vec, dtype=float)
+        gh = g / np.linalg.norm(g)
+        if np.dot(ki, gh) > 0:
+            gh = -gh
+        sth = -float(np.dot(ki, gh))
+        kf = ki + 2.0 * sth * gh
+        return kf / np.linalg.norm(kf)
+
+    kf_a = _kf_for_hkl([1, 0, 0])
+    kf_b = _kf_for_hkl([0, 1, 0])
+    kf_c = _kf_for_hkl([0, 0, 1])
+
+    def _make_flat_bank_at_dir(
+        kf_dir: np.ndarray, az_offset_deg: float, width_m: float, height_m: float
+    ) -> dict[str, object]:
+        rot_y = Rotation.from_euler("y", az_offset_deg, degrees=True).as_matrix()
+        d_center = (rot_y @ kf_dir) * 0.45
+        n_hat = -d_center / np.linalg.norm(d_center)
+        up = np.array([0.0, 1.0, 0.0], dtype=float)
+        u_hat = np.cross(up, n_hat)
+        u_hat /= np.linalg.norm(u_hat)
+        v_hat = np.cross(n_hat, u_hat)
+        v_hat /= np.linalg.norm(v_hat)
+        corner00 = d_center - 0.5 * width_m * u_hat - 0.5 * height_m * v_hat
+        return {
+            "panel": "flat",
+            "panel_type": "flat",
+            "center": corner00.tolist(),
+            "uhat": u_hat.tolist(),
+            "vhat": v_hat.tolist(),
+            "width": float(width_m),
+            "height": float(height_m),
+            "m": 128,
+            "n": 128,
+        }
+
+    kf_bc = _kf_for_hkl([0, 1, 1])
+    # Bank 1 & Bank 2 sit +/-13 deg around kf_a with angular half-width ~10.1 deg -> ~5.8 deg gap containing kf_a!
+    # Bank 5 sits on (0,1,1) = [1,0,0] x [0,1,-1] so a secondary zone-intersection hub is also on-panel at order <= 1.
+    bank_cfgs = {
+        1: _make_flat_bank_at_dir(kf_a, -13.0, 0.16, 0.22),
+        2: _make_flat_bank_at_dir(kf_a, +13.0, 0.16, 0.22),
+        3: _make_flat_bank_at_dir(kf_b, 0.0, 0.22, 0.22),
+        4: _make_flat_bank_at_dir(kf_c, 0.0, 0.22, 0.22),
+        5: _make_flat_bank_at_dir(kf_bc, 0.0, 0.22, 0.22),
+    }
+    det_objs = {bid: Detector(dict(cfg)) for bid, cfg in bank_cfgs.items()}
+    # Confirm kf_a misses every bank while kf_b hits bank 3 and kf_c hits bank 4
+    for bid, det in det_objs.items():
+        hm_a, _, _ = det.reflections_mask(
+            np.array([kf_a[0]]), np.array([kf_a[1]]), np.array([kf_a[2]])
+        )
+        assert not bool(hm_a[0]), f"Expected a* ray to lie in gap outside bank {bid}"
+    assert bool(
+        det_objs[3].reflections_mask(
+            np.array([kf_b[0]]), np.array([kf_b[1]]), np.array([kf_b[2]])
+        )[0][0]
+    )
+    assert bool(
+        det_objs[4].reflections_mask(
+            np.array([kf_c[0]]), np.array([kf_c[1]]), np.array([kf_c[2]])
+        )[0][0]
+    )
+
+    solve_h5 = tmp_path / "nodal_holz_solve.h5"
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.create_group("beam").create_dataset("ki_vec", data=ki)
+        smp = hf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 1")
+        smp.create_dataset(
+            "cell", data=np.array([a_cell, a_cell, a_cell, 90.0, 90.0, 90.0])
+        )
+        smp.create_dataset("U", data=u_mat)
+        smp.create_dataset("B", data=b_mat)
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([1.2, 3.2], dtype=float)
+        )
+        dc_root = hf.create_group("detector_calibration")
+        for bid, cfg in bank_cfgs.items():
+            g = dc_root.create_group(f"bank_{bid}")
+            g.create_dataset("panel_type", data=b"flat")
+            g.create_dataset("center", data=np.array(cfg["center"], dtype=float))
+            g.create_dataset("uhat", data=np.array(cfg["uhat"], dtype=float))
+            g.create_dataset("vhat", data=np.array(cfg["vhat"], dtype=float))
+            g.create_dataset("width", data=float(cfg["width"]))
+            g.create_dataset("height", data=float(cfg["height"]))
+            g.create_dataset("m", data=int(cfg["m"]))
+            g.create_dataset("n", data=int(cfg["n"]))
+
+    payload = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        instrument="MANDI",
+        d_min=1.5,
+        wavelength_range=(1.2, 3.2),
+        include_panel_images=False,
+    )
+    # Restrict detector_configs & panels strictly to our 4 custom banks so Bank 1/2 gap around a* is preserved
+    payload["detector_configs"] = {
+        str(bid): bank_cfgs[bid] for bid in sorted(bank_cfgs)
+    }
+    payload["panels"] = [pn for pn in payload["panels"] if int(pn["bank"]) in bank_cfgs]
+    if len(payload["panels"]) < len(bank_cfgs):
+        # Populate 2D panel envelopes from the 4 custom Detector objects
+        panels_custom = []
+        for bid, det in sorted(det_objs.items()):
+            corners_cyl = []
+            corners_sph = []
+            for rc, cc in [(0, 0), (127, 0), (127, 127), (0, 127)]:
+                pt = np.asarray(det.pixel_to_lab(rc, cc), dtype=float).reshape(3)
+                az = float(np.degrees(np.arctan2(pt[0], pt[2])))
+                r3 = float(np.linalg.norm(pt))
+                el = float(np.degrees(np.arcsin(np.clip(pt[1] / r3, -1.0, 1.0))))
+                corners_cyl.append([az, float(pt[1])])
+                corners_sph.append([az, el])
+            azs = [c[0] for c in corners_cyl]
+            ys = [c[1] for c in corners_cyl]
+            els_v = [c[1] for c in corners_sph]
+            panels_custom.append(
+                {
+                    "id": bid,
+                    "bank": bid,
+                    "name": f"Bank {bid}",
+                    "n_rows": 128,
+                    "n_cols": 128,
+                    "az_min": min(azs),
+                    "az_max": max(azs),
+                    "y_min": min(ys),
+                    "y_max": max(ys),
+                    "el_min": min(els_v),
+                    "el_max": max(els_v),
+                    "corners": corners_cyl,
+                    "corners_sph": corners_sph,
+                }
+            )
+        payload["panels"] = panels_custom
+
+    html_doc = render_rainbow_html(payload)
+    assert 'id="btn-nodal-points"' in html_doc
+    assert 'id="btn-holz-1"' in html_doc
+    assert 'id="btn-holz-2"' in html_doc
+    script = re.findall(r"<script>([\s\S]*?)</script>", html_doc)[-1]
+    script_open = script[: script.rfind("})();")]
+
+    js_file = tmp_path / "nodal_holz_check.js"
+    js_file.write_text(
+        """
+const elems = new Map();
+const ctxLogs = new Map();
+let rafCb = null;
+function makeCtx(id = "") {
+  const log = { strokes: [], texts: [], textCalls: [], arcs: [], fills: [] };
+  if (id) ctxLogs.set(id, log);
+  const ctx = {
+    fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+    textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+    setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+    transform() {}, clearRect() {}, fillRect() {},
+    strokeRect() { log.strokes.push(String(ctx.strokeStyle)); },
+    beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+    arc(x, y, r) { log.arcs.push([x, y, r]); },
+    ellipse() {},
+    quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+    stroke() { log.strokes.push(String(ctx.strokeStyle)); },
+    fill() { log.fills.push(String(ctx.fillStyle)); },
+    clip() {}, save() {}, restore() {}, setLineDash() {},
+    fillText(t, x, y) { log.texts.push(String(t)); log.textCalls.push({ t: String(t), x: Number(x), y: Number(y) }); },
+    strokeText() {}, drawImage() {},
+    measureText(t) { return { width: String(t).length * 6 }; },
+    createLinearGradient() { return { addColorStop() {} }; },
+    createRadialGradient() { return { addColorStop() {} }; },
+    getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+    putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+  };
+  return ctx;
+}
+function makeEl(id = "") {
+  const listeners = {};
+  const styleProps = {};
+  const isDetCanvas = id === "canvas-detector";
+  const cw = isDetCanvas ? 900 : 300;
+  const ch = isDetCanvas ? 540 : 240;
+  const el = {
+    id, tagName: id.startsWith("sel-") ? "SELECT" : "DIV",
+    value: id === "slider-color-emphasis" ? "0.38" : "",
+    min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: cw, height: ch, clientWidth: cw, clientHeight: ch,
+    scrollWidth: cw, scrollHeight: ch, scrollTop: 0, offsetWidth: cw, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null,
+    dataset: {},
+    style: new Proxy(styleProps, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: {
+      _s: new Set(),
+      add(...c) { c.forEach(x => this._s.add(x)); },
+      remove(...c) { c.forEach(x => this._s.delete(x)); },
+      toggle(c, f) { if (f === undefined ? !this._s.has(c) : f) { this._s.add(c); return true; } this._s.delete(c); return false; },
+      contains(c) { return this._s.has(c); }
+    },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) {
+      const arr = listeners[evObj.type] || [];
+      arr.forEach(fn => fn.call(el, evObj));
+    },
+    click() { el.dispatchEvent({ type: "click", target: el, currentTarget: el, preventDefault() {}, stopPropagation() {} }); },
+    focus() {}, blur() {}, select() {}, remove() {},
+    appendChild(chEl) { this.children.push(chEl); chEl.parentElement = this; return chEl; },
+    insertBefore(chEl) { this.children.push(chEl); chEl.parentElement = this; return chEl; },
+    replaceChildren(...chEls) { this.children = chEls; },
+    setAttribute(k, v) { this[k] = v; },
+    getAttribute(k) { return this[k] ?? null; },
+    removeAttribute(k) { delete this[k]; },
+    getBoundingClientRect() { return { left: 0, top: 0, right: cw, bottom: ch, width: cw, height: ch }; },
+    getContext() { if (!el._ctx) el._ctx = makeCtx(id); return el._ctx; },
+    querySelector() { return makeEl(); },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+  };
+  return el;
+}
+function getEl(id) {
+  if (!elems.has(id)) elems.set(id, makeEl(id));
+  return elems.get(id);
+}
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.sessionStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.location = { href: "about:srcdoc", origin: "http://localhost:8080", pathname: "/", search: "" };
+globalThis.navigator = { clipboard: { writeText: async () => {} } };
+globalThis.Image = class { set src(v) { this._src = v; } };
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.AbortController = class { constructor() { this.signal = {}; } abort() {} };
+globalThis.requestAnimationFrame = (fn) => { rafCb = fn; return 1; };
+globalThis.cancelAnimationFrame = () => {};
+globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => "" });
+globalThis.document = {
+  body: makeEl("body"),
+  documentElement: makeEl("html"),
+  activeElement: null,
+  getElementById(id) { return getEl(id); },
+  createElement(tag) { return makeEl(tag); },
+  querySelector(sel) { return sel.startsWith("#") ? getEl(sel.slice(1)) : makeEl(sel); },
+  querySelectorAll() { return []; },
+  addEventListener() {},
+  removeEventListener() {},
+};
+"""
+        + script_open
+        + """
+const detCanvasEl = getEl("canvas-detector");
+detCanvasEl.getContext("2d");
+const detLog = ctxLogs.get("canvas-detector");
+
+// 1. Even when NONE is clicked (activeZones empty), {a⋆, b⋆, c⋆} principal nodal points MUST be visible & labeled with superscript ⋆!
+getEl("btn-zones-none").click();
+detLog.texts.length = 0;
+detLog.textCalls.length = 0;
+renderDetectorCanvas(true);
+const nodalsWhenNone = getVisibleNodalPoints();
+const principalSymsWhenNone = nodalsWhenNone.filter(n => n.isPrincipal).map(n => n.principalSymbol).sort();
+const canvasLabelsWhenNone = ["a", "b", "c"].every(baseLbl => {
+  const idx = detLog.textCalls.findIndex((c, i) => (
+    c.t === baseLbl &&
+    detLog.textCalls[i + 1] &&
+    detLog.textCalls[i + 1].t === "⋆" &&
+    detLog.textCalls[i + 1].y <= c.y - 3.5
+  ));
+  return idx >= 0;
+});
+
+// Verify a⋆ lies in the inter-panel gap (onPanel === false), while b⋆ and c⋆ lie on panels (onPanel === true)
+const nodalA = nodalsWhenNone.find(n => n.principalSymbol === "a⋆");
+const nodalB = nodalsWhenNone.find(n => n.principalSymbol === "b⋆");
+const nodalC = nodalsWhenNone.find(n => n.principalSymbol === "c⋆");
+
+// Check screen-space circle radius of gap-straddling a⋆: must exceed pixel distance to nearest panel edge so it overlaps the panel!
+const hitRecA = _detNodalScreenHits.find(h => h.nodal.principalSymbol === "a⋆" && h.x >= 0 && h.x <= 900);
+const [edgeAx, edgeAy] = detToScreen(nodalA.nearAz, state.projection === "spherical" ? nodalA.nearEl : nodalA.nearY, 900, 540, 0.45);
+const distCenterToPanelPx = Math.hypot(hitRecA.x - edgeAx, hitRecA.y - edgeAy);
+const panelOverlapPx = hitRecA.r - distCenterToPanelPx;
+
+// Hover ON THE ADJACENT PANEL inside the overlapping rim of a* (3 px past the panel boundary onto the panel!)
+const dirToEdgeX = (edgeAx - hitRecA.x) / Math.max(1e-6, distCenterToPanelPx);
+const dirToEdgeY = (edgeAy - hitRecA.y) / Math.max(1e-6, distCenterToPanelPx);
+const hoverOnPanelX = edgeAx + dirToEdgeX * 2.5;
+const hoverOnPanelY = edgeAy + dirToEdgeY * 2.5;
+detCanvasEl.dispatchEvent({ type: "mousemove", clientX: hoverOnPanelX, clientY: hoverOnPanelY, buttons: 0 });
+detLog.texts.length = 0;
+renderDetectorCanvas(true);
+const gapHoverBadgeTexts = [...detLog.texts];
+const gapInspectorHtml = getEl("inspector-box").innerHTML;
+
+// 2. Re-enable <=1 Laue zones: secondary zone intersections appear, and hovering a [uvw] zone arc shows the zone badge!
+detCanvasEl.dispatchEvent({ type: "mouseleave" });
+setMaxZoneOrder(1);
+renderDetectorCanvas(true);
+const nodalsOrder1 = getVisibleNodalPoints();
+const secondaryCountOrder1 = nodalsOrder1.filter(n => !n.isPrincipal).length;
+const secRadii = _detNodalScreenHits.filter(h => !h.nodal.isPrincipal).map(h => h.r);
+const maxSecondaryR = secRadii.length > 0 ? Math.max(...secRadii) : 0;
+const minSecondaryR = secRadii.length > 0 ? Math.min(...secRadii) : 0;
+
+// Pick a rendered zone-arc segment midpoint well away from peaks and nodal points
+let chosenArcPt = null;
+let chosenArcLabel = null;
+for (const seg of _detZoneArcScreenSegs) {
+  for (let i = 0; i + 1 < seg.pts.length; i++) {
+    const mx = 0.5 * (seg.pts[i][0] + seg.pts[i + 1][0]);
+    const my = 0.5 * (seg.pts[i][1] + seg.pts[i + 1][1]);
+    if (mx < 30 || mx > 870 || my < 30 || my > 510) continue;
+    if (!findNearestPeakDetector(mx, my) && !findNearestNodalDetector(mx, my)) {
+      chosenArcPt = [mx, my];
+      chosenArcLabel = seg.zone.label;
+      break;
+    }
+  }
+  if (chosenArcPt) break;
+}
+let zoneArcBadgeTexts = [];
+let zoneArcInspectorHtml = "";
+if (chosenArcPt) {
+  detCanvasEl.dispatchEvent({ type: "mousemove", clientX: chosenArcPt[0], clientY: chosenArcPt[1], buttons: 0 });
+  detLog.texts.length = 0;
+  renderDetectorCanvas(true);
+  zoneArcBadgeTexts = [...detLog.texts];
+  zoneArcInspectorHtml = getEl("inspector-box").innerHTML;
+}
+
+// 3. Toggle ±1 and ±2 Higher-Order Laue Zones (#btn-holz-1, #btn-holz-2):
+//    verify small-circle cone equation kf·t_lab == ki·t_lab + N*lam/d_direct and reflection capture!
+detCanvasEl.dispatchEvent({ type: "mouseleave" });
+getEl("btn-holz-1").click();
+getEl("btn-holz-2").click();
+const holzBtn1Active = getEl("btn-holz-1").classList.contains("active-btn");
+const holzBtn2Active = getEl("btn-holz-2").classList.contains("active-btn");
+const holzSegs = getHolzSegmentsForActiveZones();
+const holzOrdersSeen = Array.from(new Set(holzSegs.map(h => Math.abs(h.holzN)))).sort();
+
+// Verify exact Ewald small-circle kinematics on a sampled HOLZ point via inverse ray direction
+const sampleZone = ZONES.find(z => state.activeZones.has(z.zone_id));
+const synthHolzPeak1 = { hkl: [1, 0, 0], zone_ids: [] }; // for uvw=[1,0,0] or [1,1,0], |h·u| in {1, 2}
+// Keep only one known active zone [1, 0, 0] to test exact N=1 and N=2 capture vs N=3 rejection
+const z100 = ZONES.find(z => Array.isArray(z.uvw) && z.uvw[0] === 1 && z.uvw[1] === 0 && z.uvw[2] === 0) || ZONES[0];
+state.activeZones = new Set([z100.zone_id]);
+const u0 = z100.uvw;
+// Construct HKLs with h·u = 1, 2, 3 (since u0 has a +/-1 entry)
+const idxOne = u0.findIndex(v => Math.abs(v) === 1);
+function makeLayerPeak(nVal) {
+  const hkl = [0, 0, 0];
+  hkl[idxOne] = nVal * Math.sign(u0[idxOne]);
+  return { hkl, zone_ids: [] };
+}
+const capN1 = isPeakCapturedByActiveZone(makeLayerPeak(1));
+const capN2 = isPeakCapturedByActiveZone(makeLayerPeak(2));
+const capN3 = isPeakCapturedByActiveZone(makeLayerPeak(3));
+
+// Hover a HOLZ segment (with order-1 zones active) and verify floating badge reports HOLZ N=
+setMaxZoneOrder(1);
+renderDetectorCanvas(true);
+let holzHoverTexts = [];
+let hPt = null;
+for (const seg of _detZoneArcScreenSegs) {
+  if (!seg.holzN || seg.pts.length < 2) continue;
+  for (let i = 0; i + 1 < seg.pts.length; i++) {
+    const mx = 0.5 * (seg.pts[i][0] + seg.pts[i + 1][0]);
+    const my = 0.5 * (seg.pts[i][1] + seg.pts[i + 1][1]);
+    if (
+      mx >= 20 && mx <= 880 && my >= 20 && my <= 520 &&
+      !findNearestPeakDetector(mx, my) &&
+      !findNearestNodalDetector(mx, my)
+    ) {
+      const zHit = findNearestZoneArcDetector(mx, my);
+      if (zHit && zHit.holzN !== 0) {
+        hPt = [mx, my];
+        break;
+      }
+    }
+  }
+  if (hPt) break;
+}
+if (hPt) {
+  detCanvasEl.dispatchEvent({ type: "mousemove", clientX: hPt[0], clientY: hPt[1], buttons: 0 });
+  detLog.texts.length = 0;
+  renderDetectorCanvas(true);
+  holzHoverTexts = [...detLog.texts];
+}
+
+// Verify that when a* is > 25% of a panel width away from every panel (removing Banks 1 & 2), a* is NOT drawn
+const savedPanels = [...PANELS];
+const savedCfgs = Object.assign({}, DATA.detector_configs);
+PANELS.splice(0, PANELS.length, ...savedPanels.filter(p => (p.bank ?? p.id) >= 3));
+delete DATA.detector_configs["1"];
+delete DATA.detector_configs["2"];
+_fullFacePanelsCacheKey = "";
+_nodalPointsCacheSig = "";
+const symsWithoutBank12 = getVisibleNodalPoints().filter(n => n.isPrincipal).map(n => n.principalSymbol).sort();
+PANELS.splice(0, PANELS.length, ...savedPanels);
+DATA.detector_configs = savedCfgs;
+_fullFacePanelsCacheKey = "";
+_nodalPointsCacheSig = "";
+
+// Toggle #btn-nodal-points off -> nodals hidden
+getEl("btn-nodal-points").click();
+const nodalsWhenOff = getVisibleNodalPoints().length;
+
+console.log(JSON.stringify({
+  principalSymsWhenNone,
+  canvasLabelsWhenNone,
+  aOnPanel: nodalA ? nodalA.onPanel : null,
+  aGapPanelFrac: nodalA ? nodalA.gapPanelFrac : null,
+  bOnPanel: nodalB ? nodalB.onPanel : null,
+  cOnPanel: nodalC ? nodalC.onPanel : null,
+  symsWithoutBank12,
+  distCenterToPanelPx,
+  nodalARadiusPx: hitRecA ? hitRecA.r : 0,
+  panelOverlapPx,
+  gapHoverHasBadge: (
+    gapHoverBadgeTexts.includes("Nodal ") &&
+    gapHoverBadgeTexts.includes("a") &&
+    gapHoverBadgeTexts.includes("⋆") &&
+    gapHoverBadgeTexts.some(t => t.includes("[gap]"))
+  ),
+  gapHoverUsesZonesLabel: gapHoverBadgeTexts.some(t => t.includes("zones)")),
+  gapInspectorHasAStar: gapInspectorHtml.includes("a<sup") && gapInspectorHtml.includes(">⋆</sup>") && gapInspectorHtml.includes("% panel width"),
+  secondaryCountOrder1,
+  maxSecondaryR,
+  minSecondaryR,
+  chosenArcLabel,
+  zoneArcHasBadge: Boolean(chosenArcLabel && zoneArcBadgeTexts.some(t => t.includes(`Zone ${chosenArcLabel}`))),
+  zoneArcInspectorHasLabel: Boolean(chosenArcLabel && zoneArcInspectorHtml.includes(`Zone ${chosenArcLabel}`)),
+  holzBtn1Active,
+  holzBtn2Active,
+  holzSegCount: holzSegs.length,
+  holzOrdersSeen,
+  capN1,
+  capN2,
+  capN3,
+  holzHoverHasBadge: holzHoverTexts.some(t => t.includes("HOLZ N=")),
+  nodalsWhenOff,
+}));
+})();
+process.exit(0);
+""",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert out["principalSymsWhenNone"] == ["a⋆", "b⋆", "c⋆"]
+    assert out["canvasLabelsWhenNone"] is True
+    assert out["aOnPanel"] is False
+    assert 0.0 < out["aGapPanelFrac"] <= 0.25
+    assert out["bOnPanel"] is True
+    assert out["cOnPanel"] is True
+    assert out["symsWithoutBank12"] == ["b⋆", "c⋆"]
+    assert out["distCenterToPanelPx"] > 2.0
+    assert out["panelOverlapPx"] >= 2.5
+    assert out["maxSecondaryR"] <= 12.0
+    assert abs(out["maxSecondaryR"] - out["minSecondaryR"]) < 1e-6
+    assert out["gapHoverHasBadge"] is True
+    assert out["gapHoverUsesZonesLabel"] is True
+    assert out["gapInspectorHasAStar"] is True
+    assert out["secondaryCountOrder1"] >= 1
+    assert out["zoneArcHasBadge"] is True
+    assert out["zoneArcInspectorHasLabel"] is True
+    assert out["holzBtn1Active"] is True
+    assert out["holzBtn2Active"] is True
+    assert out["holzSegCount"] >= 2
+    assert out["holzOrdersSeen"] == [1, 2]
+    assert out["capN1"] is True
+    assert out["capN2"] is True
+    assert out["capN3"] is False
+    assert out["holzHoverHasBadge"] is True
+    assert out["nodalsWhenOff"] == 0
+
+
+def test_cg4d_calibrated_flat_panels_nodal_alignment_and_holz_spot_counts(tmp_path):
+    """Verify calibrated CG4D flat-panel post-indexing reload keeps nodal hubs aligned to <0.03 deg and counts HOLZ spots."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import numpy as np
+
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.rainbow_zones import (
+        _compute_zones_payload_for_geometry,
+        _encode_panel_textures,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+
+    # 1. Start from uncalibrated CG4D (80 flat panels arranged around a cylinder)
+    nominal_payload = build_rainbow_zone_payload(
+        replay_h5=None, images_h5=None, instrument="CG4D"
+    )
+    html = render_rainbow_html(nominal_payload)
+
+    # 2. Build a calibrated CG4D solve payload with shifted flat panels (~25 mm / ~20 px)
+    # and active frame_index=2 with distinct per-run sample_offset_lab.
+    cal_det_cfgs: dict[str, dict] = {}
+    cal_detectors: dict[int, Detector] = {}
+    shift_vec = np.array([0.018, -0.012, 0.014], dtype=float)
+    for k_str, cfg in nominal_payload["detector_configs"].items():
+        bid = int(k_str)
+        new_center = (np.asarray(cfg["center"], dtype=float) + shift_vec).tolist()
+        cal_det_cfgs[str(bid)] = {
+            "panel_type": cfg.get("panel_type", "flat"),
+            "m": int(cfg["m"]),
+            "n": int(cfg["n"]),
+            "width": float(cfg["width"]),
+            "height": float(cfg["height"]),
+            "center": list(new_center),
+            "uhat": list(cfg["uhat"]),
+            "vhat": list(cfg["vhat"]),
+        }
+        cal_detectors[bid] = Detector(
+            {
+                "panel": cfg.get("panel_type", "flat"),
+                "m": int(cfg["m"]),
+                "n": int(cfg["n"]),
+                "width": float(cfg["width"]),
+                "height": float(cfg["height"]),
+                "center": list(new_center),
+                "uhat": list(cfg["uhat"]),
+                "vhat": list(cfg["vhat"]),
+            }
+        )
+
+    ang = np.deg2rad(17.0)
+    R_active = np.array(
+        [
+            [np.cos(ang), 0.0, np.sin(ang)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(ang), 0.0, np.cos(ang)],
+        ],
+        dtype=float,
+    )
+    ub = np.array(
+        [
+            [0.082, 0.014, -0.009],
+            [-0.011, 0.076, 0.018],
+            [0.012, -0.015, 0.069],
+        ],
+        dtype=float,
+    )
+    ki_hat = np.array([0.0, 0.0, 1.0], dtype=float)
+    s_lab_run0 = np.array([-0.004, -0.005, 0.003], dtype=float)
+    s_lab_run2 = np.array([0.0035, 0.0045, -0.0025], dtype=float)
+
+    _, zones_payload = _compute_zones_payload_for_geometry(
+        np.zeros((0, 3), dtype=float),
+        ub_matrix=ub,
+        R_gonio=R_active,
+        R_single=R_active,
+        ki_hat=ki_hat,
+        detectors=cal_detectors,
+        sample_offset_lab=s_lab_run2,
+        max_zone_index=2,
+    )
+    panels_payload, _ = _encode_panel_textures(
+        cal_detectors, None, None, None, None, None, encode_images=False
+    )
+
+    # Synthesize predicted peaks spanning ZOLZ (N=0) and HOLZ (N=±1, ±2) for zone 0
+    u0, v0, w0 = zones_payload[0]["uvw"]
+    synth_peaks = []
+    pid = 0
+    for h in range(-3, 4):
+        for k in range(-3, 4):
+            for l_idx in range(-3, 4):
+                if h == 0 and k == 0 and l_idx == 0:
+                    continue
+                layer_n = h * u0 + k * v0 + l_idx * w0
+                if abs(layer_n) > 2:
+                    continue
+                synth_peaks.append(
+                    {
+                        "id": pid,
+                        "hkl": [h, k, l_idx],
+                        "det_x": float((pid % 40) - 20.0),
+                        "det_y": 0.02,
+                        "det_el": 3.0,
+                        "wavelength": 3.2,
+                        "d_spacing": 2.5,
+                        "zone_ids": [0] if layer_n == 0 else [],
+                    }
+                )
+                pid += 1
+
+    cal_payload = dict(nominal_payload)
+    cal_payload.update(
+        {
+            "artifact_kind": "solve",
+            "instrument": "CG4D",
+            "ki": [0.0, 0.0, 1.0],
+            "wavelength_range": [2.8, 4.5],
+            "d_min": 1.8,
+            "frame_index": 2,
+            "frames": [
+                {"index": 0, "label": "Run 0"},
+                {"index": 1, "label": "Run 1"},
+                {"index": 2, "label": "Run 2"},
+            ],
+            "goniometer_R": R_active.tolist(),
+            "goniometer_R_per_run": {
+                "0": np.eye(3).tolist(),
+                "1": np.eye(3).tolist(),
+                "2": R_active.tolist(),
+            },
+            "sample_offset_lab": s_lab_run2.tolist(),
+            "sample_offset_lab_per_run": {
+                "0": s_lab_run0.tolist(),
+                "1": [0.0, 0.0, 0.0],
+                "2": s_lab_run2.tolist(),
+            },
+            "ub_matrix": ub.tolist(),
+            "u_matrix": (ub / np.linalg.norm(ub, axis=0, keepdims=True)).tolist(),
+            "detector_configs": cal_det_cfgs,
+            "panels": panels_payload,
+            "zones": zones_payload,
+            "peaks": synth_peaks,
+            "predicted_peaks": synth_peaks,
+            "sample_peaks": synth_peaks,
+            "predicted_sample_peaks": synth_peaks,
+        }
+    )
+
+    cal_json = tmp_path / "cal_cg4d.json"
+    cal_json.write_text(json.dumps(cal_payload), encoding="utf-8")
+
+    scripts = re.findall(r"<script[^>]*>([\s\S]*?)</script>", html)
+    main_js = max(scripts, key=len)
+    idx_close = main_js.rfind("})();")
+    assert idx_close > 0
+
+    probe = f"""
+const fs = require("fs");
+// Prime pre-indexing flat-panel raycast cache on nominal CG4D (80 banks)
+const _preNodals = getVisibleNodalPoints();
+const calPay = JSON.parse(fs.readFileSync({json.dumps(str(cal_json))}, "utf8"));
+recomputeBoundsAndReload(calPay, {{}});
+state.holzOrders = new Set([1, 2]);
+const nodalsAfter = getVisibleNodalPoints().filter(n => n.onPanel);
+
+function segDistDeg(px, py, segs) {{
+  let best = 1e9;
+  for (const seg of (segs || [])) {{
+    for (let i = 0; i + 1 < seg.length; i++) {{
+      const [x1, y1] = seg[i], [x2, y2] = seg[i + 1];
+      const sy = 161.4;
+      const dx = x2 - x1, dy = (y2 - y1) * sy;
+      const l2 = dx * dx + dy * dy;
+      const t = l2 > 1e-12 ? Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * sy * dy) / l2)) : 0;
+      const qx = x1 + t * dx, qy = y1 + t * (y2 - y1);
+      const d = Math.hypot(px - qx, (py - qy) * sy);
+      if (d < best) best = d;
+    }}
+  }}
+  return best;
+}}
+
+let maxErrDeg = 0.0;
+let checkedPairs = 0;
+for (const nd of nodalsAfter) {{
+  for (const zid of nd.zoneIds) {{
+    const z = ZONES.find(zz => zz.zone_id === zid);
+    if (!z || !Array.isArray(z.detector_segments) || z.detector_segments.length === 0) continue;
+    const d = segDistDeg(nd.det_x, nd.det_y, z.detector_segments);
+    if (d < 5.0) {{
+      if (d > maxErrDeg) maxErrDeg = d;
+      checkedPairs++;
+    }}
+  }}
+}}
+
+const holzCounts = getZoneHolzLayerCountMap(0);
+console.log(JSON.stringify({{
+  frameIdx: DATA.frame_index,
+  selFrameIdx: state.selectedFrameIndex,
+  onPanelCount: nodalsAfter.length,
+  checkedPairs,
+  maxErrDeg,
+  holzPos1: holzCounts[1] || 0,
+  holzNeg1: holzCounts[-1] || 0,
+  holzPos2: holzCounts[2] || 0,
+}}));
+"""
+    stub = """
+const noop = () => ({
+  style: { setProperty(){}, removeProperty(){} },
+  dataset: {}, options: [], children: [], childNodes: [],
+  classList: { add(){}, remove(){}, toggle(){}, contains(){ return false; } },
+  addEventListener(){}, removeEventListener(){}, setAttribute(){}, getAttribute(){ return null; },
+  getContext(){ return {
+    save(){}, restore(){}, beginPath(){}, moveTo(){}, lineTo(){}, stroke(){}, fill(){}, arc(){}, rect(){}, roundRect(){},
+    clearRect(){}, fillRect(){}, strokeRect(){}, fillText(){}, setLineDash(){}, clip(){}, closePath(){},
+    measureText(t){ return { width: String(t).length * 6 }; },
+    createLinearGradient(){ return { addColorStop(){} }; },
+    drawImage(){}, setTransform(){}, scale(){}, translate(){}
+  }; },
+  getBoundingClientRect(){ return { left: 0, top: 0, width: 1400, height: 800 }; },
+  appendChild(){}, removeChild(){}, innerHTML: "", textContent: "", value: "0", checked: false,
+  width: 1400, height: 800, clientWidth: 1400, clientHeight: 800, offsetWidth: 1400, offsetHeight: 800,
+  querySelector(){ return noop(); }, querySelectorAll(){ return []; }
+});
+global.requestAnimationFrame = () => 1;
+global.cancelAnimationFrame = () => {};
+global.window = {
+  innerWidth: 1600, innerHeight: 900, devicePixelRatio: 1,
+  addEventListener(){}, removeEventListener(){},
+  requestAnimationFrame: global.requestAnimationFrame, cancelAnimationFrame: global.cancelAnimationFrame,
+  location: { search: "", href: "http://localhost:8080/", pathname: "/", protocol: "http:", host: "localhost:8080" },
+  parent: null, localStorage: { getItem(){ return null; }, setItem(){} },
+};
+global.window.parent = global.window;
+global.self = global.window;
+global.document = {
+  getElementById(){ return noop(); }, createElement(){ return noop(); },
+  querySelector(){ return noop(); }, querySelectorAll(){ return []; },
+  body: noop(), documentElement: noop(), addEventListener(){},
+};
+global.navigator = { hardwareConcurrency: 4 };
+global.ResizeObserver = class { observe(){} disconnect(){} };
+global.Image = class { set src(_v){} };
+global.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
+global.performance = { now: () => 0 };
+"""
+    js_file = tmp_path / "cg4d_nodal_probe.js"
+    js_file.write_text(
+        stub + "\n" + main_js[:idx_close] + probe + main_js[idx_close:],
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert out["frameIdx"] == 2
+    assert out["selFrameIdx"] == 2
+    assert out["onPanelCount"] >= 4
+    assert out["checkedPairs"] >= 8
+    assert out["maxErrDeg"] < 0.03
+    assert out["holzPos1"] > 0
+    assert out["holzNeg1"] > 0
+    assert out["holzPos2"] > 0
+
+
+def test_nova_app_tof_route_and_fast_frame_switch(tmp_path):
+    """Verify MainApp POST /api/tof_delta_theta (no 405) and fast frame_only=1 switching parity."""
+    import asyncio
+    import importlib.util
+    import json
+    import re
+    import shutil
+    import subprocess
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import h5py
+    import numpy as np
+
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+    from subhkl.instrument.detector import Detector
+    from subhkl.io.events import ANGSTROM_M_PER_US, write_events
+    from subhkl.viz.nova_rainbow_view import RainbowZonesViewModel
+    from subhkl.viz.rainbow_zones import (
+        build_frame_only_response,
+        build_rainbow_zone_payload,
+        merge_frame_only_payload,
+        render_rainbow_html,
+    )
+
+    cfg32 = dict(beamlines["MANDI"]["32"])
+    det32 = Detector(cfg32)
+    H, W = int(det32.n), int(det32.m)
+    ki_hat = np.array([0.0, 0.0, 1.0], dtype=float)
+    l1_true = 30.0
+    xyz_c = np.asarray(det32.pixel_to_lab(128.0, 128.0), dtype=float).ravel()
+    l2_c = float(np.linalg.norm(xyz_c))
+    kf_c = xyz_c / l2_c
+    q_vec = kf_c - ki_hat
+    q_norm = float(np.linalg.norm(q_vec))
+    q_hat = q_vec / q_norm
+    z_ax = q_hat
+    x_ax = np.cross(np.array([0.0, 1.0, 0.0]), z_ax)
+    x_ax /= float(np.linalg.norm(x_ax))
+    y_ax = np.cross(z_ax, x_ax)
+    u_mat = np.column_stack([x_ax, y_ax, z_ax])
+    a_cell = 18.0
+    cell_c = [a_cell, a_cell, a_cell, 90.0, 90.0, 90.0]
+    b_mat, _ = cartesian_matrix_metric_tensor(*cell_c[:3], *np.deg2rad(cell_c[3:]))
+    lam_2 = (a_cell / 2.0) * q_norm
+    t_pred_2 = lam_2 * (l1_true + l2_c) / ANGSTROM_M_PER_US
+
+    def _make_bank_events(center_r: int, center_c: int):
+        lists = [[] for _ in range(H * W)]
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                p_flat = (center_r + dr) * W + (center_c + dc)
+                lists[p_flat] = [
+                    float(t_pred_2 - 2.0),
+                    float(t_pred_2),
+                    float(t_pred_2 + 2.0),
+                ]
+        img = np.zeros(H * W, dtype=np.float32)
+        flat: list[float] = []
+        for idx_p, ev_l in enumerate(lists):
+            if ev_l:
+                flat.extend(ev_l)
+                img[idx_p] = float(len(ev_l))
+        return img.reshape(H, W), np.asarray(flat, dtype=np.float32)
+
+    img_f0, tof_f0 = _make_bank_events(128, 128)
+    img_f1, tof_f1 = _make_bank_events(132, 124)
+    rot_f1 = np.array(
+        [
+            [np.cos(0.08), -np.sin(0.08), 0.0],
+            [np.sin(0.08), np.cos(0.08), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    R_two = np.stack([np.eye(3), rot_f1], axis=0)
+
+    merged_h5 = tmp_path / "mandi_2run_merged.h5"
+    with h5py.File(merged_h5, "w") as mf:
+        mf.attrs["instrument"] = "MANDI"
+        mf.create_dataset("images", data=np.stack([img_f0, img_f1], axis=0))
+        mf.create_dataset("bank_ids", data=np.array([32, 32], dtype=np.int32))
+        mf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        mf.create_dataset(
+            "files",
+            data=np.array(["MANDI_run0.nxs.h5", "MANDI_run1.nxs.h5"], dtype="S32"),
+        )
+        mf.create_group("goniometer").create_dataset("R", data=R_two)
+        inst_g = mf.create_group("instrument")
+        inst_g.create_dataset("wavelength", data=np.array([1.8, 4.2], dtype=float))
+        write_events(mf, [tof_f0, tof_f1], l1=l1_true)
+
+    integ_h5 = tmp_path / "mandi_2run_integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.attrs["source"] = str(merged_h5)
+        hf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_run0.nxs.h5", "MANDI_run1.nxs.h5"], dtype="S32"),
+        )
+        smp = hf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 1")
+        smp.create_dataset("cell", data=np.array(cell_c, dtype=float))
+        for k_n, v_n in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell_c):
+            smp.create_dataset(k_n, data=float(v_n))
+        smp.create_dataset("U", data=u_mat)
+        smp.create_dataset("B", data=b_mat)
+        hf.create_group("goniometer").create_dataset("R", data=R_two)
+        ig = hf.create_group("instrument")
+        ig.create_dataset("wavelength", data=np.array([1.8, 4.2], dtype=float))
+        ig.create_dataset("L1", data=float(l1_true))
+        pk = hf.create_group("peaks")
+        pk.create_dataset("run_index", data=np.array([0, 0, 1, 1], dtype=np.int32))
+        pk.create_dataset("bank", data=np.array([32, 32, 32, 32], dtype=np.int32))
+        pk.create_dataset(
+            "pixel_r", data=np.array([128.0, 140.0, 132.0, 144.0], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "pixel_c", data=np.array([128.0, 140.0, 124.0, 136.0], dtype=np.float64)
+        )
+        pk.create_dataset("h", data=np.array([0, 0, 0, 1], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([0, 0, 0, 0], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([2, 2, 2, 2], dtype=np.int32))
+        pk.create_dataset(
+            "intensity", data=np.array([220.0, 90.0, 185.0, 110.0], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "sigma", data=np.array([12.0, 9.0, 11.0, 8.5], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "wavelength",
+            data=np.array([2.8, 3.1, 2.8, 3.3], dtype=np.float64),
+        )
+        pk.create_dataset(
+            "var_u", data=np.array([1.4, 1.2, 1.5, 1.1], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "var_v", data=np.array([0.8, 0.9, 0.7, 0.85], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "cov_uv", data=np.array([0.1, -0.1, 0.2, 0.0], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "careless_residual", data=np.array([0.2, -0.4, 0.3, -0.1], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "merged_i", data=np.array([200.0, 95.0, 200.0, 112.0], dtype=np.float64)
+        )
+        cg = hf.create_group("careless")
+        cg.create_dataset(
+            "metrics_json",
+            data=json.dumps(
+                {"cc_half": 0.985, "multiplicity": 2.0, "n_merged_asu": 3}
+            ).encode("utf-8"),
+        )
+
+    # 1. Bit-exact parity between include_all_runs_peaks=False and True on frame 1
+    p_init = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        frame_index=0,
+        d_min=4.0,
+        include_all_runs_peaks=True,
+    )
+    p_f1_fast = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        frame_index=1,
+        d_min=4.0,
+        include_all_runs_peaks=False,
+    )
+    p_f1_full = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        frame_index=1,
+        d_min=4.0,
+        include_all_runs_peaks=True,
+    )
+    assert p_f1_fast["integrated_peaks"] == p_f1_full["integrated_peaks"]
+    assert p_f1_fast["predicted_peaks"] == p_f1_full["predicted_peaks"]
+    assert p_f1_fast["zones"] == p_f1_full["zones"]
+    assert p_f1_fast["tof_gate"] == p_f1_full["tof_gate"]
+    assert p_f1_fast["sample_peaks"] == []
+    merged_srv = merge_frame_only_payload(p_init, dict(p_f1_fast))
+    assert merged_srv["sample_peaks"] == p_init["sample_peaks"]
+    assert merged_srv["merge_metrics"] == p_init["merge_metrics"]
+    assert merged_srv["pixel_mask_bits"] == p_init["pixel_mask_bits"]
+
+    wire_f1 = build_frame_only_response(merged_srv)
+    assert wire_f1["frame_only"] is True
+    assert "sample_peaks" not in wire_f1
+    assert "merge_metrics" not in wire_f1
+    assert wire_f1["peaks"] is None
+    assert len(wire_f1["integrated_peaks"]) == 2
+
+    # Standalone HTTP ViewModel fast frame reload preserves sample_peaks & merge_metrics
+    vm = RainbowZonesViewModel(
+        replay_h5=integ_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        d_min=4.0,
+    )
+    assert len(vm.payload["sample_peaks"]) == 4
+    vm_f1 = vm.reload(frame_index=1, include_all_runs_peaks=False)
+    assert vm_f1["frame_index"] == 1
+    assert len(vm_f1["sample_peaks"]) == 4
+    assert vm_f1["merge_metrics"] == p_init["merge_metrics"]
+
+    # 2. MainApp HTTP routes: POST /api/tof_delta_theta (200, not 405!) & GET /api/payload?frame=1&frame_only=1
+    if importlib.util.find_spec("aiohttp") is not None:
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        from subhkl.viz.nova_app.models.subhkl_model import (
+            InstrumentOptions,
+            SubhklGalaxyModel,
+        )
+        from subhkl.viz.nova_app.views.main_view import MainApp
+
+        sub_m = SubhklGalaxyModel()
+        sub_m.data.peaks_file = str(integ_h5)
+        sub_m.data.images_file = str(merged_h5)
+        sub_m.data.instrument = InstrumentOptions.MANDI
+        sub_m.data.d_min = 4.0
+        sub_m.refresh_payload(frame_index=0, preserve_params=True)
+        assert len(sub_m.payload["sample_peaks"]) == 4
+        init_sub_mm = dict(sub_m.payload["merge_metrics"])
+
+        app_inst = object.__new__(MainApp)
+        app_inst.pipeline_runner = MagicMock()
+        app_inst.pipeline_runner.current_frame_index = 0
+        app_inst.view_model = SimpleNamespace(model=SimpleNamespace(subhkl=sub_m))
+        aio_app = web.Application()
+        app_inst._bind_routes(SimpleNamespace(app=aio_app))
+
+        tof_req_body = json.dumps(
+            {
+                "frame_index": 0,
+                "d_min": 5.5,
+                "wavelength_range": [1.8, 4.2],
+                "ub_matrix": p_init["ub_matrix"],
+                "R_run": p_init["goniometer_R"],
+                "instrument": "MANDI",
+                "space_group": "P 1",
+                "cell": cell_c,
+                "tof_l1": l1_true,
+            }
+        ).encode("utf-8")
+
+        async def _exercise_routes():
+            req_tof = make_mocked_request(
+                "POST",
+                "/api/tof_delta_theta",
+                headers={"Content-Type": "application/json"},
+                app=aio_app,
+            )
+            req_tof._read_bytes = tof_req_body
+            resp_tof = await aio_app._handle(req_tof)
+            req_fo = make_mocked_request(
+                "GET",
+                "/api/payload?frame=1&frame_only=1",
+                app=aio_app,
+            )
+            resp_fo = await aio_app._handle(req_fo)
+            return resp_tof, resp_fo
+
+        resp_tof, resp_fo = asyncio.run(_exercise_routes())
+        assert resp_tof.status == 200
+        tof_json = json.loads(resp_tof.text)
+        assert tof_json["ok"] is True
+        assert tof_json["angular_error_mode"] == "tof_3d"
+
+        assert resp_fo.status == 200
+        fo_json = json.loads(resp_fo.text)
+        assert fo_json["frame_only"] is True
+        assert fo_json["frame_index"] == 1
+        assert "sample_peaks" not in fo_json
+        assert len(sub_m.payload["sample_peaks"]) == 4
+        assert sub_m.payload["merge_metrics"] == init_sub_mm
+
+    # 3. Client JS frame switch with frame_only=1 preserves SAMPLE_PEAKS & merge_metrics
+    if shutil.which("node"):
+        html_doc = render_rainbow_html(p_init)
+        scripts = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        js_src = scripts[-1]
+        iife_end = js_src.rfind("})();")
+        assert iife_end > 0
+        wire_f1_json = json.dumps(wire_f1)
+        js_harness = """
+const elems = new Map();
+function makeEl(id = "") {
+  const listeners = {};
+  return {
+    id, tagName: "DIV", value: "", min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: 800, height: 520, clientWidth: 800, clientHeight: 520,
+    scrollWidth: 800, scrollHeight: 520, scrollTop: 0, offsetWidth: 800, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null, dataset: {},
+    style: new Proxy({}, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: { add() {}, remove() {}, toggle() { return false; }, contains() { return false; } },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) { (listeners[evObj.type] || []).forEach(fn => fn(evObj)); },
+    appendChild(c) { return c; }, insertBefore(c) { return c; }, replaceChildren() {},
+    setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
+    getBoundingClientRect() { return { left: 0, top: 0, right: 800, bottom: 520, width: 800, height: 520 }; },
+    getContext() {
+      return {
+        fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+        textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+        setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+        transform() {}, clearRect() {}, fillRect() {}, strokeRect() {},
+        beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, arc() {}, ellipse() {},
+        quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+        stroke() {}, fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+        fillText() {}, strokeText() {}, drawImage() {},
+        measureText(t) { return { width: String(t).length * 6 }; },
+        createLinearGradient() { return { addColorStop() {} }; },
+        createRadialGradient() { return { addColorStop() {} }; },
+        getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+        putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+      };
+    },
+    querySelector() { return makeEl(); }, querySelectorAll() { return []; }, closest() { return null; },
+  };
+}
+function getEl(id) { if (!elems.has(id)) elems.set(id, makeEl(id)); return elems.get(id); }
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.requestAnimationFrame = () => 1;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.Image = class { set src(_v) {} };
+globalThis.document = {
+  body: makeEl("body"), documentElement: makeEl("html"),
+  getElementById: (id) => getEl(id),
+  createElement: (tag) => makeEl(tag),
+  querySelector: () => makeEl(), querySelectorAll: () => [],
+  addEventListener() {}, removeEventListener() {},
+};
+"""
+        js_probe = f"""
+const seenUrls = [];
+globalThis.fetch = (url, _opts) => {{
+  seenUrls.push(String(url));
+  if (String(url).includes("frame_only=1")) {{
+    return Promise.resolve({{ ok: true, json: () => Promise.resolve({wire_f1_json}) }});
+  }}
+  return Promise.resolve({{ ok: true, json: () => Promise.resolve({{ ok: false }}) }});
+}};
+selectFrame(1);
+setTimeout(() => {{
+  console.log(JSON.stringify({{
+    seenUrls,
+    stateFrame: state.selectedFrameIndex,
+    dataFrame: DATA.frame_index,
+    samplePeaksLen: SAMPLE_PEAKS.length,
+    integSampleLen: INTEGRATED_SAMPLE_PEAKS.length,
+    peaksRows: PEAKS.filter(p => p.peak_source === "integrated").map(p => p.row),
+    hasMergeMetrics: !!(DATA.merge_metrics && DATA.merge_metrics.cc_half),
+    hasPixelMaskBits: !!DATA.pixel_mask_bits,
+  }}));
+}}, 20);
+}})();
+"""
+        js_path = tmp_path / "fast_frame_switch_ui_test.js"
+        js_path.write_text(
+            js_harness + "\n" + js_src[:iife_end] + "\n" + js_probe, encoding="utf-8"
+        )
+        proc = subprocess.run(
+            ["node", str(js_path)], check=True, capture_output=True, text=True
+        )
+        js_out = json.loads(proc.stdout.strip())
+        assert any("frame=1" in u and "frame_only=1" in u for u in js_out["seenUrls"])
+        assert js_out["stateFrame"] == 1
+        assert js_out["dataFrame"] == 1
+        assert js_out["samplePeaksLen"] == 4
+        assert js_out["integSampleLen"] == 4
+        assert js_out["peaksRows"] == [132.0, 144.0]
+        assert js_out["hasMergeMetrics"] is True
+        assert js_out["hasPixelMaskBits"] is True

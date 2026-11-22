@@ -89,6 +89,15 @@ python -m subhkl.io.parser integrator scan_master.h5 MANDI peak_predictor.h5 int
   example `--tof-gate=-0.01,0.015`.
 - `--tof-gate off` integrates the whole band as before.
 
+The sideband background is scaled to the gate by each image's own time
+spectrum (`--tof-sideband-measure spectrum`, the default), not by the length
+of the intervals in time, because the spectrum is curved and falls off at the
+band edges. `--tof-sideband-measure time` assumes a rate flat in time.
+
+To check that a merge's CC½ is Bragg signal, integrate once more with the gate
+moved off the reflections, for example `--tof-gate=0.06,0.11`, and merge that:
+whatever CC½ remains in a resolution shell is not from the reflections.
+
 Each output row is then one reflection at its own wavelength. `integrator.h5`
 records the window used (`tof_gate`), the stacked time profile it was read
 from, and per row the gate centre (`peaks/tof`, microseconds) and the expected

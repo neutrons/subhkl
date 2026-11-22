@@ -1157,6 +1157,8 @@ def run_peak_predictor(
     wavel_min: float | None = None,
     wavel_max: float | None = None,
     max_workers: int = 16,
+    rel_border_width: float = 0.0,
+    static_mask_file: str | None = None,
 ):
     apply_detector_calibration(indexed_hdf5_filename, instrument)
 
@@ -1349,30 +1351,62 @@ def run_peak_predictor(
         harmonic_rot=harmonic_rot,
     )
 
-    if em_mask_by_bank:
+    if static_mask_file:
+        from subhkl.search.static_mask import load_mask_for_banks
+
+        first_im = next(iter(peaks.image.ims.values()), None)
+        if first_im is not None:
+            uniq_banks = sorted({int(b) for b in peaks.image.bank_mapping.values()})
+            ext_masks = load_mask_for_banks(
+                static_mask_file, uniq_banks, first_im.shape
+            )
+            for idx_b, bid_b in enumerate(uniq_banks):
+                valid_ext = ext_masks[idx_b] > 0.5
+                if bid_b in em_mask_by_bank:
+                    em_mask_by_bank[bid_b] = em_mask_by_bank[bid_b] & valid_ext
+                else:
+                    em_mask_by_bank[bid_b] = valid_ext
+
+    rel_bw = max(0.0, float(rel_border_width or 0.0))
+    if em_mask_by_bank or rel_bw > 0.0:
         n_rej_dark = 0
         n_rej_bright = 0
         n_rej_other = 0
+        n_rej_border = 0
         filtered_map = {}
         for img_key, (i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr) in results_map.items():
-            phys_bank = int(peaks.image.bank_mapping.get(img_key, img_key))
-            if phys_bank not in em_mask_by_bank or len(i_arr) == 0:
+            if len(i_arr) == 0:
                 filtered_map[img_key] = (i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr)
                 continue
-            valid_px = em_mask_by_bank[phys_bank]
-            n_r_px, n_c_px = valid_px.shape
-            ri = np.clip(np.round(i_arr).astype(int), 0, n_r_px - 1)
-            ci = np.clip(np.round(j_arr).astype(int), 0, n_c_px - 1)
-            keep = valid_px[ri, ci]
-            if not np.all(keep):
-                rej = ~keep
-                if phys_bank in em_class_by_bank:
-                    rej_cls = em_class_by_bank[phys_bank][ri[rej], ci[rej]]
-                    n_rej_dark += int(np.sum(rej_cls == 1))
-                    n_rej_bright += int(np.sum(rej_cls == 2))
-                    n_rej_other += int(np.sum((rej_cls != 1) & (rej_cls != 2)))
-                else:
-                    n_rej_other += int(np.sum(rej))
+            phys_bank = int(peaks.image.bank_mapping.get(img_key, img_key))
+            im_shape = peaks.image.ims[img_key].shape
+            n_r_px, n_c_px = int(im_shape[0]), int(im_shape[1])
+            keep = np.ones(len(i_arr), dtype=bool)
+            if rel_bw > 0.0:
+                bw = int(rel_bw * min(n_r_px, n_c_px))
+                if bw > 0:
+                    hi_r = n_r_px - 1 - bw
+                    hi_c = n_c_px - 1 - bw
+                    in_border = (
+                        (i_arr >= bw) & (i_arr < hi_r) & (j_arr >= bw) & (j_arr < hi_c)
+                    )
+                    n_rej_border += int(np.sum(~in_border))
+                    keep &= in_border
+            if phys_bank in em_mask_by_bank:
+                valid_px = em_mask_by_bank[phys_bank]
+                ri = np.clip(np.round(i_arr).astype(int), 0, valid_px.shape[0] - 1)
+                ci = np.clip(np.round(j_arr).astype(int), 0, valid_px.shape[1] - 1)
+                px_ok = valid_px[ri, ci]
+                rej = keep & (~px_ok)
+                if np.any(rej):
+                    if phys_bank in em_class_by_bank:
+                        rej_cls = em_class_by_bank[phys_bank][ri[rej], ci[rej]]
+                        n_rej_dark += int(np.sum(rej_cls == 1))
+                        n_rej_bright += int(np.sum(rej_cls == 2))
+                        n_rej_other += int(np.sum((rej_cls != 1) & (rej_cls != 2)))
+                    else:
+                        n_rej_other += int(np.sum(rej))
+                keep &= px_ok
             if np.any(keep):
                 filtered_map[img_key] = (
                     i_arr[keep],
@@ -1382,11 +1416,13 @@ def run_peak_predictor(
                     l_arr[keep],
                     wl_arr[keep],
                 )
-        n_rej_tot = n_rej_dark + n_rej_bright + n_rej_other
-        print(
-            f"Filtered {n_rej_tot} predicted peaks via detector/pixel_mask "
-            f"({n_rej_dark} dark/shadowed, {n_rej_bright} static-bright)."
-        )
+        n_rej_mask = n_rej_dark + n_rej_bright + n_rej_other
+        if em_mask_by_bank or n_rej_border > 0:
+            print(
+                f"Filtered {n_rej_mask + n_rej_border} predicted peaks "
+                f"({n_rej_border} border, {n_rej_dark} dark/shadowed, "
+                f"{n_rej_bright} static-bright, {n_rej_other} masked)."
+            )
         results_map = filtered_map
 
     print(f"Saving predictions to {integration_peaks_filename}")
@@ -1470,6 +1506,9 @@ def run_rbf_integrator(
     tof_gate_coverage: float = 0.95,
     tof_gate_search: float = 0.05,
     tof_sideband_factor: float = 4.0,
+    tof_sideband_measure: str = "spectrum",
+    tof_max_variance_inflation: float | None = 1000.0,
+    tof_amplitude_ridge: str = "fixed",
 ):
     """Integrate the predicted reflections.
 
@@ -1568,6 +1607,9 @@ def run_rbf_integrator(
     def _read_events(img_key):
         return event_store.image_events(int(img_key), peaks.image.ims[img_key])
 
+    if event_store is not None:
+        _read_events.event_store = event_store
+
     result = integrate_peaks_rbf_ssn(
         peak_dict=peak_dict,
         peaks_obj=peaks,  # Pass the full Peaks object
@@ -1603,6 +1645,9 @@ def run_rbf_integrator(
         tof_gate_coverage=tof_gate_coverage,
         tof_gate_search=tof_gate_search,
         tof_sideband_factor=tof_sideband_factor,
+        tof_sideband_measure=tof_sideband_measure,
+        tof_max_variance_inflation=tof_max_variance_inflation,
+        tof_amplitude_ridge=tof_amplitude_ridge,
         tof_band=peaks_band,
     )
     if event_store is not None:

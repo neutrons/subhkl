@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import time
 from pathlib import Path
@@ -43,13 +44,25 @@ class MainApp:
     ) -> None:
         import threading
 
+        from subhkl.io.shared_storage import resolve_input_h5_path
+
         self.server = server or get_server(None, client_type="vue3")
         self.state = self.server.state
-        self._peaks_h5 = peaks_h5
-        self._images_h5 = images_h5
+        self._peaks_h5 = (
+            resolve_input_h5_path(peaks_h5, must_exist=False)[0]
+            if peaks_h5 is not None
+            else None
+        )
+        self._images_h5 = (
+            resolve_input_h5_path(images_h5, must_exist=False)[0]
+            if images_h5 is not None
+            else None
+        )
         self._instrument = instrument
         self._payload_lock = threading.RLock()
         self.pipeline_runner = NovaGalaxyPipelineRunner()
+        if self.pipeline_runner.is_explicit_galaxy_exec_mode():
+            self.pipeline_runner.require_shared_dir_for_galaxy_mode()
 
         self.create_vm()
         sub_init = self.view_model.model.subhkl
@@ -228,6 +241,8 @@ class MainApp:
             except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                 return web.Response(text=str(exc), status=404)
 
+        latest_frame_only_target: list[int | None] = [None]
+
         def _compute_payload_response(
             query_dict: dict[str, str],
         ) -> tuple[dict[str, Any], int]:
@@ -285,7 +300,29 @@ class MainApp:
                         payload_lock.release()
                 return (tex_doc, 200)
 
+            frame_only_q = query_dict.get("frame_only") == "1"
+            f_idx_pre: int | None = None
+            frame_q_pre = query_dict.get("frame")
+            if frame_q_pre is not None and str(frame_q_pre).strip() != "":
+                with contextlib.suppress(ValueError, TypeError):
+                    f_idx_pre = int(frame_q_pre)
+            if frame_only_q and f_idx_pre is not None:
+                latest_frame_only_target[0] = f_idx_pre
+
             with payload_lock:
+                if (
+                    frame_only_q
+                    and f_idx_pre is not None
+                    and latest_frame_only_target[0] not in (None, f_idx_pre)
+                ):
+                    return (
+                        {
+                            "status": "superseded",
+                            "frame_only": True,
+                            "frame_index": f_idx_pre,
+                        },
+                        200,
+                    )
                 frame_q = query_dict.get("frame")
                 f_idx: int | None = None
                 if frame_q is not None and str(frame_q).strip() != "":
@@ -541,6 +578,15 @@ class MainApp:
                             ),
                             work_d_ds,
                         )
+                        active_img = str(
+                            self.view_model.model.subhkl.data.images_file or ""
+                        )
+                        self.pipeline_runner.release_shared_scan_intermediates(
+                            keep_work_dir=work_d_ds,
+                            keep_paths={os.path.realpath(active_img)}
+                            if active_img and os.path.isfile(active_img)
+                            else set(),
+                        )
                         if (
                             not is_reduce_ds
                             and (self.view_model.model.subhkl.payload or {}).get(
@@ -575,7 +621,10 @@ class MainApp:
                         return ({"status": "error", "error": str(exc)}, 400)
 
                 if not refreshed:
-                    from subhkl.viz.rainbow_zones import _discover_images_h5
+                    from subhkl.viz.rainbow_zones import (
+                        _discover_images_h5,
+                        build_frame_only_response,
+                    )
 
                     cur_payload = self.view_model.model.subhkl.payload
                     cur_f = (
@@ -603,6 +652,17 @@ class MainApp:
                             )
                         )
                     )
+                    fast_frame_only = bool(
+                        frame_only_q
+                        and isinstance(cur_payload, dict)
+                        and not newly_hydrated
+                        and (
+                            cur_payload.get("sample_peaks")
+                            or cur_payload.get("integrated_sample_peaks")
+                            or cur_payload.get("predicted_sample_peaks")
+                            or len(cur_payload.get("frames") or ()) <= 1
+                        )
+                    )
                     needs_refresh = (
                         not isinstance(cur_payload, dict)
                         or newly_hydrated
@@ -626,7 +686,9 @@ class MainApp:
                             OSError, RuntimeError, ValueError, TypeError, KeyError
                         ):
                             self.view_model.model.subhkl.refresh_payload(
-                                frame_index=f_idx, preserve_params=True
+                                frame_index=f_idx,
+                                preserve_params=True,
+                                include_all_runs_peaks=not fast_frame_only,
                             )
                     elif (
                         isinstance(cur_payload, dict)
@@ -634,6 +696,8 @@ class MainApp:
                         and preserve_q
                     ):
                         cur_payload["d_min"] = round(d_min_val, 3)
+                else:
+                    fast_frame_only = False
                 if isinstance(self.view_model.model.subhkl.payload, dict):
                     with contextlib.suppress(
                         OSError, RuntimeError, ValueError, TypeError, KeyError
@@ -642,6 +706,15 @@ class MainApp:
                             self.view_model.model.subhkl.payload,
                             frame_index=f_idx,
                         )
+                    if fast_frame_only:
+                        from subhkl.viz.rainbow_zones import build_frame_only_response
+
+                        return (
+                            build_frame_only_response(
+                                self.view_model.model.subhkl.payload
+                            ),
+                            200,
+                        )
                 return (self.view_model.model.subhkl.payload or {}, 200)
 
         async def handle_payload(request: web.Request) -> web.Response:
@@ -649,7 +722,90 @@ class MainApp:
             payload_doc, status_code = await asyncio.to_thread(
                 _compute_payload_response, q_snap
             )
-            return web.json_response(payload_doc, status=status_code)
+            return web.json_response(
+                payload_doc,
+                status=status_code,
+                dumps=lambda obj: json.dumps(obj, separators=(",", ":")),
+            )
+
+        def _compute_tof_delta_theta_response(
+            req_json: dict[str, Any],
+        ) -> tuple[dict[str, Any], int]:
+            try:
+                from subhkl.viz.rainbow_zones import (
+                    compute_live_tof_delta_theta_payload,
+                )
+
+                sub_m = self.view_model.model.subhkl
+                cur_pl = sub_m.payload if isinstance(sub_m.payload, dict) else {}
+                cur_imgs = sub_m.data.images_file or cur_pl.get("images_h5")
+                cur_replay = sub_m.data.peaks_file
+                raw_inst = getattr(
+                    sub_m.data.instrument, "value", sub_m.data.instrument
+                )
+                def_inst = str(cur_pl.get("instrument") or raw_inst or "IMAGINE")
+                def_sg = str(
+                    cur_pl.get("space_group") or sub_m.data.space_group or "P 1"
+                )
+                def_cell = cur_pl.get("cell")
+                def_wl = cur_pl.get("wavelength_range") or [
+                    float(sub_m.data.wavelength_min),
+                    float(sub_m.data.wavelength_max),
+                ]
+                def_dmin = float(cur_pl.get("d_min") or sub_m.data.d_min or 1.5)
+                def_ki = cur_pl.get("ki") or [0.0, 0.0, 1.0]
+                if not cur_imgs and cur_replay:
+                    cur_imgs = self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                        cur_replay
+                    )
+                wl_in = req_json.get("wavelength_range") or def_wl
+                wl_tup = (float(wl_in[0]), float(wl_in[1]))
+                result = compute_live_tof_delta_theta_payload(
+                    images_h5=cur_imgs,
+                    replay_h5=cur_replay,
+                    frame_index=int(req_json.get("frame_index") or 0),
+                    d_min=float(req_json.get("d_min") or def_dmin),
+                    wavelength_range=wl_tup,
+                    ub_matrix=req_json.get("ub_matrix"),
+                    R_run=req_json.get("R_run"),
+                    sample_offset_lab=req_json.get("sample_offset_lab"),
+                    ki=req_json.get("ki") or def_ki,
+                    instrument=str(req_json.get("instrument") or def_inst),
+                    space_group=str(req_json.get("space_group") or def_sg),
+                    cell=req_json.get("cell") or def_cell,
+                    detector_configs=req_json.get("detector_configs"),
+                    tof_l1=req_json.get("tof_l1"),
+                    zone_axes_crystal=req_json.get("zone_axes_crystal"),
+                    zone_tolerance_deg=float(
+                        req_json.get("zone_tolerance_deg") or 0.75
+                    ),
+                )
+                return (result, 200 if result.get("ok") else 400)
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ) as exc:
+                return ({"ok": False, "error": str(exc)}, 400)
+
+        async def handle_tof_delta_theta(request: web.Request) -> web.Response:
+            try:
+                body = await request.json()
+                if not isinstance(body, dict):
+                    body = {}
+            except (OSError, RuntimeError, ValueError, TypeError):
+                body = {}
+            res_doc, status_code = await asyncio.to_thread(
+                _compute_tof_delta_theta_response, body
+            )
+            return web.json_response(
+                res_doc,
+                status=status_code,
+                dumps=lambda obj: json.dumps(obj, separators=(",", ":")),
+            )
 
         async def handle_dataset_display(request: web.Request) -> web.Response:
             ds_id = request.match_info.get("ds_id", "")
@@ -937,6 +1093,7 @@ class MainApp:
                 web.post("/api/pipeline/oncat_auth", handle_oncat_auth_post),
                 web.get("/api/artifacts/download", handle_artifact_download),
                 web.get("/api/payload", handle_payload),
+                web.post("/api/tof_delta_theta", handle_tof_delta_theta),
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
                 web.post("/api/pipeline/cancel", handle_cancel),

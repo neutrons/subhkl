@@ -133,9 +133,15 @@ def merge_events(h5_files, f_out):
 class EventStore:
     """Read access to the pixel-sorted events of a reduced or merged file."""
 
-    def __init__(self, filename):
+    def __init__(self, filename, rdcc_nbytes: int = 64 * 1024 * 1024):
         self.filename = filename
-        self._f = h5py.File(filename, "r")
+        self._f = h5py.File(
+            filename,
+            "r",
+            rdcc_nbytes=int(rdcc_nbytes),
+            rdcc_nslots=4099,
+            rdcc_w0=0.75,
+        )
         if EVENTS_TOF not in self._f or EVENTS_OFFSETS not in self._f:
             self._f.close()
             raise KeyError(f"{filename} carries no events")
@@ -173,6 +179,89 @@ class EventStore:
                 "its events"
             )
         return tof, pix_offsets
+
+    def image_event_count(self, img_idx: int) -> int:
+        """Number of stored events in ``img_idx`` without reading ``events/tof``."""
+        return int(self.offsets[int(img_idx) + 1]) - int(self.offsets[int(img_idx)])
+
+    def read_slab(
+        self,
+        img_indices,
+        images_slab: np.ndarray,
+        out_tof: np.ndarray | None = None,
+        out_pix_offsets: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        """Coalesced multi-image event read into preallocated slab buffers.
+
+        Adjacent images in ``events/tof`` are read with a single ``read_direct``
+        slice so LZF chunks straddling image boundaries are decompressed once,
+        and per-pixel offsets are shifted into slab-global ``int32`` coordinates.
+        """
+        idx_arr = np.asarray(img_indices, dtype=np.int64)
+        m_imgs = len(idx_arr)
+        images_arr = np.asarray(images_slab)
+        n_pix = int(images_arr.shape[1]) * int(images_arr.shape[2])
+        if m_imgs == 0:
+            tof_buf = out_tof if out_tof is not None else np.zeros(1, dtype=np.float32)
+            off_buf = (
+                out_pix_offsets
+                if out_pix_offsets is not None
+                else np.zeros((1, n_pix + 1), dtype=np.int32)
+            )
+            return tof_buf, off_buf, 0
+
+        los = self.offsets[idx_arr].astype(np.int64, copy=False)
+        his = self.offsets[idx_arr + 1].astype(np.int64, copy=False)
+        lens = his - los
+        total_ev = int(lens.sum())
+
+        if out_tof is None or len(out_tof) < max(total_ev, 1):
+            out_tof = np.zeros(max(total_ev, 1), dtype=np.float32)
+        if (
+            out_pix_offsets is None
+            or out_pix_offsets.shape[0] < m_imgs
+            or out_pix_offsets.shape[1] != n_pix + 1
+        ):
+            out_pix_offsets = np.zeros((m_imgs, n_pix + 1), dtype=np.int32)
+
+        dset = self._f[EVENTS_TOF]
+        dst = 0
+        i = 0
+        while i < m_imgs:
+            run_lo = int(los[i])
+            run_hi = int(his[i])
+            j = i + 1
+            while j < m_imgs and int(los[j]) == run_hi:
+                run_hi = int(his[j])
+                j += 1
+            n_run = run_hi - run_lo
+            if n_run > 0:
+                dset.read_direct(
+                    out_tof,
+                    np.s_[run_lo:run_hi],
+                    np.s_[dst : dst + n_run],
+                )
+                dst += n_run
+            i = j
+
+        counts_2d = np.rint(images_arr[:m_imgs]).astype(np.int64).reshape(m_imgs, n_pix)
+        cum_counts = np.cumsum(counts_2d, axis=1, dtype=np.int64)
+        bad = np.flatnonzero(cum_counts[:, -1] != lens)
+        if len(bad) > 0:
+            b0 = int(bad[0])
+            raise ValueError(
+                f"image {int(idx_arr[b0])} of {self.filename} holds "
+                f"{int(cum_counts[b0, -1])} counts but {int(lens[b0])} events; "
+                "the image is no longer the histogram of its events"
+            )
+        img_bases = np.zeros(m_imgs, dtype=np.int32)
+        if m_imgs > 1:
+            np.cumsum(lens[:-1], dtype=np.int32, out=img_bases[1:])
+        out_pix_offsets[:m_imgs, 0] = img_bases
+        out_pix_offsets[:m_imgs, 1:] = cum_counts.astype(np.int32) + img_bases[:, None]
+        if out_pix_offsets.shape[0] > m_imgs:
+            out_pix_offsets[m_imgs:, :] = total_ev
+        return out_tof, out_pix_offsets, total_ev
 
 
 def box_events(tof, pix_offsets, width, r0, r1, c0, c1):

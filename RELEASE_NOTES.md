@@ -4,6 +4,219 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0]
+
+### Added
+
+- **Three-tier shared storage orchestration for Galaxy/Pulsar runner mode with NFS race-free UUID sideband publication (`shared_storage`, `parser`, `nova_rainbow_view`, `galaxy`)**:
+  - Separated intermediate and persistent data across three storage tiers so
+    interactive `subhkl-nova-app` sessions release GPUs to job runners without
+    moving multi-GB HDF5 files through Galaxy/Pulsar object-storage caches:
+    - **Tier 1 (`SUBHKL_STAGING_DIR` / `TMPDIR`)**: fast node-local NVMe scratch
+      for step-local work (`reduce-batch` per-run files, local HDF5 assembly,
+      and Careless scratch).
+    - **Tier 2 (`SUBHKL_SHARED_DIR`, mandatory when `SUBHKL_EXEC_MODE=galaxy`)**:
+      network filesystem exchanging compact `subhkl_shared_pointer/v1` JSON
+      sideband pointers (`--shared-pointer-out`) for large cross-step HDF5
+      artifacts (`merged.h5`, `predictor.h5`, `integrated.h5`), with automatic
+      `/proc/self/mountinfo` canonical network-path translation across
+      heterogeneous runner mounts (e.g. `/scratch` on `imaginex-{1,2}` vs.
+      `/gpfs/neutronsfs/scratch` on `analysis.sns.gov`) and deterministic
+      cleanup (`subhkl cleanup-shared` and app exit hooks).
+    - **Tier 3 (Galaxy Object Storage / History)**: persists thin crystallography
+      artifacts (`solve.h5`, `reflections.mtz`, `merged.mtz`, `xval.mtz`,
+      `careless_metrics.json`, `merge_table.{csv,html}`), reconstructing reduced
+      detector data on the fly when restarting from a History `solve.h5`.
+  - Hardened Tier 2 sideband publication for lockless/non-atomic NFS mounts:
+    allocates fresh 128-bit UUIDv4 filenames (`subhkl_shared_<32hex>_<artifact>`)
+    opened via `O_WRONLY | O_CREAT | O_EXCL` with zero pre-creation `stat`
+    probes to guarantee cold client dcache/attribute/page-cache misses, flushes
+    and `os.fsync`s + closes the HDF5 file (and parent directory) strictly
+    **before** writing and `os.fsync`ing the JSON pointer, exports
+    `HDF5_USE_FILE_LOCKING=FALSE`, and keeps published shared files
+    write-once/read-only.
+- **Laue nodal bullseyes (`a⋆`, `b⋆`, `c⋆` & zone hubs), `[uvw]` arc hover badges, and `±1`/`±2` Higher-Order Laue Zones (`rainbow_zones`)**:
+  - Rendered uniform-radius Laue nodal bullseye markers at zone-axis
+    intersections (with superscript `a⋆`, `b⋆`, `c⋆` labels on principal
+    reciprocal axes, dimmed markers in inter-panel gaps within 25% of a panel
+    width, and intersection-count hover badges), calibrated flat-panel hub
+    raycasting on cylindrical bank assemblies (e.g. CG4D), interactive `[uvw]`
+    zone-axis hover badges, and optional `±1` / `±2` HOLZ curves with live
+    predicted reflection counts.
+- **3D ToF reciprocal-space `Δθ`, warm divergent `I/σ` colorscale, and direct numerical slider inputs (`rainbow_zones`)**:
+  - Added directional 3D ToF-gated reciprocal-space `Δθ` (`arccos` unit-vector
+    placement) with a dedicated `/api/tof_delta_theta` route and $10\times$
+    faster frame switching.
+  - Added a warm quantile-normalized divergent `I/σ` colorscale (with matching
+    gold `Integ` button styling), median/outlier-robust `ΔI/σ` colorbar bounds,
+    click-to-edit `0.01 Å` numerical inputs on the $[\lambda_{\min},
+    \lambda_{\max}]$ and $d_{\min}$ sliders (paired with `0.05 Å` slider drag
+    steps on `#slider-dmin`), fixed-width `1-Frame`/`All-Runs` toggle geometry,
+    and corner `^`/`v` magnification carets on the Wulff pane.
+- **Unlocked `0.50 Å` high-resolution $d_{\min}$ floor on large macromolecular unit cells via Ewald-shell rod slicing & viewport-frustum LOD (`rainbow_zones`, `crystallography`)**:
+  - Removed the `2,000,000` full-sphere lattice-point UI $d_{\min}$ ceiling
+    (which clamped `P 61 2 2`, $80\times 80\times 238\text{ Å}$, at `1.41 Å`),
+    allowing `#slider-dmin` to reach `0.50 Å` across all unit-cell volumes.
+  - Added closed-form Ewald-shell $(h, k)$ rod slicing in both the browser
+    (`raycastRunDirectEwaldShell`) and Python (`generate_ewald_reflections`) plus
+    slabbed quadratic rod bounds in `generate_reflections` so high-resolution
+    macromolecular shells ($40\text{M}+$ reciprocal lattice points) evaluate
+    directly inside the active $[\lambda_{\min}, \lambda_{\max}]$ Ewald band
+    without multi-GB 3D `meshgrid` allocations.
+  - Upgraded Detector and Wulff-sphere LOD thinning with two-tier
+    viewport-frustum high-resolution streaming (up to `48×` detector zoom) and
+    gameplay-style canonical dyadic Spherical BVHs (`buildDetectorSphericalBVH`,
+    `buildWulffSphericalBVH`) paired with solid-angle stratified Ewald sampling
+    (`_stratified_spherical_subsample` on server, `selectSpatiallyStratifiedOrder`
+    on client): outer resolution shells and back-scattering banks populate
+    immediately at `1×` zoom as `#slider-dmin` decreases while screen peak
+    density stays bounded (~18 px cells), and zooming in subdivides cells
+    100% pop-free down to full doublet/harmonic separation (`0.50 Å`).
+- **GPU multi-panel peak prediction & fixed-chunk $O(n)$ TOF-gated integration for large macromolecular unit cells (`physics`, `tof_gate`, `detector`)**:
+  - Replaced per-bank `ProcessPoolExecutor` peak prediction (which regenerated
+    millions of `(h, k, l)` tuples inside every worker process, taking ~3–4 min
+    on `P 61 2 2` at $d_{\min} = 1.0\text{ Å}$) with `predict_peaks_batch_gpu`:
+    generates candidate `(h, k, l)` once, filters Ewald shells and batches flat
+    or curved panel intersections on GPU using static-shape `Precision.HIGHEST`
+    kernels (~1.6–2.1 s across 41–164 banks), and finalizes surviving hits in
+    float64 for exact parity with `predict_single_bank`.
+  - Eliminated per-bank XLA JIT recompilation stalls and $O(n^2)$ host overhead
+    in `integrate_reflections_tof_gated` by evaluating `_scatter_events_impl`,
+    `_box_sums_impl`, `_tiles_impl`, `_snap_positions_impl`, and
+    `_solve_tiles` in fixed-size chunks, freeing intermediate 3D prefix cubes
+    immediately after sideband box sums, replacing dense $n \times n$ neighbor
+    broadcasts and `np.nanmedian` with `scipy.spatial.cKDTree` sparse Chebyshev
+    queries + vectorized masked row medians, and prefetching next-bank events in
+    a background thread.
+
+### Fixed
+
+- **Time-of-flight sideband background biased by the shape of the spectrum (`tof_gate`, `detector`)**:
+  - The gated integrator scaled each reflection's sideband background to its
+    gate by the length of the intervals in time, which assumes a background
+    rate flat in time. The incident spectrum is curved and falls off steeply at
+    the band edges, so weak reflections carried an additive offset of up to
+    about ±1.5σ depending on wavelength, scattering angle and bank. The offset
+    repeats between measurements and showed up as CC½ where there is no Bragg
+    signal.
+  - Intervals are now measured in each image's own cumulative time spectrum
+    (`--tof-sideband-measure spectrum`, the default, folded directly into the
+    fused on-GPU 4D slab prefix sums alongside consistent detector border/pixel
+    mask enforcement across prediction, gating, and visualization), so the
+    background is taken as proportional to what the image shows at each time;
+    images with too few events for a spectrum fall back to plain time.
+    `--tof-sideband-measure time` restores the previous behaviour.
+  - Check for this kind of bias with an off-peak control: integrate with the
+    gate moved off the reflections (e.g. `--tof-gate=0.06,0.11`) and merge; any
+    CC½ that survives is not Bragg signal.
+
+- **Unresolvable overlaps reported with meaningless intensities (`tof_gate`, `matrix_free`)**:
+  - Where reflections sit closer together than the spot width inside one time
+    window (around the direction of a long cell axis, e.g. within ~10° of c*
+    for c = 238 Å), the joint amplitude fit is singular to working precision.
+    The reported σ then saturated at the fixed regularisation constant (1000
+    photons) while the signed estimate left it by orders of magnitude, giving
+    rows with |I/σ| in the hundreds; merged, their reproducible values added
+    CC½ of 0.2–0.4 in shells without signal.
+  - A gated reflection is now censored (σ_I = 0, dropped from the export) when
+    overlapping neighbours inflate the variance of its intensity more than
+    1000-fold relative to an isolated reflection
+    (`--tof-max-variance-inflation`; 0 keeps every row). Only the sum of such a
+    group is determined, and a per-reflection table cannot carry it.
+  - `--tof-amplitude-ridge counts` sets the regularisation of the joint fit to
+    the gross counts under each reflection's own profile instead of a fixed
+    1000 photons. It gives unresolved reflections a meaningful σ, but on a
+    crowded lattice it also shrinks weak, partly overlapped reflections, so
+    `fixed` stays the default.
+
+- **Detector view sideways drift when zooming out (`rainbow_zones`)**:
+  - Anchored `detCanvas` wheel zoom-in at the cursor and zoom-out horizontally at
+    `viewCenterX` (with periodic $\pm 360^\circ$ pan wrapping and smooth vertical
+    recentering toward `1×`), eliminating unexpected sideways azimuth shifts and
+    coupled Wulff rotations when zooming out.
+- **Rhombohedral hexagonal (`:H`) vs. primitive rhombohedral (`:R`) space-group settings in cell refinement and UI**:
+  - `gemmi.SpaceGroup` reports `ext='H', centring_type()='R'` for
+    hexagonal-axes `R` space groups (`R 3`, `R 3:H`, `R -3 m`) and
+    `ext='R', centring_type()='P'` for primitive rhombohedral-axes settings
+    (`R 3:R`, `R -3 m :R`).
+  - Fixed `optimization.get_lattice_system` and
+    `scan_band._cell_symmetry_spec` to inspect `sg.ext == 'R'` rather than
+    `centering == 'R'`, preserving hexagonal cell constraints
+    ($a=b\neq c,\,90^\circ,90^\circ,120^\circ$, 3-point `R` centering) on
+    default/`:H` `R` groups and primitive rhombohedral angle/length constraints
+    ($a=b=c,\,\alpha=\beta=\gamma$, `P` centering) on `:R` groups.
+  - Prevented `trigonal_r` from overwriting bare `R` symbols (`"R 3"`,
+    `"R -3 m"`, `"R 3 2"`) in Rainbow Zones' client-side `SG_SYMMETRY_LOOKUP`.
+- **Generalized multi-run unit-cell, detector-geometry, and per-run crystal-slip refinement (`scan_band`, `scan_refine`)**:
+  - Included unwarped `search/proposal_orientations` in the bootstrap candidate
+    pool and replaced the `1.5%` radial `shared_geometry` cliff with a direct
+    Ewald + per-run zone-funnel competition against nominal detector geometry
+    (refreshing EM pixel responsibilities when nominal wins while preserving
+    genuine uncalibrated detector shifts).
+  - Kept pure nominal geometry (`s_init = 0`) as a distinct Stage 0 trial,
+    stopped re-injecting rejected `shared_geometry`, and freed unit-cell
+    ratios/angles ($\pm 3.5\%$) from Stage 0 onward on multi-setting scans so
+    anisotropic cell errors (`0.5–1.0 Å`) are not absorbed into fake detector
+    warps.
+  - Replaced the single-pass $0.15^\circ$-clamped Stage 3 post-cell orientation
+    polish with a 2-pass alternating `(cell <-> 0.6° U + zone-funnel + per-run R)`
+    polish so monoclinic/anisotropic cell updates unwind coupled shear
+    rotations.
+  - Re-anchored `(R_r, U)` to `anchor_run` (`ΔΘ_anchor = 0°`) across Ewald and
+    Stage 4 ICP polishes and regularized $\chi = 0$ gimbal-lock 3-axis
+    goniometer decomposition across both axis handedness conventions.
+
+## [1.6.6]
+
+### Added
+
+- Cell- and $d_{\min}$-aware automatic `Solve` band binning (`binning=4` on
+  $\le 256\times 256$ panels for dense long-axis cells), `b2=2` (`128×128`)
+  Ewald excess maps, and a `<option value="2">2</option>` binning option in the
+  Rainbow Zones `Params` drawer.
+- Live client-side HUD `Δθ` (`angular_rms_deg`) recomputation in Rainbow Zones
+  when switching scan frames or dragging wavelength, $d_{\min}$, or manual
+  orientation controls.
+
+### Fixed
+
+- **Long-axis joint scan refinement, per-run crystal slip, and Stage 4 ICP aliasing (`scan_refine`, `scan_band`)**:
+  - Computed exact metric-tensor unit-cell volume and Bravais centering
+    multiplicity in `_ewald_d_min`, applied the Laue kinematic lower bound
+    $q_{\min} = 2\sin\theta_{\min}/\lambda_{\max}$, and stratified large
+    Ewald reflection pools across $|G|$ shells instead of truncating to
+    overlapping inner rings.
+  - Added per-run Gaussian zone-band pre-alignment (`_zone_funnel_seed_per_run`,
+    $\pm 3.8^\circ$) plus fine-stepped `polish_per_run` to capture genuine
+    inter-batch crystal slips into `R_refined[r]` without rigid-orientation
+    overwrites, direct Stage 3 Ewald unit-cell axis-ratio polish, and
+    off-singularity `Y-Z-Y` gimbal-lock seeds in `_decompose_R_to_angles`.
+  - Adapted Stage 4 per-run ICP matching radii to median nearest-neighbor
+    predicted spot spacing with unambiguous second-neighbor filtering
+    (`d2_best < 0.55 * d2_second`) and an Ewald non-degradation guard.
+- **Missing (`"-"`) and neighbor-contaminated HUD `Δθ` on multi-frame datasets (`rainbow_zones`)**:
+  - Resolved `bank_ids` before `banks` in `_load_cached_frame_bank_images` (fixing
+    `Δθ = "-"` on frames $\ge 1$ and bank-scrambling on non-contiguous detector
+    bank lists) and enforced Voronoi nearest-predicted-reflection ownership in
+    both Python and client-side JS spot-centroid error estimation.
+
+## [1.6.5]
+
+### Added
+
+- Promoted the wavelength interval ($\lambda_{\min}$–$\lambda_{\max}$) to a
+  dedicated dual-knob (`[` and `]`) sidebar range slider above $d_{\min}$ in
+  Rainbow Zones and simplified the `Params` drawer to `Unit cell / Params`.
+
+### Fixed
+
+- Fixed `ReferenceError: getActiveWulffSourceArray is not defined` in
+  `updatePeakInspector` when hovering detector panels.
+- Wired `stage_derived_h5_in_work_dir` and background `Reduce` frame hydration
+  into the Trame `MainApp` / `SubhklGalaxyModel.refresh_payload` path (plus
+  `.reduce.h5` → `.nxs.h5` provenance recovery) so reloading `solve.h5` or
+  `integrated.h5` from NDIP Galaxy History regenerates detector images.
+
 ## [1.6.4]
 
 ### Added
