@@ -711,8 +711,16 @@ def test_galaxy_runner_pointer_orchestration_and_shared_lifecycle(
     assert os.path.exists(shared_merged_1)
 
     # 4. Restarting from thin solve.h5 in SUBHKL_EXEC_MODE=galaxy triggers Galaxy runner hydration (NOT local GPU!)
+    #    Use a non-mounted /HFIR path so hydration is verified even when UI/CI hosts do NOT mount /HFIR or /SNS.
     other_solve = tmp_path / "restart_solve.h5"
     other_solve.write_bytes(thin_solve_hda.read_bytes())
+    with h5py.File(other_solve, "a") as osf:
+        del osf["source_files"]
+        osf.create_dataset(
+            "source_files",
+            data=[b"/HFIR/CG4D/IPTS-999999/nexus/CG4D_999999.nxs.h5"],
+        )
+    assert not os.path.exists("/HFIR/CG4D/IPTS-999999/nexus/CG4D_999999.nxs.h5")
     with patch.object(
         runner,
         "submit_galaxy_stage",
@@ -727,6 +735,9 @@ def test_galaxy_runner_pointer_orchestration_and_shared_lifecycle(
     mock_sub_gx.assert_called_once()
     assert mock_sub_gx.call_args.args[0] == "reduce"
     assert mock_sub_gx.call_args.args[1]["hydrate_only"] is True
+    assert mock_sub_gx.call_args.args[1]["nexus_files"] == [
+        "/HFIR/CG4D/IPTS-999999/nexus/CG4D_999999.nxs.h5"
+    ]
 
     # 5. Switching to a different dataset work_dir cleans up shared_merged_1 and purges ds_scan_ptr_1!
     removed_on_switch = runner.release_shared_scan_intermediates(
@@ -912,3 +923,188 @@ def test_nfs_race_free_uuid_staging_and_fsync_before_pointer_publish(
         < idx_close_ptr
     )
     assert os.environ.get("HDF5_USE_FILE_LOCKING") == "FALSE"
+
+
+def test_readonly_ui_shared_dir_and_worker_cleanup_tool_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify UI requires only read-only (ro) SUBHKL_SHARED_DIR access and delegates cleanup to imaginex_subhkl_cleanup_shared."""
+    nvme_dir = tmp_path / "ui_nvme"
+    shared_dir = tmp_path / "shared_nfs_ro"
+    nvme_dir.mkdir()
+    shared_dir.mkdir()
+    monkeypatch.setenv("SUBHKL_EXEC_MODE", "galaxy")
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(nvme_dir))
+    monkeypatch.setenv("SUBHKL_SHARED_DIR", str(shared_dir))
+
+    # 1. Worker (with rw access) produces merged.h5 + scan.ref.json BEFORE UI mounts shared_dir read-only
+    shared_merged_local, shared_merged_net = allocate_shared_artifact_path(
+        "merged.h5", tag="RO_TEST"
+    )
+    with h5py.File(shared_merged_local, "w") as mf:
+        mf.attrs["instrument"] = "CG4D"
+        mf.create_dataset("images", data=np.ones((1, 4, 4), dtype=np.float32))
+        mf.create_dataset("bank_ids", data=np.array([1], dtype=np.int32))
+    scan_ptr_hda = tmp_path / "hda_scan_ro.json"
+    write_shared_pointer(scan_ptr_hda, shared_merged_local, artifact="merged.h5")
+
+    # 2. Lock shared_dir to read-only (0o555) to simulate a strict `ro` bind-mount in the UI container
+    os.chmod(shared_dir, 0o555)
+    try:
+        runner = NovaGalaxyPipelineRunner(
+            galaxy_url="http://localhost:8080",
+            galaxy_api_key="fake_key",
+            history_id="hist_ro",
+        )
+
+        # UI startup / stage check succeeds with read-only access (writable=False)
+        assert runner.require_shared_dir_for_galaxy_mode() == str(shared_dir)
+
+        # Worker-side writer check properly rejects read-only mount (writable=True)
+        with pytest.raises(RuntimeError, match="not a writable directory"):
+            get_shared_dir_local(require=True, create=False, writable=True)
+
+        dispatched_cleanup: list[tuple[str, dict[str, object]]] = []
+        purged_ids: list[str] = []
+
+        def _fake_api(
+            method: str,
+            endpoint: str,
+            payload: dict[str, object] | None = None,
+            **_kw: object,
+        ):
+            if method == "PUT" and isinstance(payload, dict) and payload.get("deleted"):
+                purged_ids.append(endpoint.rsplit("/", 1)[-1])
+                return {"id": purged_ids[-1], "deleted": True}
+            if "/api/jobs/" in endpoint:
+                return {
+                    "state": "ok",
+                    "exit_code": 0,
+                    "tool_stdout": "done\n",
+                    "tool_stderr": "",
+                }
+            if "/api/datasets/" in endpoint:
+                did = endpoint.rsplit("/", 1)[-1].split("?")[0]
+                return {
+                    "id": did,
+                    "name": f"{did}.json",
+                    "state": "ok",
+                    "deleted": False,
+                }
+            return {}
+
+        def _fake_dl(ds_id: str, dest: str, **_kw: object) -> int:
+            assert ds_id == "ds_scan_ro_1"
+            data = scan_ptr_hda.read_bytes()
+            os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+            Path(dest).write_bytes(data)
+            return len(data)
+
+        class _FakeTools:
+            def run_tool(
+                self,
+                history_id: str,
+                tool_id: str,
+                tool_inputs: dict[str, object],
+            ):
+                if tool_id == "imaginex_subhkl_prepare_peaks":
+                    return {
+                        "jobs": [{"id": "j_prep_ro"}],
+                        "outputs": [
+                            {
+                                "id": "ds_scan_ro_1",
+                                "name": "scan_ref.json",
+                                "file_ext": "json",
+                            }
+                        ],
+                    }
+                if tool_id == "imaginex_subhkl_cleanup_shared":
+                    dispatched_cleanup.append((tool_id, dict(tool_inputs)))
+                    # Simulate worker node (which mounts shared_dir rw) executing subhkl cleanup-shared!
+                    os.chmod(shared_dir, 0o777)
+                    try:
+                        cli_res = CliRunner().invoke(
+                            cli_app,
+                            ["cleanup-shared", str(tool_inputs["networkPath"])],
+                        )
+                        assert cli_res.exit_code == 0
+                    finally:
+                        os.chmod(shared_dir, 0o555)
+                    return {
+                        "jobs": [{"id": "j_cleanup_1"}],
+                        "outputs": [
+                            {
+                                "id": "ds_cleanup_log_1",
+                                "name": "cleanup.log",
+                                "file_ext": "txt",
+                            }
+                        ],
+                    }
+                raise AssertionError(f"Unexpected tool {tool_id}")
+
+        class _FakeDatasets:
+            def show_dataset(self, ds_id: str):
+                return {"id": ds_id, "name": ds_id, "state": "ok", "deleted": False}
+
+            def get_datasets(self, **_kw: object):
+                return []
+
+            def wait_for_dataset(self, *_a: object, **_kw: object):
+                return None
+
+        fake_store = SimpleNamespace(
+            history_id="hist_ro",
+            nova_connection=SimpleNamespace(
+                galaxy_instance=SimpleNamespace(
+                    base_url="http://localhost:8080",
+                    tools=_FakeTools(),
+                    datasets=_FakeDatasets(),
+                )
+            ),
+        )
+        monkeypatch.setattr(runner, "_api_request", _fake_api)
+        monkeypatch.setattr(runner, "_download_dataset_to_file", _fake_dl)
+        monkeypatch.setattr(runner, "get_datastore", lambda *_a, **_k: fake_store)
+        monkeypatch.setattr(runner, "_has_tool_on_galaxy", lambda _t: True)
+        monkeypatch.setattr(runner, "_get_tool_version", lambda _t: "0.3.0")
+        monkeypatch.setattr(
+            runner, "attach_dataset_cell_metadata_from_file", lambda *_a, **_k: None
+        )
+
+        # 3. UI receives pointer on ro mount, symlinks merged.h5, and reads detector frames cleanly
+        rec_red: dict[str, object] = {
+            "job_id": "r_ro",
+            "stage_id": "reduce",
+            "stdout": "",
+        }
+        runner._dispatch_nova_galaxy_thread(
+            "reduce",
+            {
+                "instrument": "CG4D",
+                "nexus_files": ["/HFIR/CG4D/IPTS-999999/nexus/CG4D_999999.nxs.h5"],
+                "cell": [50, 60, 70, 90, 90, 90],
+                "space_group": "P 21 21 21",
+            },
+            rec_red,
+        )
+        assert not rec_red.get("stderr"), f"Unexpected reduce error: {rec_red}"
+        out_merged = str(rec_red["output_h5_path"])
+        assert os.path.islink(out_merged)
+        with h5py.File(out_merged, "r") as ro_hf:
+            assert ro_hf["images"].shape == (1, 4, 4)
+
+        # 4. On dataset switch / shutdown, local unlink is denied on ro mount -> UI dispatches worker cleanup tool!
+        removed = runner.release_shared_scan_intermediates(
+            keep_work_dir=str(nvme_dir / "subhkl_work_NEXT"),
+            keep_paths=set(),
+            wait_remote=True,
+        )
+        assert os.path.abspath(shared_merged_local) in removed
+        assert len(dispatched_cleanup) == 1
+        assert dispatched_cleanup[0][0] == "imaginex_subhkl_cleanup_shared"
+        assert dispatched_cleanup[0][1]["networkPath"] == shared_merged_net
+        assert not os.path.exists(shared_merged_local)
+        assert "ds_scan_ro_1" in purged_ids
+        assert "ds_cleanup_log_1" in purged_ids
+    finally:
+        os.chmod(shared_dir, 0o777)

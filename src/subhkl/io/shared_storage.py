@@ -425,10 +425,16 @@ def get_shared_dir_local(
     *,
     require: bool = False,
     create: bool = True,
+    writable: bool | None = None,
     shared_dir_override: str | None = None,
     mountinfo_text: str | None = None,
 ) -> str | None:
-    """Return local mount path for ``SUBHKL_SHARED_DIR`` (raising if ``require=True`` and unset)."""
+    """Return local mount path for ``SUBHKL_SHARED_DIR`` (raising if ``require=True`` and unset).
+
+    Worker writers pass ``create=True`` (default ``writable=True``) to verify ``W_OK | X_OK``.
+    Read-only consumers such as the UI container pass ``create=False, writable=False`` so a
+    read-only (``ro``) network mount only requires ``R_OK | X_OK``.
+    """
     raw_val = str(
         shared_dir_override
         if shared_dir_override is not None
@@ -447,14 +453,34 @@ def get_shared_dir_local(
         shared_dir_env="",
         must_exist=False,
     )
-    if create and mountinfo_text is None:
-        existed = os.path.isdir(local_dir)
-        os.makedirs(local_dir, mode=0o777, exist_ok=True)
-        if not existed:
-            _chmod_shared_rw(local_dir, is_dir=True)
-        if not os.path.isdir(local_dir) or not os.access(local_dir, os.W_OK | os.X_OK):
+    need_write = bool(create) if writable is None else bool(writable)
+    if mountinfo_text is None:
+        if not os.path.isdir(local_dir):
+            with contextlib.suppress(OSError):
+                os.makedirs(local_dir, mode=0o777, exist_ok=True)
+                _chmod_shared_rw(local_dir, is_dir=True)
+        if need_write:
+            has_write_bits = True
+            if (
+                hasattr(os, "geteuid")
+                and os.geteuid() == 0
+                and os.path.isdir(local_dir)
+            ):
+                with contextlib.suppress(OSError):
+                    has_write_bits = bool(os.stat(local_dir).st_mode & 0o222)
+            if (
+                not os.path.isdir(local_dir)
+                or not has_write_bits
+                or not os.access(local_dir, os.W_OK | os.X_OK)
+            ):
+                raise RuntimeError(
+                    f"SUBHKL_SHARED_DIR ('{raw_val}' -> '{local_dir}') is not a writable directory."
+                )
+        elif require and (
+            not os.path.isdir(local_dir) or not os.access(local_dir, os.R_OK | os.X_OK)
+        ):
             raise RuntimeError(
-                f"SUBHKL_SHARED_DIR ('{raw_val}' -> '{local_dir}') is not a writable directory."
+                f"SUBHKL_SHARED_DIR ('{raw_val}' -> '{local_dir}') is not a readable directory."
             )
     return local_dir
 

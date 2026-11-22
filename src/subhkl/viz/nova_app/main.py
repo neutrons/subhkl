@@ -77,14 +77,14 @@ def main(
         images_h5=images_h5,
         instrument=instrument,
     )
-    install_exit_cleanup_signal_handlers(app.pipeline_runner.cancel_active_job)
+    install_exit_cleanup_signal_handlers(app.pipeline_runner.shutdown_cleanup)
     try:
         app.server.start(**kwargs)
     except KeyboardInterrupt:
         pass
     finally:
         with contextlib.suppress(Exception):
-            app.pipeline_runner.cancel_active_job()
+            app.pipeline_runner.shutdown_cleanup()
         cleanup_registered_temp_artifacts()
 
 

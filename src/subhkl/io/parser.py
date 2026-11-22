@@ -1855,7 +1855,13 @@ def cleanup_shared_cmd(
     """Remove shared-filesystem intermediates created by Galaxy runner steps."""
     from subhkl.io.shared_storage import cleanup_shared_artifact
 
-    for tgt in targets:
+    expanded_targets = [
+        part.strip()
+        for raw_tgt in targets
+        for part in str(raw_tgt or "").split(",")
+        if part.strip()
+    ]
+    for tgt in expanded_targets:
         removed = cleanup_shared_artifact(
             tgt,
             only_if_delete_after_use=if_ephemeral,
