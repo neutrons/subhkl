@@ -945,13 +945,36 @@ class MainApp:
             import asyncio
 
             try:
-                body = await request.json()
+                raw_txt = await request.text()
+                body = json.loads(raw_txt) if raw_txt and raw_txt.strip() else {}
             except (OSError, RuntimeError, ValueError, TypeError):
                 body = {}
+            if not isinstance(body, dict):
+                body = {}
+            phase_req = str(body.get("phase") or "confirm").strip().lower()
             should_shutdown = not (
-                isinstance(body, dict) and body.get("shutdown") is False
+                phase_req == "prepare" or body.get("shutdown") is False
             )
-            res = await asyncio.to_thread(self.pipeline_runner.execute_app_exit)
+            sub_m = self.view_model.model.subhkl
+            cur_peaks_ex = str(sub_m.data.peaks_file or "") or None
+            cur_imgs_ex = str(sub_m.data.images_file or "") or None
+            cur_pl_ex = sub_m.payload if isinstance(sub_m.payload, dict) else None
+            mtz_info_ex = getattr(sub_m, "mtz_overlay_info", None)
+
+            res = await asyncio.to_thread(
+                self.pipeline_runner.execute_app_exit,
+                phase=phase_req,
+                current_h5=cur_peaks_ex,
+                images_h5=cur_imgs_ex,
+                payload=cur_pl_ex,
+                mtz_overlay_info=mtz_info_ex,
+            )
+            if not res.get("deferred_cleanup"):
+                with payload_lock:
+                    if cur_peaks_ex and not os.path.isfile(cur_peaks_ex):
+                        sub_m.data.peaks_file = ""
+                    if cur_imgs_ex and not os.path.isfile(cur_imgs_ex):
+                        sub_m.data.images_file = ""
             if should_shutdown:
                 try:
                     cur_tpl = self.state.trame__template_main
@@ -962,7 +985,7 @@ class MainApp:
                 except (AttributeError, RuntimeError, TypeError, KeyError):
                     pass
                 loop = asyncio.get_running_loop()
-                loop.call_later(0.45, lambda: asyncio.create_task(self.server.stop()))
+                loop.call_later(0.35, lambda: asyncio.create_task(self.server.stop()))
             return web.json_response(res)
 
         async def handle_upload_h5(request: web.Request) -> web.Response:

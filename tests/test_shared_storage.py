@@ -1135,19 +1135,27 @@ def test_arcade_exit_quips_and_banner_html() -> None:
     }
     html_arcade = render_rainbow_html(sample_payload, default_mode="arcade")
     assert 'id="btn-exit-app"' in html_arcade
+    assert ">\n        ⏻\n      </button>" in html_arcade
+    assert "⏻ Exit" not in html_arcade
     assert 'id="modal-arcade-exit"' in html_arcade
     assert 'font-family: "SubhklArcade"' in html_arcade
     assert ARCADE_PIXEL_FONT_DATA_URI in html_arcade
+    assert 'id="btn-arcade-exit-cancel"' in html_arcade
+    assert "Go back" in html_arcade
+    assert "Another vibe" not in html_arcade
     assert (
         'id="btn-arcade-exit-close-tab" type="button" class="arcade-exit-btn" disabled'
         in html_arcade
     )
+    assert "#btn-arcade-exit-close-tab {\n    border-color: #ef4444;" in html_arcade
     assert "arcade-exit-pixel-svg" not in html_arcade
     assert "AudioContext" not in html_arcade
     assert "🎲" not in html_arcade
     assert "✋" not in html_arcade
     assert "window.ARCADE_EXIT_QUIPS = " in html_arcade
-    assert 'fetch("api/pipeline/exit"' in html_arcade
+    assert 'phase: "prepare"' in html_arcade
+    assert 'phase: "confirm"' in html_arcade
+    assert "restorePreviousStepAfterCancel" in html_arcade
 
     html_pro = render_rainbow_html(sample_payload, default_mode="pro")
     assert 'id="btn-exit-app"' in html_pro
@@ -1157,7 +1165,7 @@ def test_arcade_exit_quips_and_banner_html() -> None:
 def test_exit_endpoint_cleans_shared_and_staging_and_stops_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify POST /api/pipeline/exit sweeps shared + staging intermediates, returns JSON, and stops the server cleanly."""
+    """Verify two-phase POST /api/pipeline/exit defers cleanup in Local prepare and sweeps + stops on confirm."""
     import socket
     import threading
     import time
@@ -1176,6 +1184,8 @@ def test_exit_endpoint_cleans_shared_and_staging_and_stops_server(
     monkeypatch.setenv("SUBHKL_SHARED_DIR", str(shared_dir))
     monkeypatch.delenv("SUBHKL_EXEC_MODE", raising=False)
     monkeypatch.delenv("EP_PATH", raising=False)
+    monkeypatch.delenv("GALAXY_URL", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
 
     staging_tmp = nvme_dir / "temp_stage_buf.h5"
     staging_tmp.write_bytes(b"STAGE_TMP")
@@ -1227,11 +1237,35 @@ def test_exit_endpoint_cleans_shared_and_staging_and_stops_server(
     else:
         pytest.fail("serve_rainbow_zones did not become ready in time")
 
-    # Trigger POST /api/pipeline/exit -> cleans staging + shared files, returns 200 JSON, then exits server cleanly
+    # Phase 1 ("prepare") in Local mode: defers cleanup so "Go back" keeps local state intact, and keeps server alive
+    req_prep = urllib.request.Request(
+        f"{base_url}/api/pipeline/exit",
+        data=json.dumps({"phase": "prepare"}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req_prep, timeout=5.0) as resp_prep:
+        assert resp_prep.status == 200
+        doc_prep = json.loads(resp_prep.read().decode("utf-8"))
+
+    assert doc_prep["ok"] is True
+    assert doc_prep["status"] == "prepared"
+    assert doc_prep["deferred_cleanup"] is True
+    assert doc_prep["restore_plan"]["mode"] == "local_deferred"
+    assert staging_tmp.exists()
+    assert os.path.exists(shared_merged)
+
+    # Server remains responsive if the user clicks "Go back"
+    with urllib.request.urlopen(
+        f"{base_url}/api/pipeline/status", timeout=1.0
+    ) as r_alive:
+        assert r_alive.status == 200
+
+    # Phase 2 ("confirm", e.g. text/plain sendBeacon on "Close tab"): sweeps files and stops server cleanly
     req = urllib.request.Request(
         f"{base_url}/api/pipeline/exit",
-        data=b"{}",
-        headers={"Content-Type": "application/json"},
+        data=json.dumps({"phase": "confirm"}).encode("utf-8"),
+        headers={"Content-Type": "text/plain;charset=UTF-8"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=5.0) as resp:
@@ -1240,12 +1274,79 @@ def test_exit_endpoint_cleans_shared_and_staging_and_stops_server(
 
     assert doc["ok"] is True
     assert doc["status"] == "exited"
+    assert doc["deferred_cleanup"] is False
     assert doc["cleaned_staging_count"] >= 2
     assert not staging_tmp.exists()
     assert not os.path.exists(shared_merged)
 
     t.join(timeout=3.0)
     assert not t.is_alive(), (
-        "Server thread should stop cleanly after /api/pipeline/exit"
+        "Server thread should stop cleanly after /api/pipeline/exit confirm"
     )
     assert srv_err == []
+
+
+def test_galaxy_exit_prepare_cleans_immediately_and_builds_restore_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In Galaxy mode, prepare cleans intermediates immediately and returns a Galaxy History restore plan."""
+    from subhkl.viz.nova_rainbow_view import (
+        NovaGalaxyPipelineRunner,
+        register_temp_artifact,
+    )
+
+    nvme_dir = tmp_path / "gx_exit_nvme"
+    nvme_dir.mkdir()
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(nvme_dir))
+
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://galaxy.example.org",
+        galaxy_api_key="fake-api-key",
+        history_id="hist_123",
+    )
+
+    staged_solve = nvme_dir / "galaxy_ds_solve_42_solve.h5"
+    staged_solve.write_bytes(b"SOLVE_TMP")
+    register_temp_artifact(str(staged_solve))
+    runner._dataset_id_by_path[os.path.abspath(str(staged_solve))] = "ds_solve_42"
+
+    monkeypatch.setattr(
+        runner,
+        "list_history_datasets",
+        lambda limit=200: [
+            {"id": "ds_solve_42", "name": "CG4D_solve.h5", "state": "ok", "hid": 10},
+            {
+                "id": "ds_mtz_9",
+                "name": "careless_merged.mtz",
+                "state": "ok",
+                "hid": 11,
+            },
+        ],
+    )
+    swept_calls: list[bool] = []
+    monkeypatch.setattr(
+        runner,
+        "release_shared_scan_intermediates",
+        lambda wait_remote=False: (
+            swept_calls.append(bool(wait_remote)) or ["/shared/merged.h5"]
+        ),
+    )
+
+    res = runner.execute_app_exit(
+        phase="prepare",
+        current_h5=str(staged_solve),
+        payload={"artifact_kind": "solve", "frame_index": 3, "instrument": "CG4D"},
+        mtz_overlay_info={"id": "ds_mtz_9"},
+    )
+    assert res["ok"] is True
+    assert res["status"] == "prepared"
+    assert res["deferred_cleanup"] is False
+    assert swept_calls == [True]
+    assert not staged_solve.exists()
+    assert res["restore_plan"] == {
+        "mode": "galaxy_dataset",
+        "dataset_id": "ds_solve_42",
+        "mtz_dataset_id": "ds_mtz_9",
+        "frame_index": 3,
+        "artifact_kind": "solve",
+    }

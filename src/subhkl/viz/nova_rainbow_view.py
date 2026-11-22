@@ -573,6 +573,7 @@ class NovaGalaxyPipelineRunner:
         self.step_timings: dict[str, dict[str, Any]] = {}
         self.current_frame_index: int | None = None
         self._upload_lock = threading.RLock()
+        self._dataset_id_by_path: dict[str, str] = {}
         self._dataset_sig_by_path: dict[str, tuple[int, int, str]] = {}
         self._auto_discover_local_galaxy()
         with contextlib.suppress(ImportError):
@@ -3218,12 +3219,13 @@ class NovaGalaxyPipelineRunner:
                 ):
                     ds_id = str(ds.get("id") or "").strip()
                     if ds_id:
-                        local_m, _ = self.resolve_dataset_to_local_h5(ds_id)
-                        _, final_m = self._resolve_work_dir_and_merged(local_m)
-                        if final_m and os.path.isfile(final_m):
-                            with h5py.File(final_m, "r") as hf_m:
-                                if "images" in hf_m:
-                                    return final_m
+                        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                            local_m, _ = self.resolve_dataset_to_local_h5(ds_id)
+                            _, final_m = self._resolve_work_dir_and_merged(local_m)
+                            if final_m and os.path.isfile(final_m):
+                                with h5py.File(final_m, "r") as hf_m:
+                                    if "images" in hf_m:
+                                        return final_m
         return None
 
     def stage_derived_h5_in_work_dir(
@@ -3608,6 +3610,9 @@ class NovaGalaxyPipelineRunner:
                     removed_paths.append(abs_p)
         self._dataset_id_by_path = known_map
         self._shared_pointer_ds_by_path = ptr_map
+        if removed_paths:
+            self._cached_history_datasets = None
+            self._cached_history_datasets_ts = 0.0
         return removed_paths
 
     def cleanup_ephemeral_predictor_intermediate(
@@ -3671,9 +3676,184 @@ class NovaGalaxyPipelineRunner:
         with contextlib.suppress(Exception):
             self.release_shared_scan_intermediates(wait_remote=True)
 
-    def execute_app_exit(self) -> dict[str, Any]:
-        """Run full exit cleanup (cancel active job, sweep shared + staging intermediates) and return summary."""
+    def build_exit_restore_plan(
+        self,
+        *,
+        current_h5: str | None = None,
+        images_h5: str | None = None,
+        payload: dict[str, Any] | None = None,
+        mtz_overlay_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Snapshot how to restore the active step if the user cancels the Exit screen ('I changed my mind')."""
+        if not self.is_connected:
+            return {"mode": "local_deferred"}
+
+        pl = payload if isinstance(payload, dict) else {}
+        art_kind = str(pl.get("artifact_kind") or "").strip().lower()
+        frame_index = int(
+            pl.get("frame_index") or getattr(self, "current_frame_index", 0) or 0
+        )
+        if art_kind in ("", "empty") and not current_h5 and not images_h5:
+            return {"mode": "empty"}
+
+        self._cached_history_datasets = None
+        self._cached_history_datasets_ts = 0.0
+        hist_ds = list(self.list_history_datasets(limit=200) or [])
+        hist_ds.sort(key=lambda d: int(d.get("hid") or 0), reverse=True)
+
+        def _is_ok_non_pointer(ds: dict[str, Any]) -> bool:
+            if ds.get("deleted") is True:
+                return False
+            if ds.get("state") and ds.get("state") != "ok":
+                return False
+            nm = str(ds.get("name") or "").strip().lower()
+            return bool(ds.get("id")) and not nm.endswith(".ref.json")
+
+        ok_ds = [d for d in hist_ds if _is_ok_non_pointer(d)]
+        by_id = {str(d["id"]): d for d in ok_ds}
+        known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
+        sig_map: dict[str, tuple[int, int, str]] = getattr(
+            self, "_dataset_sig_by_path", {}
+        )
+        mtz_ds_id = str((mtz_overlay_info or {}).get("id") or "").strip()
+        if mtz_ds_id and mtz_ds_id not in by_id:
+            mtz_ds_id = ""
+
+        # 1. Derived stages (solve / integrate / merge): restore thin HDF5 from Galaxy History (hydrates reduce on the fly)
+        is_derived = art_kind in (
+            "solve",
+            "finder",
+            "indexer",
+            "integrator",
+            "merged_careless",
+        )
+        if not is_derived and current_h5:
+            bn_low = os.path.basename(str(current_h5)).lower()
+            is_derived = any(k in bn_low for k in ("solve", "integrat", "predict"))
+
+        if is_derived:
+            restore_id = ""
+            if current_h5:
+                for p_key in (
+                    os.path.abspath(str(current_h5)),
+                    os.path.realpath(str(current_h5)),
+                ):
+                    cand_id = str(known_map.get(p_key) or "").strip()
+                    if not cand_id and p_key in sig_map:
+                        cand_id = str(sig_map[p_key][2] or "").strip()
+                    if cand_id and cand_id in by_id:
+                        cand_nm = str(by_id[cand_id].get("name") or "").lower()
+                        if not cand_nm.endswith((".mtz", ".csv", ".html", ".json")):
+                            restore_id = cand_id
+                            break
+            if not restore_id:
+                want_int = art_kind in ("integrator", "merged_careless") or (
+                    current_h5
+                    and "integrat" in os.path.basename(str(current_h5)).lower()
+                )
+                for d in ok_ds:
+                    nm = os.path.basename(str(d.get("name") or "")).lower()
+                    if nm.endswith(
+                        (".mtz", ".csv", ".html", ".json", ".nxs", ".nxs.h5")
+                    ):
+                        continue
+                    if want_int and "integrat" in nm:
+                        restore_id = str(d["id"])
+                        break
+                    if not want_int and ("solve" in nm or "index" in nm):
+                        restore_id = str(d["id"])
+                        break
+            if restore_id:
+                return {
+                    "mode": "galaxy_dataset",
+                    "dataset_id": restore_id,
+                    "mtz_dataset_id": mtz_ds_id,
+                    "frame_index": frame_index,
+                    "artifact_kind": art_kind,
+                }
+
+        # 2. Step 1 (Reduce / merged.h5): check persisted merged.h5, local/facility NeXus recipe, or raw NeXus dataset in History
+        for d in ok_ds:
+            nm = os.path.basename(str(d.get("name") or "")).lower()
+            if (
+                any(k in nm for k in ("merged", "scan", "image"))
+                and "careless" not in nm
+                and nm.endswith((".h5", ".hdf5"))
+            ):
+                return {
+                    "mode": "galaxy_dataset",
+                    "dataset_id": str(d["id"]),
+                    "frame_index": frame_index,
+                    "artifact_kind": "merged",
+                }
+
+        src_for_recipe = images_h5 or current_h5
+        if src_for_recipe and os.path.isfile(str(src_for_recipe)):
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                recipe = self._extract_reduce_recipe_from_derived_h5(
+                    str(src_for_recipe)
+                )
+                if recipe and recipe.get("nexus_files"):
+                    return {
+                        "mode": "reduce_recipe",
+                        "params": recipe,
+                        "frame_index": frame_index,
+                    }
+
+        for d in ok_ds:
+            nm = str(d.get("name") or "").lower()
+            ext = str(d.get("extension") or "").lower()
+            if nm.endswith((".nxs.h5", ".nxs")) or ext in ("nxs", "nxs.h5"):
+                return {
+                    "mode": "galaxy_dataset",
+                    "dataset_id": str(d["id"]),
+                    "frame_index": 0,
+                    "artifact_kind": "raw_nexus",
+                }
+
+        for d in ok_ds:
+            nm = os.path.basename(str(d.get("name") or "")).lower()
+            if nm.endswith((".h5", ".hdf5")) and any(
+                k in nm for k in ("integrat", "solve", "index")
+            ):
+                return {
+                    "mode": "galaxy_dataset",
+                    "dataset_id": str(d["id"]),
+                    "frame_index": frame_index,
+                    "artifact_kind": art_kind,
+                }
+
+        return {"mode": "empty"}
+
+    def execute_app_exit(
+        self,
+        *,
+        phase: str = "confirm",
+        current_h5: str | None = None,
+        images_h5: str | None = None,
+        payload: dict[str, Any] | None = None,
+        mtz_overlay_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Handle two-step app exit ('prepare' on modal open, 'confirm' on tab close/shutdown).
+
+        In Galaxy/NDIP mode, 'prepare' snapshots a Galaxy-history restore plan and immediately
+        sweeps shared + staging intermediates while keeping the server alive so the user can still
+        click 'I changed my mind' (reconstructing reduced frames on the fly from Galaxy History).
+        In Local mode (no Galaxy History), 'prepare' cancels any active job but defers deleting
+        files until 'confirm' (or process termination).
+        """
         t0 = time.monotonic()
+        norm_phase = str(phase or "confirm").strip().lower()
+        restore_plan: dict[str, Any] | None = None
+        if norm_phase == "prepare":
+            with contextlib.suppress(Exception):
+                restore_plan = self.build_exit_restore_plan(
+                    current_h5=current_h5,
+                    images_h5=images_h5,
+                    payload=payload,
+                    mtz_overlay_info=mtz_overlay_info,
+                )
+
         cancelled_active = False
         cleaned_shared: list[str] = []
         cleaned_staging: list[str] = []
@@ -3683,20 +3863,32 @@ class NovaGalaxyPipelineRunner:
                 isinstance(cancel_res, dict)
                 and (cancel_res.get("cancelled") or cancel_res.get("job"))
             )
-        with contextlib.suppress(Exception):
-            cleaned_shared = self.release_shared_scan_intermediates(wait_remote=True)
-        with contextlib.suppress(Exception):
-            cleaned_staging = cleanup_registered_temp_artifacts()
+
+        galaxy_conn = bool(self.is_connected)
+        defer_files = norm_phase == "prepare" and not galaxy_conn
+        if not defer_files:
+            with contextlib.suppress(Exception):
+                cleaned_shared = self.release_shared_scan_intermediates(
+                    wait_remote=True
+                )
+            with contextlib.suppress(Exception):
+                cleaned_staging = cleanup_registered_temp_artifacts()
+
         elapsed_ms = round((time.monotonic() - t0) * 1000)
-        return {
+        out: dict[str, Any] = {
             "ok": True,
-            "status": "exited",
+            "status": "prepared" if norm_phase == "prepare" else "exited",
+            "phase": norm_phase,
+            "deferred_cleanup": defer_files,
             "cancelled_active_job": cancelled_active,
             "cleaned_shared_count": len(cleaned_shared),
             "cleaned_staging_count": len(cleaned_staging),
-            "galaxy_connected": bool(self.is_connected),
+            "galaxy_connected": galaxy_conn,
             "elapsed_ms": elapsed_ms,
         }
+        if restore_plan is not None:
+            out["restore_plan"] = restore_plan
+        return out
 
     def _is_local_staging_mode(self) -> bool:
         """Return True when heavy subhkl stages should run inside local NVMe staging.
@@ -10603,9 +10795,29 @@ def serve_rainbow_zones(
                 should_shutdown = True
                 try:
                     req_json = json.loads(raw_body.decode("utf-8") or "{}")
-                    if isinstance(req_json, dict) and req_json.get("shutdown") is False:
+                    if not isinstance(req_json, dict):
+                        req_json = {}
+                    phase_req = str(req_json.get("phase") or "confirm").strip().lower()
+                    if phase_req == "prepare" or req_json.get("shutdown") is False:
                         should_shutdown = False
-                    result = vm.pipeline_runner.execute_app_exit()
+                    cur_imgs_ex = vm.payload_kwargs.get("images_h5") or (
+                        vm.payload.get("images_h5")
+                        if isinstance(vm.payload, dict)
+                        else None
+                    )
+                    result = vm.pipeline_runner.execute_app_exit(
+                        phase=phase_req,
+                        current_h5=(str(vm.replay_h5) if vm.replay_h5 else None),
+                        images_h5=(str(cur_imgs_ex) if cur_imgs_ex else None),
+                        payload=(vm.payload if isinstance(vm.payload, dict) else None),
+                        mtz_overlay_info=getattr(vm, "mtz_overlay_info", None),
+                    )
+                    if not result.get("deferred_cleanup"):
+                        with vm_lock:
+                            if vm.replay_h5 and not os.path.isfile(str(vm.replay_h5)):
+                                vm.replay_h5 = None
+                            if cur_imgs_ex and not os.path.isfile(str(cur_imgs_ex)):
+                                vm.payload_kwargs["images_h5"] = None
                     code = 200
                 except _NOVA_RECOVERABLE_ERRORS as exc:
                     result = {"ok": False, "error": str(exc)}
@@ -10622,7 +10834,7 @@ def serve_rainbow_zones(
                     srv = self.server
 
                     def _deferred_httpd_stop() -> None:
-                        time.sleep(0.45)
+                        time.sleep(0.35)
                         with contextlib.suppress(Exception):
                             srv.shutdown()
 

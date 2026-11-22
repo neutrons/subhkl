@@ -11214,13 +11214,9 @@ def render_rainbow_html(
     font-display: block;
   }}
   #btn-exit-app {{
-    border-color: rgba(245, 158, 11, 0.55);
-    color: #fcd34d;
-  }}
-  #btn-exit-app:hover {{
-    border-color: #fbbf24;
-    color: #fef3c7;
-    background: rgba(245, 158, 11, 0.14);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }}
   #modal-arcade-exit {{
     display: none;
@@ -11274,7 +11270,8 @@ def render_rainbow_html(
     line-height: 16px;
     letter-spacing: 1px;
     padding: 10px 16px;
-    border: 1px solid rgba(245, 158, 11, 0.40);
+    border: 1px solid rgba(245, 158, 11, 0.44);
+    border-radius: 0;
     background: transparent;
     color: #fcd34d;
     cursor: pointer;
@@ -11288,14 +11285,14 @@ def render_rainbow_html(
     color: #fef3c7;
   }}
   #btn-arcade-exit-close-tab {{
-    border-color: #fbbf24;
-    background: rgba(245, 158, 11, 0.18);
-    color: #fef08a;
+    border-color: #ef4444;
+    background: rgba(220, 38, 38, 0.22);
+    color: #fca5a5;
   }}
   #btn-arcade-exit-close-tab:hover:not(:disabled) {{
-    border-color: #fde047;
-    background: rgba(245, 158, 11, 0.30);
-    color: #ffffff;
+    border-color: #f87171;
+    background: rgba(220, 38, 38, 0.36);
+    color: #fff1f2;
   }}
   #btn-arcade-exit-close-tab:disabled {{
     border-color: rgba(148, 163, 184, 0.22);
@@ -11408,8 +11405,8 @@ def render_rainbow_html(
       <button id="btn-new-tab" style="border-color:var(--accent-gold);color:var(--accent-gold);" title="Open this view in its own full-screen browser tab">
         Tab
       </button>
-      <button id="btn-exit-app" type="button" title="Clean up temporary &amp; shared intermediates and close SubHKL session">
-        Exit
+      <button id="btn-exit-app" type="button" aria-label="Exit" title="Clean up temporary &amp; shared intermediates and close SubHKL session">
+        ⏻
       </button>
     </div>
   </header>
@@ -11883,9 +11880,9 @@ def render_rainbow_html(
   <div id="modal-arcade-exit" role="dialog" aria-modal="true" aria-labelledby="arcade-exit-quip-text">
     <div class="arcade-exit-cabinet">
       <div id="arcade-exit-quip-text"></div>
-      <div class="arcade-exit-actions">
-        <button id="btn-arcade-exit-next" type="button" class="arcade-exit-btn">
-          Another vibe
+      <div class="arcade-exit-actions" id="arcade-exit-actions">
+        <button id="btn-arcade-exit-cancel" type="button" class="arcade-exit-btn">
+          Go back
         </button>
         <button id="btn-arcade-exit-close-tab" type="button" class="arcade-exit-btn" disabled>
           Close tab
@@ -22748,12 +22745,25 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const modalExit = document.getElementById("modal-arcade-exit");
     if (!btnExitApp || !modalExit) return;
 
-    const initialHostWin = (() => {{
+    const hostTabWin = (() => {{
       try {{
         const href = String((window.location && window.location.href) || "");
         if (href.startsWith("about:srcdoc") && window.parent) return window.parent;
       }} catch (_e) {{}}
       return window;
+    }})();
+
+    const exitEndpointUrl = (() => {{
+      try {{
+        const baseHref = (document.baseURI && /^https?:/i.test(document.baseURI))
+          ? document.baseURI
+          : ((hostTabWin.location && /^https?:/i.test(hostTabWin.location.href))
+            ? hostTabWin.location.href
+            : window.location.href);
+        return new URL("api/pipeline/exit", baseHref).href;
+      }} catch (_e) {{
+        return "api/pipeline/exit";
+      }}
     }})();
 
     const quipsList = (Array.isArray(window.ARCADE_EXIT_QUIPS) && window.ARCADE_EXIT_QUIPS.length > 0)
@@ -22762,7 +22772,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
     let shuffledDeck = [];
     let deckCursor = 0;
-    let exitStarted = false;
+    let exitModalOpen = false;
+    let exitConfirmed = false;
+    let preparePromise = null;
+    let lastRestorePlan = null;
 
     if (UI_MODE === "pro") {{
       modalExit.classList.add("pro-exit-mode");
@@ -22788,84 +22801,149 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       if (qTextEl) qTextEl.textContent = quipsList[quipIdx];
     }}
 
-    function promoteModalOutsideTrameIfEmbedded() {{
+    function sendFinalExitShutdown() {{
+      if (exitConfirmed) return;
+      exitConfirmed = true;
+      const bodyStr = JSON.stringify({{ phase: "confirm" }});
+      let sent = false;
       try {{
-        if (window.parent && window.parent !== window && window.parent.document) {{
-          const pDoc = window.parent.document;
-          if (pDoc.documentElement && pDoc.documentElement.dataset && pDoc.documentElement.dataset.appName === "trame") {{
-            const styleEl = document.getElementById("arcade-exit-style");
-            if (styleEl && !pDoc.getElementById("arcade-exit-style")) {{
-              pDoc.head.appendChild(styleEl.cloneNode(true));
-            }}
-            if (modalExit.parentNode !== pDoc.body) {{
-              pDoc.body.appendChild(modalExit);
-            }}
-          }}
+        if (navigator.sendBeacon) {{
+          sent = navigator.sendBeacon(
+            exitEndpointUrl,
+            new Blob([bodyStr], {{ type: "text/plain;charset=UTF-8" }})
+          );
         }}
       }} catch (_e) {{}}
+      if (!sent) {{
+        try {{
+          fetch(exitEndpointUrl, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: bodyStr,
+            keepalive: true,
+          }}).catch(() => {{}});
+        }} catch (_e2) {{}}
+      }}
     }}
 
+    // If the user opened the Exit screen and closes the browser tab manually (Ctrl+W / tab X),
+    // finalize any deferred local cleanup and stop the container cleanly.
+    const onUnloadWhileExiting = () => {{
+      if (exitModalOpen && !exitConfirmed) {{
+        sendFinalExitShutdown();
+      }}
+    }};
+    try {{ hostTabWin.addEventListener("pagehide", onUnloadWhileExiting); }} catch (_e) {{}}
+    window.addEventListener("pagehide", onUnloadWhileExiting);
+
     function closeHostBrowserTab() {{
-      const ownerWin = (modalExit.ownerDocument && modalExit.ownerDocument.defaultView) || initialHostWin || window;
+      sendFinalExitShutdown();
+
       let inOuterFrame = false;
       try {{
-        inOuterFrame = Boolean(ownerWin !== ownerWin.top);
+        inOuterFrame = Boolean(hostTabWin !== hostTabWin.top);
       }} catch (_e) {{
         inOuterFrame = true;
       }}
 
+      // Invoke window.close() synchronously within the user's click activation
       if (!inOuterFrame) {{
-        try {{ ownerWin.close(); }} catch (_e) {{}}
+        try {{ hostTabWin.close(); }} catch (_e) {{}}
         try {{
-          const wSelf = ownerWin.open("", "_self");
-          if (wSelf) wSelf.close();
+          if (!hostTabWin.closed) {{
+            const wSelf = hostTabWin.open("", "_self");
+            if (wSelf) wSelf.close();
+          }}
         }} catch (_e) {{}}
+      }} else {{
         try {{
-          if (ownerWin.top && ownerWin.top !== ownerWin) ownerWin.top.close();
+          if (hostTabWin.top) hostTabWin.top.close();
         }} catch (_e) {{}}
       }}
       try {{ window.close(); }} catch (_e) {{}}
 
-      // Fallback when browser tab security blocks closing a non-script-opened tab or Galaxy iframe
-      const checkTimer = (ownerWin && typeof ownerWin.setTimeout === "function") ? ownerWin.setTimeout : setTimeout;
-      checkTimer(() => {{
+      // If the browser's tab-security policy blocked closing a manually-opened tab,
+      // wait long enough not to race ClosePage() IPC and then show a clean confirmation.
+      setTimeout(() => {{
         try {{
-          if (ownerWin.closed) return;
+          if (hostTabWin.closed) return;
         }} catch (_e) {{
           return;
         }}
-        try {{
-          const ref = String((ownerWin.document && ownerWin.document.referrer) || "");
-          if (!inOuterFrame && /^https?:/i.test(ref)) {{
-            ownerWin.location.replace(ref);
-            return;
-          }}
-        }} catch (_e) {{}}
-        try {{
-          ownerWin.location.replace("about:blank");
-        }} catch (_e) {{
-          try {{ window.location.replace("about:blank"); }} catch (_e2) {{}}
+        const qTextEl = modalExit.querySelector("#arcade-exit-quip-text");
+        const actionsEl = modalExit.querySelector("#arcade-exit-actions");
+        if (actionsEl) actionsEl.style.display = "none";
+        if (qTextEl) {{
+          qTextEl.textContent =
+            "SESSION CLOSED. Temporary files are clean — press Ctrl+W (or Cmd+W) to close this tab.";
         }}
-      }}, 120);
+      }}, 550);
     }}
 
-    const btnNextVibe = modalExit.querySelector("#btn-arcade-exit-next");
-    if (btnNextVibe) {{
-      btnNextVibe.addEventListener("click", () => {{
-        drawNextQuip();
+    async function restorePreviousStepAfterCancel(plan) {{
+      if (!plan || plan.mode === "local_deferred" || plan.mode === "empty") {{
+        probeGalaxyConnection();
+        return;
+      }}
+      if (plan.mode === "galaxy_dataset" && plan.dataset_id) {{
+        await probeGalaxyConnection();
+        await loadFromGalaxyDatasetId(plan.dataset_id, {{
+          preserveFrameIndex: typeof plan.frame_index === "number" ? plan.frame_index : 0,
+        }});
+        if (plan.mtz_dataset_id && plan.mtz_dataset_id !== plan.dataset_id) {{
+          await loadFromGalaxyDatasetId(plan.mtz_dataset_id);
+        }}
+        return;
+      }}
+      if (plan.mode === "reduce_recipe" && plan.params) {{
+        setStatusLine(
+          "[AUTO-REDUCE]",
+          "Restoring session — regenerating reduced detector frames on the fly via <strong>Step 1 (Reduce)</strong>…"
+        );
+        selectPipelineStage(0, true);
+        await executeWorkflowStage(0, plan.params);
+        return;
+      }}
+      probeGalaxyConnection();
+    }}
+
+    const btnCancelExit = modalExit.querySelector("#btn-arcade-exit-cancel");
+    const btnCloseTab = modalExit.querySelector("#btn-arcade-exit-close-tab");
+    const actionsWrap = modalExit.querySelector("#arcade-exit-actions");
+
+    if (btnCancelExit) {{
+      btnCancelExit.addEventListener("click", async () => {{
+        if (exitConfirmed) return;
+        exitModalOpen = false;
+        modalExit.classList.remove("arcade-exit-card-open");
+        const pendingPrep = preparePromise;
+        if (pendingPrep) {{
+          setStatusLine(
+            "[RESTORING SESSION]",
+            "Finishing cleanup sync and restoring previous step from Galaxy History…"
+          );
+          try {{
+            await pendingPrep;
+          }} catch (_e) {{}}
+        }}
+        if (exitModalOpen || exitConfirmed) return;
+        const plan = lastRestorePlan;
+        lastRestorePlan = null;
+        await restorePreviousStepAfterCancel(plan);
       }});
     }}
 
-    const btnCloseTab = modalExit.querySelector("#btn-arcade-exit-close-tab");
     if (btnCloseTab) {{
       btnCloseTab.addEventListener("click", () => {{
         if (btnCloseTab.disabled) return;
+        btnCloseTab.disabled = true;
+        if (btnCancelExit) btnCancelExit.disabled = true;
         closeHostBrowserTab();
       }});
     }}
 
     btnExitApp.addEventListener("click", async () => {{
-      if (exitStarted) {{
+      if (exitModalOpen) {{
         modalExit.classList.add("arcade-exit-card-open");
         return;
       }}
@@ -22875,28 +22953,46 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         );
         if (!okAbort) return;
       }}
-      exitStarted = true;
+      exitModalOpen = true;
+      exitConfirmed = false;
+      lastRestorePlan = null;
       if (typeof galaxyBridge !== "undefined" && galaxyBridge.pollTimer) {{
         clearInterval(galaxyBridge.pollTimer);
         galaxyBridge.pollTimer = null;
       }}
 
+      if (actionsWrap) actionsWrap.style.display = "";
+      if (btnCancelExit) btnCancelExit.disabled = false;
       if (btnCloseTab) btnCloseTab.disabled = true;
       drawNextQuip();
-      promoteModalOutsideTrameIfEmbedded();
       modalExit.classList.add("arcade-exit-card-open");
 
-      try {{
-        await fetch("api/pipeline/exit", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify({{}})
-        }});
-      }} catch (_err) {{
-        // Standalone static HTML or container closed cleanly during response teardown
-      }} finally {{
-        if (btnCloseTab) btnCloseTab.disabled = false;
-      }}
+      const curPrep = (async () => {{
+        try {{
+          const r = await fetch(exitEndpointUrl, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ phase: "prepare" }}),
+          }});
+          if (r.ok) {{
+            const doc = await r.json();
+            if (doc && doc.restore_plan) {{
+              lastRestorePlan = doc.restore_plan;
+            }}
+          }}
+        }} catch (_err) {{
+          // Static HTML export without backend server
+        }} finally {{
+          if (preparePromise === curPrep) {{
+            preparePromise = null;
+          }}
+          if (exitModalOpen && !exitConfirmed && btnCloseTab) {{
+            btnCloseTab.disabled = false;
+          }}
+        }}
+      }})();
+      preparePromise = curPrep;
+      await curPrep;
     }});
   }})();
 
@@ -26943,8 +27039,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       let serverResponded = false;
       try {{
         if (dsExt !== "mtz") {{
-          state.selectedFrameIndex = 0;
-          DATA.frame_index = 0;
+          const targetFrame = (opts && typeof opts.preserveFrameIndex === "number" && opts.preserveFrameIndex >= 0)
+            ? opts.preserveFrameIndex
+            : 0;
+          state.selectedFrameIndex = targetFrame;
+          DATA.frame_index = targetFrame;
         }}
         const hasGeomFlag = hasActiveDetectorGeometryForMtz() ? "1" : "0";
         const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{state.selectedFrameIndex || 0}}&has_active_geometry=${{hasGeomFlag}}${{getRenderBinningQuery()}}`, {{
