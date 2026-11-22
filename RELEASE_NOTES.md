@@ -4,10 +4,55 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.6.7]
+## [1.7.0]
 
 ### Added
 
+- **Three-tier shared storage orchestration for Galaxy/Pulsar runner mode with NFS race-free UUID sideband publication (`shared_storage`, `parser`, `nova_rainbow_view`, `galaxy`)**:
+  - Separated intermediate and persistent data across three storage tiers so
+    interactive `subhkl-nova-app` sessions release GPUs to job runners without
+    moving multi-GB HDF5 files through Galaxy/Pulsar object-storage caches:
+    - **Tier 1 (`SUBHKL_STAGING_DIR` / `TMPDIR`)**: fast node-local NVMe scratch
+      for step-local work (`reduce-batch` per-run files, local HDF5 assembly,
+      and Careless scratch).
+    - **Tier 2 (`SUBHKL_SHARED_DIR`, mandatory when `SUBHKL_EXEC_MODE=galaxy`)**:
+      network filesystem exchanging compact `subhkl_shared_pointer/v1` JSON
+      sideband pointers (`--shared-pointer-out`) for large cross-step HDF5
+      artifacts (`merged.h5`, `predictor.h5`, `integrated.h5`), with automatic
+      `/proc/self/mountinfo` canonical network-path translation across
+      heterogeneous runner mounts (e.g. `/scratch` on `imaginex-{1,2}` vs.
+      `/gpfs/neutronsfs/scratch` on `analysis.sns.gov`) and deterministic
+      cleanup (`subhkl cleanup-shared` and app exit hooks).
+    - **Tier 3 (Galaxy Object Storage / History)**: persists thin crystallography
+      artifacts (`solve.h5`, `reflections.mtz`, `merged.mtz`, `xval.mtz`,
+      `careless_metrics.json`, `merge_table.{csv,html}`), reconstructing reduced
+      detector data on the fly when restarting from a History `solve.h5`.
+  - Hardened Tier 2 sideband publication for lockless/non-atomic NFS mounts:
+    allocates fresh 128-bit UUIDv4 filenames (`subhkl_shared_<32hex>_<artifact>`)
+    opened via `O_WRONLY | O_CREAT | O_EXCL` with zero pre-creation `stat`
+    probes to guarantee cold client dcache/attribute/page-cache misses, flushes
+    and `os.fsync`s + closes the HDF5 file (and parent directory) strictly
+    **before** writing and `os.fsync`ing the JSON pointer, exports
+    `HDF5_USE_FILE_LOCKING=FALSE`, and keeps published shared files
+    write-once/read-only.
+- **Laue nodal bullseyes (`a⋆`, `b⋆`, `c⋆` & zone hubs), `[uvw]` arc hover badges, and `±1`/`±2` Higher-Order Laue Zones (`rainbow_zones`)**:
+  - Rendered uniform-radius Laue nodal bullseye markers at zone-axis
+    intersections (with superscript `a⋆`, `b⋆`, `c⋆` labels on principal
+    reciprocal axes, dimmed markers in inter-panel gaps within 25% of a panel
+    width, and intersection-count hover badges), calibrated flat-panel hub
+    raycasting on cylindrical bank assemblies (e.g. CG4D), interactive `[uvw]`
+    zone-axis hover badges, and optional `±1` / `±2` HOLZ curves with live
+    predicted reflection counts.
+- **3D ToF reciprocal-space `Δθ`, warm divergent `I/σ` colorscale, and direct numerical slider inputs (`rainbow_zones`)**:
+  - Added directional 3D ToF-gated reciprocal-space `Δθ` (`arccos` unit-vector
+    placement) with a dedicated `/api/tof_delta_theta` route and $10\times$
+    faster frame switching.
+  - Added a warm quantile-normalized divergent `I/σ` colorscale (with matching
+    gold `Integ` button styling), median/outlier-robust `ΔI/σ` colorbar bounds,
+    click-to-edit `0.01 Å` numerical inputs on the $[\lambda_{\min},
+    \lambda_{\max}]$ and $d_{\min}$ sliders (paired with `0.05 Å` slider drag
+    steps on `#slider-dmin`), fixed-width `1-Frame`/`All-Runs` toggle geometry,
+    and corner `^`/`v` magnification carets on the Wulff pane.
 - **Unlocked `0.50 Å` high-resolution $d_{\min}$ floor on large macromolecular unit cells via Ewald-shell rod slicing & viewport-frustum LOD (`rainbow_zones`, `crystallography`)**:
   - Removed the `2,000,000` full-sphere lattice-point UI $d_{\min}$ ceiling
     (which clamped `P 61 2 2`, $80\times 80\times 238\text{ Å}$, at `1.41 Å`),
@@ -46,7 +91,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Time-of-flight sideband background biased by the shape of the spectrum (`tof_gate`)**:
+- **Time-of-flight sideband background biased by the shape of the spectrum (`tof_gate`, `detector`)**:
   - The gated integrator scaled each reflection's sideband background to its
     gate by the length of the intervals in time, which assumes a background
     rate flat in time. The incident spectrum is curved and falls off steeply at
@@ -55,10 +100,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     repeats between measurements and showed up as CC½ where there is no Bragg
     signal.
   - Intervals are now measured in each image's own cumulative time spectrum
-    (`--tof-sideband-measure spectrum`, the default), so the background is
-    taken as proportional to what the image shows at each time; images with too
-    few events for a spectrum fall back to plain time. `--tof-sideband-measure
-    time` restores the previous behaviour.
+    (`--tof-sideband-measure spectrum`, the default, folded directly into the
+    fused on-GPU 4D slab prefix sums alongside consistent detector border/pixel
+    mask enforcement across prediction, gating, and visualization), so the
+    background is taken as proportional to what the image shows at each time;
+    images with too few events for a spectrum fall back to plain time.
+    `--tof-sideband-measure time` restores the previous behaviour.
   - Check for this kind of bias with an off-peak control: integrate with the
     gate moved off the reflections (e.g. `--tof-gate=0.06,0.11`) and merge; any
     CC½ that survives is not Bragg signal.
@@ -100,10 +147,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     ($a=b=c,\,\alpha=\beta=\gamma$, `P` centering) on `:R` groups.
   - Prevented `trigonal_r` from overwriting bare `R` symbols (`"R 3"`,
     `"R -3 m"`, `"R 3 2"`) in Rainbow Zones' client-side `SG_SYMMETRY_LOOKUP`.
-- **Smooth `0.01 Å` $d_{\min}$ slider increments in Rainbow Zones (`rainbow_zones`)**:
-  - Standardized `#slider-dmin` (HTML default and `setRangeBounds` floor/step)
-    to `0.01 Å` increments so non-integer wavelength limits (e.g. `2.0–4.4 Å`)
-    no longer force coarse `0.05 Å` steps onto odd values like `1.99 Å`.
 - **Generalized multi-run unit-cell, detector-geometry, and per-run crystal-slip refinement (`scan_band`, `scan_refine`)**:
   - Included unwarped `search/proposal_orientations` in the bootstrap candidate
     pool and replaced the `1.5%` radial `shared_geometry` cliff with a direct
