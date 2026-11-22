@@ -10394,10 +10394,7 @@ def test_nova_app_tof_route_and_fast_frame_switch(tmp_path):
     assert vm_f1["merge_metrics"] == p_init["merge_metrics"]
 
     # 2. MainApp HTTP routes: POST /api/tof_delta_theta (200, not 405!) & GET /api/payload?frame=1&frame_only=1
-    if (
-        importlib.util.find_spec("aiohttp") is not None
-        and importlib.util.find_spec("nova.mvvm") is not None
-    ):
+    if importlib.util.find_spec("aiohttp") is not None:
         from aiohttp import web
         from aiohttp.test_utils import make_mocked_request
 
