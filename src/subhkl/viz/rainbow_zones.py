@@ -2528,7 +2528,7 @@ def apply_mtz_to_payload(
                 iv_m, sv_m = float(hit[0]), max(float(hit[1]), 1e-6)
                 pk_copy["mtz_i"] = round(iv_m, 2)
                 pk_copy["mtz_sigi"] = round(sv_m, 2)
-                pk_copy["mtz_isigi"] = round(max(0.0, iv_m) / sv_m, 3)
+                pk_copy["mtz_isigi"] = round(iv_m / sv_m, 3)
                 pk_copy["merged_i"] = round(iv_m, 2)
                 pk_copy["merged_sigi"] = round(sv_m, 2)
                 n_hit += 1
@@ -11198,11 +11198,11 @@ def render_rainbow_html(
             <div class="stereo-toolbar">
               <button id="btn-wulff-scope" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
               <button id="btn-wulff-friedel" class="active-btn" title="Show antipodal Friedel mates (-h,-k,-l) on the Wulff sphere (fills the θ vs 2θ hemisphere; violet symmetry links vs gold proper rotations)">±Friedel</button>
-              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, Logarithmic I/σ, .mtz I/σ, or Careless Merge Residual">
+              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, Divergent Quantile I/σ, .mtz I/σ, or Careless Merge Residual">
                 <option value="wavelength">Color: λ/Zone</option>
                 <option value="orbit">Color: ASU Orbit</option>
-                <option value="isigi">Color: I/σ (Log)</option>
-                <option value="mtz_isigi">Color: .mtz I/σ (Log)</option>
+                <option value="isigi">Color: I/σ</option>
+                <option value="mtz_isigi">Color: .mtz I/σ</option>
                 <option value="residual">Color: ΔI/σ Residual</option>
                 <option value="scale">Color: Scale</option>
               </select>
@@ -11231,9 +11231,9 @@ def render_rainbow_html(
 
           <div class="slider-row">
             <span>Colorscale Crossover</span>
-            <span id="lbl-color-emphasis" style="white-space:nowrap;">I/σ ~ 3.2</span>
+            <span id="lbl-color-emphasis" style="white-space:nowrap;">-3.0 · 3.0 · 20.0</span>
           </div>
-          <input type="range" id="slider-color-emphasis" min="0.05" max="0.95" step="0.01" value="0.38" title="Drag knob to shift the (log-)scale midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
+          <input type="range" id="slider-color-emphasis" min="0.05" max="0.95" step="0.01" value="0.38" title="Drag knob to tune colorscale contrast / midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
 
           <div class="slider-row">
             <span>Wavelength λ [Å]</span>
@@ -11256,11 +11256,11 @@ def render_rainbow_html(
 
           <div class="slider-row" style="margin-top:2px;">
             <span>Spot Color</span>
-            <select id="sel-spot-color" title="Color reflections on Detector & Wulff Net by Wavelength, ASU Orbit, Logarithmic I/σ, .mtz I/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
+            <select id="sel-spot-color" title="Color reflections on Detector & Wulff Net by Wavelength, ASU Orbit, Divergent Quantile I/σ, .mtz I/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
               <option value="wavelength">Color: λ/Zone</option>
               <option value="orbit">Color: ASU Orbit</option>
-              <option value="isigi">Color: I/σ (Log)</option>
-              <option value="mtz_isigi">Color: .mtz I/σ (Log)</option>
+              <option value="isigi">Color: I/σ</option>
+              <option value="mtz_isigi">Color: .mtz I/σ</option>
               <option value="residual">Color: ΔI/σ Residual</option>
               <option value="scale">Color: Scale</option>
             </select>
@@ -12752,7 +12752,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const ivM = Number(mtzHit[0]), svM = Math.max(Number(mtzHit[1]) || 0, 1e-6);
           pk.mtz_i = ivM;
           pk.mtz_sigi = Number(mtzHit[1]);
-          pk.mtz_isigi = Number((Math.max(0.0, ivM) / svM).toFixed(3));
+          pk.mtz_isigi = Number((ivM / svM).toFixed(3));
           if (pk.merged_i === undefined || pk.merged_i === null) {{
             pk.merged_i = ivM;
             pk.merged_sigi = Number(mtzHit[1]);
@@ -13305,7 +13305,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const ivM = Number(mtzHit[0]), svM = Math.max(Number(mtzHit[1]) || 0, 1e-6);
           pk.mtz_i = ivM;
           pk.mtz_sigi = Number(mtzHit[1]);
-          pk.mtz_isigi = Number((Math.max(0.0, ivM) / svM).toFixed(3));
+          pk.mtz_isigi = Number((ivM / svM).toFixed(3));
           if (pk.merged_i === undefined || pk.merged_i === null) {{
             pk.merged_i = ivM;
             pk.merged_sigi = Number(mtzHit[1]);
@@ -13793,6 +13793,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     hasScales: false,
     isigiTop: 40.0,
     mtzIsigiTop: 40.0,
+    isigiMin: -3.0,
+    isigiQ25: 0.0,
+    isigiMedian: 3.0,
+    isigiQ75: 7.0,
+    isigiMax: 20.0,
+    isigiBounds: null,
+    mtzIsigiMin: -3.0,
+    mtzIsigiQ25: 0.0,
+    mtzIsigiMedian: 3.0,
+    mtzIsigiQ75: 7.0,
+    mtzIsigiMax: 20.0,
+    mtzIsigiBounds: null,
     resMin: -3.0,
     resMax: 3.0,
     resMedian: 0.0,
@@ -15380,19 +15392,93 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function peakUnscaledIsigi(p) {{
     if (!p) return NaN;
-    if (typeof p.intensity !== "number" || typeof p.sigma !== "number" || p.sigma <= 0) return NaN;
-    return Math.max(0.0, p.intensity) / Math.max(p.sigma, 1e-6);
+    if (
+      typeof p.intensity !== "number" ||
+      !Number.isFinite(p.intensity) ||
+      typeof p.sigma !== "number" ||
+      !Number.isFinite(p.sigma) ||
+      p.sigma <= 0
+    ) {{
+      return NaN;
+    }}
+    return p.intensity / Math.max(p.sigma, 1e-6);
   }}
 
   function peakMtzIsigi(p) {{
     if (!p) return NaN;
     if (typeof p.mtz_isigi === "number" && Number.isFinite(p.mtz_isigi)) {{
-      return Math.max(0.0, p.mtz_isigi);
+      return p.mtz_isigi;
     }}
-    if (typeof p.mtz_i === "number" && typeof p.mtz_sigi === "number" && p.mtz_sigi > 0) {{
-      return Math.max(0.0, p.mtz_i) / Math.max(p.mtz_sigi, 1e-6);
+    if (
+      typeof p.mtz_i === "number" &&
+      Number.isFinite(p.mtz_i) &&
+      typeof p.mtz_sigi === "number" &&
+      Number.isFinite(p.mtz_sigi) &&
+      p.mtz_sigi > 0
+    ) {{
+      return p.mtz_i / Math.max(p.mtz_sigi, 1e-6);
     }}
     return NaN;
+  }}
+
+  function computeQuantileScaleBounds(rawVals, defLo = -3.0, defMid = 3.0, defHi = 20.0) {{
+    if (!Array.isArray(rawVals) || rawVals.length === 0) {{
+      return {{
+        min: defLo,
+        q25: 0.5 * (defLo + defMid),
+        median: defMid,
+        q75: 0.5 * (defMid + defHi),
+        max: defHi,
+      }};
+    }}
+    const sorted = rawVals.slice().sort((a, b) => a - b);
+    const qAt = (q) => {{
+      if (sorted.length === 1) return sorted[0];
+      const pos = Math.max(0.0, Math.min(1.0, q)) * (sorted.length - 1);
+      const base = Math.floor(pos);
+      const rest = pos - base;
+      const next = sorted[Math.min(sorted.length - 1, base + 1)];
+      return sorted[base] + rest * (next - sorted[base]);
+    }};
+    const med = qAt(0.5);
+    const q25Raw = qAt(0.25);
+    const q75Raw = qAt(0.75);
+    let lo = sorted.length >= 20 ? qAt(0.015) : sorted[0];
+    let hi = sorted.length >= 20 ? qAt(0.985) : sorted[sorted.length - 1];
+    if (sorted.length >= 4) {{
+      const iqr = Math.max(0.0, q75Raw - q25Raw);
+      const absDevs = sorted.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+      const mPos = 0.5 * (absDevs.length - 1);
+      const mBase = Math.floor(mPos);
+      const mad = absDevs[mBase] + (mPos - mBase) * (absDevs[Math.min(absDevs.length - 1, mBase + 1)] - absDevs[mBase]);
+      const sigmaMad = 1.4826 * mad;
+      const spread = Math.max(sigmaMad, iqr / 1.349);
+      if (spread > 1e-6) {{
+        lo = Math.max(lo, med - 5.0 * spread);
+        hi = Math.min(hi, med + 5.0 * spread);
+      }}
+    }}
+    let minV = Math.min(lo, med);
+    let maxV = Math.max(hi, med);
+    if (maxV - minV < 1e-6) {{
+      minV = med - 1.0;
+      maxV = med + 1.0;
+    }} else if (med - minV < 1e-6) {{
+      minV = med - Math.max(1.0, 0.25 * (maxV - med));
+    }} else if (maxV - med < 1e-6) {{
+      maxV = med + Math.max(1.0, 0.25 * (med - minV));
+    }}
+    const negSpan = Math.max(1e-6, med - minV);
+    const posSpan = Math.max(1e-6, maxV - med);
+    const q25 = Math.max(minV + 0.05 * negSpan, Math.min(med - 0.05 * negSpan, q25Raw));
+    const q75 = Math.max(med + 0.05 * posSpan, Math.min(maxV - 0.05 * posSpan, q75Raw));
+    return {{
+      min: minV,
+      q25,
+      median: med,
+      q75,
+      max: maxV,
+    }};
   }}
 
   function getPeakDataAvailability() {{
@@ -15403,7 +15489,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const dynEp = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
     const r0 = p0 && typeof p0.careless_residual === "number" && Number.isFinite(p0.careless_residual) ? p0.careless_residual.toFixed(3) : "";
     const rs0 = s0 && typeof s0.careless_residual === "number" && Number.isFinite(s0.careless_residual) ? s0.careless_residual.toFixed(3) : "";
-    const sig = `${{dynEp}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}`;
+    const i0 = p0 && Number.isFinite(peakUnscaledIsigi(p0)) ? peakUnscaledIsigi(p0).toFixed(3) : "";
+    const m0 = p0 && Number.isFinite(peakMtzIsigi(p0)) ? peakMtzIsigi(p0).toFixed(3) : "";
+    const sig = `${{dynEp}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}|${{i0}}|${{m0}}`;
     if (
       _peakDataAvailabilitySig === sig &&
       _peakDataAvailability._p0 === p0 &&
@@ -15412,29 +15500,37 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return _peakDataAvailability;
     }}
     let hasIsigi = false, hasMtz = false, hasRes = false, hasScl = false;
-    const isigiSamples = [];
-    const mtzSamples = [];
+    const peaksIsigiSamples = [];
+    const sampleIsigiSamples = [];
+    const peaksMtzSamples = [];
+    const sampleMtzSamples = [];
     const peaksResSamples = [];
     const sampleResSamples = [];
     const scanArr = (arr, isSamplePool) => {{
       if (!Array.isArray(arr)) return;
-      const step = arr.length > 2400 ? Math.ceil(arr.length / 2400) : 1;
-      const resStep = arr.length > 16384 ? Math.ceil(arr.length / 16384) : 1;
+      const sampleStep = arr.length > 16384 ? Math.ceil(arr.length / 16384) : 1;
       for (let i = 0; i < arr.length; i++) {{
         const p = arr[i];
         if (!p) continue;
-        if (typeof p.intensity === "number" && Number.isFinite(p.intensity) && typeof p.sigma === "number" && p.sigma > 0) {{
+        const iv = peakUnscaledIsigi(p);
+        if (Number.isFinite(iv)) {{
           hasIsigi = true;
-          if (i % step === 0) isigiSamples.push(Math.max(0.0, p.intensity) / Math.max(p.sigma, 1e-6));
+          if (i % sampleStep === 0) {{
+            if (isSamplePool) sampleIsigiSamples.push(iv);
+            else peaksIsigiSamples.push(iv);
+          }}
         }}
         const mv = peakMtzIsigi(p);
         if (Number.isFinite(mv)) {{
           hasMtz = true;
-          if (i % step === 0) mtzSamples.push(mv);
+          if (i % sampleStep === 0) {{
+            if (isSamplePool) sampleMtzSamples.push(mv);
+            else peaksMtzSamples.push(mv);
+          }}
         }}
         if (typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)) {{
           hasRes = true;
-          if (i % resStep === 0) {{
+          if (i % sampleStep === 0) {{
             if (isSamplePool) sampleResSamples.push(p.careless_residual);
             else peaksResSamples.push(p.careless_residual);
           }}
@@ -15477,12 +15573,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         resMax = resMedian + 1.0;
       }}
     }}
-    const computeP99 = (vals) => {{
-      if (vals.length === 0) return 40.0;
-      vals.sort((a, b) => a - b);
-      const q = vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.985))];
-      return Math.max(12.0, q || 40.0);
-    }};
+    // Prefer unbiased active-frame PEAKS for I/σ when >=20 peaks exist (all-runs SAMPLE_PEAKS is top-k by intensity)
+    const isigiVals = peaksIsigiSamples.length >= 20
+      ? peaksIsigiSamples
+      : (sampleIsigiSamples.length > peaksIsigiSamples.length ? sampleIsigiSamples : peaksIsigiSamples);
+    const mtzVals = sampleMtzSamples.length >= peaksMtzSamples.length && sampleMtzSamples.length > 0
+      ? sampleMtzSamples
+      : peaksMtzSamples;
+    const isigiBounds = computeQuantileScaleBounds(isigiVals, -3.0, 3.0, 20.0);
+    const mtzIsigiBounds = computeQuantileScaleBounds(mtzVals, -3.0, 3.0, 20.0);
     _peakDataAvailabilitySig = sig;
     _peakDataAvailability = {{
       _p0: p0,
@@ -15491,8 +15590,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       hasMtzIsigi: hasMtz,
       hasResiduals: hasRes,
       hasScales: hasScl,
-      isigiTop: computeP99(isigiSamples),
-      mtzIsigiTop: computeP99(mtzSamples),
+      isigiTop: Math.max(12.0, isigiBounds.max),
+      mtzIsigiTop: Math.max(12.0, mtzIsigiBounds.max),
+      isigiMin: isigiBounds.min,
+      isigiQ25: isigiBounds.q25,
+      isigiMedian: isigiBounds.median,
+      isigiQ75: isigiBounds.q75,
+      isigiMax: isigiBounds.max,
+      isigiBounds,
+      mtzIsigiMin: mtzIsigiBounds.min,
+      mtzIsigiQ25: mtzIsigiBounds.q25,
+      mtzIsigiMedian: mtzIsigiBounds.median,
+      mtzIsigiQ75: mtzIsigiBounds.q75,
+      mtzIsigiMax: mtzIsigiBounds.max,
+      mtzIsigiBounds,
       resMin,
       resMax,
       resMedian,
@@ -15501,52 +15612,96 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return _peakDataAvailability;
   }}
 
-  // Logarithmic non-negative I/SIGI colormap (O(1) per peak), distinctly keyed to Peak Source:
-  // - Integrated (⬭ Integ ellipses): Transparent (alpha=0) -> Vivid Solar Gold (250, 204, 21) at
-  //   crossover (t=0.5, alpha=0.5) -> Fully Opaque Electric Chartreuse-Lime (163, 242, 44) at t=1.
-  // - Predicted (○ Pred circles): Transparent (alpha=0) -> Vivid Sky-Cyan (56, 189, 248) at
-  //   crossover (t=0.5, alpha=0.5) -> Fully Opaque Electric Ice-Cyan (0, 240, 255) at t=1.
-  function isigiToColor(isigiVal, alpha = 1.0, topScale = 40.0, peakSrc = state.peakSource) {{
-    const isInteg = String(peakSrc || state.peakSource) === "integrated";
-    if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal) || isigiVal <= 0.0) {{
-      return isInteg ? "rgba(252, 238, 184, 0.000)" : "rgba(186, 244, 255, 0.000)";
+  // Warm Geyser-inspired diverging I/σ colormap, piecewise quantile-normalized over
+  // [lo (Q1.5), Q25, median (Q50), Q75, hi (Q98.5)] so [Q25, Q75] always sits inside the
+  // central warm band (distinct from Blue–White–Red ΔI/σ):
+  //   lo (weak/negative tail): Sea-Teal (20, 184, 166) -> Warm Sage-Cream (162, 220, 178) ->
+  //   median (bulk of peaks): Warm Sunlit Champagne-Gold (254, 232, 170) ->
+  //   hi (strong Bragg peaks): Vivid Solar Tangerine (251, 140, 36) -> Fiery Flame-Vermilion (232, 56, 24).
+  function isigiToColor(isigiVal, alpha = 1.0, bounds = null) {{
+    if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal)) {{
+      return "rgba(148, 163, 184, 0.000)";
     }}
-    const snr = Math.max(0.0, isigiVal);
-    const denom = Math.log10(1.0 + Math.max(12.0, topScale));
-    const uLog = Math.max(0.0, Math.min(1.0, Math.log10(1.0 + snr) / Math.max(0.5, denom)));
-    const t = applyCrossoverCurve(uLog);
-    const effAlpha = Math.max(0.0, Math.min(1.0, alpha * t));
-    let r, g, b;
-    if (isInteg) {{
-      if (t < 0.5) {{
-        // Warm Ivory-Gold (252, 238, 184) -> Vivid Solar Gold (250, 204, 21) right at crossover t=0.5
-        const u = t / 0.5;
-        r = Math.round(252 + (250 - 252) * u);
-        g = Math.round(238 + (204 - 238) * u);
-        b = Math.round(184 + (21 - 184) * u);
+    const bulkFrac = 0.28;
+    let b = null;
+    if (bounds && typeof bounds === "object") {{
+      b = Number.isFinite(bounds.median)
+        ? bounds
+        : (bounds.isigiBounds || {{
+            min: bounds.isigiMin,
+            q25: bounds.isigiQ25,
+            median: bounds.isigiMedian,
+            q75: bounds.isigiQ75,
+            max: bounds.isigiMax,
+          }});
+    }} else if (typeof bounds === "number" && Number.isFinite(bounds)) {{
+      const topHi = Math.max(12.0, bounds);
+      b = {{ min: -3.0, q25: 0.0, median: 3.0, q75: 0.30 * topHi, max: topHi }};
+    }} else {{
+      const av = getPeakDataAvailability();
+      b = state.wulffColorMode === "mtz_isigi" ? av.mtzIsigiBounds : av.isigiBounds;
+    }}
+    const lo = Number.isFinite(b && b.min) ? b.min : -3.0;
+    const hi = Number.isFinite(b && b.max) ? b.max : 20.0;
+    const rawMid = Number.isFinite(b && b.median) ? b.median : 0.5 * (lo + hi);
+    const mid = Math.max(lo, Math.min(hi, rawMid));
+    const q25 = Number.isFinite(b && b.q25) ? Math.max(lo, Math.min(mid, b.q25)) : 0.5 * (lo + mid);
+    const q75 = Number.isFinite(b && b.q75) ? Math.max(mid, Math.min(hi, b.q75)) : 0.5 * (mid + hi);
+    const c = getColorCrossover();
+    const knobGamma = (-Math.log(DEFAULT_COLOR_CROSSOVER)) / Math.max(0.05, -Math.log(c));
+    const clamped = Math.max(lo, Math.min(hi, isigiVal));
+    const effAlpha = Math.max(0.0, Math.min(1.0, alpha));
+    let r, g, bl;
+    if (clamped < mid) {{
+      let qFrac = 0.0;
+      if (clamped >= q25 && mid - q25 > 1e-6) {{
+        qFrac = bulkFrac * ((mid - clamped) / (mid - q25));
+      }} else if (q25 - lo > 1e-6) {{
+        qFrac = bulkFrac + (1.0 - bulkFrac) * ((q25 - clamped) / (q25 - lo));
+      }} else if (mid - lo > 1e-6) {{
+        qFrac = (mid - clamped) / (mid - lo);
+      }}
+      qFrac = Math.max(0.0, Math.min(1.0, qFrac));
+      const u = qFrac <= 0.0 ? 0.0 : (qFrac >= 1.0 ? 1.0 : Math.pow(qFrac, knobGamma));
+      if (u <= 0.5) {{
+        // Warm Sunlit Champagne-Gold (254, 232, 170) -> Warm Sage-Cream (162, 220, 178)
+        const s = u / 0.5;
+        r = Math.round(254 + (162 - 254) * s);
+        g = Math.round(232 + (220 - 232) * s);
+        bl = Math.round(170 + (178 - 170) * s);
       }} else {{
-        // Vivid Solar Gold (250, 204, 21) -> Electric Chartreuse-Lime (163, 242, 44) at t=1.0
-        const u = (t - 0.5) / 0.5;
-        r = Math.round(250 + (163 - 250) * u);
-        g = Math.round(204 + (242 - 204) * u);
-        b = Math.round(21 + (44 - 21) * u);
+        // Warm Sage-Cream (162, 220, 178) -> Luminous Sea-Teal (20, 184, 166)
+        const s = (u - 0.5) / 0.5;
+        r = Math.round(162 + (20 - 162) * s);
+        g = Math.round(220 + (184 - 220) * s);
+        bl = Math.round(178 + (166 - 178) * s);
       }}
     }} else {{
-      if (t < 0.5) {{
-        // Pale Ice-Cyan (186, 244, 255) -> Vivid Sky-Cyan (56, 189, 248) right at crossover t=0.5
-        const u = t / 0.5;
-        r = Math.round(186 + (56 - 186) * u);
-        g = Math.round(244 + (189 - 244) * u);
-        b = Math.round(255 + (248 - 255) * u);
+      let qFrac = 0.0;
+      if (clamped <= q75 && q75 - mid > 1e-6) {{
+        qFrac = bulkFrac * ((clamped - mid) / (q75 - mid));
+      }} else if (hi - q75 > 1e-6) {{
+        qFrac = bulkFrac + (1.0 - bulkFrac) * ((clamped - q75) / (hi - q75));
+      }} else if (hi - mid > 1e-6) {{
+        qFrac = (clamped - mid) / (hi - mid);
+      }}
+      qFrac = Math.max(0.0, Math.min(1.0, qFrac));
+      const u = qFrac <= 0.0 ? 0.0 : (qFrac >= 1.0 ? 1.0 : Math.pow(qFrac, knobGamma));
+      if (u <= 0.5) {{
+        // Warm Sunlit Champagne-Gold (254, 232, 170) -> Vivid Solar Tangerine (251, 140, 36)
+        const s = u / 0.5;
+        r = Math.round(254 + (251 - 254) * s);
+        g = Math.round(232 + (140 - 232) * s);
+        bl = Math.round(170 + (36 - 170) * s);
       }} else {{
-        // Vivid Sky-Cyan (56, 189, 248) -> Electric Cyan-Aqua (0, 240, 255) at t=1.0
-        const u = (t - 0.5) / 0.5;
-        r = Math.round(56 + (0 - 56) * u);
-        g = Math.round(189 + (240 - 189) * u);
-        b = Math.round(248 + (255 - 248) * u);
+        // Vivid Solar Tangerine (251, 140, 36) -> Fiery Flame-Vermilion (232, 56, 24)
+        const s = (u - 0.5) / 0.5;
+        r = Math.round(251 + (232 - 251) * s);
+        g = Math.round(140 + (56 - 140) * s);
+        bl = Math.round(36 + (24 - 36) * s);
       }}
     }}
-    return `rgba(${{r}}, ${{g}}, ${{b}}, ${{effAlpha.toFixed(3)}})`;
+    return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{effAlpha.toFixed(3)}})`;
   }}
 
   function hasIntegratedIsigi() {{
@@ -15614,10 +15769,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return hexToRgba(ORBIT_PALETTE[idx], effA);
     }}
     if (mode === "mtz_isigi") {{
-      return isigiToColor(peakMtzIsigi(p), alpha, avail.mtzIsigiTop);
+      return isigiToColor(peakMtzIsigi(p), alpha, avail.mtzIsigiBounds);
     }}
     if (mode === "isigi") {{
-      return isigiToColor(peakUnscaledIsigi(p), alpha, avail.isigiTop);
+      return isigiToColor(peakUnscaledIsigi(p), alpha, avail.isigiBounds);
     }}
     if (mode === "residual") {{
       return residualToColor(p.careless_residual, alpha);
@@ -15637,15 +15792,54 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const N = 16;
     let label = "";
     let tooltip = "";
+    const fmtCompactMetric = (v) => {{
+      const clean = Math.abs(v) < 0.05 ? 0.0 : v;
+      const absV = Math.abs(clean);
+      if (absV >= 1000) return `${{(clean / 1000).toFixed(1)}}k`;
+      if (absV >= 100) return clean.toFixed(0);
+      return clean.toFixed(1);
+    }};
     if (mode === "isigi" || mode === "mtz_isigi") {{
-      const topS = Math.max(12.0, mode === "mtz_isigi" ? avail.mtzIsigiTop : avail.isigiTop);
+      const bulkFrac = 0.28;
+      const b = mode === "mtz_isigi"
+        ? (avail.mtzIsigiBounds || {{
+            min: Number.isFinite(avail.mtzIsigiMin) ? avail.mtzIsigiMin : -3.0,
+            q25: Number.isFinite(avail.mtzIsigiQ25) ? avail.mtzIsigiQ25 : 0.0,
+            median: Number.isFinite(avail.mtzIsigiMedian) ? avail.mtzIsigiMedian : 3.0,
+            q75: Number.isFinite(avail.mtzIsigiQ75) ? avail.mtzIsigiQ75 : 7.0,
+            max: Number.isFinite(avail.mtzIsigiMax) ? avail.mtzIsigiMax : 20.0,
+          }})
+        : (avail.isigiBounds || {{
+            min: Number.isFinite(avail.isigiMin) ? avail.isigiMin : -3.0,
+            q25: Number.isFinite(avail.isigiQ25) ? avail.isigiQ25 : 0.0,
+            median: Number.isFinite(avail.isigiMedian) ? avail.isigiMedian : 3.0,
+            q75: Number.isFinite(avail.isigiQ75) ? avail.isigiQ75 : 7.0,
+            max: Number.isFinite(avail.isigiMax) ? avail.isigiMax : 20.0,
+          }});
+      const lo = Number.isFinite(b.min) ? b.min : -3.0;
+      const hi = Number.isFinite(b.max) ? b.max : 20.0;
+      const mid = Math.max(lo, Math.min(hi, Number.isFinite(b.median) ? b.median : 0.5 * (lo + hi)));
+      const q25 = Number.isFinite(b.q25) ? Math.max(lo, Math.min(mid, b.q25)) : 0.5 * (lo + mid);
+      const q75 = Number.isFinite(b.q75) ? Math.max(mid, Math.min(hi, b.q75)) : 0.5 * (mid + hi);
       for (let k = 0; k <= N; k++) {{
         const u = k / N;
-        const snr = u <= 0 ? 0.0 : (Math.pow(1.0 + topS, u) - 1.0);
-        stops.push(`${{isigiToColor(snr, 1.0, topS)}} ${{(u * 100).toFixed(1)}}%`);
+        let snr;
+        if (u <= 0.5) {{
+          const qFrac = (0.5 - u) / 0.5;
+          snr = qFrac <= bulkFrac
+            ? (mid - (mid - q25) * (qFrac / Math.max(1e-6, bulkFrac)))
+            : (q25 - (q25 - lo) * ((qFrac - bulkFrac) / Math.max(1e-6, 1.0 - bulkFrac)));
+        }} else {{
+          const qFrac = (u - 0.5) / 0.5;
+          snr = qFrac <= bulkFrac
+            ? (mid + (q75 - mid) * (qFrac / Math.max(1e-6, bulkFrac)))
+            : (q75 + (hi - q75) * ((qFrac - bulkFrac) / Math.max(1e-6, 1.0 - bulkFrac)));
+        }}
+        stops.push(`${{isigiToColor(snr, 1.0, b)}} ${{(u * 100).toFixed(1)}}%`);
       }}
-      const crossSnr = Math.pow(1.0 + topS, c) - 1.0;
-      label = `I/σ ~ ${{crossSnr >= 10 ? crossSnr.toFixed(0) : crossSnr.toFixed(1)}}`;
+      const prefix = mode === "mtz_isigi" ? ".mtz I/σ" : "I/σ";
+      label = `${{fmtCompactMetric(lo)}} · ${{fmtCompactMetric(mid)}} · ${{fmtCompactMetric(hi)}}`;
+      tooltip = `${{prefix}} quantile-normalized range [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at median ${{fmtCompactMetric(mid)}} (bulk IQR [${{fmtCompactMetric(q25)}}, ${{fmtCompactMetric(q75)}}])`;
     }} else if (mode === "residual") {{
       const lo = Number.isFinite(avail.resMin) ? avail.resMin : -3.0;
       const hi = Number.isFinite(avail.resMax) ? avail.resMax : 3.0;
@@ -15658,15 +15852,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           : (mid + ((u - 0.5) / 0.5) * (hi - mid));
         stops.push(`${{residualToColor(res, 1.0, avail)}} ${{(u * 100).toFixed(1)}}%`);
       }}
-      const fmtRes = (v) => {{
-        const clean = Math.abs(v) < 0.05 ? 0.0 : v;
-        const absV = Math.abs(clean);
-        if (absV >= 1000) return `${{(clean / 1000).toFixed(1)}}k`;
-        if (absV >= 100) return clean.toFixed(0);
-        return clean.toFixed(1);
-      }};
-      label = `${{fmtRes(lo)}} · ${{fmtRes(mid)}} · ${{fmtRes(hi)}}`;
-      tooltip = `ΔI/σ outlier-robust range [${{fmtRes(lo)}}, ${{fmtRes(hi)}}] centered at median ${{fmtRes(mid)}}σ`;
+      label = `${{fmtCompactMetric(lo)}} · ${{fmtCompactMetric(mid)}} · ${{fmtCompactMetric(hi)}}`;
+      tooltip = `ΔI/σ outlier-robust range [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at median ${{fmtCompactMetric(mid)}}σ`;
     }} else if (mode === "scale") {{
       for (let k = 0; k <= N; k++) {{
         const u = k / N;
@@ -15765,7 +15952,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     const mtzOptLabel = DATA.mtz_overlay_name
       ? `Color: .mtz I/σ (${{String(DATA.mtz_overlay_name).slice(0, 18)}})`
-      : "Color: .mtz I/σ (Log)";
+      : "Color: .mtz I/σ";
     [selColor, selSpotColor].forEach(sel => {{
       if (!sel) return;
       Array.from(sel.options).forEach(opt => {{
@@ -18754,6 +18941,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const av = getPeakDataAvailability();
       const mid = Number.isFinite(av.resMedian) ? av.resMedian : (av.resMean || 0.0);
       return Math.abs(p.careless_residual - mid);
+    }}
+    if (state.wulffColorMode === "mtz_isigi") {{
+      const mv = peakMtzIsigi(p);
+      if (Number.isFinite(mv)) return Math.abs(mv);
     }}
     if (typeof p.merged_i === "number" && typeof p.merged_sigi === "number" && p.merged_sigi > 0) {{
       return Math.abs(p.merged_i) / p.merged_sigi;
