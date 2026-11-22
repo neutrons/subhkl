@@ -2288,6 +2288,7 @@ def apply_mtz_to_payload(
                         R_single=R_single,
                         ki_hat=ki_hat,
                         detectors=detectors_all,
+                        sample_offset_lab=s_lab_single,
                     )
                 if len(pts_miss) > 0:
                     extra_pred = _serialize_peak_entries(
@@ -6007,6 +6008,7 @@ def _compute_zones_payload_for_geometry(
     R_single: np.ndarray,
     ki_hat: np.ndarray,
     detectors: dict[int, Any],
+    sample_offset_lab: Any = None,
     max_zone_index: int = 3,
     zone_tolerance_deg: float = 0.75,
     min_zone_peaks: int = 2,
@@ -6014,6 +6016,11 @@ def _compute_zones_payload_for_geometry(
     n_arc: int = 720,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Identify and serialize detector/stereographic Laue zone arcs."""
+    s_off = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None and np.asarray(sample_offset_lab).size >= 3
+        else None
+    )
     n_peaks = len(pts)
     raw_zones = (
         identify_zones(
@@ -6093,7 +6100,9 @@ def _compute_zones_payload_for_geometry(
                     KeyError,
                     IndexError,
                 ):
-                    mask, row, col = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
+                    mask, row, col = det.reflections_mask(
+                        kf[:, 0], kf[:, 1], kf[:, 2], sample_offset=s_off
+                    )
                     if not np.any(mask):
                         continue
                     idx_hits = np.where(mask)[0]
@@ -6106,22 +6115,25 @@ def _compute_zones_payload_for_geometry(
                         _, pel = _spherical_angles(xyz_seg)
                         if np.ptp(px) <= 90.0:
                             step_s = max(1, len(px) // 32)
+                            sample_idx = list(range(0, len(px), step_s))
+                            if sample_idx[-1] != len(px) - 1:
+                                sample_idx.append(len(px) - 1)
                             det_segments.append(
                                 [
                                     [
-                                        round(float(px[j]), 2),
-                                        round(float(py[j]), 4),
+                                        round(float(px[j]), 3),
+                                        round(float(py[j]), 5),
                                     ]
-                                    for j in range(0, len(px), step_s)
+                                    for j in sample_idx
                                 ]
                             )
                             det_segments_sph.append(
                                 [
                                     [
-                                        round(float(px[j]), 2),
+                                        round(float(px[j]), 3),
                                         round(float(pel[j]), 3),
                                     ]
-                                    for j in range(0, len(px), step_s)
+                                    for j in sample_idx
                                 ]
                             )
 
@@ -8848,6 +8860,7 @@ def build_rainbow_zone_payload(
         R_single=R_single,
         ki_hat=ki_hat,
         detectors=detectors,
+        sample_offset_lab=s_lab_single,
         max_zone_index=max_zone_index,
         zone_tolerance_deg=zone_tolerance_deg,
         min_zone_peaks=min_zone_peaks,
@@ -16182,17 +16195,67 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     updateHUD();
   }}
 
+  let _zoneHolzCountsCacheSig = "";
+  let _zoneHolzCountsMap = new Map();
+  function getZoneHolzLayerCountMap(zoneId) {{
+    if (!Array.isArray(ZONES) || ZONES.length === 0) return null;
+    const visPeaks = getVisibleDetectorPeaks();
+    const sig = `${{_detVisiblePeaksSig}}|${{ZONES.length}}`;
+    if (_zoneHolzCountsCacheSig !== sig) {{
+      _zoneHolzCountsCacheSig = sig;
+      _zoneHolzCountsMap = new Map();
+      const validZones = [];
+      for (let zi = 0; zi < ZONES.length; zi++) {{
+        const zn = ZONES[zi];
+        if (zn && Array.isArray(zn.uvw) && zn.uvw.length === 3) {{
+          const m = {{ "1": 0, "-1": 0, "2": 0, "-2": 0 }};
+          _zoneHolzCountsMap.set(zn.zone_id, m);
+          validZones.push({{ u: zn.uvw[0], v: zn.uvw[1], w: zn.uvw[2], m }});
+        }}
+      }}
+      for (let pi = 0; pi < visPeaks.length; pi++) {{
+        const hkl = visPeaks[pi] && visPeaks[pi].hkl;
+        if (!Array.isArray(hkl) || hkl.length !== 3) continue;
+        const h = hkl[0], k = hkl[1], l = hkl[2];
+        for (let zi = 0; zi < validZones.length; zi++) {{
+          const vz = validZones[zi];
+          const nOrd = h * vz.u + k * vz.v + l * vz.w;
+          if (nOrd === 1) vz.m["1"]++;
+          else if (nOrd === -1) vz.m["-1"]++;
+          else if (nOrd === 2) vz.m["2"]++;
+          else if (nOrd === -2) vz.m["-2"]++;
+        }}
+      }}
+    }}
+    return _zoneHolzCountsMap.get(zoneId) || null;
+  }}
+
   function renderZoneList() {{
     const container = document.getElementById("zone-list");
     container.innerHTML = "";
+    const hasHolz = state.holzOrders instanceof Set && state.holzOrders.size > 0;
     const filtered = ZONES.filter(z => (z.order || 1) <= state.maxZoneOrder);
     filtered.forEach(z => {{
       const item = document.createElement("div");
       const isAct = state.activeZones.has(z.zone_id);
       item.className = "zone-item" + (isAct ? " zone-active" : "");
       const color = z.rainbow_color;
-      const rightStat = z.n_peaks > 0 ? `${{z.n_peaks}}p` : `o${{z.order || 1}}`;
-      item.title = `${{z.label}} (order ${{z.order || 1}}) • ${{z.n_peaks}} spots • Δθ=${{z.angular_rms_deg.toFixed(2)}}°`;
+      let holzSpots = 0;
+      if (hasHolz) {{
+        const hm = getZoneHolzLayerCountMap(z.zone_id);
+        if (hm) {{
+          state.holzOrders.forEach(nOrd => {{
+            holzSpots += (hm[String(nOrd)] || 0) + (hm[String(-nOrd)] || 0);
+          }});
+        }}
+      }}
+      const rightStat = hasHolz && (z.n_peaks > 0 || holzSpots > 0)
+        ? `${{z.n_peaks}}+${{holzSpots}}p`
+        : (z.n_peaks > 0 ? `${{z.n_peaks}}p` : `o${{z.order || 1}}`);
+      const spotsTitle = hasHolz
+        ? `${{z.n_peaks}} ZOLZ + ${{holzSpots}} HOLZ spots`
+        : `${{z.n_peaks}} spots`;
+      item.title = `${{z.label}} (order ${{z.order || 1}}) • ${{spotsTitle}} • Δθ=${{z.angular_rms_deg.toFixed(2)}}°`;
       item.innerHTML = `
         <div style="display:flex;align-items:center;min-width:0;overflow:hidden;">
           <span class="zone-swatch" style="background:${{color}};"></span>
@@ -17505,6 +17568,56 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return [ph, pk, pl];
   }}
 
+  function getActiveIncidentBeam() {{
+    const raw = (Array.isArray(DATA.ki) && DATA.ki.length === 3)
+      ? DATA.ki
+      : ((Array.isArray(DATA.incident_beam) && DATA.incident_beam.length === 3) ? DATA.incident_beam : [0.0, 0.0, 1.0]);
+    const ux = Number(raw[0]) || 0.0;
+    const uy = Number(raw[1]) || 0.0;
+    const uz = Number(raw[2]);
+    return vecUnit([ux, uy, Number.isFinite(uz) ? uz : 1.0]);
+  }}
+
+  function getActiveSampleOffsetLab() {{
+    const activeRunIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : null;
+    const raw = (sMap && Array.isArray(sMap[String(activeRunIdx)]) && sMap[String(activeRunIdx)].length >= 3)
+      ? sMap[String(activeRunIdx)]
+      : ((Array.isArray(DATA.sample_offset_lab) && DATA.sample_offset_lab.length >= 3)
+        ? DATA.sample_offset_lab
+        : ((Array.isArray(DATA.sample_offset) && DATA.sample_offset.length >= 3) ? DATA.sample_offset : [0.0, 0.0, 0.0]));
+    return [Number(raw[0]) || 0.0, Number(raw[1]) || 0.0, Number(raw[2]) || 0.0];
+  }}
+
+  function computeDetectorConfigsSignature(cfgs) {{
+    if (!cfgs || typeof cfgs !== "object") return "none";
+    const keys = Object.keys(cfgs).sort();
+    if (keys.length === 0) return "empty";
+    let h = 2166136261 >>> 0;
+    const mixNum = (v) => {{
+      const q = Math.round((Number(v) || 0.0) * 1e6);
+      h = Math.imul(h ^ (q & 0xffff), 16777619) >>> 0;
+      h = Math.imul(h ^ ((q >>> 16) & 0xffff), 16777619) >>> 0;
+    }};
+    for (let i = 0; i < keys.length; i++) {{
+      const dc = cfgs[keys[i]];
+      if (!dc) continue;
+      mixNum(parseInt(keys[i], 10) || i);
+      mixNum(dc.width);
+      mixNum(dc.height);
+      mixNum(dc.radius);
+      if (Array.isArray(dc.center)) {{ mixNum(dc.center[0]); mixNum(dc.center[1]); mixNum(dc.center[2]); }}
+      if (Array.isArray(dc.uhat)) {{ mixNum(dc.uhat[0]); mixNum(dc.uhat[1]); mixNum(dc.uhat[2]); }}
+      if (Array.isArray(dc.vhat)) {{ mixNum(dc.vhat[0]); mixNum(dc.vhat[1]); mixNum(dc.vhat[2]); }}
+      if (Array.isArray(dc.rhat)) {{ mixNum(dc.rhat[0]); mixNum(dc.rhat[1]); mixNum(dc.rhat[2]); }}
+    }}
+    return `${{keys.length}}:${{h.toString(16)}}`;
+  }}
+
   let _fullFacePanelsCacheKey = "";
   let _fullFacePanelsCache = [];
   function buildFullFaceDetectorRaycastPanels(sLab) {{
@@ -17513,7 +17626,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const sx0 = Number(sLab[0]) || 0.0;
     const sy0 = Number(sLab[1]) || 0.0;
     const sz0 = Number(sLab[2]) || 0.0;
-    const key = `${{Object.keys(cfgs).length}}|${{sx0.toFixed(5)}},${{sy0.toFixed(5)}},${{sz0.toFixed(5)}}`;
+    const geomSig = computeDetectorConfigsSignature(cfgs);
+    const key = `${{geomSig}}|${{sx0.toFixed(6)}},${{sy0.toFixed(6)}},${{sz0.toFixed(6)}}`;
     if (_fullFacePanelsCacheKey === key && _fullFacePanelsCache.length > 0) {{
       return _fullFacePanelsCache;
     }}
@@ -17681,31 +17795,67 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }};
     }}
 
-    // Estimate 3D intersection distance t from the angularly nearest physical panel (or cylindrical fallback)
+    // Estimate 3D intersection distance t from the physically closest panel plane/cylinder
     const rFallback = estimateDetectorRadiusM(fullPanels);
     let tEst = -1.0;
     if (fullPanels.length > 0) {{
+      let bestOverFrac = 1e9;
       let bestCos = -2.0;
+      let fallbackT = -1.0;
       for (let i = 0; i < fullPanels.length; i++) {{
         const fp = fullPanels[i];
         if (fp.isCurved) {{
-          const horiz = Math.hypot(kfx, kfz);
-          if (horiz > 1e-5) {{
-            tEst = fp.radius / horiz;
-            break;
+          const vx = fp.vhat[0], vy = fp.vhat[1], vz = fp.vhat[2];
+          const dx = kfy * vz - kfz * vy;
+          const dy = kfz * vx - kfx * vz;
+          const dz = kfx * vy - kfy * vx;
+          const qa = dx * dx + dy * dy + dz * dz;
+          if (qa > 1e-12) {{
+            const qb = 2.0 * (fp.bVec[0] * dx + fp.bVec[1] * dy + fp.bVec[2] * dz);
+            const delta = qb * qb - 4.0 * qa * fp.qc;
+            if (delta >= 0.0) {{
+              const sq = Math.sqrt(delta);
+              const t2 = (-qb - sq) / (2.0 * qa);
+              const t1 = (-qb + sq) / (2.0 * qa);
+              const tRay = t2 > 1e-6 ? t2 : (t1 > 1e-6 ? t1 : -1.0);
+              if (tRay > 1e-6) {{
+                tEst = tRay;
+                break;
+              }}
+            }}
           }}
         }} else {{
-          const cNorm = vecUnit(fp.midPt);
-          const cosAng = kfx * cNorm[0] + kfy * cNorm[1] + kfz * cNorm[2];
-          if (cosAng > bestCos) {{
-            bestCos = cosAng;
-            const denom = kfx * fp.nhat[0] + kfy * fp.nhat[1] + kfz * fp.nhat[2];
-            const distC = Math.hypot(fp.midPt[0] - sx0, fp.midPt[1] - sy0, fp.midPt[2] - sz0);
-            tEst = (Math.abs(denom) > 0.15 && (fp.planeNum / denom) > 0.0)
-              ? Math.min(distC * 1.6, Math.max(distC * 0.6, fp.planeNum / denom))
-              : distC;
+          const denom = kfx * fp.nhat[0] + kfy * fp.nhat[1] + kfz * fp.nhat[2];
+          if (Math.abs(denom) > 0.08) {{
+            const tRay = fp.planeNum / denom;
+            if (tRay > 1e-4) {{
+              const px = sx0 + tRay * kfx - fp.center[0];
+              const py = sy0 + tRay * kfy - fp.center[1];
+              const pz = sz0 + tRay * kfz - fp.center[2];
+              const du = px * fp.uhat[0] + py * fp.uhat[1] + pz * fp.uhat[2];
+              const dv = px * fp.vhat[0] + py * fp.vhat[1] + pz * fp.vhat[2];
+              const overU = du < 0.0 ? -du : (du > fp.width ? du - fp.width : 0.0);
+              const overV = dv < 0.0 ? -dv : (dv > fp.height ? dv - fp.height : 0.0);
+              const overFrac = Math.hypot(overU / Math.max(1e-4, fp.width), overV / Math.max(1e-4, fp.height));
+              if (overFrac < bestOverFrac) {{
+                bestOverFrac = overFrac;
+                tEst = tRay;
+              }}
+            }}
+          }}
+          const relMid = [fp.midPt[0] - sx0, fp.midPt[1] - sy0, fp.midPt[2] - sz0];
+          const distC = Math.hypot(relMid[0], relMid[1], relMid[2]);
+          if (distC > 1e-4) {{
+            const cosAng = (kfx * relMid[0] + kfy * relMid[1] + kfz * relMid[2]) / distC;
+            if (cosAng > bestCos) {{
+              bestCos = cosAng;
+              fallbackT = distC;
+            }}
           }}
         }}
+      }}
+      if (!(tEst > 1e-4) && fallbackT > 1e-4) {{
+        tEst = fallbackT;
       }}
     }}
     if (!(tEst > 1e-4)) {{
@@ -17839,15 +17989,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (!state.showNodalPoints) return [];
     const ub = getActiveUbMatrix();
     const Rg = getActiveGoniometerR();
-    const ki = vecUnit((DATA.incident_beam || [0.0, 0.0, 1.0]).map(Number));
-    const sLab = (DATA.sample_offset || [0.0, 0.0, 0.0]).map(Number);
+    const ki = getActiveIncidentBeam();
+    const sLab = getActiveSampleOffsetLab();
+    const detCfgSig = computeDetectorConfigsSignature(DATA.detector_configs);
     const actZoneKey = Array.from(state.activeZones || []).join(",");
     const ubSig = ub
       ? `${{ub[0][0].toFixed(6)}},${{ub[1][1].toFixed(6)}},${{ub[2][2].toFixed(6)}},${{ub[0][1].toFixed(6)}},${{ub[0][2].toFixed(6)}},${{ub[1][2].toFixed(6)}}`
       : "noub";
     const sig = [
       ubSig,
-      Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[2][2].toFixed(5),
+      Rg[0][0].toFixed(5), Rg[0][1].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[1][2].toFixed(5), Rg[2][2].toFixed(5),
+      ki[0].toFixed(5), ki[1].toFixed(5), ki[2].toFixed(5),
+      sLab[0].toFixed(6), sLab[1].toFixed(6), sLab[2].toFixed(6),
+      detCfgSig,
       actZoneKey,
       ZONES.length,
       PANELS.length,
@@ -18080,8 +18234,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const ub = getActiveUbMatrix();
     const invUb = ub ? mat3Inv(ub) : null;
     const Rg = getActiveGoniometerR();
-    const ki = vecUnit((DATA.incident_beam || [0.0, 0.0, 1.0]).map(Number));
-    const sLab = (DATA.sample_offset || [0.0, 0.0, 0.0]).map(Number);
+    const ki = getActiveIncidentBeam();
+    const sLab = getActiveSampleOffsetLab();
+    const detCfgSig = computeDetectorConfigsSignature(DATA.detector_configs);
     const wlMin = Math.max(0.05, Number(state.lamMin) || 0.5);
     const wlMax = Math.max(wlMin, Number(state.lamMax) || wlMin);
     const dMin = Math.max(0.05, Number(state.dMin) || 0.5);
@@ -18095,7 +18250,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       wlMax.toFixed(4),
       dMin.toFixed(4),
       ubSig,
-      Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[2][2].toFixed(5),
+      Rg[0][0].toFixed(5), Rg[0][1].toFixed(5), Rg[0][2].toFixed(5), Rg[1][2].toFixed(5), Rg[2][2].toFixed(5),
+      ki[0].toFixed(5), ki[1].toFixed(5), ki[2].toFixed(5),
+      sLab[0].toFixed(6), sLab[1].toFixed(6), sLab[2].toFixed(6),
+      detCfgSig,
       PANELS.length,
       ZONES.length,
     ].join("|");
@@ -19140,7 +19298,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const panY = Number(state.detPanY) || 0.0;
     const panBinX = Math.round(panX / 24.0);
     const panBinY = Math.round(panY / 24.0);
-    const zonesKey = state.showZoneArcs ? Array.from(state.activeZones).join(",") : "off";
+    const holzLodKey = (state.holzOrders instanceof Set && state.holzOrders.size > 0)
+      ? Array.from(state.holzOrders).sort((a, b) => a - b).join(",")
+      : "";
+    const zonesKey = state.showZoneArcs ? `${{Array.from(state.activeZones).join(",")}}:${{holzLodKey}}` : "off";
     const hovId = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
     const selId = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
     const firstRef = allVisible.length > 0 ? allVisible[0] : null;
@@ -19358,10 +19519,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const hovZoneSig = state.hoveredZoneId !== null && state.hoveredZoneId !== undefined
       ? `${{state.hoveredZoneId}}:${{state.hoveredZoneHolzN || 0}}:${{state.hoveredZonePos ? Math.round(state.hoveredZonePos[0]) + "," + Math.round(state.hoveredZonePos[1]) : ""}}`
       : "";
+    const sLabDet = getActiveSampleOffsetLab();
     const detSig = [
       targetW, targetH,
       state.projection,
       bounds.minX.toFixed(3), bounds.maxX.toFixed(3), bounds.minY.toFixed(3), bounds.maxY.toFixed(3),
+      sLabDet[0].toFixed(5), sLabDet[1].toFixed(5), sLabDet[2].toFixed(5),
       state.detZoom.toFixed(5),
       state.detPanX.toFixed(2),
       state.detPanY.toFixed(2),
@@ -20023,9 +20186,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const hz = ZONES.find(z => z.zone_id === state.hoveredZoneId);
       if (hz) {{
         const holzN = state.hoveredZoneHolzN || 0;
-        const eqTag = holzN
-          ? `HOLZ N=${{holzN > 0 ? "+" : ""}}${{holzN}}`
-          : `${{hz.n_peaks || 0}} spots`;
+        let eqTag = `${{hz.n_peaks || 0}} spots`;
+        if (holzN) {{
+          const hm = getZoneHolzLayerCountMap(hz.zone_id);
+          const nLayerSpots = hm ? (hm[String(holzN)] || 0) : 0;
+          eqTag = `HOLZ N=${{holzN > 0 ? "+" : ""}}${{holzN}} • ${{nLayerSpots}} spots`;
+        }}
         const dTag = typeof hz.d_direct === "number" && hz.d_direct > 0 ? ` • |t|=${{hz.d_direct.toFixed(2)}}Å` : "";
         const zTag = `Zone ${{hz.label}} • ${{eqTag}}${{dTag}}`;
         const hx = state.hoveredZonePos[0];
@@ -20076,6 +20242,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function getActiveGoniometerR() {{
+    if (
+      typeof state.selectedFrameIndex === "number" &&
+      typeof DATA.frame_index === "number" &&
+      state.selectedFrameIndex !== DATA.frame_index &&
+      DATA.goniometer_R_per_run &&
+      typeof DATA.goniometer_R_per_run === "object"
+    ) {{
+      const Rrun = DATA.goniometer_R_per_run[String(state.selectedFrameIndex)];
+      if (Array.isArray(Rrun) && Rrun.length === 3 && Array.isArray(Rrun[0]) && Rrun[0].length === 3) {{
+        return Rrun;
+      }}
+    }}
     const R = DATA.goniometer_R;
     if (Array.isArray(R) && R.length === 3 && Array.isArray(R[0]) && R[0].length === 3) {{
       return R;
@@ -20466,7 +20644,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const yawDeg = Number(state.wulffYawDeg) || 0.0;
     const pitchDeg = Number(state.wulffPitchDeg) || 0.0;
     const withFriedel = Boolean(state.showWulffFriedel);
-    const zonesKey = state.showZoneArcs ? Array.from(state.activeZones).join(",") : "off";
+    const holzWulffKey = (state.holzOrders instanceof Set && state.holzOrders.size > 0)
+      ? Array.from(state.holzOrders).sort((a, b) => a - b).join(",")
+      : "";
+    const zonesKey = state.showZoneArcs ? `${{Array.from(state.activeZones).join(",")}}:${{holzWulffKey}}` : "off";
     const Rg = getActiveGoniometerR();
     const hovId = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
     const selId = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
@@ -22018,6 +22199,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           }}
         }}
         syncNodalAndHolzButtons();
+        renderZoneList();
         updateHUD();
         renderDetector();
         renderStereoInset(true);
@@ -22543,14 +22725,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const nextF = typeof newPayload.frame_index === "number" ? newPayload.frame_index : 0;
       state.selectedFrameIndex = nextF;
       DATA.frame_index = nextF;
+    }} else if (!isFrameSwitch && !preserveParams && typeof newPayload.frame_index === "number") {{
+      state.selectedFrameIndex = newPayload.frame_index;
+      DATA.frame_index = newPayload.frame_index;
+    }} else if (typeof newPayload.frame_index === "number") {{
+      DATA.frame_index = newPayload.frame_index;
+      if (
+        typeof state.selectedFrameIndex !== "number" ||
+        (nFrames > 0 && (state.selectedFrameIndex < 0 || state.selectedFrameIndex >= nFrames))
+      ) {{
+        state.selectedFrameIndex = newPayload.frame_index;
+      }}
     }} else if (
       typeof state.selectedFrameIndex === "number" &&
       (nFrames === 0 || (state.selectedFrameIndex >= 0 && state.selectedFrameIndex < nFrames))
     ) {{
       DATA.frame_index = state.selectedFrameIndex;
-    }} else if (typeof newPayload.frame_index === "number") {{
-      state.selectedFrameIndex = newPayload.frame_index;
-      DATA.frame_index = newPayload.frame_index;
     }}
     if (newPayload.goniometer_summary) DATA.goniometer_summary = newPayload.goniometer_summary;
     if (Array.isArray(newPayload.goniometer_R)) DATA.goniometer_R = newPayload.goniometer_R;
@@ -22561,6 +22751,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (newPayload.b_matrix) DATA.b_matrix = newPayload.b_matrix;
     if (newPayload.ub_matrix) DATA.ub_matrix = newPayload.ub_matrix;
     if (newPayload.detector_configs) DATA.detector_configs = newPayload.detector_configs;
+    _fullFacePanelsCacheKey = "";
+    _nodalPointsCacheSig = "";
+    _holzCacheSig = "";
+    _zoneHolzCountsCacheSig = "";
     if (newPayload.space_group_ops) DATA.space_group_ops = newPayload.space_group_ops;
     if (Array.isArray(newPayload.ki)) DATA.ki = newPayload.ki;
     if (typeof newPayload.has_tof_data === "boolean") DATA.has_tof_data = newPayload.has_tof_data;

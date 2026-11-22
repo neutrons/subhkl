@@ -11702,3 +11702,280 @@ process.exit(0);
     assert out["capN3"] is False
     assert out["holzHoverHasBadge"] is True
     assert out["nodalsWhenOff"] == 0
+
+
+def test_cg4d_calibrated_flat_panels_nodal_alignment_and_holz_spot_counts(tmp_path):
+    """Verify calibrated CG4D flat-panel post-indexing reload keeps nodal hubs aligned to <0.03 deg and counts HOLZ spots."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import numpy as np
+
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.rainbow_zones import (
+        _compute_zones_payload_for_geometry,
+        _encode_panel_textures,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+
+    # 1. Start from uncalibrated CG4D (80 flat panels arranged around a cylinder)
+    nominal_payload = build_rainbow_zone_payload(
+        replay_h5=None, images_h5=None, instrument="CG4D"
+    )
+    html = render_rainbow_html(nominal_payload)
+
+    # 2. Build a calibrated CG4D solve payload with shifted flat panels (~25 mm / ~20 px)
+    # and active frame_index=2 with distinct per-run sample_offset_lab.
+    cal_det_cfgs: dict[str, dict] = {}
+    cal_detectors: dict[int, Detector] = {}
+    shift_vec = np.array([0.018, -0.012, 0.014], dtype=float)
+    for k_str, cfg in nominal_payload["detector_configs"].items():
+        bid = int(k_str)
+        new_center = (np.asarray(cfg["center"], dtype=float) + shift_vec).tolist()
+        cal_det_cfgs[str(bid)] = {
+            "panel_type": cfg.get("panel_type", "flat"),
+            "m": int(cfg["m"]),
+            "n": int(cfg["n"]),
+            "width": float(cfg["width"]),
+            "height": float(cfg["height"]),
+            "center": list(new_center),
+            "uhat": list(cfg["uhat"]),
+            "vhat": list(cfg["vhat"]),
+        }
+        cal_detectors[bid] = Detector(
+            {
+                "panel": cfg.get("panel_type", "flat"),
+                "m": int(cfg["m"]),
+                "n": int(cfg["n"]),
+                "width": float(cfg["width"]),
+                "height": float(cfg["height"]),
+                "center": list(new_center),
+                "uhat": list(cfg["uhat"]),
+                "vhat": list(cfg["vhat"]),
+            }
+        )
+
+    ang = np.deg2rad(17.0)
+    R_active = np.array(
+        [
+            [np.cos(ang), 0.0, np.sin(ang)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(ang), 0.0, np.cos(ang)],
+        ],
+        dtype=float,
+    )
+    ub = np.array(
+        [
+            [0.082, 0.014, -0.009],
+            [-0.011, 0.076, 0.018],
+            [0.012, -0.015, 0.069],
+        ],
+        dtype=float,
+    )
+    ki_hat = np.array([0.0, 0.0, 1.0], dtype=float)
+    s_lab_run0 = np.array([-0.004, -0.005, 0.003], dtype=float)
+    s_lab_run2 = np.array([0.0035, 0.0045, -0.0025], dtype=float)
+
+    _, zones_payload = _compute_zones_payload_for_geometry(
+        np.zeros((0, 3), dtype=float),
+        ub_matrix=ub,
+        R_gonio=R_active,
+        R_single=R_active,
+        ki_hat=ki_hat,
+        detectors=cal_detectors,
+        sample_offset_lab=s_lab_run2,
+        max_zone_index=2,
+    )
+    panels_payload, _ = _encode_panel_textures(
+        cal_detectors, None, None, None, None, None, encode_images=False
+    )
+
+    # Synthesize predicted peaks spanning ZOLZ (N=0) and HOLZ (N=±1, ±2) for zone 0
+    u0, v0, w0 = zones_payload[0]["uvw"]
+    synth_peaks = []
+    pid = 0
+    for h in range(-3, 4):
+        for k in range(-3, 4):
+            for l_idx in range(-3, 4):
+                if h == 0 and k == 0 and l_idx == 0:
+                    continue
+                layer_n = h * u0 + k * v0 + l_idx * w0
+                if abs(layer_n) > 2:
+                    continue
+                synth_peaks.append(
+                    {
+                        "id": pid,
+                        "hkl": [h, k, l_idx],
+                        "det_x": float((pid % 40) - 20.0),
+                        "det_y": 0.02,
+                        "det_el": 3.0,
+                        "wavelength": 3.2,
+                        "d_spacing": 2.5,
+                        "zone_ids": [0] if layer_n == 0 else [],
+                    }
+                )
+                pid += 1
+
+    cal_payload = dict(nominal_payload)
+    cal_payload.update(
+        {
+            "artifact_kind": "solve",
+            "instrument": "CG4D",
+            "ki": [0.0, 0.0, 1.0],
+            "wavelength_range": [2.8, 4.5],
+            "d_min": 1.8,
+            "frame_index": 2,
+            "frames": [
+                {"index": 0, "label": "Run 0"},
+                {"index": 1, "label": "Run 1"},
+                {"index": 2, "label": "Run 2"},
+            ],
+            "goniometer_R": R_active.tolist(),
+            "goniometer_R_per_run": {
+                "0": np.eye(3).tolist(),
+                "1": np.eye(3).tolist(),
+                "2": R_active.tolist(),
+            },
+            "sample_offset_lab": s_lab_run2.tolist(),
+            "sample_offset_lab_per_run": {
+                "0": s_lab_run0.tolist(),
+                "1": [0.0, 0.0, 0.0],
+                "2": s_lab_run2.tolist(),
+            },
+            "ub_matrix": ub.tolist(),
+            "u_matrix": (ub / np.linalg.norm(ub, axis=0, keepdims=True)).tolist(),
+            "detector_configs": cal_det_cfgs,
+            "panels": panels_payload,
+            "zones": zones_payload,
+            "peaks": synth_peaks,
+            "predicted_peaks": synth_peaks,
+            "sample_peaks": synth_peaks,
+            "predicted_sample_peaks": synth_peaks,
+        }
+    )
+
+    cal_json = tmp_path / "cal_cg4d.json"
+    cal_json.write_text(json.dumps(cal_payload), encoding="utf-8")
+
+    scripts = re.findall(r"<script[^>]*>([\s\S]*?)</script>", html)
+    main_js = max(scripts, key=len)
+    idx_close = main_js.rfind("})();")
+    assert idx_close > 0
+
+    probe = f"""
+const fs = require("fs");
+// Prime pre-indexing flat-panel raycast cache on nominal CG4D (80 banks)
+const _preNodals = getVisibleNodalPoints();
+const calPay = JSON.parse(fs.readFileSync({json.dumps(str(cal_json))}, "utf8"));
+recomputeBoundsAndReload(calPay, {{}});
+state.holzOrders = new Set([1, 2]);
+const nodalsAfter = getVisibleNodalPoints().filter(n => n.onPanel);
+
+function segDistDeg(px, py, segs) {{
+  let best = 1e9;
+  for (const seg of (segs || [])) {{
+    for (let i = 0; i + 1 < seg.length; i++) {{
+      const [x1, y1] = seg[i], [x2, y2] = seg[i + 1];
+      const sy = 161.4;
+      const dx = x2 - x1, dy = (y2 - y1) * sy;
+      const l2 = dx * dx + dy * dy;
+      const t = l2 > 1e-12 ? Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * sy * dy) / l2)) : 0;
+      const qx = x1 + t * dx, qy = y1 + t * (y2 - y1);
+      const d = Math.hypot(px - qx, (py - qy) * sy);
+      if (d < best) best = d;
+    }}
+  }}
+  return best;
+}}
+
+let maxErrDeg = 0.0;
+let checkedPairs = 0;
+for (const nd of nodalsAfter) {{
+  for (const zid of nd.zoneIds) {{
+    const z = ZONES.find(zz => zz.zone_id === zid);
+    if (!z || !Array.isArray(z.detector_segments) || z.detector_segments.length === 0) continue;
+    const d = segDistDeg(nd.det_x, nd.det_y, z.detector_segments);
+    if (d < 5.0) {{
+      if (d > maxErrDeg) maxErrDeg = d;
+      checkedPairs++;
+    }}
+  }}
+}}
+
+const holzCounts = getZoneHolzLayerCountMap(0);
+console.log(JSON.stringify({{
+  frameIdx: DATA.frame_index,
+  selFrameIdx: state.selectedFrameIndex,
+  onPanelCount: nodalsAfter.length,
+  checkedPairs,
+  maxErrDeg,
+  holzPos1: holzCounts[1] || 0,
+  holzNeg1: holzCounts[-1] || 0,
+  holzPos2: holzCounts[2] || 0,
+}}));
+"""
+    stub = """
+const noop = () => ({
+  style: { setProperty(){}, removeProperty(){} },
+  dataset: {}, options: [], children: [], childNodes: [],
+  classList: { add(){}, remove(){}, toggle(){}, contains(){ return false; } },
+  addEventListener(){}, removeEventListener(){}, setAttribute(){}, getAttribute(){ return null; },
+  getContext(){ return {
+    save(){}, restore(){}, beginPath(){}, moveTo(){}, lineTo(){}, stroke(){}, fill(){}, arc(){}, rect(){}, roundRect(){},
+    clearRect(){}, fillRect(){}, strokeRect(){}, fillText(){}, setLineDash(){}, clip(){}, closePath(){},
+    measureText(t){ return { width: String(t).length * 6 }; },
+    createLinearGradient(){ return { addColorStop(){} }; },
+    drawImage(){}, setTransform(){}, scale(){}, translate(){}
+  }; },
+  getBoundingClientRect(){ return { left: 0, top: 0, width: 1400, height: 800 }; },
+  appendChild(){}, removeChild(){}, innerHTML: "", textContent: "", value: "0", checked: false,
+  width: 1400, height: 800, clientWidth: 1400, clientHeight: 800, offsetWidth: 1400, offsetHeight: 800,
+  querySelector(){ return noop(); }, querySelectorAll(){ return []; }
+});
+global.requestAnimationFrame = () => 1;
+global.cancelAnimationFrame = () => {};
+global.window = {
+  innerWidth: 1600, innerHeight: 900, devicePixelRatio: 1,
+  addEventListener(){}, removeEventListener(){},
+  requestAnimationFrame: global.requestAnimationFrame, cancelAnimationFrame: global.cancelAnimationFrame,
+  location: { search: "", href: "http://localhost:8080/", pathname: "/", protocol: "http:", host: "localhost:8080" },
+  parent: null, localStorage: { getItem(){ return null; }, setItem(){} },
+};
+global.window.parent = global.window;
+global.self = global.window;
+global.document = {
+  getElementById(){ return noop(); }, createElement(){ return noop(); },
+  querySelector(){ return noop(); }, querySelectorAll(){ return []; },
+  body: noop(), documentElement: noop(), addEventListener(){},
+};
+global.navigator = { hardwareConcurrency: 4 };
+global.ResizeObserver = class { observe(){} disconnect(){} };
+global.Image = class { set src(_v){} };
+global.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
+global.performance = { now: () => 0 };
+"""
+    js_file = tmp_path / "cg4d_nodal_probe.js"
+    js_file.write_text(
+        stub + "\n" + main_js[:idx_close] + probe + main_js[idx_close:],
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert out["frameIdx"] == 2
+    assert out["selFrameIdx"] == 2
+    assert out["onPanelCount"] >= 4
+    assert out["checkedPairs"] >= 8
+    assert out["maxErrDeg"] < 0.03
+    assert out["holzPos1"] > 0
+    assert out["holzNeg1"] > 0
+    assert out["holzPos2"] > 0
