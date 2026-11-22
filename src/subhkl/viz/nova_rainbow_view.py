@@ -228,6 +228,7 @@ class _HttpRangeReader(io.RawIOBase):
 
 _TEMP_CLEANUP_LOCK = threading.Lock()
 _REGISTERED_TEMP_PATHS: dict[str, str] = {}
+_REGISTERED_SHARED_ARTIFACTS: dict[str, dict[str, Any]] = {}
 _ATEXIT_CLEANUP_REGISTERED = False
 _SIGNAL_CLEANUP_INSTALLED = False
 
@@ -348,12 +349,81 @@ def _remove_temp_artifact_now(path: str | os.PathLike[str] | None) -> bool:
     return False
 
 
+def register_shared_intermediate(
+    path: str | os.PathLike[str] | None,
+    *,
+    network_path: str = "",
+    dataset_id: str = "",
+    history_id: str = "",
+    work_dir: str = "",
+    delete_after_use: bool = False,
+) -> str | None:
+    """Track a SUBHKL_SHARED_DIR intermediate file for lifecycle and process-exit cleanup."""
+    global _ATEXIT_CLEANUP_REGISTERED
+    if not path:
+        return None
+    from subhkl.io.shared_storage import (
+        is_safe_shared_intermediate,
+        to_shared_network_path,
+    )
+
+    real_p = os.path.abspath(os.path.realpath(os.fspath(path)))
+    if not is_safe_shared_intermediate(real_p):
+        return None
+    net_p = network_path or to_shared_network_path(real_p)
+    with _TEMP_CLEANUP_LOCK:
+        prev = _REGISTERED_SHARED_ARTIFACTS.get(real_p, {})
+        _REGISTERED_SHARED_ARTIFACTS[real_p] = {
+            "local_path": real_p,
+            "network_path": net_p,
+            "dataset_id": str(dataset_id or prev.get("dataset_id") or ""),
+            "history_id": str(history_id or prev.get("history_id") or ""),
+            "work_dir": (
+                os.path.abspath(work_dir)
+                if work_dir
+                else str(prev.get("work_dir") or "")
+            ),
+            "delete_after_use": bool(
+                delete_after_use or prev.get("delete_after_use", False)
+            ),
+        }
+        if not _ATEXIT_CLEANUP_REGISTERED:
+            atexit.register(cleanup_registered_temp_artifacts)
+            _ATEXIT_CLEANUP_REGISTERED = True
+    return real_p
+
+
+def _symlink_shared_into_work_dir(src_shared_path: str, dest_work_path: str) -> None:
+    """Create a zero-copy symlink in local NVMe work_dir pointing to a shared intermediate."""
+    abs_src = os.path.abspath(src_shared_path)
+    abs_dest = os.path.abspath(dest_work_path)
+    if abs_src == abs_dest:
+        return
+    if os.path.islink(abs_dest):
+        with contextlib.suppress(OSError):
+            if os.path.abspath(os.path.realpath(abs_dest)) == abs_src:
+                return
+    with contextlib.suppress(OSError):
+        if os.path.lexists(abs_dest) and not os.path.isdir(abs_dest):
+            os.unlink(abs_dest)
+        os.makedirs(os.path.dirname(abs_dest), mode=0o777, exist_ok=True)
+        os.symlink(abs_src, abs_dest)
+
+
 def cleanup_registered_temp_artifacts() -> list[str]:
-    """Remove all tracked TMPDIR files and directories created during this process."""
+    """Remove all tracked local TMPDIR/staging files and SUBHKL_SHARED_DIR intermediates."""
+    from subhkl.io.shared_storage import cleanup_shared_artifact
+
     with _TEMP_CLEANUP_LOCK:
         items = list(_REGISTERED_TEMP_PATHS.items())
         _REGISTERED_TEMP_PATHS.clear()
+        shared_items = list(_REGISTERED_SHARED_ARTIFACTS.values())
+        _REGISTERED_SHARED_ARTIFACTS.clear()
     removed: list[str] = []
+    for sh_meta in shared_items:
+        sh_local = str(sh_meta.get("local_path") or "")
+        if sh_local and cleanup_shared_artifact(sh_local):
+            removed.append(sh_local)
     for abs_p, tmp_root in sorted(items, key=lambda kv: len(kv[0]), reverse=True):
         if not _is_strictly_inside_root(abs_p, tmp_root):
             continue
@@ -2310,8 +2380,37 @@ class NovaGalaxyPipelineRunner:
                 f"Cannot ingest Galaxy dataset {lbl}: dataset state is '{state}' (must be 'ok')."
             )
         known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
+        ptr_map: dict[str, str] = getattr(self, "_shared_pointer_ds_by_path", {})
 
         def _remember(path: str) -> str:
+            from subhkl.io.shared_storage import (
+                read_shared_pointer,
+                resolve_input_h5_path,
+            )
+
+            ptr_doc = read_shared_pointer(path)
+            if ptr_doc is not None:
+                try:
+                    resolved_sh, _ = resolve_input_h5_path(path, must_exist=True)
+                except (FileNotFoundError, ValueError) as exc:
+                    hid = info.get("hid")
+                    lbl = f"#{hid} '{name}'" if hid else f"'{name}'"
+                    raise ValueError(
+                        f"Cannot ingest Galaxy shared pointer {lbl}: intermediate '{ptr_doc.get('network_path')}' "
+                        f"was already cleaned up from SUBHKL_SHARED_DIR ({exc})."
+                    ) from exc
+                abs_sh = os.path.abspath(resolved_sh)
+                ptr_map[abs_sh] = ds_id
+                ptr_map[os.path.realpath(resolved_sh)] = ds_id
+                self._shared_pointer_ds_by_path = ptr_map
+                register_shared_intermediate(
+                    abs_sh,
+                    network_path=str(ptr_doc.get("network_path") or ""),
+                    dataset_id=ds_id,
+                    history_id=str(self.history_id or ""),
+                    delete_after_use=bool(ptr_doc.get("delete_after_use")),
+                )
+                path = abs_sh
             known_map[os.path.abspath(path)] = ds_id
             known_map[os.path.realpath(path)] = ds_id
             self._dataset_id_by_path = known_map
@@ -2803,18 +2902,32 @@ class NovaGalaxyPipelineRunner:
         return work_d, f"{safe_tag}_merged.h5"
 
     def _resolve_work_dir_and_merged(self, merged_path: str) -> tuple[str, str]:
-        """Ensure a merged HDF5 file inside staging/TMPDIR or Pulsar inputs uses a dedicated subhkl_work_<tag> directory."""
+        """Ensure a merged HDF5 file inside staging/TMPDIR, shared storage, or Pulsar inputs uses a dedicated subhkl_work_<tag> directory."""
         import glob as _glob
         import re as _re
         import shutil as _shutil
 
-        abs_m = os.path.abspath(merged_path)
+        from subhkl.io.shared_storage import (
+            is_safe_shared_intermediate,
+            read_shared_pointer,
+            resolve_input_h5_path,
+        )
+
+        raw_m = str(merged_path)
+        if read_shared_pointer(raw_m) is not None:
+            with contextlib.suppress(FileNotFoundError, ValueError):
+                raw_m, _ = resolve_input_h5_path(raw_m, must_exist=True)
+        abs_m = os.path.abspath(raw_m)
+        real_m = os.path.abspath(os.path.realpath(abs_m))
         parent_d = os.path.dirname(abs_m)
         orig_bn = os.path.basename(abs_m)
         tmp_root = _get_staging_root()
         tmp_roots = {tmp_root, os.path.abspath(tempfile.gettempdir())}
         is_staging_dat = _is_readonly_galaxy_dat(abs_m)
-        if parent_d not in tmp_roots and not is_staging_dat:
+        is_shared_interm = is_safe_shared_intermediate(real_m) or orig_bn.startswith(
+            "subhkl_shared_"
+        )
+        if parent_d not in tmp_roots and not is_staging_dat and not is_shared_interm:
             return parent_d, abs_m
 
         m_gx = _re.match(r"^subhkl_gx_([0-9a-fA-F]+)_(.+)$", orig_bn)
@@ -2822,6 +2935,9 @@ class NovaGalaxyPipelineRunner:
             register_temp_artifact(abs_m)
         gx_ds_id = m_gx.group(1) if m_gx else None
         clean_bn = m_gx.group(2) if m_gx else orig_bn
+        m_sh = _re.match(r"^subhkl_shared_[0-9a-fA-F]{8,}_(.+)$", clean_bn)
+        if m_sh:
+            clean_bn = m_sh.group(1)
 
         tag = ""
         is_images_h5 = False
@@ -2907,23 +3023,29 @@ class NovaGalaxyPipelineRunner:
             return False
 
         if os.path.isfile(abs_m) and is_images_h5:
-            src_sz = os.path.getsize(abs_m)
-            if (
-                not os.path.isfile(dest_m)
-                or os.path.getsize(dest_m) != src_sz
-                or not _has_h5_images(dest_m)
-            ):
-                try:
-                    self._link_or_copy_file(abs_m, dest_m)
-                except OSError:
-                    return work_d, abs_m
-            if dest_m != legacy_m and (
-                not os.path.isfile(legacy_m)
-                or os.path.getsize(legacy_m) != src_sz
-                or not _has_h5_images(legacy_m)
-            ):
-                with contextlib.suppress(OSError):
-                    self._link_or_copy_file(abs_m, legacy_m)
+            if is_shared_interm:
+                _symlink_shared_into_work_dir(real_m, dest_m)
+                if dest_m != legacy_m:
+                    _symlink_shared_into_work_dir(real_m, legacy_m)
+                register_shared_intermediate(real_m, work_dir=work_d)
+            else:
+                src_sz = os.path.getsize(abs_m)
+                if (
+                    not os.path.isfile(dest_m)
+                    or os.path.getsize(dest_m) != src_sz
+                    or not _has_h5_images(dest_m)
+                ):
+                    try:
+                        self._link_or_copy_file(abs_m, dest_m)
+                    except OSError:
+                        return work_d, abs_m
+                if dest_m != legacy_m and (
+                    not os.path.isfile(legacy_m)
+                    or os.path.getsize(legacy_m) != src_sz
+                    or not _has_h5_images(legacy_m)
+                ):
+                    with contextlib.suppress(OSError):
+                        self._link_or_copy_file(abs_m, legacy_m)
             final_m = dest_m if os.path.isfile(dest_m) else abs_m
             mapped_id = (
                 known_map.get(abs_m)
@@ -2982,9 +3104,11 @@ class NovaGalaxyPipelineRunner:
         # Self-heal dest_m / legacy_m if missing or previously overwritten by a non-image HDF5
         if not _has_h5_images(dest_m):
             for bad_p in (dest_m, legacy_m):
-                if os.path.isfile(bad_p) and not _has_h5_images(bad_p):
+                if (os.path.islink(bad_p) and not os.path.exists(bad_p)) or (
+                    os.path.isfile(bad_p) and not _has_h5_images(bad_p)
+                ):
                     with contextlib.suppress(OSError):
-                        os.remove(bad_p)
+                        os.unlink(bad_p)
                 known_map.pop(os.path.abspath(bad_p), None)
                 known_map.pop(os.path.realpath(bad_p), None)
             for gx_f in sorted(
@@ -3073,6 +3197,9 @@ class NovaGalaxyPipelineRunner:
         target_names = {
             f"{safe_tag}_merged.h5".lower(),
             f"{tag}_merged.h5".lower(),
+            f"{safe_tag}_scan.ref.json".lower(),
+            f"{tag}_scan.ref.json".lower(),
+            f"{safe_tag}_merged.ref.json".lower(),
         }
         with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
             import h5py
@@ -3083,7 +3210,10 @@ class NovaGalaxyPipelineRunner:
                     continue
                 dname = str(ds.get("name") or "").strip().lower()
                 if dname in target_names or (
-                    safe_tag.lower() in dname and dname.endswith("_merged.h5")
+                    safe_tag.lower() in dname
+                    and dname.endswith(
+                        ("_merged.h5", "_scan.ref.json", "_merged.ref.json")
+                    )
                 ):
                     ds_id = str(ds.get("id") or "").strip()
                     if ds_id:
@@ -3276,6 +3406,130 @@ class NovaGalaxyPipelineRunner:
             return explicit
         return "poly"
 
+    @staticmethod
+    def is_explicit_galaxy_exec_mode() -> bool:
+        """Return True when SUBHKL_EXEC_MODE explicitly selects Galaxy runner orchestration."""
+        raw_mode = str(os.environ.get("SUBHKL_EXEC_MODE") or "").strip().lower()
+        return raw_mode in ("galaxy", "remote", "0", "false", "no")
+
+    def is_galaxy_exec_mode(self) -> bool:
+        """Return True when pipeline subtasks execute via Galaxy runners rather than local GPU."""
+        if self.is_explicit_galaxy_exec_mode():
+            return True
+        return bool(self.is_connected and not self._is_local_staging_mode())
+
+    def require_shared_dir_for_galaxy_mode(self) -> str:
+        """Validate and resolve mandatory SUBHKL_SHARED_DIR when executing in Galaxy mode."""
+        from subhkl.io.shared_storage import get_shared_dir_local
+
+        local_shared = get_shared_dir_local(require=True, create=True)
+        assert local_shared is not None
+        return local_shared
+
+    def _purge_galaxy_dataset_id(self, ds_id: str | None) -> None:
+        """Best-effort delete/purge of a transient shared-pointer HDA in Galaxy History."""
+        clean_id = str(ds_id or "").strip()
+        if not clean_id or not self.is_connected:
+            return
+        hist_map: dict[str, str] = getattr(self, "_dataset_history_by_id", {})
+        hid = str(hist_map.get(clean_id) or self.history_id or "").strip()
+        if not hid:
+            return
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            self._api_request(
+                "PUT",
+                f"/api/histories/{hid}/contents/{clean_id}",
+                payload={"deleted": True, "purged": True},
+            )
+        self._cached_history_datasets = None
+
+    def release_shared_scan_intermediates(
+        self,
+        *,
+        keep_work_dir: str | None = None,
+        keep_paths: set[str] | None = None,
+        job_record: dict[str, Any] | None = None,
+    ) -> list[str]:
+        """Delete superseded shared intermediates in SUBHKL_SHARED_DIR and purge their pointer HDAs."""
+        from subhkl.io.shared_storage import cleanup_shared_artifact
+
+        keep_wd_abs = os.path.abspath(keep_work_dir) if keep_work_dir else None
+        keep_abs_set = {
+            os.path.abspath(os.path.realpath(p)) for p in (keep_paths or set()) if p
+        }
+        with _TEMP_CLEANUP_LOCK:
+            candidates = list(_REGISTERED_SHARED_ARTIFACTS.items())
+
+        removed_paths: list[str] = []
+        known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
+        ptr_map: dict[str, str] = getattr(self, "_shared_pointer_ds_by_path", {})
+
+        for abs_p, meta in candidates:
+            if abs_p in keep_abs_set:
+                continue
+            item_wd = str(meta.get("work_dir") or "")
+            if (
+                keep_wd_abs
+                and item_wd
+                and os.path.abspath(item_wd) == keep_wd_abs
+                and not keep_abs_set
+            ):
+                continue
+            with _TEMP_CLEANUP_LOCK:
+                _REGISTERED_SHARED_ARTIFACTS.pop(abs_p, None)
+            deleted = cleanup_shared_artifact(abs_p)
+            if deleted:
+                removed_paths.append(abs_p)
+                if isinstance(job_record, dict):
+                    job_record["stdout"] = job_record.get("stdout", "") + (
+                        f"[subhkl] Cleaned up superseded shared intermediate '{os.path.basename(abs_p)}'\n"
+                    )
+            ds_id = str(meta.get("dataset_id") or ptr_map.pop(abs_p, "") or "")
+            ptr_map.pop(abs_p, None)
+            known_map.pop(abs_p, None)
+            if ds_id:
+                for k_alias, v_id in list(known_map.items()):
+                    if v_id == ds_id:
+                        known_map.pop(k_alias, None)
+                self._purge_galaxy_dataset_id(ds_id)
+        self._dataset_id_by_path = known_map
+        self._shared_pointer_ds_by_path = ptr_map
+        return removed_paths
+
+    def cleanup_ephemeral_predictor_intermediate(
+        self,
+        pred_ds_id: str | None,
+        *,
+        work_dir: str | None = None,
+        job_record: dict[str, Any] | None = None,
+    ) -> None:
+        """Delete ephemeral peak_predictor.h5 from SUBHKL_SHARED_DIR and purge its pointer HDA after Integrate."""
+        from subhkl.io.shared_storage import cleanup_shared_artifact
+
+        clean_ds = str(pred_ds_id or "").strip()
+        with _TEMP_CLEANUP_LOCK:
+            matched_keys = [
+                k
+                for k, meta in _REGISTERED_SHARED_ARTIFACTS.items()
+                if bool(meta.get("delete_after_use"))
+                or (clean_ds and str(meta.get("dataset_id") or "") == clean_ds)
+                or k.endswith("_peak_predictor.h5")
+            ]
+            for mk in matched_keys:
+                _REGISTERED_SHARED_ARTIFACTS.pop(mk, None)
+        for mk in matched_keys:
+            if cleanup_shared_artifact(mk) and isinstance(job_record, dict):
+                job_record["stdout"] = job_record.get("stdout", "") + (
+                    f"[subhkl] Deleted ephemeral shared predictor '{os.path.basename(mk)}'\n"
+                )
+        if work_dir and os.path.isdir(work_dir):
+            pred_link = os.path.join(work_dir, "predictor.h5")
+            if os.path.islink(pred_link) and not os.path.exists(pred_link):
+                with contextlib.suppress(OSError):
+                    os.unlink(pred_link)
+        if clean_ds:
+            self._purge_galaxy_dataset_id(clean_ds)
+
     def _is_local_staging_mode(self) -> bool:
         """Return True when heavy subhkl stages should run inside local NVMe staging.
 
@@ -3389,6 +3643,9 @@ class NovaGalaxyPipelineRunner:
                 fallback_reason=local_reason,
             )
 
+        if not self._is_local_staging_mode():
+            self.require_shared_dir_for_galaxy_mode()
+
         job_record: dict[str, Any] = {
             "job_id": f"nova-{int(time.time())}",
             "tool_id": self.STAGE_TOOLS[stage_id][0],
@@ -3404,7 +3661,11 @@ class NovaGalaxyPipelineRunner:
             "outputs": [],
             "updated_payload_ready": False,
             "started_at": time.time(),
+            "hydrate_only": bool(params.get("hydrate_only")),
         }
+        if params.get("hydrate_only"):
+            job_record["work_dir"] = str(params.get("work_dir") or "")
+            job_record["n_runs"] = len(params.get("nexus_files") or ())
         if stage_id == "solve":
             wl_r = params.get("wavelength_range")
             raw_bin = params.get("binning")
@@ -4088,15 +4349,28 @@ class NovaGalaxyPipelineRunner:
         with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
             hydrate_params = dict(recipe)
             hydrate_params["hydrate_only"] = True
-            job_rec = self._submit_local_subhkl_stage(
-                "reduce",
-                hydrate_params,
-                on_complete_h5=_on_hydrated,
-                fallback_reason=(
-                    f"hydrating detector image frames on the fly from {len(recipe['nexus_files'])} raw NeXus run(s)"
-                ),
-                preserve_downstream=True,
-            )
+            hydrate_params["work_dir"] = work_d
+            if self.is_galaxy_exec_mode():
+                sub_res = self.submit_galaxy_stage(
+                    "reduce",
+                    hydrate_params,
+                    on_complete_h5=_on_hydrated,
+                )
+                job_rec = (
+                    sub_res.get("job")
+                    if isinstance(sub_res.get("job"), dict)
+                    else sub_res
+                )
+            else:
+                job_rec = self._submit_local_subhkl_stage(
+                    "reduce",
+                    hydrate_params,
+                    on_complete_h5=_on_hydrated,
+                    fallback_reason=(
+                        f"hydrating detector image frames on the fly from {len(recipe['nexus_files'])} raw NeXus run(s)"
+                    ),
+                    preserve_downstream=True,
+                )
             return {
                 "job_id": job_rec.get("job_id"),
                 "state": job_rec.get("state", "running"),
@@ -4798,6 +5072,120 @@ class NovaGalaxyPipelineRunner:
         )
         return ds_id
 
+    def _ensure_galaxy_shared_scan_pointer(
+        self,
+        store: Any,
+        merged_path: str,
+        job_record: dict[str, Any],
+        *,
+        work_dir: str = "",
+        instrument: str = "",
+    ) -> str:
+        """Ensure ``merged_path`` resides in mandatory ``SUBHKL_SHARED_DIR`` and return a tiny JSON pointer HDA id."""
+        from subhkl.io.shared_storage import (
+            allocate_shared_artifact_path,
+            is_safe_shared_intermediate,
+            to_shared_network_path,
+            write_shared_pointer,
+        )
+
+        self.require_shared_dir_for_galaxy_mode()
+        gi = store.nova_connection.galaxy_instance
+        real_m = os.path.abspath(os.path.realpath(merged_path))
+        if not os.path.isfile(real_m):
+            raise FileNotFoundError(f"Merged scan HDF5 not found: {merged_path}")
+
+        parent_bn = os.path.basename(
+            os.path.abspath(work_dir or os.path.dirname(merged_path))
+        )
+        tag_part = (
+            parent_bn[len("subhkl_work_") :]
+            if parent_bn.startswith("subhkl_work_")
+            and len(parent_bn) > len("subhkl_work_")
+            else ""
+        )
+
+        if is_safe_shared_intermediate(real_m):
+            shared_local = real_m
+        else:
+            shared_local, _ = allocate_shared_artifact_path(
+                "merged.h5",
+                tag=tag_part or instrument,
+            )
+            shutil.copy2(real_m, shared_local)
+            _chmod_world_rw(shared_local, is_dir=False)
+            if work_dir and os.path.isdir(work_dir):
+                _symlink_shared_into_work_dir(
+                    shared_local, os.path.join(work_dir, "merged.h5")
+                )
+
+        net_path = to_shared_network_path(shared_local)
+        ptr_map: dict[str, str] = getattr(self, "_shared_pointer_ds_by_path", {})
+        known_ptr_id = ptr_map.get(os.path.abspath(shared_local))
+        if known_ptr_id:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                info = gi.datasets.show_dataset(known_ptr_id)
+                if (
+                    isinstance(info, dict)
+                    and info.get("state") == "ok"
+                    and not info.get("deleted")
+                ):
+                    register_shared_intermediate(
+                        shared_local,
+                        network_path=net_path,
+                        dataset_id=known_ptr_id,
+                        history_id=str(store.history_id or ""),
+                        work_dir=work_dir,
+                    )
+                    self.touch_dataset(known_ptr_id)
+                    job_record["stdout"] += (
+                        f"[nova -> galaxy] Linked shared scan pointer (id={known_ptr_id}) -> {net_path}\n"
+                    )
+                    return str(known_ptr_id)
+
+        ptr_label = f"{tag_part}_scan.ref.json" if tag_part else "scan.ref.json"
+        ptr_tmp = os.path.join(
+            _get_staging_root(),
+            f"subhkl_ptr_{os.path.basename(shared_local)}.ref.json",
+        )
+        register_temp_artifact(ptr_tmp)
+        write_shared_pointer(
+            ptr_tmp,
+            shared_local,
+            artifact="merged.h5",
+            delete_after_use=False,
+            metadata={"instrument": instrument or None, "tag": tag_part or None},
+        )
+        is_local_gx = any(
+            h in (getattr(gi, "base_url", "") or self.galaxy_url or "")
+            for h in ("127.0.0.1", "localhost")
+        )
+        up_info = gi.tools.upload_file(
+            path=ptr_tmp,
+            history_id=store.history_id,
+            file_name=ptr_label,
+            file_type="json",
+            to_posix_lines=False,
+            link_to_files=is_local_gx,
+        )
+        ds_id = str(up_info["outputs"][0]["id"])
+        with contextlib.suppress(Exception):
+            gi.datasets.wait_for_dataset(ds_id, maxwait=60, interval=1.5, check=False)
+        ptr_map[os.path.abspath(shared_local)] = ds_id
+        self._shared_pointer_ds_by_path = ptr_map
+        self._dataset_history_by_id[ds_id] = str(store.history_id)
+        register_shared_intermediate(
+            shared_local,
+            network_path=net_path,
+            dataset_id=ds_id,
+            history_id=str(store.history_id or ""),
+            work_dir=work_dir,
+        )
+        job_record["stdout"] += (
+            f"[nova -> galaxy] Uploaded shared scan pointer '{ptr_label}' (id={ds_id}) -> {net_path}\n"
+        )
+        return ds_id
+
     def _dispatch_nova_galaxy_thread(
         self,
         stage_id: str,
@@ -4807,6 +5195,8 @@ class NovaGalaxyPipelineRunner:
     ) -> None:
         """Background worker that links/uploads datasets, dispatches to Pulsar on IMAGINEX-1, and streams console_output."""
         try:
+            if not self._is_local_staging_mode():
+                self.require_shared_dir_for_galaxy_mode()
             store = self.get_datastore("IMAGINE-X SubHKL")
             self.history_id = store.history_id
             gi = store.nova_connection.galaxy_instance
@@ -4878,7 +5268,8 @@ class NovaGalaxyPipelineRunner:
                 merged_path = ""
             else:
                 work_dir, merged_path = (_get_staging_root(), "")
-            self.invalidate_subsequent_stages(stage_id, work_dir)
+            if not params.get("hydrate_only"):
+                self.invalidate_subsequent_stages(stage_id, work_dir)
             solve_path = params.get("peaks_file") or os.path.join(work_dir, "solve.h5")
             solve_bn = os.path.basename(solve_path).lower()
             cand_solve = os.path.join(work_dir, "solve.h5")
@@ -4969,7 +5360,13 @@ class NovaGalaxyPipelineRunner:
                     "binning": solve_binning,
                 }
                 primary_tool = "imaginex_subhkl_solve"
-                scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
+                scan_id = self._ensure_galaxy_shared_scan_pointer(
+                    store,
+                    merged_path,
+                    job_record,
+                    work_dir=work_dir,
+                    instrument=inst,
+                )
                 tool_inputs = {
                     "scan": {"src": "hda", "id": scan_id},
                     "instrument": inst,
@@ -4992,7 +5389,13 @@ class NovaGalaxyPipelineRunner:
                         tool_inputs["poissonBinning"] = solve_binning
             elif stage_id == "integrate":
                 primary_tool = "imaginex_subhkl_predict"
-                scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
+                scan_id = self._ensure_galaxy_shared_scan_pointer(
+                    store,
+                    merged_path,
+                    job_record,
+                    work_dir=work_dir,
+                    instrument=inst,
+                )
                 idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
                 d_min_req = float(params.get("d_min") or round(0.5 * float(wl[0]), 2))
                 tool_inputs = {
@@ -5575,49 +5978,58 @@ class NovaGalaxyPipelineRunner:
                 and job_record.get("outputs")
             ):
                 pred_ds_id = job_record["outputs"][0]["id"]
-                gi.datasets.wait_for_dataset(
-                    pred_ds_id, maxwait=60, interval=1.5, check=True
-                )
-                int_tool = "imaginex_subhkl_integrate"
-                int_inputs = {
-                    "scan": {"src": "hda", "id": scan_id},
-                    "predicted": {"src": "hda", "id": pred_ds_id},
-                    "instrument": inst,
-                    "anisotropic": True,
-                    "mosaicFit": True,
-                    "normalized": True,
-                    "snr": 5.0,
-                    "matrix": True,
-                    "matrixProfile": "gaussian",
-                    "createVisualizations": False,
-                }
-                job_record["tool_id"] = int_tool
-                int_results = gi.tools.run_tool(
-                    history_id=store.history_id,
-                    tool_id=int_tool,
-                    tool_inputs=int_inputs,
-                )
-                int_job_id = int_results["jobs"][0]["id"]
-                job_record["job_id"] = int_job_id
-                job_record.setdefault("galaxy_job_ids", []).append(int_job_id)
-                job_record["outputs"] = [
-                    {
-                        "id": d.get("id"),
-                        "name": d.get("output_name") or d.get("name"),
-                        "extension": d.get("file_ext") or d.get("extension") or "h5",
+                try:
+                    gi.datasets.wait_for_dataset(
+                        pred_ds_id, maxwait=60, interval=1.5, check=True
+                    )
+                    int_tool = "imaginex_subhkl_integrate"
+                    int_inputs = {
+                        "scan": {"src": "hda", "id": scan_id},
+                        "predicted": {"src": "hda", "id": pred_ds_id},
+                        "instrument": inst,
+                        "anisotropic": True,
+                        "mosaicFit": True,
+                        "normalized": True,
+                        "snr": 5.0,
+                        "matrix": True,
+                        "matrixProfile": "gaussian",
+                        "createVisualizations": False,
                     }
-                    for d in (int_results.get("outputs") or [])
-                    if isinstance(d, dict)
-                ]
-                job_record["stdout"] += (
-                    f"\n[galaxy -> pulsar] Dispatched Step 2/2 {int_tool} (Galaxy job_id={int_job_id}) -> Pulsar GPU queue\n"
-                )
-                self._poll_galaxy_job(
-                    job_record,
-                    on_complete_h5,
-                    final_step=True,
-                    work_dir=work_dir,
-                )
+                    job_record["tool_id"] = int_tool
+                    int_results = gi.tools.run_tool(
+                        history_id=store.history_id,
+                        tool_id=int_tool,
+                        tool_inputs=int_inputs,
+                    )
+                    int_job_id = int_results["jobs"][0]["id"]
+                    job_record["job_id"] = int_job_id
+                    job_record.setdefault("galaxy_job_ids", []).append(int_job_id)
+                    job_record["outputs"] = [
+                        {
+                            "id": d.get("id"),
+                            "name": d.get("output_name") or d.get("name"),
+                            "extension": d.get("file_ext")
+                            or d.get("extension")
+                            or "h5",
+                        }
+                        for d in (int_results.get("outputs") or [])
+                        if isinstance(d, dict)
+                    ]
+                    job_record["stdout"] += (
+                        f"\n[galaxy -> pulsar] Dispatched Step 2/2 {int_tool} (Galaxy job_id={int_job_id}) -> Pulsar GPU queue\n"
+                    )
+                    self._poll_galaxy_job(
+                        job_record,
+                        on_complete_h5,
+                        final_step=True,
+                        work_dir=work_dir,
+                    )
+                finally:
+                    self.cleanup_ephemeral_predictor_intermediate(
+                        pred_ds_id,
+                        work_dir=work_dir,
+                        job_record=job_record,
+                    )
         except FileNotFoundError as fnf_exc:
             clean_msg = self._clean_err_msg(fnf_exc)
             job_record["state"] = "error"
@@ -5635,7 +6047,11 @@ class NovaGalaxyPipelineRunner:
                 and not any(h in self.galaxy_url for h in ("127.0.0.1", "localhost"))
             )
             has_container_rt = bool(_shutil.which("podman") or _shutil.which("docker"))
-            if is_remote_galaxy and not has_container_rt:
+            if (
+                self.is_explicit_galaxy_exec_mode()
+                or "SUBHKL_SHARED_DIR" in clean_msg
+                or (is_remote_galaxy and not has_container_rt)
+            ):
                 job_record["state"] = "error"
                 job_record["stderr"] = f"{clean_msg}\n"
                 job_record["stdout"] += f"\n[nova -> galaxy] Error: {clean_msg}\n"
@@ -8467,11 +8883,21 @@ class NovaGalaxyPipelineRunner:
                                 o
                                 for o in job_record.get("outputs", [])
                                 if o.get("extension")
-                                in ("h5", "hdf5", "data", "auto", "binary", None)
+                                in (
+                                    "h5",
+                                    "hdf5",
+                                    "json",
+                                    "data",
+                                    "auto",
+                                    "binary",
+                                    None,
+                                )
                                 and not str(o.get("name", ""))
                                 .lower()
-                                .endswith((".mtz", ".png", ".pdf", ".log"))
+                                .endswith((".mtz", ".png", ".pdf", ".log", ".html"))
                                 and "mtz" not in str(o.get("name", "")).lower()
+                                and "careless_metrics"
+                                not in str(o.get("name", "")).lower()
                             ]
                             mtz_outs = [
                                 o
@@ -8498,6 +8924,23 @@ class NovaGalaxyPipelineRunner:
                                 merged_label = str(
                                     job_record.get("merged_label") or default_lbl
                                 )
+                                out0_ext = str(
+                                    h5_outs[0].get("extension") or ""
+                                ).lower()
+                                out0_name = str(h5_outs[0].get("name") or "").lower()
+                                is_json_ptr_out = (
+                                    out0_ext == "json" or out0_name.endswith(".json")
+                                )
+                                hist_rename_lbl = (
+                                    re.sub(
+                                        r"(_merged)?\.(h5|hdf5)$",
+                                        "_scan.ref.json",
+                                        merged_label,
+                                        flags=re.IGNORECASE,
+                                    )
+                                    if (is_json_ptr_out and st_id == "reduce")
+                                    else merged_label
+                                )
                                 if (
                                     job_record.get("stage_id") == "reduce"
                                     and final_step
@@ -8507,11 +8950,11 @@ class NovaGalaxyPipelineRunner:
                                         self._api_request(
                                             "PUT",
                                             f"/api/histories/{self.history_id}/contents/{ds_id}",
-                                            payload={"name": merged_label},
+                                            payload={"name": hist_rename_lbl},
                                         )
-                                        h5_outs[0]["name"] = merged_label
+                                        h5_outs[0]["name"] = hist_rename_lbl
                                         job_record["stdout"] += (
-                                            f"[galaxy -> history] Created dataset '{merged_label}' (id={ds_id}) in Galaxy history\n"
+                                            f"[galaxy -> history] Created dataset '{hist_rename_lbl}' (id={ds_id}) in Galaxy history\n"
                                         )
                                 target_path = None
                                 if (
@@ -8601,27 +9044,84 @@ class NovaGalaxyPipelineRunner:
                                         with contextlib.suppress(OSError):
                                             os.remove(resume_part)
                                 if n_synced > 0 and os.path.isfile(dl_dest):
-                                    tmp_path = dl_dest
-                                    if target_path:
-                                        mb_s = n_synced / (1024.0 * 1024.0)
-                                        slim_remote_b = int(
-                                            job_record.pop("_last_slim_remote_bytes", 0)
-                                            or 0
+                                    from subhkl.io.shared_storage import (
+                                        read_shared_pointer,
+                                        resolve_input_h5_path,
+                                    )
+
+                                    ptr_doc = read_shared_pointer(dl_dest)
+                                    if ptr_doc is not None:
+                                        resolved_shared_p, _ = resolve_input_h5_path(
+                                            dl_dest, must_exist=True
                                         )
-                                        if slim_remote_b > n_synced:
-                                            sz_tag = (
-                                                f", {mb_s:.1f} MB 2D stack synced; "
-                                                f"{slim_remote_b / (1024.0**3):.2f} GB with TOF events in Galaxy"
+                                        abs_sh_p = os.path.abspath(resolved_shared_p)
+                                        ptr_cache_p = f"{cache_gx_path}.ref.json"
+                                        register_temp_artifact(ptr_cache_p)
+                                        with contextlib.suppress(OSError):
+                                            shutil.move(dl_dest, ptr_cache_p)
+                                        if target_path:
+                                            _symlink_shared_into_work_dir(
+                                                abs_sh_p, target_path
                                             )
+                                            tmp_path = target_path
                                         else:
-                                            sz_tag = (
-                                                f", {mb_s:.1f} MB"
-                                                if mb_s >= 1.0
-                                                else ""
+                                            tmp_path = abs_sh_p
+                                        ptr_map = getattr(
+                                            self, "_shared_pointer_ds_by_path", {}
+                                        )
+                                        ptr_map[abs_sh_p] = ds_id
+                                        self._shared_pointer_ds_by_path = ptr_map
+                                        self._dataset_history_by_id[str(ds_id)] = str(
+                                            self.history_id or ""
+                                        )
+                                        register_shared_intermediate(
+                                            abs_sh_p,
+                                            network_path=str(
+                                                ptr_doc.get("network_path") or ""
+                                            ),
+                                            dataset_id=str(ds_id),
+                                            history_id=str(self.history_id or ""),
+                                            work_dir=str(work_dir or ""),
+                                            delete_after_use=bool(
+                                                ptr_doc.get("delete_after_use")
+                                            ),
+                                        )
+                                        if (
+                                            job_record.get("stage_id") == "reduce"
+                                            and final_step
+                                        ):
+                                            self.release_shared_scan_intermediates(
+                                                keep_work_dir=work_dir,
+                                                keep_paths={abs_sh_p},
+                                                job_record=job_record,
                                             )
                                         job_record["stdout"] += (
-                                            f"[nova <- galaxy] Synced '{merged_label}' (id={ds_id}{sz_tag}) -> {target_path}\n"
+                                            f"[nova <- shared] Resolved '{ptr_doc.get('network_path')}' -> {abs_sh_p}\n"
                                         )
+                                    else:
+                                        tmp_path = dl_dest
+                                        if target_path:
+                                            mb_s = n_synced / (1024.0 * 1024.0)
+                                            slim_remote_b = int(
+                                                job_record.pop(
+                                                    "_last_slim_remote_bytes", 0
+                                                )
+                                                or 0
+                                            )
+                                            if slim_remote_b > n_synced:
+                                                sz_tag = (
+                                                    f", {mb_s:.1f} MB 2D stack synced; "
+                                                    f"{slim_remote_b / (1024.0**3):.2f} GB with TOF events in Galaxy"
+                                                )
+                                            else:
+                                                sz_tag = (
+                                                    f", {mb_s:.1f} MB"
+                                                    if mb_s >= 1.0
+                                                    else ""
+                                                )
+                                            job_record["stdout"] += (
+                                                f"[nova <- galaxy] Synced '{merged_label}' (id={ds_id}{sz_tag}) -> {target_path}\n"
+                                            )
                                 else:
                                     if final_step and target_path:
                                         known_map = getattr(
@@ -8756,6 +9256,7 @@ class NovaGalaxyPipelineRunner:
                                 if (
                                     tmp_path
                                     and os.path.isfile(tmp_path)
+                                    and not os.path.islink(tmp_path)
                                     and target_path
                                     and not job_record.get("reduce_part_path")
                                 ):
@@ -8784,7 +9285,14 @@ class NovaGalaxyPipelineRunner:
                                         with contextlib.suppress(
                                             *_NOVA_RECOVERABLE_ERRORS
                                         ):
-                                            self._link_or_copy_file(tmp_path, lbl_path)
+                                            if os.path.islink(tmp_path):
+                                                _symlink_shared_into_work_dir(
+                                                    os.path.realpath(tmp_path), lbl_path
+                                                )
+                                            else:
+                                                self._link_or_copy_file(
+                                                    tmp_path, lbl_path
+                                                )
                                     self._dataset_id_by_path = known_map
                                     job_record["output_h5_path"] = tmp_path
                                     if callable(on_complete_h5):
@@ -9051,17 +9559,28 @@ class RainbowZonesViewModel:
         default_mode: str = "arcade",
         **payload_kwargs: Any,
     ) -> None:
-        self.replay_h5 = str(replay_h5) if replay_h5 is not None else None
+        from subhkl.io.shared_storage import resolve_input_h5_path
+
+        resolved_replay = (
+            resolve_input_h5_path(replay_h5, must_exist=False)[0]
+            if replay_h5 is not None
+            else None
+        )
+        self.replay_h5 = str(resolved_replay) if resolved_replay is not None else None
         self.default_mode = default_mode
         self.payload_kwargs = dict(payload_kwargs)
+        if self.payload_kwargs.get("images_h5"):
+            self.payload_kwargs["images_h5"] = resolve_input_h5_path(
+                self.payload_kwargs["images_h5"], must_exist=False
+            )[0]
         self.pipeline_runner = NovaGalaxyPipelineRunner()
         self.mtz_overlay_path: str | None = None
         self.mtz_overlay_info: dict[str, Any] | None = None
         if payload is not None:
             self.payload = payload
-        elif replay_h5 is not None:
+        elif self.replay_h5 is not None:
             self.payload = build_rainbow_zone_payload(
-                replay_h5=replay_h5, **self.payload_kwargs
+                replay_h5=self.replay_h5, **self.payload_kwargs
             )
         else:
             self.payload = build_rainbow_zone_payload(**self.payload_kwargs)
@@ -9191,6 +9710,8 @@ def serve_rainbow_zones(
         default_mode=default_mode,
         **payload_kwargs,
     )
+    if vm.pipeline_runner.is_explicit_galaxy_exec_mode():
+        vm.pipeline_runner.require_shared_dir_for_galaxy_mode()
 
     if prefer_trame:
         try:
@@ -9437,6 +9958,12 @@ def serve_rainbow_zones(
                             (vm._payload or {}).get("artifact_kind"),
                             work_d_ds,
                         )
+                        vm.pipeline_runner.release_shared_scan_intermediates(
+                            keep_work_dir=work_d_ds,
+                            keep_paths={os.path.realpath(local_h5)}
+                            if os.path.isfile(local_h5)
+                            else set(),
+                        )
                     else:
                         work_d_ds, staged_ds_h5 = (
                             vm.pipeline_runner.stage_derived_h5_in_work_dir(
@@ -9470,6 +9997,12 @@ def serve_rainbow_zones(
                         vm.pipeline_runner.invalidate_subsequent_stages(
                             (vm._payload or {}).get("artifact_kind"),
                             work_d_ds,
+                        )
+                        vm.pipeline_runner.release_shared_scan_intermediates(
+                            keep_work_dir=work_d_ds,
+                            keep_paths={os.path.realpath(str(disc_img))}
+                            if disc_img and os.path.isfile(str(disc_img))
+                            else set(),
                         )
                         if (vm._payload or {}).get("intensity_source") != "raw_h5":
                             hyd_job = vm.pipeline_runner._maybe_trigger_hydrate_reduce(

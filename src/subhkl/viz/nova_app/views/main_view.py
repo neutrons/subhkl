@@ -44,13 +44,25 @@ class MainApp:
     ) -> None:
         import threading
 
+        from subhkl.io.shared_storage import resolve_input_h5_path
+
         self.server = server or get_server(None, client_type="vue3")
         self.state = self.server.state
-        self._peaks_h5 = peaks_h5
-        self._images_h5 = images_h5
+        self._peaks_h5 = (
+            resolve_input_h5_path(peaks_h5, must_exist=False)[0]
+            if peaks_h5 is not None
+            else None
+        )
+        self._images_h5 = (
+            resolve_input_h5_path(images_h5, must_exist=False)[0]
+            if images_h5 is not None
+            else None
+        )
         self._instrument = instrument
         self._payload_lock = threading.RLock()
         self.pipeline_runner = NovaGalaxyPipelineRunner()
+        if self.pipeline_runner.is_explicit_galaxy_exec_mode():
+            self.pipeline_runner.require_shared_dir_for_galaxy_mode()
 
         self.create_vm()
         sub_init = self.view_model.model.subhkl
@@ -565,6 +577,15 @@ class MainApp:
                                 "artifact_kind"
                             ),
                             work_d_ds,
+                        )
+                        active_img = str(
+                            self.view_model.model.subhkl.data.images_file or ""
+                        )
+                        self.pipeline_runner.release_shared_scan_intermediates(
+                            keep_work_dir=work_d_ds,
+                            keep_paths={os.path.realpath(active_img)}
+                            if active_img and os.path.isfile(active_img)
+                            else set(),
                         )
                         if (
                             not is_reduce_ds

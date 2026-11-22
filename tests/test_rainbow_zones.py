@@ -7302,7 +7302,7 @@ def test_solve_binning_param_drawer_and_cli_forwarding(tmp_path):
 
 
 def test_careless_mono_mode_auto_selected_for_tof_without_ui_selector(
-    tmp_path,
+    tmp_path, monkeypatch
 ) -> None:
     """Verify UI has no mono/poly selector and automatically selects careless mono (without --wavelength-key, keeping WAVEL in metadata) whenever TOF data is available."""
     import json
@@ -7517,6 +7517,7 @@ console.log(JSON.stringify({{ pPoly, pMono }}));
     assert "'mode': 'mono'" in post_mono_src
 
     # 6. Verify Galaxy imaginex_subhkl_merge tool_inputs passes mode="mono" for TOF and mode="poly" for non-TOF
+    monkeypatch.setenv("SUBHKL_SHARED_DIR", str(tmp_path / "shared_dir"))
     gx_runner = NovaGalaxyPipelineRunner(
         galaxy_url="http://localhost:8080", galaxy_api_key="fake-key"
     )

@@ -13,8 +13,16 @@
     <environment_variable name="GALAXY_API_KEY" inject="api_key"/>
     <environment_variable name="HISTORY_ID">$__history_id__</environment_variable>
     <environment_variable name="EP_PATH" inject="entry_point_path_for_label">app_entry</environment_variable>
+    <environment_variable name="SUBHKL_EXEC_MODE">galaxy</environment_variable>
+    <environment_variable name="SUBHKL_SHARED_DIR">/gpfs/neutronsfs/scratch/subhkl_shared</environment_variable>
+    <environment_variable name="JAX_PLATFORMS">cpu</environment_variable>
   </environment_variables>
   <command detect_errors="exit_code"><![CDATA[
+    mkdir -p "\$PWD/subhkl_staging" &&
+    chmod 0777 "\$PWD/subhkl_staging" &&
+    export TMPDIR="\$PWD/subhkl_staging" SUBHKL_STAGING_DIR="\$PWD/subhkl_staging" &&
+    export SUBHKL_EXEC_MODE="\${SUBHKL_EXEC_MODE:-galaxy}" &&
+    export SUBHKL_SHARED_DIR="\${SUBHKL_SHARED_DIR:-/gpfs/neutronsfs/scratch/subhkl_shared}" &&
     mv "$peaks_h5" "$peaks_h5.element_identifier" ;
     python -m subhkl.io.parser rainbow-visualize "$peaks_h5.element_identifier"
       --serve
@@ -25,7 +33,7 @@
       > >(tee -a $output_status) 2> >(tee -a $output_status >&2)
   ]]></command>
   <inputs>
-    <param format="h5" name="peaks_h5" type="data" label="Indexed or Found Peaks HDF5 (indexer.h5 / solve.h5 / finder.h5)" />
+    <param format="h5,json" name="peaks_h5" type="data" label="Indexed or Found Peaks HDF5 (indexer.h5 / solve.h5 / finder.h5)" />
     <param name="max_zone_index" type="integer" value="3" min="1" max="4" label="Max Zone Axis Miller Index |u|,|v|,|w|" />
     <param name="zone_tolerance_deg" type="float" value="0.75" min="0.05" max="3.0" label="Zone Capture Angular Tolerance (deg)" />
   </inputs>

@@ -1376,6 +1376,16 @@ def validate_subhkl_ingestible_dataset(
         raise ValueError(
             f"Cannot ingest Galaxy dataset {ds_label}: dataset file is empty or missing."
         )
+    from subhkl.io.shared_storage import read_shared_pointer, resolve_input_h5_path
+
+    if read_shared_pointer(p) is not None:
+        try:
+            resolved_p, _ = resolve_input_h5_path(p, must_exist=True)
+            p = Path(resolved_p)
+        except (FileNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"Cannot ingest shared intermediate {ds_label}: its shared file in SUBHKL_SHARED_DIR was already cleaned up after use ({exc})."
+            ) from exc
     if ext == "mtz" or str(p).lower().endswith(".mtz"):
         if not has_active_geometry:
             raise ValueError(
@@ -24517,6 +24527,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     if (ext === "h5" || ext === "hdf5" || ext === "nxs.h5" || ext === "nxs") {{
       return {{ canLoad: true, ext, hint: "" }};
+    }}
+    const rawNameLow = String((d && d.name) || "").toLowerCase();
+    if (ext === "json" && (rawNameLow.endsWith(".ref.json") || rawNameLow.endsWith("_ref.json"))) {{
+      return {{ canLoad: true, ext: "json", hint: "shared ref" }};
     }}
     if (ext === "mtz") {{
       if (hasActiveDetectorGeometryForMtz()) {{
