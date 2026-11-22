@@ -11371,7 +11371,7 @@ def render_rainbow_html(
             <span>Resolution Cutoff d_min [Å]</span>
             <span id="lbl-dmin-val" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact resolution cutoff d_min [Å]">{init_dmin:.2f} Å</span>
           </div>
-          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.01" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å]" />
+          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å] (0.05 Å slider steps; click value for 0.01 Å input)" />
 
           <div class="slider-row" style="margin-top:2px;">
             <span>Spot Color</span>
@@ -14654,7 +14654,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const dFloor = getDynamicDminFloor();
     const rawVal = Number(nextDmin);
     const clampedVal = Math.max(dFloor, Math.min(25.0, Number.isFinite(rawVal) && rawVal > 0 ? rawVal : dFloor));
-    const v = Math.max(dFloor, Math.round(clampedVal * 100) / 100);
+    const snappedVal = sourceEl === slDmin
+      ? Math.round(clampedVal * 20) / 20
+      : Math.round(clampedVal * 100) / 100;
+    const v = Math.max(dFloor, Math.round(snappedVal * 100) / 100);
     const clampedAtFloor = Number.isFinite(rawVal) && rawVal > 0 && rawVal <= dFloor + 1e-4;
     state.dMin = v;
     DATA.d_min = v;
@@ -14673,12 +14676,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         : `Active resolution cutoff d_min = ${{v.toFixed(2)}} Å (hard floor ${{dFloor.toFixed(2)}} Å; Ewald-shell LOD active) — click to enter exact value`;
     }}
     if (slDmin) {{
-      slDmin.min = dFloor.toFixed(2);
-      if (v > parseFloat(slDmin.max)) slDmin.max = (v + 1.0).toFixed(2);
-      if (sourceEl !== slDmin || clampedAtFloor) {{
+      const slMinAligned = Math.ceil(dFloor * 20 - 1e-9) / 20;
+      slDmin.min = slMinAligned.toFixed(2);
+      slDmin.step = "0.05";
+      if (v > parseFloat(slDmin.max)) {{
+        slDmin.max = (Math.ceil((v + 1.0) * 20 - 1e-9) / 20).toFixed(2);
+      }}
+      if (sourceEl !== slDmin || clampedAtFloor || Math.abs(parseFloat(slDmin.value) - v) > 1e-4) {{
         slDmin.value = v.toFixed(2);
       }}
-      slDmin.title = `High-resolution cutoff d_min [Å] — Ewald-shell predictor & viewport LOD down to ${{dFloor.toFixed(2)}} Å`;
+      slDmin.title = `High-resolution cutoff d_min [Å] (0.05 Å slider steps; click value for 0.01 Å input) — Ewald-shell predictor & viewport LOD down to ${{dFloor.toFixed(2)}} Å`;
     }}
   }}
 
@@ -17798,8 +17805,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     // Estimate 3D intersection distance t from the physically closest panel plane/cylinder
     const rFallback = estimateDetectorRadiusM(fullPanels);
     let tEst = -1.0;
+    let bestFlatOverFrac = 1e9;
+    let hasFlatFullPanels = false;
     if (fullPanels.length > 0) {{
-      let bestOverFrac = 1e9;
       let bestCos = -2.0;
       let fallbackT = -1.0;
       for (let i = 0; i < fullPanels.length; i++) {{
@@ -17825,6 +17833,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
           }}
         }} else {{
+          hasFlatFullPanels = true;
           const denom = kfx * fp.nhat[0] + kfy * fp.nhat[1] + kfz * fp.nhat[2];
           if (Math.abs(denom) > 0.08) {{
             const tRay = fp.planeNum / denom;
@@ -17837,8 +17846,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               const overU = du < 0.0 ? -du : (du > fp.width ? du - fp.width : 0.0);
               const overV = dv < 0.0 ? -dv : (dv > fp.height ? dv - fp.height : 0.0);
               const overFrac = Math.hypot(overU / Math.max(1e-4, fp.width), overV / Math.max(1e-4, fp.height));
-              if (overFrac < bestOverFrac) {{
-                bestOverFrac = overFrac;
+              if (overFrac < bestFlatOverFrac) {{
+                bestFlatOverFrac = overFrac;
                 tEst = tRay;
               }}
             }}
@@ -17963,6 +17972,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         nearY,
         nearEl,
       }};
+    }}
+
+    if (hasFlatFullPanels && bestFlatOverFrac < 1e8) {{
+      minGapPanelFrac = Math.max(minGapPanelFrac, bestFlatOverFrac);
     }}
 
     // Suppress nodals beyond 25% of a panel width/height away from any active detector panel
@@ -20039,20 +20052,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const y = affScaleY * nVert + affOffsetY;
             if (x < -44 || x > w + 44 || y < -44 || y > h + 44) continue;
 
-            const baseNodalR = nd.isPrincipal
-              ? Math.max(12.5, Math.min(20.0, 11.0 + 1.8 * Math.sqrt(state.detZoom)))
-              : Math.max(9.5, Math.min(16.5, 8.2 + 1.5 * Math.sqrt(state.detZoom)));
-            let nodalR = baseNodalR;
-            if (!nd.onPanel) {{
-              const nearVert = isSph ? nd.nearEl : nd.nearY;
-              const edgeX = affScaleX * nd.nearAz + shiftPxX;
-              const edgeY = affScaleY * nearVert + affOffsetY;
-              const dPanelPx = Math.hypot(x - edgeX, y - edgeY);
-              if (Number.isFinite(dPanelPx) && dPanelPx > 0.0) {{
-                // Bridge narrow inter-panel gaps (<= 25% panel width) so >= 6.5 px overlaps onto the adjacent panel
-                nodalR = Math.max(baseNodalR, Math.min(28.0, dPanelPx + 6.5));
-              }}
-            }}
+            // Keep uniform nodal radii (never scaling with intersection count or inflating in wide MANDI gaps)
+            const nodalR = nd.isPrincipal
+              ? Math.max(12.0, Math.min(15.5, 10.8 + 1.2 * Math.sqrt(state.detZoom)))
+              : Math.max(9.0, Math.min(12.0, 7.8 + 1.2 * Math.sqrt(state.detZoom)));
 
             const isHovNodal = state.hoveredNodalKey !== null && state.hoveredNodalKey === nd.key;
             const offPanelDim = nd.onPanel

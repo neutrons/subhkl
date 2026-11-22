@@ -2120,7 +2120,7 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert 'id="inp-lmax"' not in html_doc
     assert 'id="inp-dmin"' not in html_doc
     assert 'id="slider-dmin"' in html_doc
-    assert 'id="slider-dmin" min="0.50" max="5.00" step="0.01"' in html_doc
+    assert 'id="slider-dmin" min="0.50" max="5.00" step="0.05"' in html_doc
     assert 'id="sel-spot-color"' in html_doc
     assert '<option value="isigi">Color: I/σ</option>' in html_doc
     assert '<option value="mtz_isigi">Color: .mtz I/σ</option>' in html_doc
@@ -10688,7 +10688,7 @@ inpEsc.value = "3.99";
 inpEsc.dispatch("keydown", {{ key: "Escape" }});
 const lamMinAfterEsc = state.lamMin;
 
-// B. Click d_min -> type 1.12 -> Enter updates d_min & slider; typing 0.05 clamps cleanly to dynamic floor
+// B. Click d_min -> type 1.12 -> Enter updates d_min in 0.01 A steps; dragging slider snaps to 0.05 A steps; typing 0.02 clamps to dynamic floor
 openDminDirectInput();
 const inpD = els["lbl-dmin-val"].querySelector("input.inline-slider-input");
 inpD.value = "1.12";
@@ -10696,6 +10696,12 @@ inpD.dispatch("keydown", {{ key: "Enter" }});
 const dMinAfterCommit = state.dMin;
 const lblDAfterCommit = els["lbl-dmin-val"].textContent;
 const slDValAfterCommit = slDmin.value;
+const slDStepAttr = slDmin.step;
+
+slDmin.value = "1.73";
+syncDminControls(slDmin.value, slDmin);
+const dMinAfterSliderSnap = state.dMin;
+const lblDAfterSliderSnap = els["lbl-dmin-val"].textContent;
 
 openDminDirectInput();
 const inpDFloor = els["lbl-dmin-val"].querySelector("input.inline-slider-input");
@@ -10738,6 +10744,9 @@ console.log(JSON.stringify({{
   dFloorExpected,
   dMinAfterFloor,
   repredictCount,
+  slDStepAttr,
+  dMinAfterSliderSnap,
+  lblDAfterSliderSnap,
   legBorderInteg,
   btnIntegActive,
   scopeSingleLbl,
@@ -10772,6 +10781,9 @@ console.log(JSON.stringify({{
     assert abs(out["dMinAfterCommit"] - 1.12) < 1e-6
     assert out["lblDAfterCommit"] == "1.12 Å"
     assert out["slDValAfterCommit"] == "1.12"
+    assert out["slDStepAttr"] == "0.05"
+    assert abs(out["dMinAfterSliderSnap"] - 1.75) < 1e-6
+    assert out["lblDAfterSliderSnap"] == "1.75 Å"
     assert abs(out["dMinAfterFloor"] - out["dFloorExpected"]) < 0.02
     assert out["repredictCount"] >= 4
 
@@ -11534,6 +11546,9 @@ setMaxZoneOrder(1);
 renderDetectorCanvas(true);
 const nodalsOrder1 = getVisibleNodalPoints();
 const secondaryCountOrder1 = nodalsOrder1.filter(n => !n.isPrincipal).length;
+const secRadii = _detNodalScreenHits.filter(h => !h.nodal.isPrincipal).map(h => h.r);
+const maxSecondaryR = secRadii.length > 0 ? Math.max(...secRadii) : 0;
+const minSecondaryR = secRadii.length > 0 ? Math.min(...secRadii) : 0;
 
 // Pick a rendered zone-arc segment midpoint well away from peaks and nodal points
 let chosenArcPt = null;
@@ -11653,6 +11668,8 @@ console.log(JSON.stringify({
   gapHoverUsesZonesLabel: gapHoverBadgeTexts.some(t => t.includes("zones)")),
   gapInspectorHasAStar: gapInspectorHtml.includes("a*") && gapInspectorHtml.includes("% panel width"),
   secondaryCountOrder1,
+  maxSecondaryR,
+  minSecondaryR,
   chosenArcLabel,
   zoneArcHasBadge: Boolean(chosenArcLabel && zoneArcBadgeTexts.some(t => t.includes(`Zone ${chosenArcLabel}`))),
   zoneArcInspectorHasLabel: Boolean(chosenArcLabel && zoneArcInspectorHtml.includes(`Zone ${chosenArcLabel}`)),
@@ -11686,7 +11703,9 @@ process.exit(0);
     assert out["cOnPanel"] is True
     assert out["symsWithoutBank12"] == ["b*", "c*"]
     assert out["distCenterToPanelPx"] > 2.0
-    assert out["panelOverlapPx"] >= 6.0
+    assert out["panelOverlapPx"] >= 2.5
+    assert out["maxSecondaryR"] <= 12.0
+    assert abs(out["maxSecondaryR"] - out["minSecondaryR"]) < 1e-6
     assert out["gapHoverHasBadge"] is True
     assert out["gapHoverUsesZonesLabel"] is True
     assert out["gapInspectorHasAStar"] is True
