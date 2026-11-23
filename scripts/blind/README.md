@@ -131,6 +131,42 @@ so the glide-forbidden classes at 17–20 per node are at that level. The
 axial condition rests on two to four nodes; the 4% found in h = 4n+2 is
 significant against counting noise and has not been explained.
 
+## Space-group candidates from the Laue class
+
+`absences.py events.h5 MANDI --laue <class> (--basis cell.npz | --solve refined.h5)`
+
+The general form of the two tests above. Every space group of the given
+Laue class is a hypothesis about which nodes are empty. The forbidden
+nodes are split into elementary classes (nodes that the same candidates
+forbid); a hypothesis is consistent if none of the classes it forbids
+carries more than 15% of what allowed nodes of the same resolution carry.
+The most restrictive consistent hypothesis is reported, with every other
+group that forbids the same nodes.
+
+A node of index n is blurred by about (relative precision) × n, so a
+forbidden node only counts as evidence if no allowed node lies inside its
+blur. That is what makes the test usable along a long axis, where
+neighbouring reflections overlap.
+
+| Dataset | Laue class | Candidates | Result |
+|---|---|---|---|
+| Garnet, one run | m-3m | 24 groups, 15 patterns | Ia-3d |
+| MANDI 11324–11338 | 6/mmm | 18 groups, 7 patterns | P6₁22 or P6₅22 |
+
+Both are correct. Things to know about these two results:
+
+- Garnet: the face-centred candidates fail at 60–160%. The class behind
+  the 4₁ screw (h00 with h = 4n+2, five nodes) carries 14.4%, a hair under
+  the threshold; with a 10% threshold the answer would have been Im-3m.
+- MANDI: only 18 of the 59 nodes P6₁22 forbids are testable (l = 6n+3,
+  away from allowed neighbours), and they are empty. P6₂22/P6₄22 and
+  P6₃22 forbid subsets none of which is testable here, so they are not
+  rejected; they rank below because they explain less. The glide-plane
+  groups are rejected at about 140%.
+- The Laue class is an input, the 15% threshold and the 1.2% precision
+  are set by hand, and the reference level is taken from nodes no
+  candidate forbids.
+
 ## Not done
 
 - The rest of the space group: other axes, glide planes, and a proper
