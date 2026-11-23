@@ -904,6 +904,10 @@ class MainApp:
                             data.wavelength_max = float(params["wavelength_max"])
                         if "d_min" in params:
                             data.d_min = float(params["d_min"])
+                    prev_frame = self.view_model.model.subhkl.frame_index
+                    prev_runner_frame = self.pipeline_runner.current_frame_index
+                    prev_images_file = self.view_model.model.subhkl.data.images_file
+                    prev_peaks_file = self.view_model.model.subhkl.data.peaks_file
                     if is_reduce_out:
                         self.view_model.model.subhkl.frame_index = 0
                         self.pipeline_runner.current_frame_index = 0
@@ -914,10 +918,17 @@ class MainApp:
                             self.pipeline_runner.current_frame_index or 0
                         )
                         self.view_model.model.subhkl.data.peaks_file = new_h5_path
-                    self.view_model.model.subhkl.refresh_payload(
-                        frame_index=self.view_model.model.subhkl.frame_index,
-                        preserve_params=not is_reduce_out,
-                    )
+                    try:
+                        self.view_model.model.subhkl.refresh_payload(
+                            frame_index=self.view_model.model.subhkl.frame_index,
+                            preserve_params=not is_reduce_out,
+                        )
+                    except Exception:
+                        self.view_model.model.subhkl.frame_index = prev_frame
+                        self.pipeline_runner.current_frame_index = prev_runner_frame
+                        self.view_model.model.subhkl.data.images_file = prev_images_file
+                        self.view_model.model.subhkl.data.peaks_file = prev_peaks_file
+                        raise
 
             try:
                 res = self.pipeline_runner.submit_galaxy_stage(

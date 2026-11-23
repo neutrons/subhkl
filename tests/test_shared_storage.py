@@ -1412,3 +1412,307 @@ def test_careless_merge_reports_runner_host_local_and_galaxy(
         job_rec["stdout"]
     )
     assert "[pulsar] Runner host: gpu-worker-07" in str(job_rec["stdout"])
+
+
+def test_galaxy_careless_merge_completes_without_h5_signature_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: NDIP ``imaginex_subhkl_merge`` must not feed ``metrics_json`` to ``h5py.File``."""
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        infer_dataset_extension,
+        render_rainbow_html,
+    )
+
+    assert infer_dataset_extension("merge_table.csv", None) == "csv"
+    assert infer_dataset_extension("merge_table_csv", None) == "csv"
+    assert infer_dataset_extension("metrics_json", None) == "json"
+    assert infer_dataset_extension("merged_mtz", None) == "mtz"
+
+    html = render_rainbow_html(
+        {
+            "instrument": "CG4D",
+            "space_group": "I a -3 d",
+            "peaks": [],
+            "zones": [],
+            "panels": [],
+        }
+    )
+    assert 'stageId !== "merge" && Array.isArray(aj.outputs)' in html
+
+    # Build a read-only shared integrated.h5 and symlink it into work_dir/integrated.h5
+    shared_ro_dir = tmp_path / "shared_ro"
+    shared_ro_dir.mkdir()
+    shared_int_h5 = shared_ro_dir / "integrated_shared.h5"
+    with h5py.File(shared_int_h5, "w") as hf:
+        hf["instrument"] = b"CG4D"
+        hf["wavelengths"] = np.array([2.0, 4.0], dtype=np.float64)
+        sgrp = hf.create_group("sample")
+        sgrp["space_group"] = b"I a -3 d"
+        sgrp["cell"] = np.array(
+            [11.93, 11.93, 11.93, 90.0, 90.0, 90.0], dtype=np.float64
+        )
+        sgrp["B"] = np.diag([1.0 / 11.93, 1.0 / 11.93, 1.0 / 11.93])
+        sgrp["U"] = np.eye(3, dtype=np.float64)
+        ggrp = hf.create_group("goniometer")
+        ggrp["R"] = np.eye(3, dtype=np.float64)[None, :, :]
+        pgrp = hf.create_group("peaks")
+        pgrp["xyz"] = np.array([[0.25, 0.0, -1.0], [0.0, 0.25, -1.0]], dtype=np.float64)
+        pgrp["h"] = np.array([2, 0], dtype=np.int32)
+        pgrp["k"] = np.array([0, 2], dtype=np.int32)
+        pgrp["l"] = np.array([0, 0], dtype=np.int32)
+        pgrp["intensity"] = np.array([120.0, 95.0], dtype=np.float64)
+        pgrp["sigma"] = np.array([6.0, 5.0], dtype=np.float64)
+        pgrp["run_index"] = np.array([0, 0], dtype=np.int32)
+        pgrp["wavelength"] = np.array([2.4, 2.8], dtype=np.float64)
+        pgrp["two_theta"] = np.array([0.35, 0.35], dtype=np.float64)
+        pgrp["azimuthal"] = np.array([0.0, 1.57], dtype=np.float64)
+        pgrp["var_u"] = np.array([2.25, 2.25], dtype=np.float64)
+        pgrp["var_v"] = np.array([2.25, 2.25], dtype=np.float64)
+    shared_int_h5.chmod(0o444)
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    work_int_h5 = work_dir / "integrated.h5"
+    work_int_h5.symlink_to(shared_int_h5)
+
+    # Create valid minimal MTZ binaries via gemmi for merged.mtz, predictions.mtz, xval.mtz
+    mtz_build_dir = tmp_path / "mtz_src"
+    mtz_build_dir.mkdir()
+
+    def _make_merged_mtz(dest: Path) -> bytes:
+        mtz = gemmi.Mtz(with_base=True)
+        mtz.spacegroup = gemmi.find_spacegroup_by_name("I a -3 d")
+        mtz.set_cell_for_all(gemmi.UnitCell(11.93, 11.93, 11.93, 90, 90, 90))
+        mtz.add_dataset("crystal")
+        mtz.add_column("I", "J")
+        mtz.add_column("SigI", "Q")
+        mtz.add_column("N", "I")
+        mtz.set_data(
+            np.array(
+                [
+                    [2.0, 0.0, 0.0, 118.0, 5.5, 2.0],
+                    [0.0, 2.0, 0.0, 96.0, 5.0, 2.0],
+                ],
+                dtype=np.float32,
+            )
+        )
+        mtz.write_to_file(str(dest))
+        return dest.read_bytes()
+
+    def _make_pred_mtz(dest: Path) -> bytes:
+        mtz = gemmi.Mtz(with_base=True)
+        mtz.spacegroup = gemmi.find_spacegroup_by_name("I a -3 d")
+        mtz.set_cell_for_all(gemmi.UnitCell(11.93, 11.93, 11.93, 90, 90, 90))
+        mtz.add_dataset("crystal")
+        for lbl, ctype in (
+            ("Batch", "B"),
+            ("Iobs", "J"),
+            ("SigIobs", "Q"),
+            ("Ipred", "J"),
+            ("SigIpred", "Q"),
+            ("Scale", "R"),
+        ):
+            mtz.add_column(lbl, ctype)
+        mtz.set_data(
+            np.array(
+                [
+                    [2.0, 0.0, 0.0, 1.0, 120.0, 6.0, 117.5, 5.2, 1.02],
+                    [0.0, 2.0, 0.0, 1.0, 95.0, 5.0, 96.2, 4.8, 0.99],
+                ],
+                dtype=np.float32,
+            )
+        )
+        mtz.write_to_file(str(dest))
+        return dest.read_bytes()
+
+    merged_bytes = _make_merged_mtz(mtz_build_dir / "merged.mtz")
+    pred_bytes = _make_pred_mtz(mtz_build_dir / "predictions.mtz")
+    xval_bytes = merged_bytes
+    metrics_payload = {
+        "cc_half": 0.964,
+        "cc_pred": 0.981,
+        "r_pim": 0.042,
+        "r_meas": 0.061,
+        "i_over_sigma": 18.5,
+        "completeness": 0.945,
+        "multiplicity": 4.2,
+        "n_unique": 2,
+        "n_observations": 2,
+    }
+    metrics_bytes = json.dumps(metrics_payload).encode("utf-8")
+    csv_bytes = b"shell,d_max,d_min,cc_half\nall,10.0,1.0,0.964\n"
+    html_bytes = b"<html><body><table><tr><td>CC1/2</td><td>0.964</td></tr></table></body></html>"
+
+    dataset_blobs = {
+        "ds_merged": merged_bytes,
+        "ds_pred": pred_bytes,
+        "ds_xval": xval_bytes,
+        "ds_metrics": metrics_bytes,
+        "ds_csv": csv_bytes,
+        "ds_html": html_bytes,
+    }
+
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://galaxy.example.org",
+        galaxy_api_key="fake-api-key",
+        history_id="6644e5c0e8a790e1",
+    )
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    monkeypatch.setattr(runner, "_upload_compact_ndip_artifact", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner, "get_datastore", lambda *_a, **_k: object())
+
+    # Simulate Galaxy's run_tool response where file_ext can be empty or 'json'
+    raw_run_tool_outputs = [
+        {
+            "id": "ds_merged",
+            "output_name": "merged_mtz",
+            "name": "merged.mtz",
+            "file_ext": "",
+        },
+        {
+            "id": "ds_pred",
+            "output_name": "predictions_mtz",
+            "name": "predictions.mtz",
+            "file_ext": "mtz",
+        },
+        {
+            "id": "ds_xval",
+            "output_name": "xval_mtz",
+            "name": "xval.mtz",
+            "file_ext": "mtz",
+        },
+        {
+            "id": "ds_metrics",
+            "output_name": "metrics_json",
+            "name": "careless_metrics.json",
+            "file_ext": "json",
+        },
+        {
+            "id": "ds_csv",
+            "output_name": "merge_table_csv",
+            "name": "merge_table.csv",
+            "file_ext": "",
+        },
+        {
+            "id": "ds_html",
+            "output_name": "merge_table_html",
+            "name": "merge_table.html",
+            "file_ext": "html",
+        },
+    ]
+    norm_outputs = runner._normalize_galaxy_job_outputs(
+        raw_run_tool_outputs, stage_id="merge"
+    )
+    assert [o["extension"] for o in norm_outputs] == [
+        "mtz",
+        "mtz",
+        "mtz",
+        "json",
+        "csv",
+        "html",
+    ]
+
+    def _fake_api(
+        method: str, path: str, payload: object = None, **kwargs: object
+    ) -> object:
+        _ = (method, payload)
+        if kwargs.get("raw"):
+            for dsid, blob in dataset_blobs.items():
+                if f"/api/datasets/{dsid}/display" in path:
+                    return blob
+            raise AssertionError(f"Unexpected raw dataset request: {path}")
+        if "/console_output" in path:
+            return {
+                "stdout": "[pulsar] Runner host: IMAGINEX-2\nCareless version 0.5.4\n",
+                "stderr": "Merging repeat 1 half 2: 100%\n",
+            }
+        if path.startswith("/api/jobs/"):
+            return {
+                "state": "ok",
+                "command_line": "careless poly ...",
+                "outputs": {
+                    "merged_mtz": {"id": "ds_merged", "src": "hda"},
+                    "predictions_mtz": {"id": "ds_pred", "src": "hda"},
+                    "xval_mtz": {"id": "ds_xval", "src": "hda"},
+                    "metrics_json": {"id": "ds_metrics", "src": "hda"},
+                    "merge_table_csv": {"id": "ds_csv", "src": "hda"},
+                    "merge_table_html": {"id": "ds_html", "src": "hda"},
+                },
+            }
+        return {}
+
+    monkeypatch.setattr(runner, "_api_request", _fake_api)
+
+    completed_paths: list[str] = []
+    reloaded_payloads: list[dict[str, object]] = []
+
+    def _on_complete(h5_path: str) -> None:
+        completed_paths.append(h5_path)
+        reloaded_payloads.append(
+            build_rainbow_zone_payload(replay_h5=h5_path, frame_index=0)
+        )
+
+    job_rec: dict[str, object] = {
+        "job_id": "5af8bc9400aa8f53",
+        "stage_id": "merge",
+        "mode": "galaxy",
+        "state": "running",
+        "stdout": "[galaxy -> pulsar] Dispatched imaginex_subhkl_merge (Galaxy job_id=5af8bc9400aa8f53) -> Pulsar GPU queue\n",
+        "stderr": "",
+        "outputs": norm_outputs,
+        "params": {
+            "instrument": "CG4D",
+            "space_group": "I a -3 d",
+            "cell": [11.93, 11.93, 11.93, 90.0, 90.0, 90.0],
+            "wavelength_range": [2.0, 4.0],
+            "d_min": 1.0,
+            "peaks_file": str(work_int_h5),
+        },
+    }
+
+    runner._poll_galaxy_job(
+        job_rec,
+        on_complete_h5=_on_complete,
+        final_step=True,
+        work_dir=str(work_dir),
+    )
+
+    stdout_txt = str(job_rec["stdout"])
+    assert "Warning fetching job output" not in stdout_txt
+    assert "file signature not found" not in stdout_txt
+    assert job_rec["state"] == "ok"
+    assert job_rec["runner_host"] == "IMAGINEX-2"
+    assert job_rec.get("updated_payload_ready") is True
+    assert job_rec.get("output_h5_path") == str(work_int_h5)
+    assert completed_paths == [str(work_int_h5)]
+
+    # All 6 Careless artifacts must be downloaded into work_dir
+    for fname in (
+        "merged.mtz",
+        "predictions.mtz",
+        "xval.mtz",
+        "careless_metrics.json",
+        "merge_table.csv",
+        "merge_table.html",
+    ):
+        assert (work_dir / fname).is_file(), f"Missing {fname} in {work_dir}"
+
+    # Read-only shared target must remain untouched while work_dir/integrated.h5 is materialized & stamped
+    assert not work_int_h5.is_symlink()
+    with h5py.File(shared_int_h5, "r") as hf_ro:
+        assert "careless" not in hf_ro
+    with h5py.File(work_int_h5, "r") as hf_stamped:
+        assert "careless/metrics_json" in hf_stamped
+
+    assert len(reloaded_payloads) == 1
+    payload = reloaded_payloads[0]
+    assert payload["artifact_kind"] == "merged_careless"
+    assert isinstance(payload.get("merge_metrics"), dict)
+    assert payload["merge_metrics"]["cc_half"] == pytest.approx(0.964)
+    assert payload["merge_metrics"]["r_pim"] == pytest.approx(0.042)
