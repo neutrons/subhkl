@@ -318,6 +318,9 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--d-min", type=float, default=3.0)
     ap.add_argument("--grid", type=int, default=768)
+    ap.add_argument(
+        "--x-min", type=float, default=12.0, help="shortest lattice vector considered"
+    )
     args = ap.parse_args()
 
     grid, q_max = reciprocal_histogram(
@@ -333,7 +336,7 @@ def main():
     print(
         f"direct-space map: voxel {voxel:.2f} A, half-extent {0.5 * g.shape[0] * voxel:.0f} A"
     )
-    pos, height = find_peaks(g, voxel)
+    pos, height = find_peaks(g, voxel, x_min=args.x_min)
     print("strongest peaks (|x| [A], relative height):")
     for p, hgt in list(zip(pos, height))[:12]:
         print(f"   {np.linalg.norm(p):7.2f}  {hgt / height[0]:.3f}   {np.round(p, 1)}")

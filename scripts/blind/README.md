@@ -98,6 +98,39 @@ enantiomorphs and cannot be told apart from intensities). The other five
 classes sit on an equal pedestal that the background row does not remove;
 it has not been explained.
 
+## Centring and glide planes from zone sections
+
+`zone_absences.py reduced.h5 MANDI cell.npz`
+
+The same idea one dimension up. Every event is converted to fractional
+indices of the conventional cell, and the counts at integer nodes above
+the level between nodes are summed by reflection class: all nodes for
+centring, nodes in a zone for a glide plane, nodes on an axis for a screw.
+
+Tried on one MANDI run of a garnet (Ia-3d, a = 11.93 Å, band 1–3 Å, 1.3
+million events). `blind_cell.py --d-min 0.7 --grid 384 --x-min 4` returns
+the primitive cell 10.34 Å, 70.5°/109.5° in a few seconds; its
+conventional cell is cubic, 11.93 Å, with two lattice points.
+
+| Class | Nodes | Net counts per node |
+|---|---|---|
+| all: h+k+l even | 1436 | 307 |
+| all: h+k+l odd (I forbids) | 1415 | 0.0 (−52 ± 113 in total) |
+| 0kl: both even | 89 | 1142 |
+| 0kl: both odd (I allows, glide forbids) | 80 | 17 |
+| 0kl: mixed (I forbids) | 156 | 9 |
+| hhl: 2h+l = 4n | 79 | 1157 |
+| hhl: 2h+l = 4n+2 (I allows, d-glide forbids) | 71 | 20 |
+| hhl: 2h+l odd (I forbids) | 147 | 10 |
+| h00: h = 4n | 2 | 4284 |
+| h00: h = 4n+2 (4₁ forbids) | 4 | 188 |
+
+Body centring and both glide conditions are plain. In the zones a small
+pedestal remains in classes that centring already forbids (9–10 per node),
+so the glide-forbidden classes at 17–20 per node are at that level. The
+axial condition rests on two to four nodes; the 4% found in h = 4n+2 is
+significant against counting noise and has not been explained.
+
 ## Not done
 
 - The rest of the space group: other axes, glide planes, and a proper
