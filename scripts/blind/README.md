@@ -57,6 +57,14 @@ MANDI, 15 runs, known answer P6₁22 with a = b ≈ 80, c ≈ 238 Å.
 | Rotations passing the intensity test | 12 of 12, plus inversion | |
 | Laue class | 6/mmm | 6/mmm |
 
+Merged with `careless mono` in P622 after one P1 integration to 2.0 Å, the
+blind route gives CC½ 0.899 overall, against 0.900 for the route that was
+given the cell and space group (integrated to 1.41 Å). By shell (∞–4.0,
+4.0–3.0, 3.0–2.5, 2.5–2.2, 2.2–2.0 Å): 0.986, 0.953, 0.775, 0.443, 0.321
+blind against 0.982, 0.949, 0.803, 0.628, 0.352. The gap at 2.5–2.2 Å has
+not been traced; the two runs differ in prediction limit and in refined
+geometry as well as in how the cell was obtained.
+
 The blind cell is about 1% larger than the reference. The reference cell
 was supplied by hand, and a 2D Laue solve cannot see its scale; the event
 times independently put the scale 0.9% above it.
