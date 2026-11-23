@@ -23520,9 +23520,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const isig = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
       const comp = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
       const mult = typeof m.multiplicity === "number" ? `${{m.multiplicity.toFixed(2)}}×` : "—";
+      const hostInfo = m.runner_host ? ` (Host=<strong>${{escTxt(String(m.runner_host))}}</strong>)` : "";
       setStatusLine(
         `[4. MERGE COMPLETE]`,
-        `<strong style="color:var(--accent-gold);">Careless Variational Merge</strong> • CC½=<strong style="color:var(--accent-cyan);">${{cc}}</strong> • ⟨I/σ⟩=<strong>${{isig}}</strong> • Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{m.n_merged_asu || 0}} ASU, mult=${{mult}}) — Click any reflection to inspect its ASU symmetry starburst &amp; ΔI/σ residual.`
+        `<strong style="color:var(--accent-gold);">Careless Variational Merge</strong>${{hostInfo}} • CC½=<strong style="color:var(--accent-cyan);">${{cc}}</strong> • ⟨I/σ⟩=<strong>${{isig}}</strong> • Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{m.n_merged_asu || 0}} ASU, mult=${{mult}}) — Click any reflection to inspect its ASU symmetry starburst &amp; ΔI/σ residual.`
       );
     }} else if (artKind === "merged") {{
       const cStr = (DATA.cell && DATA.cell.length === 6)
@@ -27482,6 +27483,28 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         }}
         const jobObj = res.job || {{}};
         const jobId = jobObj.job_id || "local";
+        let lastMergeHostBanner = "";
+        const syncRunningHostDisplay = (rec) => {{
+          const rHost = (rec && rec.runner_host && String(rec.runner_host).trim())
+            ? String(rec.runner_host).trim().toUpperCase()
+            : ((String(`${{(rec && rec.stdout) || ""}}\n${{(rec && rec.stderr) || ""}}`).match(/\\[(?:pulsar|subhkl|careless)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
+          const hostTag = rHost || ((rec && rec.mode === "galaxy") ? "PULSAR" : "SUBHKL");
+          const stateTag = String((rec && rec.state) || "running").toUpperCase();
+          if (cellSummary) {{
+            cellSummary.textContent = `[${{hostTag}}] ${{stateTag}}`;
+          }}
+          if (stageId === "merge" && stateTag !== "OK" && stateTag !== "ERROR" && stateTag !== "DELETED") {{
+            const sig = `${{hostTag}}:${{stateTag}}`;
+            if (sig !== lastMergeHostBanner) {{
+              lastMergeHostBanner = sig;
+              setStatusLine(
+                `[4. MERGE • ${{hostTag}}]`,
+                `Running <strong style="color:var(--accent-pink);">Careless Variational Merge</strong> on host <strong style="color:var(--accent-cyan);">${{escTxt(hostTag)}}</strong> (${{stateTag.toLowerCase()}})…`
+              );
+            }}
+          }}
+        }};
+        syncRunningHostDisplay(jobObj);
         if (jobObj.stdout || jobObj.stderr) {{
           appendTerminalLog((jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : ""), true);
         }}
@@ -27600,13 +27623,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
               selectLadderRung(aj.ladder_rung_idx, false);
             }}
             const isCancelled = aj.state === "deleted" || Boolean(aj.cancel_requested);
-            if (cellSummary) {{
-              const rHost = (aj.runner_host && String(aj.runner_host).trim())
-                ? String(aj.runner_host).trim().toUpperCase()
-                : ((String(`${{aj.stdout || ""}}\n${{aj.stderr || ""}}`).match(/\\[(?:pulsar|subhkl)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
-              const hostTag = rHost || (aj.mode === "galaxy" ? "PULSAR" : "SUBHKL");
-              cellSummary.textContent = `[${{hostTag}}] ${{(aj.state || "running").toUpperCase()}}`;
-            }}
+            syncRunningHostDisplay(aj);
             const finishedOk = aj.state === "ok";
             const finishedErr = isCancelled || aj.state === "error" || aj.state === "paused" || (!finishedOk && !!aj.error);
             if (finishedOk || finishedErr) {{
@@ -27834,8 +27851,14 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
               );
             }}
             if (cellSummary) {{
-              const rHost = ((String(`${{stdOut}}\n${{stdErr}}`).match(/\\[(?:pulsar|subhkl)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "GALAXY").toUpperCase();
+              const rHost = ((String(`${{stdOut}}\n${{stdErr}}`).match(/\\[(?:pulsar|subhkl|careless)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "GALAXY").toUpperCase();
               cellSummary.textContent = `[${{rHost}}] ${{jstate.toUpperCase()}}`;
+              if (stageId === "merge" && jstate !== "ok" && jstate !== "error" && jstate !== "deleted") {{
+                setStatusLine(
+                  `[4. MERGE • ${{rHost}}]`,
+                  `Running <strong style="color:var(--accent-pink);">Careless Variational Merge</strong> on host <strong style="color:var(--accent-cyan);">${{escTxt(rHost)}}</strong> (${{jstate.toLowerCase()}})…`
+                );
+              }}
             }}
             if (stageId === "solve" && (jstate === "queued" || jstate === "running")) {{
               rungStep = Math.min(3, rungStep + 1);

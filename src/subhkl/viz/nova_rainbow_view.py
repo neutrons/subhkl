@@ -5011,6 +5011,15 @@ class NovaGalaxyPipelineRunner:
                         fh_out.write(metrics_raw)
 
         if metrics_doc:
+            job_host = str(job_record.get("runner_host") or "").strip()
+            if job_host and not metrics_doc.get("runner_host"):
+                metrics_doc["runner_host"] = job_host
+                metrics_raw = json.dumps(metrics_doc, indent=2)
+                with (
+                    contextlib.suppress(OSError),
+                    open(metrics_path, "w", encoding="utf-8") as fh_out,
+                ):
+                    fh_out.write(metrics_raw)
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 from subhkl.viz.rainbow_zones import (
                     render_merge_table_csv,
@@ -5155,12 +5164,17 @@ class NovaGalaxyPipelineRunner:
             comp_str = (
                 f"{comp_val:.1f}%" if isinstance(comp_val, (int, float)) else "N/A"
             )
+            host_sfx = (
+                f" | Host={metrics_doc['runner_host']}"
+                if metrics_doc.get("runner_host")
+                else ""
+            )
             job_record["stdout"] = job_record.get("stdout", "") + (
                 f"\n[careless] Merged {metrics_doc.get('n_merged_asu', 0)} ASU reflections "
                 f"from {metrics_doc.get('n_observations', 0)} observations | "
                 f"CC1/2={cc_str} | <I/sigma>={metrics_doc.get('mean_isigi', 0.0):.2f} | "
                 f"Multiplicity={metrics_doc.get('mean_multiplicity', 0.0):.2f}x | "
-                f"Completeness={comp_str}\n"
+                f"Completeness={comp_str}{host_sfx}\n"
             )
 
     def _ensure_galaxy_h5_dataset(
@@ -8596,15 +8610,21 @@ class NovaGalaxyPipelineRunner:
         host_tag = detect_runner_hostname()
         cmd_str = " ".join(cmd)
         header_lines: list[str] = []
-        if stage_id != "merge":
-            if fallback_reason and existing_job_record is None:
-                header_lines.append(f"[ndip] Note: {fallback_reason}")
-            if image_fallback_note:
-                header_lines.append(f"[container] Note: {image_fallback_note}")
-            header_lines.append(f"[pulsar] Runner host: {host_tag}")
+        if fallback_reason and existing_job_record is None:
+            header_lines.append(f"[ndip] Note: {fallback_reason}")
+        if image_fallback_note:
+            header_lines.append(f"[container] Note: {image_fallback_note}")
+        header_lines.append(f"[pulsar] Runner host: {host_tag}")
+        header_lines.append(
+            f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"
+        )
+        if stage_id == "merge":
             header_lines.append(
-                f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"
+                f"$ careless {merge_mode} --jit-compile --iterations={careless_iters} "
+                f"--merge-half-datasets {wavel_key_flag}--studentt-likelihood-dof={studentt_dof} "
+                f"{extra_flags_str} <METADATA_KEYS> input_unmerged.mtz careless\n"
             )
+        else:
             header_lines.append(f"$ {cmd_str}\n")
 
         if existing_job_record is not None:
@@ -8619,12 +8639,9 @@ class NovaGalaxyPipelineRunner:
             job_record.setdefault("instrument", str(inst))
             if raw_nxs_local and not job_record.get("raw_nxs"):
                 job_record["raw_nxs"] = list(raw_nxs_local)
-            if stage_id == "merge":
-                job_record["stdout"] = ""
-            else:
-                job_record["stdout"] = (
-                    job_record.get("stdout", "") + "\n".join(header_lines)
-                )[-24000:]
+            job_record["stdout"] = (
+                job_record.get("stdout", "") + "\n".join(header_lines)
+            )[-24000:]
         else:
             job_record = {
                 "job_id": job_id,
@@ -8635,7 +8652,7 @@ class NovaGalaxyPipelineRunner:
                 "state": "running",
                 "runner_host": host_tag,
                 "command_line": cmd_str,
-                "stdout": "" if stage_id == "merge" else "\n".join(header_lines),
+                "stdout": "\n".join(header_lines),
                 "stderr": "",
                 "ladder_rung_idx": 0 if stage_id == "solve" else 4,
                 "outputs": [
@@ -9173,17 +9190,47 @@ class NovaGalaxyPipelineRunner:
                 )
                 import re as _re_h
 
+                r_host = ""
                 m_host = _re_h.search(
-                    r"\[(?:pulsar|subhkl)\]\s*Runner host:\s*([A-Za-z0-9._-]+)",
+                    r"\[(?:pulsar|subhkl|careless)\]\s*Runner host:\s*([A-Za-z0-9._-]+)",
                     f"{raw_stdout_src}\n{console_err}",
                     _re_h.IGNORECASE,
                 )
                 if m_host:
                     r_host = m_host.group(1).strip()
-                    if r_host:
-                        job_record["runner_host"] = r_host
+                if not r_host:
+                    for jm in jinfo.get("job_metrics") or []:
+                        if not isinstance(jm, dict):
+                            continue
+                        jm_name = str(jm.get("name") or "").strip().lower()
+                        jm_raw = str(
+                            jm.get("raw_value") or jm.get("value") or ""
+                        ).strip()
+                        if not jm_raw:
+                            continue
+                        if jm_name in (
+                            "pulsar_hostname",
+                            "host_hostname",
+                            "slurm_nodelist",
+                        ):
+                            r_host = jm_raw.split(".")[0].strip()
+                            break
+                        if jm_name == "uname":
+                            parts = jm_raw.split()
+                            cand = parts[1].split(".")[0] if len(parts) >= 2 else ""
+                            if cand and not _re_h.fullmatch(r"[0-9a-f]{12}", cand):
+                                r_host = cand
+                                break
+                if r_host:
+                    job_record["runner_host"] = r_host
                 if job_record.get("stage_id") == "merge":
-                    job_record["stdout"] = out_txt[-24000:]
+                    host_line = (
+                        f"[pulsar] Runner host: {job_record['runner_host']}\n"
+                        if job_record.get("runner_host")
+                        and "runner host:" not in out_txt.lower()
+                        else ""
+                    )
+                    job_record["stdout"] = f"{base_log}{host_line}{out_txt}"[-24000:]
                 else:
                     raw_cmd = str(job_record.get("command_line") or "").strip()
                     cmd_header = (

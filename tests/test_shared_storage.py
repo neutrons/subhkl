@@ -1350,3 +1350,64 @@ def test_galaxy_exit_prepare_cleans_immediately_and_builds_restore_plan(
         "frame_index": 3,
         "artifact_kind": "solve",
     }
+
+
+def test_careless_merge_reports_runner_host_local_and_galaxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Careless ('merge') surfaces runner_host in local container, Galaxy polling, and UI."""
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    html = render_rainbow_html(
+        {
+            "instrument": "CG4D",
+            "space_group": "P 1",
+            "peaks": [],
+            "zones": [],
+            "panels": [],
+        }
+    )
+    assert "syncRunningHostDisplay" in html
+    assert "[4. MERGE • ${hostTag}]" in html
+    assert "Careless Variational Merge</strong> on host" in html
+
+    # 1. Galaxy polling for stage_id == "merge" extracts runner_host from stdout or uname metric and preserves base_log
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://galaxy.example.org",
+        galaxy_api_key="fake-api-key",
+        history_id="hist_merge",
+    )
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    calls = {"n": 0}
+
+    def _fake_api(
+        method: str, path: str, payload: object = None, **kwargs: object
+    ) -> dict[str, object]:
+        _ = (method, payload, kwargs)
+        if "/console_output" in path:
+            return {
+                "stdout": "[pulsar] Runner host: gpu-worker-07\nIteration 1000/10000\n",
+                "stderr": "",
+            }
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"state": "running", "command_line": "careless poly ..."}
+        return {"state": "deleted", "command_line": "careless poly ..."}
+
+    monkeypatch.setattr(runner, "_api_request", _fake_api)
+    job_rec: dict[str, object] = {
+        "job_id": "gx_merge_99",
+        "stage_id": "merge",
+        "mode": "galaxy",
+        "state": "queued",
+        "stdout": "[galaxy -> pulsar] Dispatched imaginex_subhkl_merge\n",
+        "stderr": "",
+    }
+    runner._poll_galaxy_job(job_rec, final_step=False)
+    assert job_rec["runner_host"] == "gpu-worker-07"
+    assert "[galaxy -> pulsar] Dispatched imaginex_subhkl_merge" in str(
+        job_rec["stdout"]
+    )
+    assert "[pulsar] Runner host: gpu-worker-07" in str(job_rec["stdout"])
