@@ -4,6 +4,23 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2]
+
+### Fixed
+
+- **NDIP/Galaxy Stage 4 (`imaginex_subhkl_merge`) Careless output handling and UI completion (`nova_rainbow_view`, `rainbow_zones`, `nova_app`)**:
+  - Fixed a post-job `h5py.File` failure (`Unable to synchronously open file
+    (file signature not found)`) when `imaginex_subhkl_merge` completed on
+    Galaxy/Pulsar: `h5_outs` is now skipped completely on `stage_id == "merge"`,
+    and Galaxy output descriptors are normalized and reconciled against
+    `/api/jobs/{id}` without mislabeling non-HDF5 datasets (`metrics_json`,
+    `merge_table_csv`, `merge_table_html`, `*_mtz`) as `h5`.
+  - Materialized a local writable `integrated.h5` before stamping Careless
+    merge metrics and per-observation residuals so read-only shared `/scratch`
+    symlinks are never modified in place, supported both separate
+    `peaks/{h,k,l}` and packed `peaks/hkl` arrays during residual stamping, and
+    added state rollback guards if payload reload fails.
+
 ## [1.7.1]
 
 ### Added
