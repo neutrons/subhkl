@@ -1286,6 +1286,8 @@ def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str
         return "mtz"
     if base.endswith(".json"):
         return "json"
+    if base.endswith(".csv"):
+        return "csv"
     if base.endswith((".html", ".htm")):
         return "html"
     if base.endswith(".png"):
@@ -1298,6 +1300,14 @@ def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str
         return "dat"
     if base.endswith((".log", ".txt")):
         return "txt"
+    if base.endswith("_mtz") or base == "mtz":
+        return "mtz"
+    if base.endswith(("_json", "_ref")):
+        return "json"
+    if base.endswith("_csv"):
+        return "csv"
+    if base.endswith(("_html", "_htm")):
+        return "html"
     ext = str(raw_ext or "").strip().lower().lstrip(".")
     return ext or "data"
 
@@ -3429,7 +3439,7 @@ def _extract_from_h5(
         )
 
         merge_metrics: dict[str, Any] | None = None
-        if has_careless_peak_data:
+        if has_careless_peak_data or "careless/metrics_json" in f:
             if "careless/metrics_json" in f:
                 with contextlib.suppress(
                     OSError, RuntimeError, ValueError, TypeError, KeyError
@@ -3442,7 +3452,7 @@ def _extract_from_h5(
                         or doc_m.get("cc_half_bins")
                     ):
                         merge_metrics = _normalize_merge_metrics(doc_m)
-            if merge_metrics is None and "peaks" in f:
+            if merge_metrics is None and has_careless_peak_data and "peaks" in f:
                 sib_m = Path(h5_path).parent / "careless_metrics.json"
                 if sib_m.is_file():
                     with (
@@ -3462,7 +3472,10 @@ def _extract_from_h5(
         if var_u is not None and var_v is not None:
             artifact_kind = (
                 "merged_careless"
-                if (merge_metrics is not None and has_careless_peak_data)
+                if (
+                    merge_metrics is not None
+                    and (has_careless_peak_data or "careless/asu_hkl" in f)
+                )
                 else "integrator"
             )
             if len(var_u) > 0:
@@ -3486,6 +3499,10 @@ def _extract_from_h5(
             else:
                 is_iso = True
             peak_shape_mode = "isotropic_circle" if is_iso else "anisotropic_ellipse"
+        elif merge_metrics is not None and (
+            has_careless_peak_data or "careless/asu_hkl" in f
+        ):
+            artifact_kind = "merged_careless"
         elif "peaks/pixel_r" in f:
             artifact_kind = "finder"
             peak_shape_mode = "isotropic_circle"
@@ -27868,8 +27885,19 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
                 );
               }}
               if (finishedOk) {{
-                const h5Outs = Array.isArray(aj.outputs)
-                  ? aj.outputs.filter(o => o && o.id && (!o.extension || o.extension === "h5" || o.extension === "hdf5"))
+                const h5Outs = stageId !== "merge" && Array.isArray(aj.outputs)
+                  ? aj.outputs.filter(o => {{
+                      if (!o || !o.id) return false;
+                      const ext = String(o.extension || "").toLowerCase();
+                      const nm = String(o.name || o.output_name || "").toLowerCase();
+                      if (
+                        nm.endsWith(".mtz") || nm.endsWith(".json") || nm.endsWith(".csv") || nm.endsWith(".html")
+                        || nm.includes("mtz") || nm.includes("metrics") || nm.includes("merge_table")
+                      ) {{
+                        return false;
+                      }}
+                      return !ext || ext === "h5" || ext === "hdf5";
+                    }})
                   : [];
                 if (selGalaxyH5 && h5Outs.length > 0) {{
                   selGalaxyH5.value = h5Outs[0].id;
