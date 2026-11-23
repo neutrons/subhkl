@@ -4,6 +4,20 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.3]
+
+### Fixed
+
+- **Galaxy History derived-HDF5 (`...integrated.h5` / `...solve.h5`) background frame hydration completion (`rainbow_zones`, `nova_rainbow_view`, `nova_app`)**:
+  - Preserved a stable `client_job_id` across `submit_galaxy_stage`'s
+    placeholder `nova-<timestamp>` ID -> Galaxy/Pulsar `job_id` transition so
+    `startHydrationJobPoll` no longer aborts polling early while leaving the
+    Step 1 stopwatch running indefinitely.
+  - Kept hydration `work_dir` aligned with staged derived datasets (including
+    dot-suffixed `.integrated.h5` / `.solve.h5` names), surfaced live runner
+    host status during hydration, and cleared completed `hydration_job`
+    descriptors from cached `/api/payload` responses.
+
 ## [1.7.2]
 
 ### Fixed
@@ -20,15 +34,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     symlinks are never modified in place, supported both separate
     `peaks/{h,k,l}` and packed `peaks/hkl` arrays during residual stamping, and
     added state rollback guards if payload reload fails.
-- **Galaxy History derived-HDF5 (`...integrated.h5` / `...solve.h5`) background frame hydration completion (`rainbow_zones`, `nova_rainbow_view`, `nova_app`)**:
-  - Preserved a stable `client_job_id` across `submit_galaxy_stage`'s
-    placeholder `nova-<timestamp>` ID -> Galaxy/Pulsar `job_id` transition so
-    `startHydrationJobPoll` no longer aborts polling early while leaving the
-    Step 1 stopwatch running indefinitely.
-  - Kept hydration `work_dir` aligned with staged derived datasets (including
-    dot-suffixed `.integrated.h5` / `.solve.h5` names), surfaced live runner
-    host status during hydration, and cleared completed `hydration_job`
-    descriptors from cached `/api/payload` responses.
 
 ## [1.7.1]
 
