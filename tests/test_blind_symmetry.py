@@ -7,7 +7,9 @@ from scipy.spatial.transform import Rotation
 
 from subhkl.search.blind_cell import (
     cell_of,
+    centring_of,
     conventional_basis,
+    describe_lattice,
     direct_space_map,
     find_peaks,
     lattice_basis,
@@ -201,7 +203,7 @@ def test_candidates_follow_the_point_group_and_its_setting():
         "P 31 2 1",
         "P 32 2 1",
     }
-    assert {n.split(" (")[0] for n in names if not n.startswith("P")} == {"R 3 2"}
+    assert {n.split(" (")[0] for n in names if not n.startswith("P")} == {"R 3 2:H"}
     assert all(
         not r["consistent"] for r in results if r["space_groups"][0].startswith("R")
     )
@@ -243,3 +245,114 @@ def test_a_forbidden_node_next_to_an_allowed_one_is_not_evidence():
     assert screw["consistent"]
     assert 0 < screw["tested_nodes"] < screw["forbidden_nodes"]
     assert screw["untestable_nodes"] == 0 or screw["tested_nodes"] > 0
+
+
+_CENTRING = {
+    "P": [],
+    "I": [(0.5, 0.5, 0.5)],
+    "C": [(0.5, 0.5, 0)],
+    "F": [(0.5, 0.5, 0), (0, 0.5, 0.5), (0.5, 0, 0.5)],
+    "R": [(2 / 3, 1 / 3, 1 / 3), (1 / 3, 2 / 3, 2 / 3)],
+}
+
+
+def _primitive(cell, centring, seed):
+    """A randomly oriented primitive basis of a centred lattice."""
+    conv = _basis(cell)
+    vecs = [conv[:, i] for i in range(3)] + [
+        conv @ np.array(c) for c in _CENTRING[centring]
+    ]
+    pts = np.array(
+        [sum(n * v for n, v in zip(ns, vecs)) for ns in np.ndindex(*(3,) * len(vecs))]
+    )
+    pts = np.unique(np.round(pts - pts.mean(0), 6), axis=0)
+    origin = pts[np.argmin(np.linalg.norm(pts, axis=1))]
+    prim = []
+    for i in np.argsort(np.linalg.norm(pts - origin, axis=1))[1:]:
+        trial = [*prim, pts[i] - origin]
+        if np.linalg.matrix_rank(np.array(trial), tol=1e-6) == len(trial):
+            prim = trial
+        if len(prim) == 3:
+            break
+    return Rotation.random(random_state=seed).as_matrix() @ np.array(prim).T
+
+
+@pytest.mark.parametrize(
+    ("cell", "centring", "want_cell", "want_centring", "group", "p1"),
+    [
+        (
+            (54.75, 80.55, 88.0, 90, 96.45, 90),
+            "I",
+            (54.75, 80.55, 88.0, 90, 96.45, 90),
+            "I",
+            "I 1 2 1",
+            "I 1",
+        ),
+        (
+            (40.0, 60.0, 50.0, 90, 101.0, 90),
+            "P",
+            (40.0, 60.0, 50.0, 90, 101.0, 90),
+            "P",
+            "P 1 2 1",
+            "P 1",
+        ),
+        (
+            (18.39, 56.55, 6.54, 90, 90, 90),
+            "F",
+            (6.54, 18.39, 56.55, 90, 90, 90),
+            "F",
+            "F 2 2 2",
+            "F 1",
+        ),
+        (
+            (40.0, 40.0, 70.0, 90, 90, 90),
+            "I",
+            (40.0, 40.0, 70.0, 90, 90, 90),
+            "I",
+            "I 4 2 2",
+            "I 1",
+        ),
+        (
+            (60.0, 60.0, 95.0, 90, 90, 120),
+            "R",
+            (60.0, 60.0, 95.0, 90, 90, 120),
+            "R",
+            "R 3 2:H",
+            "P 1",
+        ),
+        (
+            (25.0, 25.0, 25.0, 90, 90, 90),
+            "F",
+            (25.0, 25.0, 25.0, 90, 90, 90),
+            "F",
+            "F 4 3 2",
+            "F 1",
+        ),
+    ],
+)
+def test_conventional_cell_of_centred_lattices(
+    cell, centring, want_cell, want_centring, group, p1
+):
+    info = describe_lattice(_primitive(cell, centring, seed=7))
+    assert info["centring"] == want_centring
+    assert info["multiplicity"] == 1 + len(_CENTRING[centring])
+    assert np.allclose(info["conventional_cell"], want_cell, atol=1e-4)
+    assert info["lattice_group"] == group
+    assert info["p1_symbol"] == p1
+    assert centring_of(info["to_conventional"])[0] == want_centring
+
+
+def test_monoclinic_centred_setting_is_found_among_the_candidates():
+    """Space group 5 in its I 1 2 1 setting: the candidates include
+    non-reference settings, and the counts pick the centring."""
+    cell = (54.75, 80.55, 88.0, 90.0, 96.45, 90.0)
+    nodes = _nodes("I 1 2 1", cell, (6, 8, 9), np.random.default_rng(12))
+    results = space_group_candidates(
+        nodes, rotations=_hkl_ops("P 1 2 1"), sohncke=True, rel_res=0.0
+    )
+    best = best_candidates(results)
+    assert len(best) == 1
+    assert "I 1 2 1" in best[0]["space_groups"]
+    assert not any(n.startswith(("C", "A", "P")) for n in best[0]["space_groups"])
+    rejected = {n for r in results if not r["consistent"] for n in r["space_groups"]}
+    assert "C 1 2 1" in rejected and "A 1 2 1" in rejected

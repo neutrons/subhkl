@@ -111,7 +111,7 @@ def main():
     band = write_seed(found, args.merged, args.instrument, seed)
     # The refinement keeps the metric symmetry of the lattice (not of the
     # crystal, which is not known yet): the lattice group constrains the cell.
-    cell_arg = ",".join(f"{v:.4f}" for v in found.symmetric_cell)
+    cell_arg = ",".join(f"{v:.4f}" for v in found.setting_cell)
 
     print("2. geometry and per-run orientation (existing refinement, seeded)")
     if not (args.reuse and refined.exists()):
@@ -129,7 +129,7 @@ def main():
             "--cell",
             cell_arg,
             "--space-group",
-            found.lattice_group if found.lattice_group != "unknown" else "P 1",
+            found.setting_group,
             "--wavelength-min",
             band[0],
             "--wavelength-max",
@@ -154,7 +154,7 @@ def main():
             "--wavel-max",
             band[1],
             "--space-group",
-            "P 1",
+            found.p1_symbol,
             "--rel-border-width",
             0.03,
             "--static-mask-file",
@@ -185,7 +185,7 @@ def main():
         "4. point group: lattice rotations tested on intensities at matched wavelength"
     )
     obs = Observations.from_file(integrated, d_min=args.test_d_min)
-    laue = laue_class(obs, found.operations)
+    laue = laue_class(obs, found.setting_operations)
     print(
         f"  same reflection twice {laue.same:.2f}, unrelated reflections {laue.unrelated:.2f}, accept below {laue.cut:.2f}"
     )
@@ -194,7 +194,7 @@ def main():
             f"  {row['name']:28s} {row['strong']:6d} strong pairs  spread {row['spread']:6.2f}  {row['verdict']}"
         )
     print(
-        f"  point group {laue.point_group}, Laue class {laue.laue} ({len(laue.rotations)} of {len(found.operations)} lattice rotations)"
+        f"  point group {laue.point_group}, Laue class {laue.laue} ({len(laue.rotations)} of {len(found.setting_operations)} lattice rotations)"
     )
     if laue.conflicts:
         print(
@@ -210,8 +210,12 @@ def main():
     with h5py.File(refined, "r") as f:
         ub = f["sample/U"][()] @ f["sample/B"][()]
         frames = f["goniometer/R"][()]
-    basis, T, mult = conventional_basis(np.linalg.inv(ub).T)
-    rotations = operations_in_basis(laue.rotations, T)
+    basis, rotations, mult = np.linalg.inv(ub).T, laue.rotations, found.multiplicity
+    if found.centring != "P" and found.p1_symbol == "P 1":
+        # A centred lattice that was integrated in its primitive cell
+        # (rhombohedral): the absences are tested in the conventional one.
+        basis, T, mult = conventional_basis(basis)
+        rotations = operations_in_basis(rotations, T)
     nodes = event_node_counts(
         args.merged, args.instrument, basis, frames, args.test_d_min
     )

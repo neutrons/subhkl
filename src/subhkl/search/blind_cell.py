@@ -395,10 +395,39 @@ def symmetrized_cell(A, mats):
     return float(a), float(b), float(c), ang(1, 2), ang(0, 2), ang(0, 1)
 
 
+def _axis_vector(W):
+    """Shortest lattice vector (integer direct coordinates) along the axis
+    of a rotation W acting on direct coordinates."""
+    vals, vecs = np.linalg.eig(W)
+    v = np.real(vecs[:, np.argmin(np.abs(vals - 1))])
+    v = v / np.abs(v).max()
+    for m in range(1, 13):
+        u = v * m
+        if np.allclose(u, np.rint(u), atol=1e-6):
+            u = np.rint(u).astype(int)
+            break
+    else:
+        return None
+    u = u // np.gcd.reduce(np.abs(u))
+    return max(tuple(-u), tuple(u))
+
+
 def conventional_basis(A, max_obliquity=3.0):
-    """Conventional basis of a reduced primitive basis, where one exists
-    with three axes along symmetry axes of the highest order (cubic
-    lattices: P, I, F).  Other lattices are returned unchanged.
+    """Conventional basis of a primitive basis, from the lattice's own rotations.
+
+    The axes are the shortest lattice vectors along rotation axes:
+
+    - monoclinic: b along the two-fold; a and c the two shortest vectors of
+      the lattice plane perpendicular to it, beta obtuse (the cell is then
+      P, C, A or I, whichever the lattice gives)
+    - orthorhombic: along the three two-folds, shortest first
+    - tetragonal: c along the four-fold, a and b along the shortest
+      perpendicular two-folds (P or I)
+    - trigonal and hexagonal: c along the three- or six-fold, a and b along
+      the shortest perpendicular two-folds, 120 degrees apart (P, or R in
+      the obverse setting)
+    - cubic: along the three four-folds (P, I or F)
+    - triclinic: unchanged
 
     Returns:
         (C, T, multiplicity): C = A @ T (columns [Angstrom]); Miller indices
@@ -406,7 +435,8 @@ def conventional_basis(A, max_obliquity=3.0):
     """
     cell = cell_of(A)
     ops = gemmi.find_lattice_symmetry(gemmi.UnitCell(*cell), "P", max_obliquity)
-    axes = []
+    axes = {}
+    twofold = None
     for op in ops.sym_ops:
         w = np.array(op.rot, dtype=float) / gemmi.Op.DEN
         order = next(
@@ -419,33 +449,127 @@ def conventional_basis(A, max_obliquity=3.0):
         )
         if order in (None, 1):
             continue
-        vals, vecs = np.linalg.eig(w)
-        v = np.real(vecs[:, np.argmin(np.abs(vals - 1))])
-        v = v / np.abs(v[np.abs(v) > 1e-6]).min()
-        uvw = np.rint(v).astype(int)
-        if tuple(uvw) < tuple(-uvw):
-            uvw = -uvw
-        axes.append((order, tuple(uvw)))
-    identity = np.eye(3)
-    if not axes:
-        return A, identity, 1
-    best = max(o for o, _ in axes)
-    cand = sorted(
-        {a for o, a in axes if o == best}, key=lambda u: np.linalg.norm(A @ np.array(u))
+        u = _axis_vector(w)
+        if u is None:
+            continue
+        axes[u] = max(order, axes.get(u, 0))
+        if order == 2:
+            twofold = w
+    n_rot = len(ops.sym_ops)
+    length = lambda u: float(np.linalg.norm(A @ np.array(u, dtype=float)))
+    cosine = lambda u, v: float(
+        (A @ np.array(u, float)) @ (A @ np.array(v, float)) / (length(u) * length(v))
     )
-    chosen = []
-    for u in cand:
-        trial = [*chosen, u]
-        if np.linalg.matrix_rank(np.array(trial, dtype=float).T) == len(trial):
-            chosen = trial
-        if len(chosen) == 3:
-            break
-    if len(chosen) < 3:
+    by_len = lambda us: sorted(us, key=length)
+    chosen = None
+    if n_rot == 2 and twofold is not None:
+        (bvec,) = axes
+        r = range(-3, 4)
+        plane = [
+            (i, j, k)
+            for i in r
+            for j in r
+            for k in r
+            if (i, j, k) != (0, 0, 0)
+            and not np.any(np.rint((twofold + np.eye(3)) @ np.array([i, j, k])))
+        ]
+        plane = by_len(plane)
+        avec = plane[0]
+        cvec = next(v for v in plane if abs(cosine(avec, v)) < 0.999)
+        if cosine(avec, cvec) > 0:
+            cvec = tuple(-np.array(cvec))
+        chosen = [avec, bvec, cvec]
+    elif n_rot == 4:
+        chosen = by_len(axes)
+    elif n_rot in (6, 8, 12):
+        main = next(
+            u for u, o in axes.items() if o == (4 if n_rot == 8 else max(axes.values()))
+        )
+        perp = by_len(
+            [u for u, o in axes.items() if u != main and abs(cosine(u, main)) < 0.05]
+        )
+        avec = perp[0]
+        want = 0.0 if n_rot == 8 else -0.5
+        cands = [v for u in perp for v in (u, tuple(-np.array(u)))]
+        bvec = next(
+            (
+                v
+                for v in cands
+                if abs(cosine(avec, v) - want) < 0.05
+                and abs(length(v) / length(avec) - 1) < 0.03
+            ),
+            None,
+        )
+        if bvec is not None:
+            chosen = [avec, bvec, main]
+    elif n_rot == 24:
+        four = by_len([u for u, o in axes.items() if o == 4])
+        if len(four) == 3:
+            chosen = four
+    identity = np.eye(3)
+    if chosen is None:
         return A, identity, 1
     T = np.array(chosen, dtype=float).T
+    if abs(np.linalg.det(T)) < 0.5:
+        return A, identity, 1
     if np.linalg.det(T) < 0:
-        T[:, 2] *= -1
+        T[:, 1 if n_rot == 2 else 2] *= -1
+    # rhombohedral lattice: use the obverse setting
+    if n_rot == 6 and centring_of(T)[0] == "R(reverse)":
+        T[:, :2] *= -1
     return A @ T, T, round(abs(np.linalg.det(T)))
+
+
+def centring_of(T):
+    """Centring of the conventional cell A @ T: (letter, list of fractional
+    lattice points inside the cell besides the origin)."""
+    Ti = np.linalg.inv(np.asarray(T, dtype=float))
+    r = range(-3, 4)
+    pts = {
+        tuple(np.round((Ti @ np.array([i, j, k])) % 1.0, 6) % 1.0)
+        for i in r
+        for j in r
+        for k in r
+    }
+    pts.discard((0.0, 0.0, 0.0))
+    key = frozenset(tuple(round(float(x) * 6) for x in p) for p in pts)
+    names = {
+        frozenset(): "P",
+        frozenset({(3, 3, 0)}): "C",
+        frozenset({(0, 3, 3)}): "A",
+        frozenset({(3, 0, 3)}): "B",
+        frozenset({(3, 3, 3)}): "I",
+        frozenset({(3, 3, 0), (0, 3, 3), (3, 0, 3)}): "F",
+        frozenset({(4, 2, 2), (2, 4, 4)}): "R",
+        frozenset({(2, 4, 2), (4, 2, 4)}): "R(reverse)",
+    }
+    return names.get(key, "?"), sorted(pts)
+
+
+def lattice_group_of(A, T, max_obliquity=3.0):
+    """Symbol of the lattice's rotation group in the conventional setting,
+    with its centring (for example "I 1 2 1"), or "unknown"."""
+    ops = gemmi.find_lattice_symmetry(gemmi.UnitCell(*cell_of(A)), "P", max_obliquity)
+    Ti = np.linalg.inv(T)
+    cen = [[0, 0, 0]] + [
+        [round(x * gemmi.Op.DEN) for x in p] for p in centring_of(T)[1]
+    ]
+    full = []
+    for op in ops.sym_ops:
+        w = Ti @ (np.array(op.rot, dtype=float) / gemmi.Op.DEN) @ T
+        for shift in cen:
+            o = gemmi.Op()
+            o.rot = np.rint(w * gemmi.Op.DEN).astype(int).tolist()
+            o.tran = shift
+            full.append(o)
+    try:
+        group = gemmi.find_spacegroup_by_ops(gemmi.GroupOps(full))
+    except (RuntimeError, ValueError):
+        group = None
+    return group.xhm() if group is not None else "unknown"
+
+
+P1_SYMBOLS = {"P": "P 1", "C": "C 1", "A": "A 1", "B": "B 1", "I": "I 1", "F": "F 1"}
 
 
 def operations_in_basis(mats, T):
@@ -468,18 +592,68 @@ def wavelength_band(merged, instrument, n_sample=4_000_000):
 
 @dataclass
 class BlindCell:
-    """Result of ``find_cell``."""
+    """Result of ``find_cell``.
+
+    ``basis`` is the reduced primitive basis.  ``setting_basis`` is the
+    basis the rest of the pipeline should index in: the conventional cell
+    where the lattice is centred and a centred P 1 symbol exists
+    (``p1_symbol``, e.g. "I 1"), otherwise the primitive one.
+    """
 
     basis: np.ndarray  # reduced primitive basis, columns [Angstrom], sample frame
     cell: tuple  # a, b, c [Angstrom], alpha, beta, gamma [degree] of ``basis``
-    symmetric_cell: tuple  # the same with the lattice symmetry imposed on the metric
     conventional_basis: np.ndarray
     conventional_cell: tuple
     to_conventional: np.ndarray  # T: h_conventional = T^T h_primitive
     multiplicity: int  # lattice points per conventional cell
+    centring: str  # P, C, A, B, I, F or R
     operations: list  # lattice rotations on primitive Miller indices
-    lattice_group: str
+    lattice_group: str  # rotation group of the lattice, conventional setting
+    setting_basis: np.ndarray
+    setting_cell: tuple  # with the lattice symmetry imposed on the metric
+    setting_operations: list  # lattice rotations on the setting's Miller indices
+    p1_symbol: str  # space group for the one integration without symmetry
+    setting_group: str  # lattice rotation group valid for ``setting_cell`` (constrains the refinement)
     diagnostics: dict = field(default_factory=dict)
+
+
+def describe_lattice(A):
+    """Everything ``BlindCell`` holds besides the diagnostics, from a primitive basis."""
+    A = reduce_basis(A)
+    cell = cell_of(A)
+    mats, primitive_group = lattice_operations(cell)
+    C, T, mult = conventional_basis(A)
+    letter = centring_of(T)[0]
+    conv_ops = operations_in_basis(mats, T)
+    if mult == 1:
+        group = lattice_group_of(A, T)
+        if group == "unknown":
+            group = primitive_group
+        setting, ops, p1 = C, conv_ops, "P 1"
+    else:
+        group = lattice_group_of(A, T)
+        if letter in P1_SYMBOLS and gemmi.find_spacegroup_by_name(P1_SYMBOLS[letter]):
+            setting, ops, p1 = C, conv_ops, P1_SYMBOLS[letter]
+        else:  # e.g. rhombohedral: integrate in the primitive cell
+            setting, ops, p1 = A, mats, "P 1"
+    return {
+        "basis": A,
+        "cell": cell,
+        "conventional_basis": C,
+        "conventional_cell": cell_of(C),
+        "to_conventional": T,
+        "multiplicity": mult,
+        "centring": letter,
+        "operations": mats,
+        "lattice_group": group,
+        "setting_basis": setting,
+        "setting_cell": symmetrized_cell(setting, ops),
+        "setting_operations": ops,
+        "p1_symbol": p1,
+        "setting_group": group
+        if setting is C
+        else (primitive_group if primitive_group != "unknown" else "P 1"),
+    }
 
 
 def find_cell(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
@@ -522,30 +696,31 @@ def find_cell(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
     q_pts = (nz + 0.5) * (2.0 * q_max / grid) - q_max
     A, before, after = refine_basis(A, q_pts, dens[dens > 0])
     diag.update(fourier_sum_before=before, fourier_sum_after=after, events=n_events)
-    A = reduce_basis(A)
-    cell = cell_of(A)
-    mats, group = lattice_operations(cell)
-    C, T, mult = conventional_basis(A)
+    info = describe_lattice(A)
     say(
         "primitive cell: a={:.2f} b={:.2f} c={:.2f} alpha={:.2f} beta={:.2f} gamma={:.2f}".format(
-            *cell
+            *info["cell"]
         )
-        + f"; lattice rotations: {len(mats)} ({group}); lattice points per conventional cell: {mult}"
     )
-    return BlindCell(
-        A, cell, symmetrized_cell(A, mats), C, cell_of(C), T, mult, mats, group, diag
+    say(
+        "conventional cell: a={:.2f} b={:.2f} c={:.2f} alpha={:.2f} beta={:.2f} gamma={:.2f}".format(
+            *info["conventional_cell"]
+        )
+        + f"; centring {info['centring']}; lattice rotations: {len(info['operations'])} ({info['lattice_group']})"
     )
+    return BlindCell(**info, diagnostics=diag)
 
 
 def write_seed(found, merged, instrument, out):
-    """Store a ``BlindCell`` as a solve-style file in space group P 1.
+    """Store a ``BlindCell`` as a solve-style file without point symmetry.
 
-    The file carries the cell and orientation (``sample/U``, ``sample/B``),
-    the wavelength band read off the events, the goniometer of the images
-    file, and under ``blind/`` the basis and the lattice rotations.  It
-    seeds ``solve --refinement band --bootstrap``.
+    The file carries the cell and orientation of ``found.setting_basis``
+    (``sample/U``, ``sample/B``), the space group ``found.p1_symbol``, the
+    wavelength band read off the events, the goniometer of the images
+    file, and under ``blind/`` the basis and the lattice rotations in that
+    indexing.  It seeds ``solve --refinement band --bootstrap``.
     """
-    UB = np.linalg.inv(found.basis).T  # q_sample = UB h
+    UB = np.linalg.inv(found.setting_basis).T  # q_sample = UB h
     U, B = np.linalg.qr(UB)
     sign = np.sign(np.diag(B))
     U, B = U * sign, (B.T * sign).T
@@ -553,9 +728,11 @@ def write_seed(found, merged, instrument, out):
     with h5py.File(merged, "r") as fm, h5py.File(out, "w") as f:
         f.attrs["instrument"] = instrument
         f.attrs["source"] = str(merged)
-        for name, value in zip(("a", "b", "c", "alpha", "beta", "gamma"), found.cell):
+        for name, value in zip(
+            ("a", "b", "c", "alpha", "beta", "gamma"), cell_of(found.setting_basis)
+        ):
             f[f"sample/{name}"] = float(value)
-        f["sample/space_group"] = np.bytes_(b"P 1")
+        f["sample/space_group"] = np.bytes_(found.p1_symbol.encode())
         f["sample/U"] = U
         f["sample/B"] = B
         f["instrument/wavelength"] = np.array(band)
@@ -570,9 +747,9 @@ def write_seed(found, merged, instrument, out):
             if key in fm:
                 fm.copy(fm[key], f, key)
         g = f.create_group("blind")
-        g["direct_basis"] = found.basis
-        g["lattice_operations"] = np.array(found.operations)
-        g["to_conventional"] = found.to_conventional
+        g["direct_basis"] = found.setting_basis
+        g["primitive_basis"] = found.basis
+        g["lattice_operations"] = np.array(found.setting_operations)
         g.attrs["lattice_group"] = found.lattice_group
-        g.attrs["multiplicity"] = found.multiplicity
+        g.attrs["centring"] = found.centring
     return band

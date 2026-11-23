@@ -24,12 +24,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     evidence. Enantiomorphic pairs are reported together.
   - `examples/blind_reduction_tof.py` chains these with the existing `solve`,
     `peak-predictor` and `integrator` commands.
-  - Tried on three MANDI datasets: IPTS-30763 runs 11324–11338 (P6₁22 or
-    P6₅22 found), a garnet from IPTS-34720 (Ia-3d found) and T4 lysozyme,
+  - The conventional cell and centring are derived for every lattice type, and
+    a centred lattice is indexed and integrated in its conventional cell
+    (`I 1`, `C 1`, ...). Candidates include non-reference settings such as
+    `I 1 2 1`.
+  - Tried on four MANDI datasets: IPTS-30763 runs 11324–11338 (P6₁22 or
+    P6₅22 found), a garnet from IPTS-34720 (Ia-3d found), T4 lysozyme,
     IPTS-34720 runs 13239–13245, a trigonal crystal in a hexagonal lattice
-    (point group 32 in the 321 setting, then P3₁21 or P3₂21 found). Centred
-    lattices other than cubic, and monoclinic cell choices with glide planes,
-    are not handled yet.
+    (point group 32 in the 321 setting, then P3₁21 or P3₂21 found), and an
+    Mpro complex, IPTS-36185 runs 13171–13188, with a body-centred monoclinic
+    lattice (I 1 2 1 found).
 
 ## [1.7.1]
 

@@ -412,22 +412,33 @@ def _laue_set(mats):
     )
 
 
-def _reference_groups(sohncke):
+def _settings(sohncke):
+    """Every tabulated space-group setting (reference and others, such as
+    I 1 2 1 or P 21 21 2), one entry per distinct symbol."""
+    seen = set()
     for sg in gemmi.spacegroup_table():
-        if sg.is_reference_setting() and (sg.is_sohncke() or not sohncke):
-            yield sg
+        name = sg.xhm()
+        if name in seen or (sohncke and not sg.is_sohncke()):
+            continue
+        seen.add(name)
+        yield sg
+
+
+def _hkl_rotations(sg):
+    out = []
+    for op in sg.operations().sym_ops:
+        w = np.array(op.rot, dtype=float) / gemmi.Op.DEN
+        out.append(np.rint(np.linalg.inv(w).T).astype(int))
+    return out
 
 
 def _settings_from_rotations(rotations, sohncke):
-    """(space group, P): reference groups whose Laue group, after the
-    change of indices h_reference = P h, is the one the rotations generate."""
+    """(space group, P): tabulated settings whose Laue group, after the
+    change of indices h_setting = P h, is the one the rotations generate."""
     target = _laue_set(close_group(rotations))
     perms = _signed_permutations()
-    for sg in _reference_groups(sohncke):
-        ref = []
-        for op in sg.operations().sym_ops:
-            w = np.array(op.rot, dtype=float) / gemmi.Op.DEN
-            ref.append(np.rint(np.linalg.inv(w).T).astype(int))
+    for sg in _settings(sohncke):
+        ref = _hkl_rotations(sg)
         if len(_laue_set(ref)) != len(target):
             continue
         for P in perms:
@@ -438,7 +449,7 @@ def _settings_from_rotations(rotations, sohncke):
 
 def _settings_from_laue(laue, basis, sohncke):
     """Fallback when only the name of the Laue class is known: reference
-    groups of that class, in the axis orders that leave the cell unchanged."""
+    settings of that class, in the axis orders that leave the cell unchanged."""
     from subhkl.search.blind_cell import cell_of
 
     base = np.array(cell_of(basis))
@@ -452,8 +463,8 @@ def _settings_from_laue(laue, basis, sohncke):
             for row, col in enumerate(perm):
                 P[row, col] = 1
             keep.append(P)
-    for sg in _reference_groups(sohncke):
-        if sg.laue_str() == laue:
+    for sg in _settings(sohncke):
+        if sg.is_reference_setting() and sg.laue_str() == laue:
             for P in keep:
                 yield sg, P
 
@@ -494,8 +505,9 @@ def space_group_candidates(
         nodes: NodeCounts
         rotations: integer matrices on the Miller indices of ``nodes`` that
             are symmetries (``LaueResult.rotations``).  Candidates are the
-            reference-setting space groups whose Laue group equals the one
-            these generate, in every axis assignment that makes it so.
+            tabulated space-group settings (reference and others, such as
+            I 1 2 1) whose Laue group equals the one these generate, in
+            every axis assignment that makes it so.
         laue: name of the Laue class (e.g. "m-3m"), used when ``rotations``
             is None; axis orders that leave the cell unchanged are tried
         sohncke: only groups a chiral molecule can crystallise in
@@ -534,19 +546,19 @@ def space_group_candidates(
             sg.operations().systematic_absences((grid @ P.T).astype(np.int32)),
             dtype=bool,
         )
-        key = forb[cov].tobytes()
-        label = (
-            sg.hm if np.array_equal(P, IDENTITY) else f"{sg.hm} (axes {_axes_label(P)})"
+        entry = hyp.setdefault(
+            forb[cov].tobytes(), {"forb": forb, "direct": [], "permuted": []}
         )
-        entry = hyp.setdefault(key, {"forb": forb, "names": [], "plain": set()})
-        if sg.hm not in entry["plain"]:
-            entry["plain"].add(sg.hm)
-            entry["names"].append(label)
-        elif np.array_equal(P, IDENTITY):
-            # prefer the unpermuted label for a group already listed
-            entry["names"] = [
-                label if n.split(" (")[0] == sg.hm else n for n in entry["names"]
-            ]
+        name = sg.xhm()
+        if np.array_equal(P, IDENTITY):
+            if name not in entry["direct"]:
+                entry["direct"].append(name)
+        elif not any(n.startswith(name + " (") for n in entry["permuted"]):
+            entry["permuted"].append(f"{name} (axes {_axes_label(P)})")
+    for entry in hyp.values():
+        # A symbol that applies to the indices as they are is preferred; the
+        # same group with its axes renamed is listed only when there is none.
+        entry["names"] = entry["direct"] or entry["permuted"][:4]
     hyps = list(hyp.values())
     if not hyps:
         raise ValueError(
