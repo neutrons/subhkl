@@ -2980,7 +2980,7 @@ class NovaGalaxyPipelineRunner:
                                 tag = m_wd.group(1)
                             else:
                                 src_bn = _re.sub(
-                                    r"(_merged|_solve|_integrated|_predictor)?\.(h5|hdf5|dat)$",
+                                    r"([._](?:merged|solve|integrated|integrator|predictor))?\.(h5|hdf5|dat)$",
                                     "",
                                     os.path.basename(src_str),
                                     flags=_re.IGNORECASE,
@@ -2995,7 +2995,7 @@ class NovaGalaxyPipelineRunner:
                                     tag = src_bn
         if not tag:
             bn = _re.sub(
-                r"(_merged|_solve|_integrated|_integrator|_predictor)?\.(h5|hdf5|dat)$",
+                r"([._](?:merged|solve|integrated|integrator|predictor))?\.(h5|hdf5|dat)$",
                 "",
                 clean_bn,
                 flags=_re.IGNORECASE,
@@ -4007,8 +4007,10 @@ class NovaGalaxyPipelineRunner:
         if not self._is_local_staging_mode():
             self.require_shared_dir_for_galaxy_mode()
 
+        init_job_id = f"nova-{int(time.time())}"
         job_record: dict[str, Any] = {
-            "job_id": f"nova-{int(time.time())}",
+            "job_id": init_job_id,
+            "client_job_id": init_job_id,
             "tool_id": self.STAGE_TOOLS[stage_id][0],
             "stage_id": stage_id,
             "mode": "galaxy",
@@ -4673,6 +4675,8 @@ class NovaGalaxyPipelineRunner:
             ) == os.path.abspath(work_d):
                 return {
                     "job_id": aj.get("job_id"),
+                    "client_job_id": aj.get("client_job_id") or aj.get("job_id"),
+                    "mode": aj.get("mode"),
                     "state": aj.get("state"),
                     "n_runs": int(aj.get("n_runs") or len(recipe["nexus_files"])),
                     "hydrate_only": True,
@@ -4744,6 +4748,8 @@ class NovaGalaxyPipelineRunner:
                 )
             return {
                 "job_id": job_rec.get("job_id"),
+                "client_job_id": job_rec.get("client_job_id") or job_rec.get("job_id"),
+                "mode": job_rec.get("mode"),
                 "state": job_rec.get("state", "running"),
                 "n_runs": len(recipe["nexus_files"]),
                 "hydrate_only": True,
@@ -5921,6 +5927,9 @@ class NovaGalaxyPipelineRunner:
                     str(params.get("peaks_file"))
                 )
                 merged_path = ""
+            elif params.get("work_dir") and os.path.isdir(str(params.get("work_dir"))):
+                work_dir = os.path.abspath(str(params.get("work_dir")))
+                merged_path = ""
             else:
                 work_dir, merged_path = (_get_staging_root(), "")
             if not params.get("hydrate_only"):
@@ -6068,7 +6077,14 @@ class NovaGalaxyPipelineRunner:
                     raise RuntimeError(
                         f"Using pre-merged scan {os.path.basename(merged_path)} (no raw *.nxs.h5 specified or in {work_dir})"
                     )
-                work_dir, merged_label = self._work_dir_for_reduce(raw_nxs, work_dir)
+                cand_wd, merged_label = self._work_dir_for_reduce(raw_nxs, work_dir)
+                if not (
+                    params.get("hydrate_only")
+                    and params.get("work_dir")
+                    and os.path.isdir(str(params.get("work_dir")))
+                ):
+                    work_dir = cand_wd
+                job_record["work_dir"] = work_dir
                 job_record["raw_nxs"] = raw_nxs
                 job_record["instrument"] = inst
                 job_record["merged_label"] = merged_label
@@ -8207,6 +8223,9 @@ class NovaGalaxyPipelineRunner:
             work_dir, merged_path = self._resolve_work_dir_and_merged(
                 os.path.abspath(str(params.get("peaks_file")))
             )
+        elif params.get("work_dir") and os.path.isdir(str(params.get("work_dir"))):
+            work_dir = os.path.abspath(str(params.get("work_dir")))
+            merged_path = os.path.join(work_dir, "merged.h5")
         else:
             work_dir, merged_path = self._resolve_work_dir_and_merged(
                 os.path.join(staging_root, "merged.h5")
@@ -8270,9 +8289,15 @@ class NovaGalaxyPipelineRunner:
                     f"Local NeXus file(s) not found or unreadable on /SNS or /HFIR: {missing_sample}"
                 )
             if raw_nxs_local:
-                work_dir, merged_label = self._work_dir_for_reduce(
+                cand_wd, merged_label = self._work_dir_for_reduce(
                     raw_nxs_local, work_dir
                 )
+                if not (
+                    preserve_downstream
+                    and params.get("work_dir")
+                    and os.path.isdir(str(params.get("work_dir")))
+                ):
+                    work_dir = cand_wd
                 solve_dest = os.path.join(work_dir, "solve.h5")
                 pred_dest = os.path.join(work_dir, "predictor.h5")
                 integrated_dest = os.path.join(work_dir, "integrated.h5")
@@ -8934,6 +8959,7 @@ class NovaGalaxyPipelineRunner:
         else:
             job_record = {
                 "job_id": job_id,
+                "client_job_id": job_id,
                 "container_name": container_name,
                 "tool_id": f"subhkl::{stage_id}",
                 "stage_id": stage_id,
@@ -10815,6 +10841,27 @@ def serve_rainbow_zones(
                 vm.pipeline_runner.apply_active_solve_overlay(
                     vm.payload, frame_index=f_idx
                 )
+            if (
+                not reloaded
+                and isinstance(vm.payload, dict)
+                and "hydration_job" in vm.payload
+            ):
+                aj_cur = vm.pipeline_runner.active_job
+                if (
+                    vm.payload.get("intensity_source") == "raw_h5"
+                    or not isinstance(aj_cur, dict)
+                    or not aj_cur.get("hydrate_only")
+                    or aj_cur.get("state") not in ("running", "queued", "new")
+                ):
+                    vm.payload.pop("hydration_job", None)
+                else:
+                    vm.payload["hydration_job"] = {
+                        **vm.payload["hydration_job"],
+                        "job_id": aj_cur.get("job_id"),
+                        "client_job_id": aj_cur.get("client_job_id")
+                        or aj_cur.get("job_id"),
+                        "state": aj_cur.get("state"),
+                    }
             if fast_frame_only and isinstance(vm.payload, dict):
                 from subhkl.viz.rainbow_zones import build_frame_only_response
 

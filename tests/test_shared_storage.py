@@ -1716,3 +1716,357 @@ def test_galaxy_careless_merge_completes_without_h5_signature_error(
     assert isinstance(payload.get("merge_metrics"), dict)
     assert payload["merge_metrics"]["cc_half"] == pytest.approx(0.964)
     assert payload["merge_metrics"]["r_pim"] == pytest.approx(0.042)
+
+
+def test_galaxy_history_integrated_h5_hydrate_reduce_completes_across_job_id_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening ``...integrated.h5`` from Galaxy History must poll hydration through ``nova-<ts>`` -> Galaxy ``job_id`` transition and stop the timer."""
+    import re
+    import shutil
+    import subprocess
+    import threading
+    from types import SimpleNamespace
+
+    from subhkl.io.shared_storage import (
+        allocate_shared_artifact_path,
+        write_shared_pointer,
+    )
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import _discover_images_h5, render_rainbow_html
+
+    nvme_dir = tmp_path / "nvme_staging"
+    shared_dir = tmp_path / "shared_scratch"
+    nvme_dir.mkdir()
+    shared_dir.mkdir()
+    monkeypatch.setenv("SUBHKL_EXEC_MODE", "galaxy")
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(nvme_dir))
+    monkeypatch.setenv("SUBHKL_SHARED_DIR", str(shared_dir))
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    # 1. Create a dot-suffixed History dataset `CG4D_2638.integrated.h5` whose raw NeXus lives only on remote /HFIR
+    gx_dl_int = nvme_dir / "subhkl_gx_deadbeef_CG4D_2638.integrated.h5"
+    dt_str = h5py.string_dtype(encoding="utf-8")
+    with h5py.File(gx_dl_int, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf.create_dataset(
+            "source_files",
+            data=np.array(
+                ["/HFIR/CG4D/IPTS-37331/nexus/CG4D_2638.nxs.h5"], dtype=object
+            ),
+            dtype=dt_str,
+        )
+        hf.create_dataset("instrument/wavelength", data=np.array([2.0, 4.0]))
+        hf.create_dataset(
+            "sample/cell", data=np.array([11.93, 11.93, 11.93, 90.0, 90.0, 90.0])
+        )
+        hf.create_dataset("sample/space_group", data=b"I a -3 d")
+        hf.create_dataset("sample/U", data=np.eye(3))
+        hf.create_dataset(
+            "sample/B", data=np.diag([1.0 / 11.93, 1.0 / 11.93, 1.0 / 11.93])
+        )
+        hf.create_dataset("goniometer/R", data=np.eye(3)[None, ...])
+        pgrp = hf.create_group("peaks")
+        pgrp["xyz"] = np.array([[0.25, 0.0, -1.0]], dtype=np.float64)
+        pgrp["hkl"] = np.array([[2, 0, 0]], dtype=np.int32)
+        pgrp["intensity"] = np.array([120.0], dtype=np.float64)
+        pgrp["sigma"] = np.array([6.0], dtype=np.float64)
+        pgrp["run_index"] = np.array([0], dtype=np.int32)
+        pgrp["wavelength"] = np.array([2.4], dtype=np.float64)
+
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://galaxy.example.org",
+        galaxy_api_key="fake-api-key",
+        history_id="6644e5c0e8a790e1",
+    )
+
+    # Dot-suffixed `.integrated.h5` must resolve cleanly to `subhkl_work_CG4D_2638`
+    work_d, staged_int = runner.stage_derived_h5_in_work_dir(
+        str(gx_dl_int), name_hint="CG4D_2638.integrated.h5"
+    )
+    assert os.path.basename(work_d) == "subhkl_work_CG4D_2638"
+    assert os.path.abspath(staged_int) == os.path.abspath(
+        os.path.join(work_d, "integrated.h5")
+    )
+
+    # Prepare shared merged.h5 + scan_ref.json pointer returned by imaginex_subhkl_prepare_peaks
+    shared_merged_local, _ = allocate_shared_artifact_path("merged.h5", tag="CG4D_2638")
+    with h5py.File(shared_merged_local, "w") as mhf:
+        mhf.attrs["instrument"] = "CG4D"
+        mhf.create_dataset("images", data=np.ones((1, 8, 8), dtype=np.float32))
+    scan_ptr_file = tmp_path / "scan_ref.json"
+    write_shared_pointer(
+        scan_ptr_file,
+        shared_merged_local,
+        artifact="merged.h5",
+        metadata={
+            "instrument": "CG4D",
+            "source_files": ["/HFIR/CG4D/IPTS-37331/nexus/CG4D_2638.nxs.h5"],
+        },
+    )
+
+    dispatch_ready = threading.Event()
+    allow_dispatch_proceed = threading.Event()
+
+    class _FakeTools:
+        def run_tool(
+            self, history_id: str, tool_id: str, tool_inputs: dict[str, object]
+        ):
+            _ = (history_id, tool_inputs)
+            assert tool_id == "imaginex_subhkl_prepare_peaks"
+            dispatch_ready.set()
+            allow_dispatch_proceed.wait(timeout=5.0)
+            return {
+                "jobs": [{"id": "86783c5f32a38590"}],
+                "outputs": [
+                    {
+                        "id": "ds_scan_ptr_hyd",
+                        "output_name": "output",
+                        "name": "scan_ref.json",
+                        "file_ext": "json",
+                    }
+                ],
+            }
+
+    fake_store = SimpleNamespace(
+        history_id="6644e5c0e8a790e1",
+        nova_connection=SimpleNamespace(
+            galaxy_instance=SimpleNamespace(tools=_FakeTools())
+        ),
+    )
+    monkeypatch.setattr(runner, "get_datastore", lambda *_a, **_k: fake_store)
+    monkeypatch.setattr(runner, "_has_tool_on_galaxy", lambda _tid: True)
+    monkeypatch.setattr(
+        runner,
+        "browse_oncat_catalog",
+        lambda _p: {"runs": [{"run": 2638}]},
+    )
+
+    def _fake_api(
+        method: str, path: str, payload: object = None, **kwargs: object
+    ) -> object:
+        _ = (method, payload)
+        if kwargs.get("raw") and "/api/datasets/ds_scan_ptr_hyd/display" in path:
+            return scan_ptr_file.read_bytes()
+        if "/console_output" in path:
+            return {
+                "stdout": "[pulsar] Runner host: IMAGINEX-2\nSaved 55 banks\n",
+                "stderr": "",
+            }
+        if path.startswith("/api/jobs/86783c5f32a38590"):
+            return {
+                "state": "ok",
+                "command_line": "subhkl prepare-peaks ...",
+                "outputs": {"output": {"id": "ds_scan_ptr_hyd", "src": "hda"}},
+            }
+        return {}
+
+    monkeypatch.setattr(runner, "_api_request", _fake_api)
+
+    refreshed_calls: list[tuple[int, bool, str]] = []
+    vm_data = SimpleNamespace(peaks_file=staged_int, images_file="")
+    vm = SimpleNamespace(
+        data=vm_data,
+        frame_index=0,
+        payload={"intensity_source": "synthetic", "panels": [], "peaks": []},
+        refresh_payload=lambda frame_index=0, preserve_params=True: (
+            refreshed_calls.append(
+                (int(frame_index), bool(preserve_params), str(vm_data.images_file))
+            ),
+            vm.payload.update({"intensity_source": "raw_h5"}),
+        ),
+    )
+    vm_lock = threading.RLock()
+
+    hyd_doc = runner._maybe_trigger_hydrate_reduce(
+        vm, vm_lock, staged_int, ds_info={"name": "CG4D_2638.integrated.h5"}
+    )
+    assert hyd_doc is not None
+    initial_job_id = str(hyd_doc["job_id"])
+    initial_client_id = str(hyd_doc["client_job_id"])
+    assert initial_job_id.startswith("nova-")
+    assert initial_client_id == initial_job_id
+    assert hyd_doc["hydrate_only"] is True
+
+    assert dispatch_ready.wait(timeout=5.0)
+    allow_dispatch_proceed.set()
+
+    # Wait for background Galaxy hydration thread to finish
+    for _ in range(100):
+        aj_now = runner.active_job
+        if isinstance(aj_now, dict) and aj_now.get("state") in ("ok", "error"):
+            break
+        threading.Event().wait(0.02)
+
+    aj_final = runner.active_job
+    assert isinstance(aj_final, dict)
+    assert aj_final["state"] == "ok"
+    assert aj_final["job_id"] == "86783c5f32a38590"
+    assert aj_final["client_job_id"] == initial_client_id
+    assert len(refreshed_calls) == 1
+    assert os.path.isfile(vm_data.images_file)
+    assert os.path.dirname(os.path.abspath(vm_data.images_file)) == os.path.abspath(
+        work_d
+    )
+    assert _discover_images_h5(staged_int) is not None
+
+    # 2. Execute the actual rendered `startHydrationJobPoll` JS across `nova-<ts>` -> `86783c5f32a38590` -> `ok`
+    node_bin = shutil.which("node")
+    assert node_bin is not None
+    html = render_rainbow_html(
+        {
+            "instrument": "CG4D",
+            "space_group": "I a -3 d",
+            "peaks": [],
+            "zones": [],
+            "panels": [],
+        }
+    )
+    m_fn = re.search(
+        r"(function startHydrationJobPoll\(hJob\)\s*\{.*?\n  \})\n\n  async function probeGalaxyConnection",
+        html,
+        flags=re.DOTALL,
+    )
+    assert m_fn is not None, (
+        "Could not extract startHydrationJobPoll from rendered HTML"
+    )
+    fn_src = m_fn.group(1)
+
+    js_harness = f"""
+const logs = [];
+const statusLines = [];
+const cellEl = {{ textContent: "" }};
+const document = {{ getElementById: (id) => (id === "cell-summary" ? cellEl : null) }};
+const state = {{
+  runningStageIdx: -1,
+  selectedFrameIndex: 0,
+  stepTimings: {{ reduce: {{ status: "idle", elapsedMs: 0 }} }},
+}};
+const DATA = {{ frame_index: 0 }};
+const galaxyBridge = {{
+  pollTimer: null,
+  hydratingJobId: null,
+  hydratingClientId: null,
+  hydratingPromise: null,
+  resolveHydrating: null,
+  datasets: [],
+  stepArtifacts: null,
+}};
+let finishArgs = null;
+let reloadedArgs = null;
+let probed = 0;
+function startStepStopwatch(stage, ms) {{
+  state.stepTimings[stage] = {{ status: "running", elapsedMs: ms || 0 }};
+}}
+function finishStepStopwatch(stage, status, ms) {{
+  state.stepTimings[stage] = {{ status, elapsedMs: ms }};
+  finishArgs = {{ stage, status, ms }};
+}}
+function renderPipeline() {{}}
+function appendTerminalLog(txt) {{ logs.push(txt); }}
+function populateGalaxyH5Selector() {{}}
+function renderFilesDrawer() {{}}
+function getRenderBinningQuery() {{ return "&render_binning=4"; }}
+function recomputeBoundsAndReload(pl, opts) {{ reloadedArgs = {{ pl, opts }}; }}
+function setStatusLine(tag, body) {{ statusLines.push({{ tag, body }}); }}
+function probeGalaxyConnection() {{ probed += 1; }}
+function escTxt(s) {{ return String(s); }}
+
+let statusCall = 0;
+async function fetch(url) {{
+  if (url.startsWith("api/pipeline/status")) {{
+    statusCall += 1;
+    if (statusCall === 1) {{
+      return {{
+        ok: true,
+        json: async () => ({{
+          active_job: {{
+            job_id: "86783c5f32a38590",
+            client_job_id: "nova-1795472980",
+            hydrate_only: true,
+            mode: "galaxy",
+            state: "running",
+            runner_host: "IMAGINEX-2",
+            stdout: "[pulsar] Runner host: IMAGINEX-2\\nReducing...",
+            stderr: "",
+          }},
+        }}),
+      }};
+    }}
+    return {{
+      ok: true,
+      json: async () => ({{
+        active_job: {{
+          job_id: "86783c5f32a38590",
+          client_job_id: "nova-1795472980",
+          hydrate_only: true,
+          mode: "galaxy",
+          state: "ok",
+          runner_host: "IMAGINEX-2",
+          elapsed_ms: 4320,
+          stdout: "[pulsar] Runner host: IMAGINEX-2\\nSaved 55 banks",
+          stderr: "",
+        }},
+      }}),
+    }};
+  }}
+  if (url.startsWith("api/payload")) {{
+    return {{
+      ok: true,
+      json: async () => ({{
+        intensity_source: "raw_h5",
+        panels: [{{ bank: 1 }}],
+        peaks: [{{ h: 2, k: 0, l: 0 }}],
+        hydration_job: {{ job_id: "stale" }},
+      }}),
+    }};
+  }}
+  throw new Error("Unexpected URL: " + url);
+}}
+
+const _origSetInterval = globalThis.setInterval;
+globalThis.setInterval = (fn, _ms) => _origSetInterval(fn, 10);
+
+{fn_src}
+
+(async () => {{
+  const ok = await startHydrationJobPoll({{
+    job_id: "nova-1795472980",
+    client_job_id: "nova-1795472980",
+    mode: "galaxy",
+    state: "queued",
+    hydrate_only: true,
+    n_runs: 1,
+  }});
+  console.log(JSON.stringify({{
+    ok,
+    statusCall,
+    runningStageIdx: state.runningStageIdx,
+    stepTiming: state.stepTimings.reduce,
+    finishArgs,
+    cellText: cellEl.textContent,
+    hasHydrationJobInReload: Boolean(reloadedArgs && reloadedArgs.pl && reloadedArgs.pl.hydration_job),
+    reloadedIntensity: reloadedArgs && reloadedArgs.pl && reloadedArgs.pl.intensity_source,
+    lastStatusTag: statusLines.length ? statusLines[statusLines.length - 1].tag : "",
+    probed,
+  }}));
+}})();
+"""
+    proc = subprocess.run(
+        [node_bin, "-e", js_harness],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
+    js_res = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert js_res["ok"] is True
+    assert js_res["statusCall"] == 2
+    assert js_res["runningStageIdx"] == -1
+    assert js_res["stepTiming"] == {"status": "done", "elapsedMs": 4320}
+    assert js_res["finishArgs"] == {"stage": "reduce", "status": "done", "ms": 4320}
+    assert js_res["cellText"] == "DONE"
+    assert js_res["hasHydrationJobInReload"] is False
+    assert js_res["reloadedIntensity"] == "raw_h5"
+    assert js_res["lastStatusTag"] == "[FRAMES HYDRATED]"
+    assert js_res["probed"] == 1
