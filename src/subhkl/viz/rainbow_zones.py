@@ -27412,20 +27412,37 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   function startHydrationJobPoll(hJob) {{
     if (!hJob || !hJob.job_id) return;
-    if (galaxyBridge.hydratingJobId === hJob.job_id && galaxyBridge.hydratingPromise) {{
+    const hydClientId = String(hJob.client_job_id || hJob.job_id);
+    if (
+      (galaxyBridge.hydratingClientId === hydClientId || galaxyBridge.hydratingJobId === String(hJob.job_id)) &&
+      galaxyBridge.hydratingPromise
+    ) {{
       return galaxyBridge.hydratingPromise;
     }}
     if (galaxyBridge.pollTimer) {{
       clearInterval(galaxyBridge.pollTimer);
       galaxyBridge.pollTimer = null;
     }}
-    const hydJobId = String(hJob.job_id);
+    let hydJobId = String(hJob.job_id);
     galaxyBridge.hydratingJobId = hydJobId;
+    galaxyBridge.hydratingClientId = hydClientId;
+    const cellSummary = document.getElementById("cell-summary");
     state.runningStageIdx = 0;
     startStepStopwatch(
       "reduce",
       typeof hJob.elapsed_ms === "number" && hJob.elapsed_ms > 0 ? hJob.elapsed_ms : 0
     );
+    const syncHydrationHostDisplay = (rec) => {{
+      const rHost = (rec && rec.runner_host && String(rec.runner_host).trim())
+        ? String(rec.runner_host).trim().toUpperCase()
+        : ((String(`${{(rec && rec.stdout) || ""}}\n${{(rec && rec.stderr) || ""}}`).match(/\\[(?:pulsar|subhkl|careless)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
+      const hostTag = rHost || ((rec && rec.mode === "galaxy") ? "PULSAR" : "SUBHKL");
+      const stateTag = String((rec && rec.state) || "running").toUpperCase();
+      if (cellSummary) {{
+        cellSummary.textContent = `[${{hostTag}}] ${{stateTag}}`;
+      }}
+    }};
+    syncHydrationHostDisplay(hJob);
     renderPipeline();
     if (hJob.stdout || hJob.stderr) {{
       appendTerminalLog(
@@ -27434,9 +27451,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       );
     }}
     galaxyBridge.hydratingPromise = new Promise((resolveHyd) => {{
+      galaxyBridge.resolveHydrating = resolveHyd;
       let pollBusy = false;
       galaxyBridge.pollTimer = setInterval(async () => {{
-        if (galaxyBridge.hydratingJobId !== hydJobId) {{
+        if (galaxyBridge.hydratingClientId !== hydClientId) {{
           clearInterval(galaxyBridge.pollTimer);
           galaxyBridge.pollTimer = null;
           resolveHyd(false);
@@ -27460,18 +27478,41 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
             renderFilesDrawer();
           }}
           const aj = sdoc.active_job;
-          if (!aj || (aj.job_id && String(aj.job_id) !== hydJobId)) {{
+          const sameHydJob = Boolean(
+            aj &&
+            aj.hydrate_only &&
+            (
+              (aj.client_job_id && String(aj.client_job_id) === hydClientId) ||
+              String(aj.job_id || "") === hydJobId ||
+              hydJobId.startsWith("nova-")
+            )
+          );
+          if (!sameHydJob) {{
             clearInterval(galaxyBridge.pollTimer);
             galaxyBridge.pollTimer = null;
             galaxyBridge.hydratingJobId = null;
+            galaxyBridge.hydratingClientId = null;
             galaxyBridge.hydratingPromise = null;
-            if (state.runningStageIdx === 0) {{
+            if (
+              state.stepTimings &&
+              state.stepTimings.reduce &&
+              state.stepTimings.reduce.status === "running" &&
+              (!aj || aj.stage_id !== "reduce")
+            ) {{
+              finishStepStopwatch("reduce", "stopped");
+            }}
+            if (state.runningStageIdx === 0 && (!aj || aj.stage_id !== "reduce")) {{
               state.runningStageIdx = -1;
               renderPipeline();
             }}
             resolveHyd(true);
             return;
           }}
+          if (aj.job_id) {{
+            hydJobId = String(aj.job_id);
+            galaxyBridge.hydratingJobId = hydJobId;
+          }}
+          syncHydrationHostDisplay(aj);
           const outText = (aj.stdout || "") + (aj.stderr ? `\\n[stderr]\\n${{aj.stderr}}` : "");
           if (outText) appendTerminalLog(outText, true);
           const isCancelled = aj.state === "deleted" || Boolean(aj.cancel_requested);
@@ -27481,6 +27522,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
             clearInterval(galaxyBridge.pollTimer);
             galaxyBridge.pollTimer = null;
             galaxyBridge.hydratingJobId = null;
+            galaxyBridge.hydratingClientId = null;
             galaxyBridge.hydratingPromise = null;
             if (state.runningStageIdx === 0) {{
               state.runningStageIdx = -1;
@@ -27490,8 +27532,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
               finishedOk ? "done" : (isCancelled ? "stopped" : "error"),
               typeof aj.elapsed_ms === "number" ? aj.elapsed_ms : null
             );
+            if (cellSummary) {{
+              cellSummary.textContent = finishedOk ? "DONE" : (isCancelled ? "STOPPED" : "ERROR");
+            }}
             renderPipeline();
             if (finishedOk) {{
+              let reloadedHydrated = false;
               try {{
                 const pr = await fetch(
                   `api/payload?frame=${{curFrame}}&preserve_params=1${{getRenderBinningQuery()}}`,
@@ -27499,11 +27545,28 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
                 );
                 if (pr.ok) {{
                   const hydratedPayload = await pr.json();
+                  if (hydratedPayload && typeof hydratedPayload === "object") {{
+                    delete hydratedPayload.hydration_job;
+                  }}
                   if (hydratedPayload && (Array.isArray(hydratedPayload.panels) || Array.isArray(hydratedPayload.peaks))) {{
                     recomputeBoundsAndReload(hydratedPayload, {{ preserveParams: true }});
+                    reloadedHydrated = true;
                   }}
                 }}
               }} catch (_he) {{}}
+              if (reloadedHydrated) {{
+                setStatusLine(
+                  "[FRAMES HYDRATED]",
+                  "Detector image frames hydrated from raw NeXus — full 2D detector intensity view ready."
+                );
+              }}
+              probeGalaxyConnection();
+            }} else {{
+              const errDetail = escTxt(String(aj.error || (isCancelled ? "Hydration job stopped." : "Failed to hydrate detector frames.")));
+              setStatusLine(
+                isCancelled ? "[HYDRATION STOPPED]" : "[HYDRATION ERROR]",
+                `<span style="color:${{isCancelled ? "var(--accent-gold)" : "#f87171"}};">${{errDetail}}</span>`
+              );
             }}
             resolveHyd(finishedOk);
           }}
@@ -27616,7 +27679,13 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const stageId = st.stage_id || "solve";
     state.workflowRunSeq = (state.workflowRunSeq || 0) + 1;
     galaxyBridge.hydratingJobId = null;
+    galaxyBridge.hydratingClientId = null;
     galaxyBridge.hydratingPromise = null;
+    if (typeof galaxyBridge.resolveHydrating === "function") {{
+      const resFn = galaxyBridge.resolveHydrating;
+      galaxyBridge.resolveHydrating = null;
+      resFn(false);
+    }}
     if (galaxyBridge.pollTimer) {{
       clearInterval(galaxyBridge.pollTimer);
       galaxyBridge.pollTimer = null;

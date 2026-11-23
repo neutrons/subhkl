@@ -706,6 +706,24 @@ class MainApp:
                             self.view_model.model.subhkl.payload,
                             frame_index=f_idx,
                         )
+                    cur_pl = self.view_model.model.subhkl.payload
+                    if not refreshed and "hydration_job" in cur_pl:
+                        aj_cur = self.pipeline_runner.active_job
+                        if (
+                            cur_pl.get("intensity_source") == "raw_h5"
+                            or not isinstance(aj_cur, dict)
+                            or not aj_cur.get("hydrate_only")
+                            or aj_cur.get("state") not in ("running", "queued", "new")
+                        ):
+                            cur_pl.pop("hydration_job", None)
+                        else:
+                            cur_pl["hydration_job"] = {
+                                **cur_pl["hydration_job"],
+                                "job_id": aj_cur.get("job_id"),
+                                "client_job_id": aj_cur.get("client_job_id")
+                                or aj_cur.get("job_id"),
+                                "state": aj_cur.get("state"),
+                            }
                     if fast_frame_only:
                         from subhkl.viz.rainbow_zones import build_frame_only_response
 
