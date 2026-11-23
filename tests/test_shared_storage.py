@@ -1368,6 +1368,7 @@ def test_careless_merge_reports_runner_host_local_and_galaxy(
             "panels": [],
         }
     )
+    assert "function escTxt(s)" in html
     assert "syncRunningHostDisplay" in html
     assert "[4. MERGE • ${hostTag}]" in html
     assert "Careless Variational Merge</strong> on host" in html

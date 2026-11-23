@@ -11897,6 +11897,13 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
 (function() {{
   const DATA = window.RAINBOW_ZONES_DATA || {{ peaks: [], sample_peaks: [], zones: [], panels: [], ladder_steps: [], pipeline_stages: [] }};
+  function escTxt(s) {{
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }}
   function extractPeakBucketsFromPayload(payload) {{
     const pObj = payload || {{}};
     const isFrameOnly = Boolean(pObj.frame_only);
@@ -23504,7 +23511,6 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       return;
     }}
     if (newPayload.mtz_overlay_name && newPayload.mtz_fresh_overlay !== false) {{
-      const escTxt = s => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       const warnHtml = newPayload.mtz_overlay_warning
         ? ` • <span style="color:var(--accent-gold);">⚠ ${{escTxt(newPayload.mtz_overlay_warning)}}</span>`
         : "";
