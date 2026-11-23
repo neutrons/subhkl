@@ -4,6 +4,53 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1]
+
+### Added
+
+- **Reversible two-phase session Exit (`⏻`) with deterministic shared/staging cleanup and 80s pixel-font exit modal (`rainbow_zones`, `arcade_exit_quips`, `nova_rainbow_view`, `nova_app`)**:
+  - Added a compact top-bar `⏻` exit button that opens a minimalist gold-on-dark
+    `8×8` pixel-font (`SubhklArcade`, offline embedded TrueType) modal with 230
+    cheerful arcade/beamline sign-off messages, paired with reversible **`GO
+    BACK`** and crimson **`CLOSE TAB`** actions (and clean sans-serif typography
+    in Pro mode).
+  - Implemented a two-phase `/api/pipeline/exit` lifecycle (`prepare` on modal
+    open, `confirm` on **`CLOSE TAB`** / tab unload):
+    - In **Galaxy/NDIP** mode, `prepare` immediately sweeps Tier 1 staging and
+      Tier 2 shared intermediates (locally or via `imaginex_subhkl_cleanup_shared`)
+      while keeping the Trame/HTTP server alive so **`GO BACK`** restores the
+      previous step and hydrates reduced detector frames on the fly from Galaxy
+      History.
+    - In **Local** mode, intermediate file deletion is deferred until `confirm`
+      or process finalization so **`GO BACK`** preserves local state intact.
+- **Execution host reporting for Careless variational merge (`nova_rainbow_view`, `rainbow_zones`)**:
+  - Surfaced the active execution host (`runner_host`, resolved from local
+    container headers, `[pulsar] Runner host:` console output, or Galaxy
+    `job_metrics`) in `#cell-summary`, the live `[4. MERGE • <HOST>]` HUD status
+    bar, terminal logs, and `careless_metrics.json`.
+
+### Fixed
+
+- **Post-integration Wulff $d_{\min}$ filtering in `Integ` / `All-Runs` mode and Careless `--dmin` cutoff forwarding (`rainbow_zones`, `nova_rainbow_view`, `nova_app`)**:
+  - Preserved the selected peak source (`Integ` vs. `Pred`) and multi-run
+    `All-Runs` peak pools when adjusting $d_{\min}$ or $[\lambda_{\min},
+    \lambda_{\max}]$ after integration: `Integ` mode filters integrated
+    reflections in place by $d \ge d_{\min}$ without switching to predicted
+    peaks, starving runs `1..N-1`, or dropping multi-run `frame_only` pools.
+  - Forwarded the active UI $d_{\min}$ as `--dmin` to both local Careless
+    containers (with pre-flight empty-cutoff validation) and Galaxy
+    `imaginex_subhkl_merge`, and stamped full `/careless/{asu_hkl,merged_i,merged_sigi}`
+    datasets so Bayesian-extrapolated harmonics ($d_{\min} <
+    d_{\min,\text{integrated}}$) retain merged structure factors.
+- **Read-only UI `SUBHKL_SHARED_DIR` mounts, worker-delegated shared cleanup, and non-ORNL Galaxy hydration (`shared_storage`, `nova_rainbow_view`)**:
+  - Relaxed UI `require_shared_dir_for_galaxy_mode()` to require read-only
+    `R_OK | X_OK` permissions (retaining `W_OK | X_OK` on worker writers),
+    dispatching `imaginex_subhkl_cleanup_shared` on a read-write worker whenever
+    the UI container mounts `SUBHKL_SHARED_DIR` read-only.
+  - Allowed canonical `/SNS` and `/HFIR` NeXus `source_files` paths to trigger
+    remote Galaxy Reduce hydration even when `/SNS` and `/HFIR` are not mounted
+    on the UI or CI host.
+
 ## [1.7.0]
 
 ### Added
