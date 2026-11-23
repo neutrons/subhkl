@@ -72,11 +72,36 @@ times independently put the scale 0.9% above it.
 Timing on one GPU: about 30 s to histogram 9×10⁸ events, under 2 minutes
 for step 1 in total.
 
+## Screw axis along c
+
+`axial_screw.py merged.h5 MANDI refined.h5`
+
+The reflections 00l share one detector position and differ only in
+wavelength, so the integrator cannot separate them (184 of the 199 axial
+rows are censored as unresolvable). But at that spot the time-of-flight
+spectrum is the one-dimensional diffraction pattern along c*. Converting
+each event near the axis to a fractional index l, and subtracting a
+parallel row between the lattice rows as background, gives on this dataset
+(l from 32 to 160):
+
+| l mod 6 | Reflections | Net counts | Per reflection |
+|---|---|---|---|
+| 0 | 21 | 1919 ± 54 | 91 |
+| 1 | 21 | 296 ± 37 | 14 |
+| 2 | 22 | 285 ± 37 | 13 |
+| 3 | 22 | 285 ± 37 | 13 |
+| 4 | 21 | 242 ± 37 | 12 |
+| 5 | 21 | 262 ± 37 | 13 |
+
+Only l = 6n stands out, by a factor of seven: a 6₁ or 6₅ axis (the two are
+enantiomorphs and cannot be told apart from intensities). The other five
+classes sit on an equal pedestal that the background row does not remove;
+it has not been explained.
+
 ## Not done
 
-- The space group beyond the Laue class. The 6₁ screw axis would show in
-  the 00l reflections, but for this long axis 184 of the 199 axial rows are
-  censored as unresolvable overlaps.
+- The rest of the space group: other axes, glide planes, and a proper
+  significance test for the screw (the pedestal above is unexplained).
 - A crystal whose point group is lower than its lattice symmetry, more than
   one lattice, or a centred lattice.
 - Instruments without event times. There the same transform with |q|
