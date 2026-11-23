@@ -711,8 +711,16 @@ def test_galaxy_runner_pointer_orchestration_and_shared_lifecycle(
     assert os.path.exists(shared_merged_1)
 
     # 4. Restarting from thin solve.h5 in SUBHKL_EXEC_MODE=galaxy triggers Galaxy runner hydration (NOT local GPU!)
+    #    Use a non-mounted /HFIR path so hydration is verified even when UI/CI hosts do NOT mount /HFIR or /SNS.
     other_solve = tmp_path / "restart_solve.h5"
     other_solve.write_bytes(thin_solve_hda.read_bytes())
+    with h5py.File(other_solve, "a") as osf:
+        del osf["source_files"]
+        osf.create_dataset(
+            "source_files",
+            data=[b"/HFIR/CG4D/IPTS-999999/nexus/CG4D_999999.nxs.h5"],
+        )
+    assert not os.path.exists("/HFIR/CG4D/IPTS-999999/nexus/CG4D_999999.nxs.h5")
     with patch.object(
         runner,
         "submit_galaxy_stage",
@@ -727,6 +735,9 @@ def test_galaxy_runner_pointer_orchestration_and_shared_lifecycle(
     mock_sub_gx.assert_called_once()
     assert mock_sub_gx.call_args.args[0] == "reduce"
     assert mock_sub_gx.call_args.args[1]["hydrate_only"] is True
+    assert mock_sub_gx.call_args.args[1]["nexus_files"] == [
+        "/HFIR/CG4D/IPTS-999999/nexus/CG4D_999999.nxs.h5"
+    ]
 
     # 5. Switching to a different dataset work_dir cleans up shared_merged_1 and purges ds_scan_ptr_1!
     removed_on_switch = runner.release_shared_scan_intermediates(
@@ -912,3 +923,492 @@ def test_nfs_race_free_uuid_staging_and_fsync_before_pointer_publish(
         < idx_close_ptr
     )
     assert os.environ.get("HDF5_USE_FILE_LOCKING") == "FALSE"
+
+
+def test_readonly_ui_shared_dir_and_worker_cleanup_tool_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify UI requires only read-only (ro) SUBHKL_SHARED_DIR access and delegates cleanup to imaginex_subhkl_cleanup_shared."""
+    nvme_dir = tmp_path / "ui_nvme"
+    shared_dir = tmp_path / "shared_nfs_ro"
+    nvme_dir.mkdir()
+    shared_dir.mkdir()
+    monkeypatch.setenv("SUBHKL_EXEC_MODE", "galaxy")
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(nvme_dir))
+    monkeypatch.setenv("SUBHKL_SHARED_DIR", str(shared_dir))
+
+    # 1. Worker (with rw access) produces merged.h5 + scan.ref.json BEFORE UI mounts shared_dir read-only
+    shared_merged_local, shared_merged_net = allocate_shared_artifact_path(
+        "merged.h5", tag="RO_TEST"
+    )
+    with h5py.File(shared_merged_local, "w") as mf:
+        mf.attrs["instrument"] = "CG4D"
+        mf.create_dataset("images", data=np.ones((1, 4, 4), dtype=np.float32))
+        mf.create_dataset("bank_ids", data=np.array([1], dtype=np.int32))
+    scan_ptr_hda = tmp_path / "hda_scan_ro.json"
+    write_shared_pointer(scan_ptr_hda, shared_merged_local, artifact="merged.h5")
+
+    # 2. Lock shared_dir to read-only (0o555) to simulate a strict `ro` bind-mount in the UI container
+    os.chmod(shared_dir, 0o555)
+    try:
+        runner = NovaGalaxyPipelineRunner(
+            galaxy_url="http://localhost:8080",
+            galaxy_api_key="fake_key",
+            history_id="hist_ro",
+        )
+
+        # UI startup / stage check succeeds with read-only access (writable=False)
+        assert runner.require_shared_dir_for_galaxy_mode() == str(shared_dir)
+
+        # Worker-side writer check properly rejects read-only mount (writable=True)
+        with pytest.raises(RuntimeError, match="not a writable directory"):
+            get_shared_dir_local(require=True, create=False, writable=True)
+
+        dispatched_cleanup: list[tuple[str, dict[str, object]]] = []
+        purged_ids: list[str] = []
+
+        def _fake_api(
+            method: str,
+            endpoint: str,
+            payload: dict[str, object] | None = None,
+            **_kw: object,
+        ):
+            if method == "PUT" and isinstance(payload, dict) and payload.get("deleted"):
+                purged_ids.append(endpoint.rsplit("/", 1)[-1])
+                return {"id": purged_ids[-1], "deleted": True}
+            if "/api/jobs/" in endpoint:
+                return {
+                    "state": "ok",
+                    "exit_code": 0,
+                    "tool_stdout": "done\n",
+                    "tool_stderr": "",
+                }
+            if "/api/datasets/" in endpoint:
+                did = endpoint.rsplit("/", 1)[-1].split("?")[0]
+                return {
+                    "id": did,
+                    "name": f"{did}.json",
+                    "state": "ok",
+                    "deleted": False,
+                }
+            return {}
+
+        def _fake_dl(ds_id: str, dest: str, **_kw: object) -> int:
+            assert ds_id == "ds_scan_ro_1"
+            data = scan_ptr_hda.read_bytes()
+            os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+            Path(dest).write_bytes(data)
+            return len(data)
+
+        class _FakeTools:
+            def run_tool(
+                self,
+                history_id: str,
+                tool_id: str,
+                tool_inputs: dict[str, object],
+            ):
+                if tool_id == "imaginex_subhkl_prepare_peaks":
+                    return {
+                        "jobs": [{"id": "j_prep_ro"}],
+                        "outputs": [
+                            {
+                                "id": "ds_scan_ro_1",
+                                "name": "scan_ref.json",
+                                "file_ext": "json",
+                            }
+                        ],
+                    }
+                if tool_id == "imaginex_subhkl_cleanup_shared":
+                    dispatched_cleanup.append((tool_id, dict(tool_inputs)))
+                    # Simulate worker node (which mounts shared_dir rw) executing subhkl cleanup-shared!
+                    os.chmod(shared_dir, 0o777)
+                    try:
+                        cli_res = CliRunner().invoke(
+                            cli_app,
+                            ["cleanup-shared", str(tool_inputs["networkPath"])],
+                        )
+                        assert cli_res.exit_code == 0
+                    finally:
+                        os.chmod(shared_dir, 0o555)
+                    return {
+                        "jobs": [{"id": "j_cleanup_1"}],
+                        "outputs": [
+                            {
+                                "id": "ds_cleanup_log_1",
+                                "name": "cleanup.log",
+                                "file_ext": "txt",
+                            }
+                        ],
+                    }
+                raise AssertionError(f"Unexpected tool {tool_id}")
+
+        class _FakeDatasets:
+            def show_dataset(self, ds_id: str):
+                return {"id": ds_id, "name": ds_id, "state": "ok", "deleted": False}
+
+            def get_datasets(self, **_kw: object):
+                return []
+
+            def wait_for_dataset(self, *_a: object, **_kw: object):
+                return None
+
+        fake_store = SimpleNamespace(
+            history_id="hist_ro",
+            nova_connection=SimpleNamespace(
+                galaxy_instance=SimpleNamespace(
+                    base_url="http://localhost:8080",
+                    tools=_FakeTools(),
+                    datasets=_FakeDatasets(),
+                )
+            ),
+        )
+        monkeypatch.setattr(runner, "_api_request", _fake_api)
+        monkeypatch.setattr(runner, "_download_dataset_to_file", _fake_dl)
+        monkeypatch.setattr(runner, "get_datastore", lambda *_a, **_k: fake_store)
+        monkeypatch.setattr(runner, "_has_tool_on_galaxy", lambda _t: True)
+        monkeypatch.setattr(runner, "_get_tool_version", lambda _t: "0.3.0")
+        monkeypatch.setattr(
+            runner, "attach_dataset_cell_metadata_from_file", lambda *_a, **_k: None
+        )
+
+        # 3. UI receives pointer on ro mount, symlinks merged.h5, and reads detector frames cleanly
+        rec_red: dict[str, object] = {
+            "job_id": "r_ro",
+            "stage_id": "reduce",
+            "stdout": "",
+        }
+        runner._dispatch_nova_galaxy_thread(
+            "reduce",
+            {
+                "instrument": "CG4D",
+                "nexus_files": ["/HFIR/CG4D/IPTS-999999/nexus/CG4D_999999.nxs.h5"],
+                "cell": [50, 60, 70, 90, 90, 90],
+                "space_group": "P 21 21 21",
+            },
+            rec_red,
+        )
+        assert not rec_red.get("stderr"), f"Unexpected reduce error: {rec_red}"
+        out_merged = str(rec_red["output_h5_path"])
+        assert os.path.islink(out_merged)
+        with h5py.File(out_merged, "r") as ro_hf:
+            assert ro_hf["images"].shape == (1, 4, 4)
+
+        # 4. On dataset switch / shutdown, local unlink is denied on ro mount -> UI dispatches worker cleanup tool!
+        removed = runner.release_shared_scan_intermediates(
+            keep_work_dir=str(nvme_dir / "subhkl_work_NEXT"),
+            keep_paths=set(),
+            wait_remote=True,
+        )
+        assert os.path.abspath(shared_merged_local) in removed
+        assert len(dispatched_cleanup) == 1
+        assert dispatched_cleanup[0][0] == "imaginex_subhkl_cleanup_shared"
+        assert dispatched_cleanup[0][1]["networkPath"] == shared_merged_net
+        assert not os.path.exists(shared_merged_local)
+        assert "ds_scan_ro_1" in purged_ids
+        assert "ds_cleanup_log_1" in purged_ids
+    finally:
+        os.chmod(shared_dir, 0o777)
+
+
+def test_arcade_exit_quips_and_banner_html() -> None:
+    """Verify all 230 cheerful space-group exit quips and the pixelated GAME OVER exit modal."""
+    from subhkl.viz.arcade_exit_quips import (
+        ARCADE_EXIT_QUIPS,
+        ARCADE_PIXEL_FONT_DATA_URI,
+        build_arcade_exit_quips_json,
+    )
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    assert len(ARCADE_EXIT_QUIPS) == 230
+    assert len(set(ARCADE_EXIT_QUIPS)) == 230
+    assert all(isinstance(q, str) and len(q.strip()) >= 20 for q in ARCADE_EXIT_QUIPS)
+    assert ARCADE_PIXEL_FONT_DATA_URI.startswith("data:font/ttf;base64,")
+    parsed = json.loads(build_arcade_exit_quips_json())
+    assert parsed == list(ARCADE_EXIT_QUIPS)
+
+    sample_payload = {
+        "instrument": "CG4D",
+        "space_group": "P 21 21 21",
+        "peaks": [],
+        "zones": [],
+        "panels": [],
+    }
+    html_arcade = render_rainbow_html(sample_payload, default_mode="arcade")
+    assert 'id="btn-exit-app"' in html_arcade
+    assert ">\n        ⏻\n      </button>" in html_arcade
+    assert "⏻ Exit" not in html_arcade
+    assert 'id="modal-arcade-exit"' in html_arcade
+    assert 'font-family: "SubhklArcade"' in html_arcade
+    assert ARCADE_PIXEL_FONT_DATA_URI in html_arcade
+    assert 'id="btn-arcade-exit-cancel"' in html_arcade
+    assert "Go back" in html_arcade
+    assert "Another vibe" not in html_arcade
+    assert (
+        'id="btn-arcade-exit-close-tab" type="button" class="arcade-exit-btn" disabled'
+        in html_arcade
+    )
+    assert "#btn-arcade-exit-close-tab {\n    border-color: #ef4444;" in html_arcade
+    assert "arcade-exit-pixel-svg" not in html_arcade
+    assert "AudioContext" not in html_arcade
+    assert "🎲" not in html_arcade
+    assert "✋" not in html_arcade
+    assert "window.ARCADE_EXIT_QUIPS = " in html_arcade
+    assert 'phase: "prepare"' in html_arcade
+    assert 'phase: "confirm"' in html_arcade
+    assert "restorePreviousStepAfterCancel" in html_arcade
+
+    html_pro = render_rainbow_html(sample_payload, default_mode="pro")
+    assert 'id="btn-exit-app"' in html_pro
+    assert 'const UI_MODE = "pro".toLowerCase();' in html_pro
+
+
+def test_exit_endpoint_cleans_shared_and_staging_and_stops_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify two-phase POST /api/pipeline/exit defers cleanup in Local prepare and sweeps + stops on confirm."""
+    import socket
+    import threading
+    import time
+    import urllib.request
+
+    from subhkl.viz.nova_rainbow_view import (
+        register_temp_artifact,
+        serve_rainbow_zones,
+    )
+
+    nvme_dir = tmp_path / "exit_nvme"
+    shared_dir = tmp_path / "exit_shared"
+    nvme_dir.mkdir()
+    shared_dir.mkdir()
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(nvme_dir))
+    monkeypatch.setenv("SUBHKL_SHARED_DIR", str(shared_dir))
+    monkeypatch.delenv("SUBHKL_EXEC_MODE", raising=False)
+    monkeypatch.delenv("EP_PATH", raising=False)
+    monkeypatch.delenv("GALAXY_URL", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    staging_tmp = nvme_dir / "temp_stage_buf.h5"
+    staging_tmp.write_bytes(b"STAGE_TMP")
+    register_temp_artifact(str(staging_tmp))
+
+    shared_merged, _ = allocate_shared_artifact_path("merged.h5", tag="EXIT_HTTP")
+    with h5py.File(shared_merged, "w") as mf:
+        mf.attrs["instrument"] = "CG4D"
+        mf.create_dataset("images", data=np.zeros((1, 2, 2), dtype=np.float32))
+    register_temp_artifact(shared_merged)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = int(s.getsockname()[1])
+
+    srv_err: list[BaseException] = []
+
+    def _run_srv() -> None:
+        try:
+            serve_rainbow_zones(
+                payload={
+                    "instrument": "CG4D",
+                    "space_group": "P 1",
+                    "peaks": [],
+                    "zones": [],
+                    "panels": [],
+                },
+                host="127.0.0.1",
+                port=port,
+                prefer_trame=False,
+            )
+        except (OSError, RuntimeError) as exc:  # pragma: no cover
+            srv_err.append(exc)
+
+    t = threading.Thread(target=_run_srv, daemon=True)
+    t.start()
+
+    # Wait until server responds on /api/pipeline/status
+    base_url = f"http://127.0.0.1:{port}"
+    for _ in range(40):
+        try:
+            with urllib.request.urlopen(
+                f"{base_url}/api/pipeline/status", timeout=1.0
+            ) as r:
+                if r.status == 200:
+                    break
+        except OSError:
+            time.sleep(0.05)
+    else:
+        pytest.fail("serve_rainbow_zones did not become ready in time")
+
+    # Phase 1 ("prepare") in Local mode: defers cleanup so "Go back" keeps local state intact, and keeps server alive
+    req_prep = urllib.request.Request(
+        f"{base_url}/api/pipeline/exit",
+        data=json.dumps({"phase": "prepare"}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req_prep, timeout=5.0) as resp_prep:
+        assert resp_prep.status == 200
+        doc_prep = json.loads(resp_prep.read().decode("utf-8"))
+
+    assert doc_prep["ok"] is True
+    assert doc_prep["status"] == "prepared"
+    assert doc_prep["deferred_cleanup"] is True
+    assert doc_prep["restore_plan"]["mode"] == "local_deferred"
+    assert staging_tmp.exists()
+    assert os.path.exists(shared_merged)
+
+    # Server remains responsive if the user clicks "Go back"
+    with urllib.request.urlopen(
+        f"{base_url}/api/pipeline/status", timeout=1.0
+    ) as r_alive:
+        assert r_alive.status == 200
+
+    # Phase 2 ("confirm", e.g. text/plain sendBeacon on "Close tab"): sweeps files and stops server cleanly
+    req = urllib.request.Request(
+        f"{base_url}/api/pipeline/exit",
+        data=json.dumps({"phase": "confirm"}).encode("utf-8"),
+        headers={"Content-Type": "text/plain;charset=UTF-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5.0) as resp:
+        assert resp.status == 200
+        doc = json.loads(resp.read().decode("utf-8"))
+
+    assert doc["ok"] is True
+    assert doc["status"] == "exited"
+    assert doc["deferred_cleanup"] is False
+    assert doc["cleaned_staging_count"] >= 2
+    assert not staging_tmp.exists()
+    assert not os.path.exists(shared_merged)
+
+    t.join(timeout=3.0)
+    assert not t.is_alive(), (
+        "Server thread should stop cleanly after /api/pipeline/exit confirm"
+    )
+    assert srv_err == []
+
+
+def test_galaxy_exit_prepare_cleans_immediately_and_builds_restore_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In Galaxy mode, prepare cleans intermediates immediately and returns a Galaxy History restore plan."""
+    from subhkl.viz.nova_rainbow_view import (
+        NovaGalaxyPipelineRunner,
+        register_temp_artifact,
+    )
+
+    nvme_dir = tmp_path / "gx_exit_nvme"
+    nvme_dir.mkdir()
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(nvme_dir))
+
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://galaxy.example.org",
+        galaxy_api_key="fake-api-key",
+        history_id="hist_123",
+    )
+
+    staged_solve = nvme_dir / "galaxy_ds_solve_42_solve.h5"
+    staged_solve.write_bytes(b"SOLVE_TMP")
+    register_temp_artifact(str(staged_solve))
+    runner._dataset_id_by_path[os.path.abspath(str(staged_solve))] = "ds_solve_42"
+
+    monkeypatch.setattr(
+        runner,
+        "list_history_datasets",
+        lambda limit=200: [
+            {"id": "ds_solve_42", "name": "CG4D_solve.h5", "state": "ok", "hid": 10},
+            {
+                "id": "ds_mtz_9",
+                "name": "careless_merged.mtz",
+                "state": "ok",
+                "hid": 11,
+            },
+        ],
+    )
+    swept_calls: list[bool] = []
+    monkeypatch.setattr(
+        runner,
+        "release_shared_scan_intermediates",
+        lambda wait_remote=False: (
+            swept_calls.append(bool(wait_remote)) or ["/shared/merged.h5"]
+        ),
+    )
+
+    res = runner.execute_app_exit(
+        phase="prepare",
+        current_h5=str(staged_solve),
+        payload={"artifact_kind": "solve", "frame_index": 3, "instrument": "CG4D"},
+        mtz_overlay_info={"id": "ds_mtz_9"},
+    )
+    assert res["ok"] is True
+    assert res["status"] == "prepared"
+    assert res["deferred_cleanup"] is False
+    assert swept_calls == [True]
+    assert not staged_solve.exists()
+    assert res["restore_plan"] == {
+        "mode": "galaxy_dataset",
+        "dataset_id": "ds_solve_42",
+        "mtz_dataset_id": "ds_mtz_9",
+        "frame_index": 3,
+        "artifact_kind": "solve",
+    }
+
+
+def test_careless_merge_reports_runner_host_local_and_galaxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Careless ('merge') surfaces runner_host in local container, Galaxy polling, and UI."""
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    html = render_rainbow_html(
+        {
+            "instrument": "CG4D",
+            "space_group": "P 1",
+            "peaks": [],
+            "zones": [],
+            "panels": [],
+        }
+    )
+    assert "function escTxt(s)" in html
+    assert "syncRunningHostDisplay" in html
+    assert "[4. MERGE • ${hostTag}]" in html
+    assert "Careless Variational Merge</strong> on host" in html
+
+    # 1. Galaxy polling for stage_id == "merge" extracts runner_host from stdout or uname metric and preserves base_log
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://galaxy.example.org",
+        galaxy_api_key="fake-api-key",
+        history_id="hist_merge",
+    )
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    calls = {"n": 0}
+
+    def _fake_api(
+        method: str, path: str, payload: object = None, **kwargs: object
+    ) -> dict[str, object]:
+        _ = (method, payload, kwargs)
+        if "/console_output" in path:
+            return {
+                "stdout": "[pulsar] Runner host: gpu-worker-07\nIteration 1000/10000\n",
+                "stderr": "",
+            }
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"state": "running", "command_line": "careless poly ..."}
+        return {"state": "deleted", "command_line": "careless poly ..."}
+
+    monkeypatch.setattr(runner, "_api_request", _fake_api)
+    job_rec: dict[str, object] = {
+        "job_id": "gx_merge_99",
+        "stage_id": "merge",
+        "mode": "galaxy",
+        "state": "queued",
+        "stdout": "[galaxy -> pulsar] Dispatched imaginex_subhkl_merge\n",
+        "stderr": "",
+    }
+    runner._poll_galaxy_job(job_rec, final_step=False)
+    assert job_rec["runner_host"] == "gpu-worker-07"
+    assert "[galaxy -> pulsar] Dispatched imaginex_subhkl_merge" in str(
+        job_rec["stdout"]
+    )
+    assert "[pulsar] Runner host: gpu-worker-07" in str(job_rec["stdout"])

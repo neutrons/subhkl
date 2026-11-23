@@ -573,6 +573,7 @@ class NovaGalaxyPipelineRunner:
         self.step_timings: dict[str, dict[str, Any]] = {}
         self.current_frame_index: int | None = None
         self._upload_lock = threading.RLock()
+        self._dataset_id_by_path: dict[str, str] = {}
         self._dataset_sig_by_path: dict[str, tuple[int, int, str]] = {}
         self._auto_discover_local_galaxy()
         with contextlib.suppress(ImportError):
@@ -3218,12 +3219,13 @@ class NovaGalaxyPipelineRunner:
                 ):
                     ds_id = str(ds.get("id") or "").strip()
                     if ds_id:
-                        local_m, _ = self.resolve_dataset_to_local_h5(ds_id)
-                        _, final_m = self._resolve_work_dir_and_merged(local_m)
-                        if final_m and os.path.isfile(final_m):
-                            with h5py.File(final_m, "r") as hf_m:
-                                if "images" in hf_m:
-                                    return final_m
+                        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                            local_m, _ = self.resolve_dataset_to_local_h5(ds_id)
+                            _, final_m = self._resolve_work_dir_and_merged(local_m)
+                            if final_m and os.path.isfile(final_m):
+                                with h5py.File(final_m, "r") as hf_m:
+                                    if "images" in hf_m:
+                                        return final_m
         return None
 
     def stage_derived_h5_in_work_dir(
@@ -3419,11 +3421,21 @@ class NovaGalaxyPipelineRunner:
             return True
         return bool(self.is_connected and not self._is_local_staging_mode())
 
-    def require_shared_dir_for_galaxy_mode(self) -> str:
-        """Validate and resolve mandatory SUBHKL_SHARED_DIR when executing in Galaxy mode."""
+    CLEANUP_SHARED_TOOL_ID = "imaginex_subhkl_cleanup_shared"
+
+    def require_shared_dir_for_galaxy_mode(self, *, writable: bool = False) -> str:
+        """Validate and resolve mandatory SUBHKL_SHARED_DIR when executing in Galaxy mode.
+
+        By default the UI container only requires read-only (``R_OK | X_OK``) access;
+        worker writers and local-to-shared staging pass ``writable=True``.
+        """
         from subhkl.io.shared_storage import get_shared_dir_local
 
-        local_shared = get_shared_dir_local(require=True, create=True)
+        local_shared = get_shared_dir_local(
+            require=True,
+            create=writable,
+            writable=writable,
+        )
         assert local_shared is not None
         return local_shared
 
@@ -3444,15 +3456,96 @@ class NovaGalaxyPipelineRunner:
             )
         self._cached_history_datasets = None
 
+    def _dispatch_galaxy_shared_cleanup(
+        self,
+        targets: list[str],
+        *,
+        if_ephemeral: bool = False,
+        wait: bool = False,
+        job_record: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Dispatch ``imaginex_subhkl_cleanup_shared`` on a worker with ``rw`` access when UI mount is ``ro``."""
+        clean_targets: list[str] = []
+        for raw_t in targets:
+            t_str = str(raw_t or "").strip()
+            if (
+                t_str
+                and "subhkl_shared_" in os.path.basename(t_str)
+                and t_str not in clean_targets
+            ):
+                clean_targets.append(t_str)
+        if not clean_targets or not self.is_connected:
+            return None
+        if not self._has_tool_on_galaxy(self.CLEANUP_SHARED_TOOL_ID):
+            return None
+
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            store = self.get_datastore("IMAGINE-X SubHKL")
+            if not self.history_id and getattr(store, "history_id", None):
+                self.history_id = store.history_id
+            gi = store.nova_connection.galaxy_instance
+            tool_inputs: dict[str, Any] = {
+                "networkPath": ",".join(clean_targets),
+                "ifEphemeral": bool(if_ephemeral),
+            }
+            res = gi.tools.run_tool(
+                history_id=store.history_id,
+                tool_id=self.CLEANUP_SHARED_TOOL_ID,
+                tool_inputs=tool_inputs,
+            )
+            c_jid = str((res.get("jobs") or [{}])[0].get("id") or "").strip()
+            c_outs = [
+                str(o.get("id"))
+                for o in (res.get("outputs") or [])
+                if isinstance(o, dict) and o.get("id")
+            ]
+            if isinstance(job_record, dict) and c_jid:
+                names = ", ".join(os.path.basename(p) for p in clean_targets)
+                job_record["stdout"] = job_record.get("stdout", "") + (
+                    f"[galaxy -> pulsar] Dispatched worker cleanup job {c_jid} for {names}\n"
+                )
+
+            def _reap_cleanup_job() -> None:
+                if c_jid:
+                    for _ in range(15):
+                        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                            jinfo = self._api_request("GET", f"/api/jobs/{c_jid}")
+                            if isinstance(jinfo, dict) and jinfo.get("state") in (
+                                "ok",
+                                "error",
+                                "deleted",
+                                "paused",
+                            ):
+                                break
+                        time.sleep(0.4)
+                for oid in c_outs:
+                    self._purge_galaxy_dataset_id(oid)
+
+            if wait:
+                _reap_cleanup_job()
+            elif c_outs:
+                threading.Thread(
+                    target=_reap_cleanup_job,
+                    name=f"subhkl-reap-cleanup-{c_jid or 'job'}",
+                    daemon=True,
+                ).start()
+            return c_jid or None
+        return None
+
     def release_shared_scan_intermediates(
         self,
         *,
         keep_work_dir: str | None = None,
         keep_paths: set[str] | None = None,
         job_record: dict[str, Any] | None = None,
+        wait_remote: bool = False,
     ) -> list[str]:
-        """Delete superseded shared intermediates in SUBHKL_SHARED_DIR and purge their pointer HDAs."""
-        from subhkl.io.shared_storage import cleanup_shared_artifact
+        """Delete superseded shared intermediates in SUBHKL_SHARED_DIR (locally or via worker tool) and purge pointer HDAs."""
+        from subhkl.io.shared_storage import (
+            cleanup_shared_artifact,
+            is_safe_shared_intermediate,
+            to_shared_network_path,
+        )
 
         keep_wd_abs = os.path.abspath(keep_work_dir) if keep_work_dir else None
         keep_abs_set = {
@@ -3462,6 +3555,7 @@ class NovaGalaxyPipelineRunner:
             candidates = list(_REGISTERED_SHARED_ARTIFACTS.items())
 
         removed_paths: list[str] = []
+        remote_pending: list[tuple[str, str]] = []
         known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
         ptr_map: dict[str, str] = getattr(self, "_shared_pointer_ds_by_path", {})
 
@@ -3485,6 +3579,17 @@ class NovaGalaxyPipelineRunner:
                     job_record["stdout"] = job_record.get("stdout", "") + (
                         f"[subhkl] Cleaned up superseded shared intermediate '{os.path.basename(abs_p)}'\n"
                     )
+            else:
+                net_t = str(meta.get("network_path") or "").strip()
+                if not net_t and is_safe_shared_intermediate(abs_p):
+                    with contextlib.suppress(OSError, ValueError, RuntimeError):
+                        net_t = to_shared_network_path(abs_p)
+                if net_t and (
+                    os.path.lexists(abs_p)
+                    or not os.path.isabs(net_t)
+                    or "subhkl_shared_" in net_t
+                ):
+                    remote_pending.append((abs_p, net_t))
             ds_id = str(meta.get("dataset_id") or ptr_map.pop(abs_p, "") or "")
             ptr_map.pop(abs_p, None)
             known_map.pop(abs_p, None)
@@ -3493,8 +3598,21 @@ class NovaGalaxyPipelineRunner:
                     if v_id == ds_id:
                         known_map.pop(k_alias, None)
                 self._purge_galaxy_dataset_id(ds_id)
+        if remote_pending:
+            c_jid = self._dispatch_galaxy_shared_cleanup(
+                [net_t for _abs_p, net_t in remote_pending],
+                if_ephemeral=False,
+                wait=wait_remote,
+                job_record=job_record,
+            )
+            if c_jid:
+                for abs_p, _net_t in remote_pending:
+                    removed_paths.append(abs_p)
         self._dataset_id_by_path = known_map
         self._shared_pointer_ds_by_path = ptr_map
+        if removed_paths:
+            self._cached_history_datasets = None
+            self._cached_history_datasets_ts = 0.0
         return removed_paths
 
     def cleanup_ephemeral_predictor_intermediate(
@@ -3505,24 +3623,44 @@ class NovaGalaxyPipelineRunner:
         job_record: dict[str, Any] | None = None,
     ) -> None:
         """Delete ephemeral peak_predictor.h5 from SUBHKL_SHARED_DIR and purge its pointer HDA after Integrate."""
-        from subhkl.io.shared_storage import cleanup_shared_artifact
+        from subhkl.io.shared_storage import (
+            cleanup_shared_artifact,
+            is_safe_shared_intermediate,
+            to_shared_network_path,
+        )
 
         clean_ds = str(pred_ds_id or "").strip()
         with _TEMP_CLEANUP_LOCK:
-            matched_keys = [
-                k
+            matched_entries = [
+                (k, dict(meta))
                 for k, meta in _REGISTERED_SHARED_ARTIFACTS.items()
                 if bool(meta.get("delete_after_use"))
                 or (clean_ds and str(meta.get("dataset_id") or "") == clean_ds)
                 or k.endswith("_peak_predictor.h5")
             ]
-            for mk in matched_keys:
+            for mk, _meta in matched_entries:
                 _REGISTERED_SHARED_ARTIFACTS.pop(mk, None)
-        for mk in matched_keys:
-            if cleanup_shared_artifact(mk) and isinstance(job_record, dict):
-                job_record["stdout"] = job_record.get("stdout", "") + (
-                    f"[subhkl] Deleted ephemeral shared predictor '{os.path.basename(mk)}'\n"
-                )
+        remote_ephem: list[str] = []
+        for mk, meta in matched_entries:
+            if cleanup_shared_artifact(mk):
+                if isinstance(job_record, dict):
+                    job_record["stdout"] = job_record.get("stdout", "") + (
+                        f"[subhkl] Deleted ephemeral shared predictor '{os.path.basename(mk)}'\n"
+                    )
+            elif os.path.lexists(mk):
+                net_t = str(meta.get("network_path") or "").strip()
+                if not net_t and is_safe_shared_intermediate(mk):
+                    with contextlib.suppress(OSError, ValueError, RuntimeError):
+                        net_t = to_shared_network_path(mk)
+                if net_t:
+                    remote_ephem.append(net_t)
+        if remote_ephem:
+            self._dispatch_galaxy_shared_cleanup(
+                remote_ephem,
+                if_ephemeral=False,
+                wait=False,
+                job_record=job_record,
+            )
         if work_dir and os.path.isdir(work_dir):
             pred_link = os.path.join(work_dir, "predictor.h5")
             if os.path.islink(pred_link) and not os.path.exists(pred_link):
@@ -3530,6 +3668,227 @@ class NovaGalaxyPipelineRunner:
                     os.unlink(pred_link)
         if clean_ds:
             self._purge_galaxy_dataset_id(clean_ds)
+
+    def shutdown_cleanup(self) -> None:
+        """Cancel any active stage job and release session shared intermediates (locally or via cleanup worker)."""
+        with contextlib.suppress(Exception):
+            self.cancel_active_job()
+        with contextlib.suppress(Exception):
+            self.release_shared_scan_intermediates(wait_remote=True)
+
+    def build_exit_restore_plan(
+        self,
+        *,
+        current_h5: str | None = None,
+        images_h5: str | None = None,
+        payload: dict[str, Any] | None = None,
+        mtz_overlay_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Snapshot how to restore the active step if the user cancels the Exit screen ('I changed my mind')."""
+        if not self.is_connected:
+            return {"mode": "local_deferred"}
+
+        pl = payload if isinstance(payload, dict) else {}
+        art_kind = str(pl.get("artifact_kind") or "").strip().lower()
+        frame_index = int(
+            pl.get("frame_index") or getattr(self, "current_frame_index", 0) or 0
+        )
+        if art_kind in ("", "empty") and not current_h5 and not images_h5:
+            return {"mode": "empty"}
+
+        self._cached_history_datasets = None
+        self._cached_history_datasets_ts = 0.0
+        hist_ds = list(self.list_history_datasets(limit=200) or [])
+        hist_ds.sort(key=lambda d: int(d.get("hid") or 0), reverse=True)
+
+        def _is_ok_non_pointer(ds: dict[str, Any]) -> bool:
+            if ds.get("deleted") is True:
+                return False
+            if ds.get("state") and ds.get("state") != "ok":
+                return False
+            nm = str(ds.get("name") or "").strip().lower()
+            return bool(ds.get("id")) and not nm.endswith(".ref.json")
+
+        ok_ds = [d for d in hist_ds if _is_ok_non_pointer(d)]
+        by_id = {str(d["id"]): d for d in ok_ds}
+        known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
+        sig_map: dict[str, tuple[int, int, str]] = getattr(
+            self, "_dataset_sig_by_path", {}
+        )
+        mtz_ds_id = str((mtz_overlay_info or {}).get("id") or "").strip()
+        if mtz_ds_id and mtz_ds_id not in by_id:
+            mtz_ds_id = ""
+
+        # 1. Derived stages (solve / integrate / merge): restore thin HDF5 from Galaxy History (hydrates reduce on the fly)
+        is_derived = art_kind in (
+            "solve",
+            "finder",
+            "indexer",
+            "integrator",
+            "merged_careless",
+        )
+        if not is_derived and current_h5:
+            bn_low = os.path.basename(str(current_h5)).lower()
+            is_derived = any(k in bn_low for k in ("solve", "integrat", "predict"))
+
+        if is_derived:
+            restore_id = ""
+            if current_h5:
+                for p_key in (
+                    os.path.abspath(str(current_h5)),
+                    os.path.realpath(str(current_h5)),
+                ):
+                    cand_id = str(known_map.get(p_key) or "").strip()
+                    if not cand_id and p_key in sig_map:
+                        cand_id = str(sig_map[p_key][2] or "").strip()
+                    if cand_id and cand_id in by_id:
+                        cand_nm = str(by_id[cand_id].get("name") or "").lower()
+                        if not cand_nm.endswith((".mtz", ".csv", ".html", ".json")):
+                            restore_id = cand_id
+                            break
+            if not restore_id:
+                want_int = art_kind in ("integrator", "merged_careless") or (
+                    current_h5
+                    and "integrat" in os.path.basename(str(current_h5)).lower()
+                )
+                for d in ok_ds:
+                    nm = os.path.basename(str(d.get("name") or "")).lower()
+                    if nm.endswith(
+                        (".mtz", ".csv", ".html", ".json", ".nxs", ".nxs.h5")
+                    ):
+                        continue
+                    if want_int and "integrat" in nm:
+                        restore_id = str(d["id"])
+                        break
+                    if not want_int and ("solve" in nm or "index" in nm):
+                        restore_id = str(d["id"])
+                        break
+            if restore_id:
+                return {
+                    "mode": "galaxy_dataset",
+                    "dataset_id": restore_id,
+                    "mtz_dataset_id": mtz_ds_id,
+                    "frame_index": frame_index,
+                    "artifact_kind": art_kind,
+                }
+
+        # 2. Step 1 (Reduce / merged.h5): check persisted merged.h5, local/facility NeXus recipe, or raw NeXus dataset in History
+        for d in ok_ds:
+            nm = os.path.basename(str(d.get("name") or "")).lower()
+            if (
+                any(k in nm for k in ("merged", "scan", "image"))
+                and "careless" not in nm
+                and nm.endswith((".h5", ".hdf5"))
+            ):
+                return {
+                    "mode": "galaxy_dataset",
+                    "dataset_id": str(d["id"]),
+                    "frame_index": frame_index,
+                    "artifact_kind": "merged",
+                }
+
+        src_for_recipe = images_h5 or current_h5
+        if src_for_recipe and os.path.isfile(str(src_for_recipe)):
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                recipe = self._extract_reduce_recipe_from_derived_h5(
+                    str(src_for_recipe)
+                )
+                if recipe and recipe.get("nexus_files"):
+                    return {
+                        "mode": "reduce_recipe",
+                        "params": recipe,
+                        "frame_index": frame_index,
+                    }
+
+        for d in ok_ds:
+            nm = str(d.get("name") or "").lower()
+            ext = str(d.get("extension") or "").lower()
+            if nm.endswith((".nxs.h5", ".nxs")) or ext in ("nxs", "nxs.h5"):
+                return {
+                    "mode": "galaxy_dataset",
+                    "dataset_id": str(d["id"]),
+                    "frame_index": 0,
+                    "artifact_kind": "raw_nexus",
+                }
+
+        for d in ok_ds:
+            nm = os.path.basename(str(d.get("name") or "")).lower()
+            if nm.endswith((".h5", ".hdf5")) and any(
+                k in nm for k in ("integrat", "solve", "index")
+            ):
+                return {
+                    "mode": "galaxy_dataset",
+                    "dataset_id": str(d["id"]),
+                    "frame_index": frame_index,
+                    "artifact_kind": art_kind,
+                }
+
+        return {"mode": "empty"}
+
+    def execute_app_exit(
+        self,
+        *,
+        phase: str = "confirm",
+        current_h5: str | None = None,
+        images_h5: str | None = None,
+        payload: dict[str, Any] | None = None,
+        mtz_overlay_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Handle two-step app exit ('prepare' on modal open, 'confirm' on tab close/shutdown).
+
+        In Galaxy/NDIP mode, 'prepare' snapshots a Galaxy-history restore plan and immediately
+        sweeps shared + staging intermediates while keeping the server alive so the user can still
+        click 'I changed my mind' (reconstructing reduced frames on the fly from Galaxy History).
+        In Local mode (no Galaxy History), 'prepare' cancels any active job but defers deleting
+        files until 'confirm' (or process termination).
+        """
+        t0 = time.monotonic()
+        norm_phase = str(phase or "confirm").strip().lower()
+        restore_plan: dict[str, Any] | None = None
+        if norm_phase == "prepare":
+            with contextlib.suppress(Exception):
+                restore_plan = self.build_exit_restore_plan(
+                    current_h5=current_h5,
+                    images_h5=images_h5,
+                    payload=payload,
+                    mtz_overlay_info=mtz_overlay_info,
+                )
+
+        cancelled_active = False
+        cleaned_shared: list[str] = []
+        cleaned_staging: list[str] = []
+        with contextlib.suppress(Exception):
+            cancel_res = self.cancel_active_job()
+            cancelled_active = bool(
+                isinstance(cancel_res, dict)
+                and (cancel_res.get("cancelled") or cancel_res.get("job"))
+            )
+
+        galaxy_conn = bool(self.is_connected)
+        defer_files = norm_phase == "prepare" and not galaxy_conn
+        if not defer_files:
+            with contextlib.suppress(Exception):
+                cleaned_shared = self.release_shared_scan_intermediates(
+                    wait_remote=True
+                )
+            with contextlib.suppress(Exception):
+                cleaned_staging = cleanup_registered_temp_artifacts()
+
+        elapsed_ms = round((time.monotonic() - t0) * 1000)
+        out: dict[str, Any] = {
+            "ok": True,
+            "status": "prepared" if norm_phase == "prepare" else "exited",
+            "phase": norm_phase,
+            "deferred_cleanup": defer_files,
+            "cancelled_active_job": cancelled_active,
+            "cleaned_shared_count": len(cleaned_shared),
+            "cleaned_staging_count": len(cleaned_staging),
+            "galaxy_connected": galaxy_conn,
+            "elapsed_ms": elapsed_ms,
+        }
+        if restore_plan is not None:
+            out["restore_plan"] = restore_plan
+        return out
 
     def _is_local_staging_mode(self) -> bool:
         """Return True when heavy subhkl stages should run inside local NVMe staging.
@@ -4123,6 +4482,7 @@ class NovaGalaxyPipelineRunner:
             return None
 
         resolved_nxs: list[str] = []
+        allow_remote_facility_paths = self.is_galaxy_exec_mode()
         # 1. Explicit full paths or basenames (including transient *.reduce.h5 paths) from `source_files` or `files`
         for cand_list in (src_candidates, file_names):
             if resolved_nxs:
@@ -4141,6 +4501,15 @@ class NovaGalaxyPipelineRunner:
                     loc_hit = _locate_basename_on_fs(p_raw, inst_val)
                     if loc_hit:
                         tmp_list.append(os.path.abspath(loc_hit))
+                    elif (
+                        allow_remote_facility_paths
+                        and _re.match(
+                            r"^/(SNS|HFIR)/.+", str(p_raw or ""), _re.IGNORECASE
+                        )
+                        and str(p_raw).lower().endswith((".nxs.h5", ".nxs"))
+                        and not str(p_raw).lower().endswith(".reduce.h5")
+                    ):
+                        tmp_list.append(str(p_raw))
             if tmp_list and len(tmp_list) == len(cand_list):
                 resolved_nxs = tmp_list
 
@@ -4642,6 +5011,15 @@ class NovaGalaxyPipelineRunner:
                         fh_out.write(metrics_raw)
 
         if metrics_doc:
+            job_host = str(job_record.get("runner_host") or "").strip()
+            if job_host and not metrics_doc.get("runner_host"):
+                metrics_doc["runner_host"] = job_host
+                metrics_raw = json.dumps(metrics_doc, indent=2)
+                with (
+                    contextlib.suppress(OSError),
+                    open(metrics_path, "w", encoding="utf-8") as fh_out,
+                ):
+                    fh_out.write(metrics_raw)
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 from subhkl.viz.rainbow_zones import (
                     render_merge_table_csv,
@@ -4786,12 +5164,17 @@ class NovaGalaxyPipelineRunner:
             comp_str = (
                 f"{comp_val:.1f}%" if isinstance(comp_val, (int, float)) else "N/A"
             )
+            host_sfx = (
+                f" | Host={metrics_doc['runner_host']}"
+                if metrics_doc.get("runner_host")
+                else ""
+            )
             job_record["stdout"] = job_record.get("stdout", "") + (
                 f"\n[careless] Merged {metrics_doc.get('n_merged_asu', 0)} ASU reflections "
                 f"from {metrics_doc.get('n_observations', 0)} observations | "
                 f"CC1/2={cc_str} | <I/sigma>={metrics_doc.get('mean_isigi', 0.0):.2f} | "
                 f"Multiplicity={metrics_doc.get('mean_multiplicity', 0.0):.2f}x | "
-                f"Completeness={comp_str}\n"
+                f"Completeness={comp_str}{host_sfx}\n"
             )
 
     def _ensure_galaxy_h5_dataset(
@@ -8227,15 +8610,21 @@ class NovaGalaxyPipelineRunner:
         host_tag = detect_runner_hostname()
         cmd_str = " ".join(cmd)
         header_lines: list[str] = []
-        if stage_id != "merge":
-            if fallback_reason and existing_job_record is None:
-                header_lines.append(f"[ndip] Note: {fallback_reason}")
-            if image_fallback_note:
-                header_lines.append(f"[container] Note: {image_fallback_note}")
-            header_lines.append(f"[pulsar] Runner host: {host_tag}")
+        if fallback_reason and existing_job_record is None:
+            header_lines.append(f"[ndip] Note: {fallback_reason}")
+        if image_fallback_note:
+            header_lines.append(f"[container] Note: {image_fallback_note}")
+        header_lines.append(f"[pulsar] Runner host: {host_tag}")
+        header_lines.append(
+            f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"
+        )
+        if stage_id == "merge":
             header_lines.append(
-                f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"
+                f"$ careless {merge_mode} --jit-compile --iterations={careless_iters} "
+                f"--merge-half-datasets {wavel_key_flag}--studentt-likelihood-dof={studentt_dof} "
+                f"{extra_flags_str} <METADATA_KEYS> input_unmerged.mtz careless\n"
             )
+        else:
             header_lines.append(f"$ {cmd_str}\n")
 
         if existing_job_record is not None:
@@ -8250,12 +8639,9 @@ class NovaGalaxyPipelineRunner:
             job_record.setdefault("instrument", str(inst))
             if raw_nxs_local and not job_record.get("raw_nxs"):
                 job_record["raw_nxs"] = list(raw_nxs_local)
-            if stage_id == "merge":
-                job_record["stdout"] = ""
-            else:
-                job_record["stdout"] = (
-                    job_record.get("stdout", "") + "\n".join(header_lines)
-                )[-24000:]
+            job_record["stdout"] = (
+                job_record.get("stdout", "") + "\n".join(header_lines)
+            )[-24000:]
         else:
             job_record = {
                 "job_id": job_id,
@@ -8266,7 +8652,7 @@ class NovaGalaxyPipelineRunner:
                 "state": "running",
                 "runner_host": host_tag,
                 "command_line": cmd_str,
-                "stdout": "" if stage_id == "merge" else "\n".join(header_lines),
+                "stdout": "\n".join(header_lines),
                 "stderr": "",
                 "ladder_rung_idx": 0 if stage_id == "solve" else 4,
                 "outputs": [
@@ -8804,17 +9190,47 @@ class NovaGalaxyPipelineRunner:
                 )
                 import re as _re_h
 
+                r_host = ""
                 m_host = _re_h.search(
-                    r"\[(?:pulsar|subhkl)\]\s*Runner host:\s*([A-Za-z0-9._-]+)",
+                    r"\[(?:pulsar|subhkl|careless)\]\s*Runner host:\s*([A-Za-z0-9._-]+)",
                     f"{raw_stdout_src}\n{console_err}",
                     _re_h.IGNORECASE,
                 )
                 if m_host:
                     r_host = m_host.group(1).strip()
-                    if r_host:
-                        job_record["runner_host"] = r_host
+                if not r_host:
+                    for jm in jinfo.get("job_metrics") or []:
+                        if not isinstance(jm, dict):
+                            continue
+                        jm_name = str(jm.get("name") or "").strip().lower()
+                        jm_raw = str(
+                            jm.get("raw_value") or jm.get("value") or ""
+                        ).strip()
+                        if not jm_raw:
+                            continue
+                        if jm_name in (
+                            "pulsar_hostname",
+                            "host_hostname",
+                            "slurm_nodelist",
+                        ):
+                            r_host = jm_raw.split(".")[0].strip()
+                            break
+                        if jm_name == "uname":
+                            parts = jm_raw.split()
+                            cand = parts[1].split(".")[0] if len(parts) >= 2 else ""
+                            if cand and not _re_h.fullmatch(r"[0-9a-f]{12}", cand):
+                                r_host = cand
+                                break
+                if r_host:
+                    job_record["runner_host"] = r_host
                 if job_record.get("stage_id") == "merge":
-                    job_record["stdout"] = out_txt[-24000:]
+                    host_line = (
+                        f"[pulsar] Runner host: {job_record['runner_host']}\n"
+                        if job_record.get("runner_host")
+                        and "runner host:" not in out_txt.lower()
+                        else ""
+                    )
+                    job_record["stdout"] = f"{base_log}{host_line}{out_txt}"[-24000:]
                 else:
                     raw_cmd = str(job_record.get("command_line") or "").strip()
                     cmd_header = (
@@ -10420,6 +10836,62 @@ def serve_rainbow_zones(
                 self.wfile.write(body)
                 return
 
+            if req_path == "/api/pipeline/exit":
+                content_len = int(self.headers.get("Content-Length", "0") or 0)
+                raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+                should_shutdown = True
+                try:
+                    req_json = json.loads(raw_body.decode("utf-8") or "{}")
+                    if not isinstance(req_json, dict):
+                        req_json = {}
+                    phase_req = str(req_json.get("phase") or "confirm").strip().lower()
+                    if phase_req == "prepare" or req_json.get("shutdown") is False:
+                        should_shutdown = False
+                    cur_imgs_ex = vm.payload_kwargs.get("images_h5") or (
+                        vm.payload.get("images_h5")
+                        if isinstance(vm.payload, dict)
+                        else None
+                    )
+                    result = vm.pipeline_runner.execute_app_exit(
+                        phase=phase_req,
+                        current_h5=(str(vm.replay_h5) if vm.replay_h5 else None),
+                        images_h5=(str(cur_imgs_ex) if cur_imgs_ex else None),
+                        payload=(vm.payload if isinstance(vm.payload, dict) else None),
+                        mtz_overlay_info=getattr(vm, "mtz_overlay_info", None),
+                    )
+                    if not result.get("deferred_cleanup"):
+                        with vm_lock:
+                            if vm.replay_h5 and not os.path.isfile(str(vm.replay_h5)):
+                                vm.replay_h5 = None
+                            if cur_imgs_ex and not os.path.isfile(str(cur_imgs_ex)):
+                                vm.payload_kwargs["images_h5"] = None
+                    code = 200
+                except _NOVA_RECOVERABLE_ERRORS as exc:
+                    result = {"ok": False, "error": str(exc)}
+                    code = 400
+                body = json.dumps(result).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                with contextlib.suppress(OSError):
+                    self.wfile.flush()
+                if code == 200 and should_shutdown:
+                    srv = self.server
+
+                    def _deferred_httpd_stop() -> None:
+                        time.sleep(0.35)
+                        with contextlib.suppress(Exception):
+                            srv.shutdown()
+
+                    threading.Thread(
+                        target=_deferred_httpd_stop,
+                        name="subhkl-exit-shutdown",
+                        daemon=True,
+                    ).start()
+                return
+
             if req_path == "/api/tof_delta_theta":
                 content_len = int(self.headers.get("Content-Length", "0") or 0)
                 raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
@@ -10657,7 +11129,7 @@ def serve_rainbow_zones(
         allow_reuse_address = True
         daemon_threads = True
 
-    install_exit_cleanup_signal_handlers(vm.pipeline_runner.cancel_active_job)
+    install_exit_cleanup_signal_handlers(vm.pipeline_runner.shutdown_cleanup)
     with _ThreadingServer((host, int(port)), _Handler) as httpd:
         print(
             f"Rainbow Zones server listening on http://{host}:{port}{ep_path or '/'} "
@@ -10669,5 +11141,5 @@ def serve_rainbow_zones(
             pass
         finally:
             with contextlib.suppress(Exception):
-                vm.pipeline_runner.cancel_active_job()
+                vm.pipeline_runner.shutdown_cleanup()
             cleanup_registered_temp_artifacts()

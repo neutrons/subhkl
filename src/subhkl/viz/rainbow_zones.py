@@ -9813,6 +9813,13 @@ def render_rainbow_html(
     sel_bin_4 = " selected" if init_binning == "4" else ""
     sel_bin_2 = " selected" if init_binning == "2" else ""
     sg_symmetry_groups_json = _build_space_group_symmetry_lookup_json()
+    from subhkl.viz.arcade_exit_quips import (
+        ARCADE_PIXEL_FONT_DATA_URI,
+        build_arcade_exit_quips_json,
+    )
+
+    arcade_exit_quips_json = build_arcade_exit_quips_json()
+    arcade_pixel_font_uri = ARCADE_PIXEL_FONT_DATA_URI
     ep_env = os.environ.get("EP_PATH", "").strip().rstrip("/")
     base_tag_html = (
         f'<base href="{ep_env}/" />\n' if ep_env and ep_env.startswith("/") else ""
@@ -11198,6 +11205,126 @@ def render_rainbow_html(
     z-index: 3;
   }}
 </style>
+<style id="arcade-exit-style">
+  @font-face {{
+    font-family: "SubhklArcade";
+    src: url("{arcade_pixel_font_uri}") format("truetype");
+    font-weight: 400 700;
+    font-style: normal;
+    font-display: block;
+  }}
+  #btn-exit-app {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }}
+  #modal-arcade-exit {{
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 2147483000;
+    background: rgba(3, 5, 11, 0.80);
+    backdrop-filter: blur(4px);
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    font-family: "SubhklArcade", "Courier New", monospace;
+    -webkit-font-smoothing: none;
+    -moz-osx-font-smoothing: grayscale;
+    font-smooth: never;
+    user-select: none;
+  }}
+  #modal-arcade-exit.arcade-exit-card-open {{
+    display: flex;
+  }}
+  .arcade-exit-cabinet {{
+    width: min(620px, 92vw);
+    background: #090b13;
+    color: #fcd34d;
+    padding: 34px 32px 28px 32px;
+    border: 1px solid rgba(245, 158, 11, 0.45);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.88);
+    text-align: center;
+  }}
+  #arcade-exit-quip-text {{
+    font-size: 16px;
+    line-height: 28px;
+    letter-spacing: 1px;
+    color: #fcd34d;
+    text-shadow: 2px 2px 0 #3b1d06;
+    margin: 0 auto 28px auto;
+    max-width: 34ch;
+    min-height: 84px;
+    user-select: text;
+  }}
+  .arcade-exit-actions {{
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }}
+  .arcade-exit-btn {{
+    font-family: "SubhklArcade", "Courier New", monospace;
+    font-size: 12px;
+    line-height: 16px;
+    letter-spacing: 1px;
+    padding: 10px 16px;
+    border: 1px solid rgba(245, 158, 11, 0.44);
+    border-radius: 0;
+    background: transparent;
+    color: #fcd34d;
+    cursor: pointer;
+    text-transform: uppercase;
+    -webkit-font-smoothing: none;
+    transition: border-color 0.14s ease, color 0.14s ease, background 0.14s ease;
+  }}
+  .arcade-exit-btn:hover:not(:disabled) {{
+    border-color: #fbbf24;
+    background: rgba(245, 158, 11, 0.14);
+    color: #fef3c7;
+  }}
+  #btn-arcade-exit-close-tab {{
+    border-color: #ef4444;
+    background: rgba(220, 38, 38, 0.22);
+    color: #fca5a5;
+  }}
+  #btn-arcade-exit-close-tab:hover:not(:disabled) {{
+    border-color: #f87171;
+    background: rgba(220, 38, 38, 0.36);
+    color: #fff1f2;
+  }}
+  #btn-arcade-exit-close-tab:disabled {{
+    border-color: rgba(148, 163, 184, 0.22);
+    background: rgba(51, 65, 85, 0.24);
+    color: rgba(148, 163, 184, 0.46);
+    cursor: default;
+  }}
+  #modal-arcade-exit.pro-exit-mode {{
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }}
+  #modal-arcade-exit.pro-exit-mode .arcade-exit-cabinet {{
+    border-radius: 8px;
+  }}
+  #modal-arcade-exit.pro-exit-mode #arcade-exit-quip-text {{
+    font-size: 1.02rem;
+    line-height: 1.6;
+    letter-spacing: 0;
+    color: #f8fafc;
+    text-shadow: none;
+    max-width: 46ch;
+    min-height: 3.2em;
+  }}
+  #modal-arcade-exit.pro-exit-mode .arcade-exit-btn {{
+    font-family: inherit;
+    font-size: 0.78rem;
+    border-radius: 5px;
+    letter-spacing: 0.04em;
+    text-transform: none;
+    -webkit-font-smoothing: antialiased;
+  }}
+</style>
 </head>
 <body>
 
@@ -11277,6 +11404,9 @@ def render_rainbow_html(
       </button>
       <button id="btn-new-tab" style="border-color:var(--accent-gold);color:var(--accent-gold);" title="Open this view in its own full-screen browser tab">
         Tab
+      </button>
+      <button id="btn-exit-app" type="button" aria-label="Exit" title="Clean up temporary &amp; shared intermediates and close SubHKL session">
+        ⏻
       </button>
     </div>
   </header>
@@ -11746,11 +11876,34 @@ def render_rainbow_html(
     </div>
   </div>
 
+  <!-- Modal Dialog: Minimalist 80s Pixel-Font Exit Popup -->
+  <div id="modal-arcade-exit" role="dialog" aria-modal="true" aria-labelledby="arcade-exit-quip-text">
+    <div class="arcade-exit-cabinet">
+      <div id="arcade-exit-quip-text"></div>
+      <div class="arcade-exit-actions" id="arcade-exit-actions">
+        <button id="btn-arcade-exit-cancel" type="button" class="arcade-exit-btn">
+          Go back
+        </button>
+        <button id="btn-arcade-exit-close-tab" type="button" class="arcade-exit-btn" disabled>
+          Close tab
+        </button>
+      </div>
+    </div>
+  </div>
+
 <script>
 window.RAINBOW_ZONES_DATA = {payload_json};
+window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
 (function() {{
   const DATA = window.RAINBOW_ZONES_DATA || {{ peaks: [], sample_peaks: [], zones: [], panels: [], ladder_steps: [], pipeline_stages: [] }};
+  function escTxt(s) {{
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }}
   function extractPeakBucketsFromPayload(payload) {{
     const pObj = payload || {{}};
     const isFrameOnly = Boolean(pObj.frame_only);
@@ -22593,6 +22746,263 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     setMaxZoneOrder(1);
   }});
 
+  // --- Minimalist 80s Pixel-Font Exit & Cleanup Controller ---
+  (function initArcadeExitController() {{
+    const btnExitApp = document.getElementById("btn-exit-app");
+    const modalExit = document.getElementById("modal-arcade-exit");
+    if (!btnExitApp || !modalExit) return;
+
+    const hostTabWin = (() => {{
+      try {{
+        const href = String((window.location && window.location.href) || "");
+        if (href.startsWith("about:srcdoc") && window.parent) return window.parent;
+      }} catch (_e) {{}}
+      return window;
+    }})();
+
+    const exitEndpointUrl = (() => {{
+      try {{
+        const baseHref = (document.baseURI && /^https?:/i.test(document.baseURI))
+          ? document.baseURI
+          : ((hostTabWin.location && /^https?:/i.test(hostTabWin.location.href))
+            ? hostTabWin.location.href
+            : window.location.href);
+        return new URL("api/pipeline/exit", baseHref).href;
+      }} catch (_e) {{
+        return "api/pipeline/exit";
+      }}
+    }})();
+
+    const quipsList = (Array.isArray(window.ARCADE_EXIT_QUIPS) && window.ARCADE_EXIT_QUIPS.length > 0)
+      ? window.ARCADE_EXIT_QUIPS
+      : ["GAME OVER. Just kidding—you crushed it. Insert coffee to continue."];
+
+    let shuffledDeck = [];
+    let deckCursor = 0;
+    let exitModalOpen = false;
+    let exitConfirmed = false;
+    let preparePromise = null;
+    let lastRestorePlan = null;
+
+    if (UI_MODE === "pro") {{
+      modalExit.classList.add("pro-exit-mode");
+    }}
+
+    function refillQuipDeck() {{
+      shuffledDeck = Array.from({{ length: quipsList.length }}, (_, i) => i);
+      for (let i = shuffledDeck.length - 1; i > 0; i--) {{
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = shuffledDeck[i];
+        shuffledDeck[i] = shuffledDeck[j];
+        shuffledDeck[j] = tmp;
+      }}
+      deckCursor = 0;
+    }}
+
+    function drawNextQuip() {{
+      if (deckCursor >= shuffledDeck.length || shuffledDeck.length === 0) {{
+        refillQuipDeck();
+      }}
+      const quipIdx = shuffledDeck[deckCursor++];
+      const qTextEl = modalExit.querySelector("#arcade-exit-quip-text");
+      if (qTextEl) qTextEl.textContent = quipsList[quipIdx];
+    }}
+
+    function sendFinalExitShutdown() {{
+      if (exitConfirmed) return;
+      exitConfirmed = true;
+      const bodyStr = JSON.stringify({{ phase: "confirm" }});
+      let sent = false;
+      try {{
+        if (navigator.sendBeacon) {{
+          sent = navigator.sendBeacon(
+            exitEndpointUrl,
+            new Blob([bodyStr], {{ type: "text/plain;charset=UTF-8" }})
+          );
+        }}
+      }} catch (_e) {{}}
+      if (!sent) {{
+        try {{
+          fetch(exitEndpointUrl, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: bodyStr,
+            keepalive: true,
+          }}).catch(() => {{}});
+        }} catch (_e2) {{}}
+      }}
+    }}
+
+    // If the user opened the Exit screen and closes the browser tab manually (Ctrl+W / tab X),
+    // finalize any deferred local cleanup and stop the container cleanly.
+    const onUnloadWhileExiting = () => {{
+      if (exitModalOpen && !exitConfirmed) {{
+        sendFinalExitShutdown();
+      }}
+    }};
+    try {{ hostTabWin.addEventListener("pagehide", onUnloadWhileExiting); }} catch (_e) {{}}
+    window.addEventListener("pagehide", onUnloadWhileExiting);
+
+    function closeHostBrowserTab() {{
+      sendFinalExitShutdown();
+
+      let inOuterFrame = false;
+      try {{
+        inOuterFrame = Boolean(hostTabWin !== hostTabWin.top);
+      }} catch (_e) {{
+        inOuterFrame = true;
+      }}
+
+      // Invoke window.close() synchronously within the user's click activation
+      if (!inOuterFrame) {{
+        try {{ hostTabWin.close(); }} catch (_e) {{}}
+        try {{
+          if (!hostTabWin.closed) {{
+            const wSelf = hostTabWin.open("", "_self");
+            if (wSelf) wSelf.close();
+          }}
+        }} catch (_e) {{}}
+      }} else {{
+        try {{
+          if (hostTabWin.top) hostTabWin.top.close();
+        }} catch (_e) {{}}
+      }}
+      try {{ window.close(); }} catch (_e) {{}}
+
+      // If the browser's tab-security policy blocked closing a manually-opened tab,
+      // wait long enough not to race ClosePage() IPC and then show a clean confirmation.
+      setTimeout(() => {{
+        try {{
+          if (hostTabWin.closed) return;
+        }} catch (_e) {{
+          return;
+        }}
+        const qTextEl = modalExit.querySelector("#arcade-exit-quip-text");
+        const actionsEl = modalExit.querySelector("#arcade-exit-actions");
+        if (actionsEl) actionsEl.style.display = "none";
+        if (qTextEl) {{
+          qTextEl.textContent =
+            "SESSION CLOSED. Temporary files are clean — press Ctrl+W (or Cmd+W) to close this tab.";
+        }}
+      }}, 550);
+    }}
+
+    async function restorePreviousStepAfterCancel(plan) {{
+      if (!plan || plan.mode === "local_deferred" || plan.mode === "empty") {{
+        probeGalaxyConnection();
+        return;
+      }}
+      if (plan.mode === "galaxy_dataset" && plan.dataset_id) {{
+        await probeGalaxyConnection();
+        await loadFromGalaxyDatasetId(plan.dataset_id, {{
+          preserveFrameIndex: typeof plan.frame_index === "number" ? plan.frame_index : 0,
+        }});
+        if (plan.mtz_dataset_id && plan.mtz_dataset_id !== plan.dataset_id) {{
+          await loadFromGalaxyDatasetId(plan.mtz_dataset_id);
+        }}
+        return;
+      }}
+      if (plan.mode === "reduce_recipe" && plan.params) {{
+        setStatusLine(
+          "[AUTO-REDUCE]",
+          "Restoring session — regenerating reduced detector frames on the fly via <strong>Step 1 (Reduce)</strong>…"
+        );
+        selectPipelineStage(0, true);
+        await executeWorkflowStage(0, plan.params);
+        return;
+      }}
+      probeGalaxyConnection();
+    }}
+
+    const btnCancelExit = modalExit.querySelector("#btn-arcade-exit-cancel");
+    const btnCloseTab = modalExit.querySelector("#btn-arcade-exit-close-tab");
+    const actionsWrap = modalExit.querySelector("#arcade-exit-actions");
+
+    if (btnCancelExit) {{
+      btnCancelExit.addEventListener("click", async () => {{
+        if (exitConfirmed) return;
+        exitModalOpen = false;
+        modalExit.classList.remove("arcade-exit-card-open");
+        const pendingPrep = preparePromise;
+        if (pendingPrep) {{
+          setStatusLine(
+            "[RESTORING SESSION]",
+            "Finishing cleanup sync and restoring previous step from Galaxy History…"
+          );
+          try {{
+            await pendingPrep;
+          }} catch (_e) {{}}
+        }}
+        if (exitModalOpen || exitConfirmed) return;
+        const plan = lastRestorePlan;
+        lastRestorePlan = null;
+        await restorePreviousStepAfterCancel(plan);
+      }});
+    }}
+
+    if (btnCloseTab) {{
+      btnCloseTab.addEventListener("click", () => {{
+        if (btnCloseTab.disabled) return;
+        btnCloseTab.disabled = true;
+        if (btnCancelExit) btnCancelExit.disabled = true;
+        closeHostBrowserTab();
+      }});
+    }}
+
+    btnExitApp.addEventListener("click", async () => {{
+      if (exitModalOpen) {{
+        modalExit.classList.add("arcade-exit-card-open");
+        return;
+      }}
+      if (typeof state.runningStageIdx === "number" && state.runningStageIdx >= 0) {{
+        const okAbort = window.confirm(
+          "A SubHKL pipeline job is currently running. Cancel active job, clean up temporary/shared files, and exit?"
+        );
+        if (!okAbort) return;
+      }}
+      exitModalOpen = true;
+      exitConfirmed = false;
+      lastRestorePlan = null;
+      if (typeof galaxyBridge !== "undefined" && galaxyBridge.pollTimer) {{
+        clearInterval(galaxyBridge.pollTimer);
+        galaxyBridge.pollTimer = null;
+      }}
+
+      if (actionsWrap) actionsWrap.style.display = "";
+      if (btnCancelExit) btnCancelExit.disabled = false;
+      if (btnCloseTab) btnCloseTab.disabled = true;
+      drawNextQuip();
+      modalExit.classList.add("arcade-exit-card-open");
+
+      const curPrep = (async () => {{
+        try {{
+          const r = await fetch(exitEndpointUrl, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ phase: "prepare" }}),
+          }});
+          if (r.ok) {{
+            const doc = await r.json();
+            if (doc && doc.restore_plan) {{
+              lastRestorePlan = doc.restore_plan;
+            }}
+          }}
+        }} catch (_err) {{
+          // Static HTML export without backend server
+        }} finally {{
+          if (preparePromise === curPrep) {{
+            preparePromise = null;
+          }}
+          if (exitModalOpen && !exitConfirmed && btnCloseTab) {{
+            btnCloseTab.disabled = false;
+          }}
+        }}
+      }})();
+      preparePromise = curPrep;
+      await curPrep;
+    }});
+  }})();
+
   applyPeakSource(state.peakSource, false);
   syncWulffYawFromDetector();
   syncWulffUI();
@@ -22689,7 +23099,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function openInOwnTab() {{
     const targetUrl = resolveStandaloneTabUrl();
     if (targetUrl) {{
-      return window.open(targetUrl, "_blank", "noopener");
+      return window.open(targetUrl, "_blank");
     }}
     const blob = new Blob([document.documentElement.outerHTML], {{ type: "text/html" }});
     return window.open(URL.createObjectURL(blob), "_blank");
@@ -23101,7 +23511,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return;
     }}
     if (newPayload.mtz_overlay_name && newPayload.mtz_fresh_overlay !== false) {{
-      const escTxt = s => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       const warnHtml = newPayload.mtz_overlay_warning
         ? ` • <span style="color:var(--accent-gold);">⚠ ${{escTxt(newPayload.mtz_overlay_warning)}}</span>`
         : "";
@@ -23117,9 +23526,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const isig = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
       const comp = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
       const mult = typeof m.multiplicity === "number" ? `${{m.multiplicity.toFixed(2)}}×` : "—";
+      const hostInfo = m.runner_host ? ` (Host=<strong>${{escTxt(String(m.runner_host))}}</strong>)` : "";
       setStatusLine(
         `[4. MERGE COMPLETE]`,
-        `<strong style="color:var(--accent-gold);">Careless Variational Merge</strong> • CC½=<strong style="color:var(--accent-cyan);">${{cc}}</strong> • ⟨I/σ⟩=<strong>${{isig}}</strong> • Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{m.n_merged_asu || 0}} ASU, mult=${{mult}}) — Click any reflection to inspect its ASU symmetry starburst &amp; ΔI/σ residual.`
+        `<strong style="color:var(--accent-gold);">Careless Variational Merge</strong>${{hostInfo}} • CC½=<strong style="color:var(--accent-cyan);">${{cc}}</strong> • ⟨I/σ⟩=<strong>${{isig}}</strong> • Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{m.n_merged_asu || 0}} ASU, mult=${{mult}}) — Click any reflection to inspect its ASU symmetry starburst &amp; ΔI/σ residual.`
       );
     }} else if (artKind === "merged") {{
       const cStr = (DATA.cell && DATA.cell.length === 6)
@@ -26636,8 +27046,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       let serverResponded = false;
       try {{
         if (dsExt !== "mtz") {{
-          state.selectedFrameIndex = 0;
-          DATA.frame_index = 0;
+          const targetFrame = (opts && typeof opts.preserveFrameIndex === "number" && opts.preserveFrameIndex >= 0)
+            ? opts.preserveFrameIndex
+            : 0;
+          state.selectedFrameIndex = targetFrame;
+          DATA.frame_index = targetFrame;
         }}
         const hasGeomFlag = hasActiveDetectorGeometryForMtz() ? "1" : "0";
         const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{state.selectedFrameIndex || 0}}&has_active_geometry=${{hasGeomFlag}}${{getRenderBinningQuery()}}`, {{
@@ -27076,6 +27489,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
         const jobObj = res.job || {{}};
         const jobId = jobObj.job_id || "local";
+        let lastMergeHostBanner = "";
+        const syncRunningHostDisplay = (rec) => {{
+          const rHost = (rec && rec.runner_host && String(rec.runner_host).trim())
+            ? String(rec.runner_host).trim().toUpperCase()
+            : ((String(`${{(rec && rec.stdout) || ""}}\n${{(rec && rec.stderr) || ""}}`).match(/\\[(?:pulsar|subhkl|careless)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
+          const hostTag = rHost || ((rec && rec.mode === "galaxy") ? "PULSAR" : "SUBHKL");
+          const stateTag = String((rec && rec.state) || "running").toUpperCase();
+          if (cellSummary) {{
+            cellSummary.textContent = `[${{hostTag}}] ${{stateTag}}`;
+          }}
+          if (stageId === "merge" && stateTag !== "OK" && stateTag !== "ERROR" && stateTag !== "DELETED") {{
+            const sig = `${{hostTag}}:${{stateTag}}`;
+            if (sig !== lastMergeHostBanner) {{
+              lastMergeHostBanner = sig;
+              setStatusLine(
+                `[4. MERGE • ${{hostTag}}]`,
+                `Running <strong style="color:var(--accent-pink);">Careless Variational Merge</strong> on host <strong style="color:var(--accent-cyan);">${{escTxt(hostTag)}}</strong> (${{stateTag.toLowerCase()}})…`
+              );
+            }}
+          }}
+        }};
+        syncRunningHostDisplay(jobObj);
         if (jobObj.stdout || jobObj.stderr) {{
           appendTerminalLog((jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : ""), true);
         }}
@@ -27194,13 +27629,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               selectLadderRung(aj.ladder_rung_idx, false);
             }}
             const isCancelled = aj.state === "deleted" || Boolean(aj.cancel_requested);
-            if (cellSummary) {{
-              const rHost = (aj.runner_host && String(aj.runner_host).trim())
-                ? String(aj.runner_host).trim().toUpperCase()
-                : ((String(`${{aj.stdout || ""}}\n${{aj.stderr || ""}}`).match(/\\[(?:pulsar|subhkl)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
-              const hostTag = rHost || (aj.mode === "galaxy" ? "PULSAR" : "SUBHKL");
-              cellSummary.textContent = `[${{hostTag}}] ${{(aj.state || "running").toUpperCase()}}`;
-            }}
+            syncRunningHostDisplay(aj);
             const finishedOk = aj.state === "ok";
             const finishedErr = isCancelled || aj.state === "error" || aj.state === "paused" || (!finishedOk && !!aj.error);
             if (finishedOk || finishedErr) {{
@@ -27428,8 +27857,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               );
             }}
             if (cellSummary) {{
-              const rHost = ((String(`${{stdOut}}\n${{stdErr}}`).match(/\\[(?:pulsar|subhkl)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "GALAXY").toUpperCase();
+              const rHost = ((String(`${{stdOut}}\n${{stdErr}}`).match(/\\[(?:pulsar|subhkl|careless)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "GALAXY").toUpperCase();
               cellSummary.textContent = `[${{rHost}}] ${{jstate.toUpperCase()}}`;
+              if (stageId === "merge" && jstate !== "ok" && jstate !== "error" && jstate !== "deleted") {{
+                setStatusLine(
+                  `[4. MERGE • ${{rHost}}]`,
+                  `Running <strong style="color:var(--accent-pink);">Careless Variational Merge</strong> on host <strong style="color:var(--accent-cyan);">${{escTxt(rHost)}}</strong> (${{jstate.toLowerCase()}})…`
+                );
+              }}
             }}
             if (stageId === "solve" && (jstate === "queued" || jstate === "running")) {{
               rungStep = Math.min(3, rungStep + 1);
