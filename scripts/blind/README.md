@@ -200,6 +200,26 @@ On 18 images of MANDI 11324–11338 (14 random, the 4 with most censoring;
   symmetry mates, has not been run.
 - One CPU core, dense eigendecomposition: 2–50 s per image.
 
+`panel_fit_gpu.py merged.h5 integrated_all.h5 out.npz` is the same fit in
+JAX: the reflections x reflections matrix is assembled pair by pair from
+neighbouring windows and solved by Cholesky, with the eigendecomposition
+only where a variance inflation exceeds 1000 (no image needed it). All 615
+images take 2.4 minutes on one GPU. Merged with `careless mono` as the
+reference was (half-dataset CC by shell; off-peak = the same fit 8.5% away
+in time, where no reflection is):
+
+| Shell (Å) | Gated tiles | off-peak | Per-image fit | off-peak |
+|---|---|---|---|---|
+| ∞–4.0 | 0.982 | 0.394 | 0.972 | 0.519 |
+| 4.0–3.0 | 0.949 | 0.391 | 0.975 | 0.433 |
+| 3.0–2.5 | 0.803 | 0.547 | 0.890 | 0.345 |
+| 2.5–2.2 | 0.628 | 0.179 | 0.791 | 0.279 |
+| 2.2–2.0 | 0.352 | 0.262 | 0.460 | 0.259 |
+| 2.0–1.8 | 0.043 | 0.245 | 0.118 | 0.161 |
+
+Overall CC½ falls from 0.900 to 0.785 because 134,000 more observations
+are kept beyond 2 Å, where there is no signal and their noise is wide.
+
 ## Not done
 
 - The rest of the space group: other axes, glide planes, and a proper

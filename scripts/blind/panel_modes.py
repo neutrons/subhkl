@@ -224,6 +224,7 @@ def analyse(image_idx, store, images, valid_px, pk, prof, thr, rng, pipe):
     cens_today = pipe["censored"][keep]
     out = {
         "image": image_idx,
+        "keep": keep,
         "n": n,
         "n_events": len(flat_ev),
         "free": free_frac,
@@ -271,6 +272,16 @@ def main():
     ap.add_argument("--n-worst", type=int, default=4)
     ap.add_argument("--threshold", type=float, default=1e-3)
     ap.add_argument("--out", default=None)
+    ap.add_argument(
+        "--shard",
+        default=None,
+        help="k/n: every n-th image starting at k, instead of a sample",
+    )
+    ap.add_argument(
+        "--write",
+        default=None,
+        help="save row index, flux and sigma of every fitted reflection",
+    )
     args = ap.parse_args()
 
     with h5py.File(args.integrated, "r") as f, h5py.File(args.censored, "r") as g:
@@ -308,7 +319,10 @@ def main():
     pk_all["d"] = pk_all["lambda"] / (2 * np.sin(tth / 2))
     censored = (s5 <= 0) & (pk_all["sigma"] > 0)
     rng = np.random.default_rng(1)
-    if args.images:
+    if args.shard:
+        k_, n_ = (int(v) for v in args.shard.split("/"))
+        pick = list(range(len(images)))[k_::n_]
+    elif args.images:
         pick = list(args.images)
     else:
         worst = np.argsort(-np.bincount(img[censored], minlength=len(images)))[
@@ -337,6 +351,7 @@ def main():
             r = analyse(
                 int(i), store, images, mask[slot], pk, prof, args.threshold, rng, pipe
             )
+            r["rows"] = ix[r["keep"]]
             res.append(r)
             lost = r["n_S"] - len(r["combos"])
             print(
@@ -345,6 +360,17 @@ def main():
                 flush=True,
             )
 
+    if args.write:
+        np.savez(
+            args.write,
+            rows=np.concatenate([r["rows"] for r in res]),
+            flux=np.concatenate([r["flux"] for r in res]),
+            sigma=np.concatenate([r["sig_flux"] for r in res]),
+            plain=np.concatenate([r["plain"] for r in res]),
+            dropped=np.array([r["dropped"] for r in res]),
+            seconds=np.array([r["seconds"] for r in res]),
+            image=np.array([r["image"] for r in res]),
+        )
     n = sum(r["n"] for r in res)
     cat = lambda k: np.concatenate([r[k] for r in res])
     lam, plain, cens = cat("lam"), cat("plain"), cat("cens")
