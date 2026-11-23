@@ -4,6 +4,38 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Time-of-flight integration fits each detector image once, in position and time (`tof_joint`, `integrator --tof-fit`)**:
+  - With events present, all reflections of an image are now fitted together
+    as spot profile × measured time profile on a background taken from the
+    voxels no reflection touches. Reflections that share pixels are told apart
+    by when their neutrons arrive. Previously each reflection was fitted on its
+    own tile, summed over the time gate, with up to seven neighbours; two
+    reflections on the same pixels and inside one another's gate were then
+    indistinguishable and were censored.
+  - The reported intensity is the reflection's whole flux, not the 95% inside
+    a gate.
+  - `--tof-max-variance-inflation` keeps its meaning. Where neighbours inflate
+    a variance beyond it, the image is refitted without the directions the data
+    do not determine, and only reflections with a share in those directions are
+    censored.
+  - `--tof-fit gated` selects the earlier method. `--tof-sideband-factor`,
+    `--tof-sideband-measure` and `--tof-amplitude-ridge` apply only to it.
+  - On MANDI IPTS-30763 runs 11324–11338 (1.89 million predictions to 1.41 Å):
+    half-dataset CC of the `careless mono` merge rises from 0.949 to 0.975 at
+    4.0–3.0 Å, 0.803 to 0.884 at 3.0–2.5 Å, 0.628 to 0.774 at 2.5–2.2 Å and
+    0.352 to 0.447 at 2.2–2.0 Å; it is 0.968 against 0.982 below 4 Å. 1.85
+    million reflections are fitted (1.74 million before) and none is censored
+    as unresolved. The overall CC½ of the merge to 1.41 Å falls from 0.900 to
+    0.759, because the added observations lie beyond 2 Å where this crystal
+    does not diffract; cut the merge at the resolution the shells support. The
+    integrator takes about three minutes on one GPU.
+  - The fit relies on the spot shape: with the nominal one-pixel spot
+    (no `--anisotropic` shape fit) the 2.5–2.2 Å shell drops to 0.19.
+
 ## [1.7.1]
 
 ### Added

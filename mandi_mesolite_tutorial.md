@@ -66,42 +66,51 @@ python -m subhkl.io.parser integrator MANDI_11612.reduce.h5 MANDI peak_predictor
 ```
 The `gaussian_fit` method refinements peak centers to sub-pixel accuracy, which is essential for high-quality indexing metrics.
 
-#### Time-of-flight gating
+#### Time-of-flight integration
 
 On MANDI, `reduce` also keeps each event's time of flight next to the images
 (`events/tof`; `--no-events` skips this) and `merge-images` carries the events
 into the merged stack. When the images file has events, `integrator` no longer
-integrates a reflection on the image of the whole wavelength band: it uses only
-the events inside a time window around the reflection's predicted time of
-flight and measures the background in time sidebands on the same pixels.
+integrates a reflection on the image of the whole wavelength band. It fits all
+reflections of a detector image at once, in position and in time: each
+reflection is its predicted spot times the time profile measured from the
+data, on a background taken from the parts of the image and of the time axis
+that no reflection touches. Reflections that share pixels are told apart by
+when their neutrons arrive.
 
 ```commandline
 python -m subhkl.io.parser integrator scan_master.h5 MANDI peak_predictor.h5 integrator.h5 --tof-gate auto
 ```
 
-- `--tof-gate auto` (default) measures the window from the data. The events
-  near all predicted positions are stacked in `t / t_predicted - 1`; the window
-  is the interval holding `--tof-gate-coverage` (default 0.95) of the Bragg
-  excess. A common offset, as from a cell-scale or flight-path error, is
-  absorbed. If the stack shows no excess the predictions do not line up with
-  the events in time and the command stops with an error.
-- `--tof-gate lo,hi` sets the window edges relative to the predicted time, for
-  example `--tof-gate=-0.01,0.015`.
+- `--tof-gate auto` (default) measures the time profile from the data. The
+  events near all predicted positions are stacked in `t / t_predicted - 1`;
+  the Bragg excess in that stack is the profile. A common offset, as from a
+  cell-scale or flight-path error, is absorbed. If the stack shows no excess
+  the predictions do not line up with the events in time and the command stops
+  with an error.
+- `--tof-gate lo,hi` uses a flat profile between these edges relative to the
+  predicted time, for example `--tof-gate=-0.01,0.015`.
 - `--tof-gate off` integrates the whole band as before.
+- `--tof-max-variance-inflation` (default 1000) bounds how much overlapping
+  neighbours may inflate the variance of a reflection. Where the bound is
+  exceeded, only the combinations of intensities that the data determine are
+  fitted and the reflections involved are censored.
+- `--tof-fit gated` selects the earlier method: one tile per reflection,
+  counts summed over a time gate holding `--tof-gate-coverage` of the excess,
+  background from time sidebands (`--tof-sideband-factor`,
+  `--tof-sideband-measure`).
 
-The sideband background is scaled to the gate by each image's own time
-spectrum (`--tof-sideband-measure spectrum`, the default), not by the length
-of the intervals in time, because the spectrum is curved and falls off at the
-band edges. `--tof-sideband-measure time` assumes a rate flat in time.
+To check that a merge's CC½ is Bragg signal, integrate once more with the
+profile moved off the reflections, for example `--tof-gate=0.06,0.11`, and
+merge that: whatever CC½ remains in a resolution shell is not from the
+reflections.
 
-To check that a merge's CC½ is Bragg signal, integrate once more with the gate
-moved off the reflections, for example `--tof-gate=0.06,0.11`, and merge that:
-whatever CC½ remains in a resolution shell is not from the reflections.
-
-Each output row is then one reflection at its own wavelength. `integrator.h5`
-records the window used (`tof_gate`), the stacked time profile it was read
-from, and per row the gate centre (`peaks/tof`, microseconds) and the expected
-background inside the gate (`peaks/tof_background`, counts per pixel).
+Each output row is one reflection at its own wavelength, and its intensity is
+the whole flux of the reflection. `integrator.h5` records the gate holding
+`--tof-gate-coverage` of the stacked excess (`tof_gate`), the stacked time
+profile, the method (`tof_gate` attribute `fit`), and per row the gate centre
+(`peaks/tof`, microseconds) and the expected background under the time profile
+(`peaks/tof_background`, counts per pixel).
 
 ### `finder-visualize` / `integrator-visualize`
 
