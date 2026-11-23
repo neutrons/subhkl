@@ -1,0 +1,663 @@
+"""Point group and space-group candidates without a known space group.
+
+Two tests, both free of wavelength normalisation:
+
+``laue_class``
+    Symmetry mates h and M.h have the same d-spacing, so two observations
+    of them share the scattering angle whenever they share the wavelength;
+    the incident spectrum and the Lorentz factor are then the same for both
+    and intensities integrated once in P 1 compare directly.  Every rotation
+    of the lattice is tested on such matched pairs against two yardsticks
+    from the same data: the same reflection measured twice, and unrelated
+    reflections of the same d.
+
+``space_group_candidates``
+    Every space group compatible with the point group is a hypothesis about
+    which reciprocal-lattice nodes are empty (centring, glide planes, screw
+    axes).  The hypotheses are scored on counts at the nodes: raw events
+    converted to fractional Miller indices (``event_node_counts``), nothing
+    integrated or normalised.
+"""
+
+import itertools
+from dataclasses import dataclass, field
+
+import gemmi
+import h5py
+import numpy as np
+
+from subhkl.config import reduction_settings
+from subhkl.io.events import ANGSTROM_M_PER_US, EventStore
+
+IDENTITY = np.eye(3, dtype=int)
+_KEY_OFFSET = 512
+
+
+def _key(hkl):
+    hkl = np.asarray(hkl, dtype=np.int64)
+    o = _KEY_OFFSET
+    return ((hkl[:, 0] + o) * 2048 + (hkl[:, 1] + o)) * 2048 + (hkl[:, 2] + o)
+
+
+def _robust_spread(z):
+    """Robust standard deviation (from the interquartile range)."""
+    if len(z) <= 30:
+        return float("nan")
+    return 0.7413 * float(np.diff(np.percentile(z, [25, 75]))[0])
+
+
+def describe_operation(M):
+    """Rotation order and axis (direct-lattice indices) of an integer matrix on hkl."""
+    M = np.asarray(M)
+    if np.array_equal(M, -IDENTITY):
+        return "inversion (Friedel)"
+    order = next(
+        (
+            n
+            for n in (1, 2, 3, 4, 6)
+            if np.array_equal(np.linalg.matrix_power(M, n), IDENTITY)
+        ),
+        None,
+    )
+    if order is None:
+        return "not a rotation"
+    if order == 1:
+        return "identity"
+    W = np.linalg.inv(M).T  # acts on direct-lattice coordinates
+    w, v = np.linalg.eig(W)
+    axis = np.real(v[:, np.argmin(np.abs(w - 1))])
+    axis = axis / np.abs(axis[np.abs(axis) > 1e-6]).min()
+    return f"{order}-fold about [{' '.join(str(round(x)) for x in axis)}]"
+
+
+def close_group(mats, limit=48):
+    """All products of the given integer matrices (the group they generate)."""
+    group = {tuple(IDENTITY.ravel())}
+    frontier = [IDENTITY]
+    gens = [np.asarray(m, dtype=int) for m in mats]
+    while frontier:
+        new = []
+        for a in frontier:
+            for g in gens:
+                p = a @ g
+                k = tuple(p.ravel())
+                if k not in group:
+                    group.add(k)
+                    new.append(p)
+        if len(group) > limit:
+            raise ValueError(
+                "The operations do not generate a crystallographic point group."
+            )
+        frontier = new
+    return [np.array(k).reshape(3, 3) for k in sorted(group)]
+
+
+def _group_ops(mats):
+    ops = []
+    for M in mats:
+        W = np.rint(np.linalg.inv(np.asarray(M, dtype=float)).T).astype(int)
+        op = gemmi.Op()
+        op.rot = (W * gemmi.Op.DEN).tolist()
+        ops.append(op)
+    return gemmi.find_spacegroup_by_ops(gemmi.GroupOps(ops))
+
+
+class Observations:
+    """Reflections integrated once in P 1, unscaled.
+
+    Args:
+        hkl: (N, 3) integer Miller indices
+        intensity, sigma: (N,) intensity and its standard error
+        wavelength: [Angstrom] (N,)
+        d: [Angstrom] (N,) d-spacing
+        group: (N,) integer label of the measurement (run and bank); a pair
+            from the same label is the same spot and is not used
+        match: [-] largest |log wavelength ratio| of a matched pair
+        min_isigi: [-] a pair counts as strong if either member exceeds this
+    """
+
+    def __init__(
+        self, hkl, intensity, sigma, wavelength, d, group, match=0.02, min_isigi=5.0
+    ):
+        ok = np.asarray(sigma) > 0
+        self.hkl = np.asarray(hkl, dtype=np.int64)[ok]
+        self.I = np.asarray(intensity, dtype=float)[ok]
+        self.sig = np.asarray(sigma, dtype=float)[ok]
+        self.lam = np.asarray(wavelength, dtype=float)[ok]
+        self.d = np.asarray(d, dtype=float)[ok]
+        self.group = np.asarray(group)[ok]
+        self.match, self.min_isigi = match, min_isigi
+        self.order = np.argsort(_key(self.hkl), kind="stable")
+        self.keys = _key(self.hkl)[self.order]
+
+    @classmethod
+    def from_file(cls, filename, d_min=2.5, **kwargs):
+        """Read an integrator output file; keep reflections with d > d_min."""
+        with h5py.File(filename, "r") as f:
+            p = {
+                k: f["peaks"][k][()]
+                for k in (
+                    "h",
+                    "k",
+                    "l",
+                    "intensity",
+                    "sigma",
+                    "lambda",
+                    "run_index",
+                    "bank",
+                )
+            }
+            B = f["sample/B"][()]
+        hkl = np.stack([p["h"], p["k"], p["l"]], 1).astype(np.int64)
+        d = 1.0 / np.maximum(np.linalg.norm(hkl @ B.T, axis=1), 1e-12)
+        keep = d > d_min
+        group = p["run_index"].astype(np.int64) * 100000 + p["bank"].astype(np.int64)
+        return cls(
+            hkl[keep],
+            p["intensity"][keep],
+            p["sigma"][keep],
+            p["lambda"][keep],
+            d[keep],
+            group[keep],
+            **kwargs,
+        )
+
+    def mate_pairs(self, M, max_pairs=300000):
+        """Pairs (i, j): observation j is of M.h_i, at matched wavelength,
+        from a different measurement."""
+        want = _key(self.hkl @ np.asarray(M).T)
+        lo = np.searchsorted(self.keys, want, side="left")
+        hi = np.searchsorted(self.keys, want, side="right")
+        cnt = hi - lo
+        i_all, j_all = [], []
+        for off in range(int(cnt.max()) if len(cnt) else 0):
+            m = cnt > off
+            i_all.append(np.flatnonzero(m))
+            j_all.append(self.order[lo[m] + off])
+        if not i_all:
+            return np.empty(0, int), np.empty(0, int)
+        i, j = np.concatenate(i_all), np.concatenate(j_all)
+        keep = (i != j) & (self.group[i] != self.group[j])
+        keep &= np.abs(np.log(self.lam[i] / self.lam[j])) < self.match
+        i, j = i[keep], j[keep]
+        if len(i) > max_pairs:
+            s = np.random.default_rng(0).choice(len(i), max_pairs, replace=False)
+            i, j = i[s], j[s]
+        return i, j
+
+    def random_pairs(self, n=600000):
+        """Unrelated reflections of the same d at matched wavelength."""
+        rng = np.random.default_rng(1)
+        i = rng.choice(len(self.I), n)
+        shell = np.argsort(self.d)
+        pos = np.searchsorted(self.d[shell], self.d[i])
+        j = shell[np.clip(pos + rng.integers(-50, 51, n), 0, len(self.I) - 1)]
+        keep = (np.abs(np.log(self.lam[i] / self.lam[j])) < self.match) & np.any(
+            self.hkl[i] != self.hkl[j], axis=1
+        )
+        return i[keep], j[keep]
+
+    def statistic(self, i, j):
+        """(pairs, strong pairs, spread of (I1 - I2) / sigma over the strong pairs)."""
+        strong = (self.I[i] / self.sig[i] > self.min_isigi) | (
+            self.I[j] / self.sig[j] > self.min_isigi
+        )
+        z = (self.I[i] - self.I[j]) / np.sqrt(self.sig[i] ** 2 + self.sig[j] ** 2)
+        return len(i), int(strong.sum()), _robust_spread(z[strong])
+
+
+@dataclass
+class LaueResult:
+    """Result of ``laue_class``."""
+
+    rows: list  # one dict per tested operation: name, matrix, pairs, strong, spread, verdict
+    same: float  # spread for the same reflection measured twice
+    unrelated: float  # spread for unrelated reflections of the same d
+    cut: float  # acceptance level
+    rotations: list  # accepted rotations and everything they generate (on hkl)
+    point_group: str  # of the rotations, e.g. "32"
+    laue: str  # e.g. "-3m"
+    symmorphic: str  # space group of the rotations without translations, e.g. "P 3 2 1"
+    conflicts: list = field(
+        default_factory=list
+    )  # rejected operations the accepted ones imply
+    friedel: float | None = None  # spread for inversion mates (a check, not an input)
+
+
+def laue_class(obs, operations, min_strong=100, level=0.5):
+    """Which rotations of the lattice are symmetries of the intensities.
+
+    Args:
+        obs: Observations
+        operations: integer matrices M on Miller indices (h' = M h), the
+            rotations of the lattice (see ``blind_cell.lattice_operations``)
+        min_strong: [-] fewest strong pairs for a verdict
+        level: [-] acceptance level between the two yardsticks (0 = same
+            reflection measured twice, 1 = unrelated reflections)
+    Returns:
+        LaueResult.  Rotations that could not be tested but follow from the
+        accepted ones are included; a rejected rotation that follows from
+        accepted ones is listed under ``conflicts``.
+    """
+    _n, _s, same = obs.statistic(*obs.mate_pairs(IDENTITY))
+    _n, _s, unrelated = obs.statistic(*obs.random_pairs())
+    if not (np.isfinite(same) and np.isfinite(unrelated)) or unrelated <= same:
+        raise ValueError(
+            "Too few repeated strong reflections at matched wavelength to set "
+            "the scale of the symmetry test (need redundancy across runs or banks)."
+        )
+    cut = same + level * (unrelated - same)
+    rows, accepted, rejected = [], [], []
+    for M in operations:
+        M = np.asarray(M, dtype=int)
+        if np.array_equal(M, IDENTITY):
+            continue
+        n, s, val = obs.statistic(*obs.mate_pairs(M))
+        if s < min_strong or not np.isfinite(val):
+            verdict = "too few pairs"
+        elif val < cut:
+            verdict = "symmetry"
+            accepted.append(M)
+        else:
+            verdict = "not a symmetry"
+            rejected.append(M)
+        rows.append(
+            {
+                "name": describe_operation(M),
+                "matrix": M,
+                "pairs": n,
+                "strong": s,
+                "spread": val,
+                "verdict": verdict,
+            }
+        )
+    rotations = close_group(accepted)
+    have = {tuple(m.ravel()) for m in rotations}
+    conflicts = [describe_operation(M) for M in rejected if tuple(M.ravel()) in have]
+    for row in rows:
+        if row["verdict"] == "too few pairs" and tuple(row["matrix"].ravel()) in have:
+            row["verdict"] = "symmetry (implied)"
+    _n, s_f, friedel = obs.statistic(*obs.mate_pairs(-IDENTITY))
+    sg = _group_ops(rotations)
+    return LaueResult(
+        rows=rows,
+        same=same,
+        unrelated=unrelated,
+        cut=cut,
+        rotations=rotations,
+        point_group=sg.point_group_hm() if sg else "unknown",
+        laue=sg.laue_str() if sg else "unknown",
+        symmorphic=sg.hm if sg else "unknown",
+        conflicts=conflicts,
+        friedel=friedel if s_f >= min_strong else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Counts at reciprocal-lattice nodes, from raw events
+# ---------------------------------------------------------------------------
+
+R_IN = 0.18  # [-] a node's signal sphere, fractional indices
+R_OUT = (0.32, 0.5)  # [-] its background shell
+
+
+@dataclass
+class NodeCounts:
+    """Net counts at integer nodes of reciprocal space.
+
+    ``net``, ``err`` and ``covered`` are dense arrays over the box
+    |h_i| <= hmax_i, indexed by h + hmax.
+    """
+
+    hmax: np.ndarray
+    net: np.ndarray
+    err: np.ndarray
+    covered: np.ndarray
+    basis: np.ndarray  # direct basis the indices refer to, columns [Angstrom]
+    d_min: float
+    events: int = 0
+
+    @property
+    def grid(self):
+        return np.stack(
+            np.meshgrid(*[np.arange(-m, m + 1) for m in self.hmax], indexing="ij"), -1
+        ).reshape(-1, 3)
+
+
+def event_node_counts(
+    events_file, instrument, basis, rotations, d_min, pixel_positions=None
+):
+    """Counts near every reciprocal-lattice node, above the level between nodes.
+
+    Args:
+        events_file: images file with pixel-sorted events
+        instrument: instrument name (L1; nominal pixel positions unless given)
+        basis: (3, 3) direct basis, columns [Angstrom], in the sample frame
+        rotations: (n_images, 3, 3) goniometer rotation of each image
+        d_min: [Angstrom] nodes and events beyond this resolution are left out
+        pixel_positions: optional callable (bank, shape) -> (H*W, 3) [m]
+    Returns:
+        NodeCounts
+    """
+    if pixel_positions is None:
+        from subhkl.search.blind_cell import pixel_positions as nominal
+
+        def pixel_positions(bank, shape):
+            return nominal(instrument, bank, shape)
+
+    l1 = float(reduction_settings[instrument]["L1"])
+    basis = np.asarray(basis, dtype=float)
+    hmax = np.ceil(np.linalg.norm(basis, axis=0) / d_min).astype(int) + 1
+    shape = tuple(2 * hmax + 1)
+    size = int(np.prod(shape))
+    sig = np.zeros(size)
+    bkg = np.zeros(size)
+    with h5py.File(events_file, "r") as f:
+        images = f["images"][()]
+        bank_ids = f["bank_ids"][()]
+    pos_cache = {}
+    n_events = 0
+    with EventStore(events_file) as store:
+        for i in range(len(images)):
+            tof, off = store.image_events(i, images[i])
+            if len(tof) == 0:
+                continue
+            bank = int(bank_ids[i])
+            if bank not in pos_cache:
+                pos_cache[bank] = np.asarray(
+                    pixel_positions(bank, images[i].shape), dtype=np.float64
+                )
+            xyz = pos_cache[bank][np.repeat(np.arange(images[i].size), np.diff(off))]
+            l2 = np.linalg.norm(xyz, axis=1)
+            lam = ANGSTROM_M_PER_US * tof / (l1 + l2)
+            q_lab = (xyz / l2[:, None] - np.array([0.0, 0.0, 1.0])) / lam[:, None]
+            q_lab = q_lab[np.linalg.norm(q_lab, axis=1) <= 1.0 / d_min]
+            h = q_lab @ (rotations[i] @ basis)  # h_j = a_j . (R^T q_lab)
+            node = np.rint(h).astype(np.int64)
+            dist = np.linalg.norm(h - node, axis=1)
+            ok = np.all(np.abs(node) <= hmax, axis=1)
+            flat = np.ravel_multi_index((node[ok] + hmax).T, shape)
+            sig += np.bincount(flat[dist[ok] < R_IN], minlength=size)
+            in_shell = (dist[ok] > R_OUT[0]) & (dist[ok] < R_OUT[1])
+            bkg += np.bincount(flat[in_shell], minlength=size)
+            n_events += len(h)
+    ratio = R_IN**3 / (R_OUT[1] ** 3 - R_OUT[0] ** 3)
+    net = (sig - ratio * bkg).reshape(shape)
+    err = np.sqrt(sig + ratio**2 * bkg + 1.0).reshape(shape)
+    covered = ((sig + bkg) >= 5).reshape(shape)
+    covered[tuple(hmax)] = False  # the origin
+    return NodeCounts(hmax, net, err, covered, basis, float(d_min), n_events)
+
+
+# ---------------------------------------------------------------------------
+# Space-group hypotheses
+# ---------------------------------------------------------------------------
+
+
+def _signed_permutations():
+    out = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1, -1), repeat=3):
+            P = np.zeros((3, 3), dtype=int)
+            for row, (col, s) in enumerate(zip(perm, signs)):
+                P[row, col] = s
+            if round(np.linalg.det(P)) == 1:
+                out.append(P)
+    return out
+
+
+def _laue_set(mats):
+    return frozenset(
+        tuple((s * np.asarray(m, dtype=int)).ravel()) for m in mats for s in (1, -1)
+    )
+
+
+def _settings(sohncke):
+    """Every tabulated space-group setting (reference and others, such as
+    I 1 2 1 or P 21 21 2), one entry per distinct symbol."""
+    seen = set()
+    for sg in gemmi.spacegroup_table():
+        name = sg.xhm()
+        if name in seen or (sohncke and not sg.is_sohncke()):
+            continue
+        seen.add(name)
+        yield sg
+
+
+def _hkl_rotations(sg):
+    out = []
+    for op in sg.operations().sym_ops:
+        w = np.array(op.rot, dtype=float) / gemmi.Op.DEN
+        out.append(np.rint(np.linalg.inv(w).T).astype(int))
+    return out
+
+
+def _settings_from_rotations(rotations, sohncke):
+    """(space group, P): tabulated settings whose Laue group, after the
+    change of indices h_setting = P h, is the one the rotations generate."""
+    target = _laue_set(close_group(rotations))
+    perms = _signed_permutations()
+    for sg in _settings(sohncke):
+        ref = _hkl_rotations(sg)
+        if len(_laue_set(ref)) != len(target):
+            continue
+        for P in perms:
+            Pi = np.rint(np.linalg.inv(P)).astype(int)
+            if _laue_set([Pi @ m @ P for m in ref]) == target:
+                yield sg, P
+
+
+def _settings_from_laue(laue, basis, sohncke):
+    """Fallback when only the name of the Laue class is known: reference
+    settings of that class, in the axis orders that leave the cell unchanged."""
+    from subhkl.search.blind_cell import cell_of
+
+    base = np.array(cell_of(basis))
+    keep = []
+    for perm in itertools.permutations(range(3)):
+        permuted = np.array(cell_of(basis[:, list(perm)]))
+        if np.allclose(permuted[:3], base[:3], rtol=0.01) and np.allclose(
+            np.cos(np.radians(permuted[3:])), np.cos(np.radians(base[3:])), atol=0.02
+        ):
+            P = np.zeros((3, 3), dtype=int)
+            for row, col in enumerate(perm):
+                P[row, col] = 1
+            keep.append(P)
+    for sg in _settings(sohncke):
+        if sg.is_reference_setting() and sg.laue_str() == laue:
+            for P in keep:
+                yield sg, P
+
+
+def _axes_label(P):
+    names = []
+    for row in np.asarray(P):
+        j = int(np.argmax(np.abs(row)))
+        names.append(("-" if row[j] < 0 else "") + "abc"[j])
+    return ",".join(names)
+
+
+def space_group_candidates(
+    nodes,
+    rotations=None,
+    laue=None,
+    sohncke=False,
+    rel_res=0.012,
+    threshold=0.15,
+    min_nodes=3,
+):
+    """Score every space group compatible with the point symmetry.
+
+    How a hypothesis G is judged:
+
+    - The nodes the candidates forbid are split into elementary classes:
+      sets of nodes that the same candidates forbid.  A class is one
+      reflection condition, or the intersection of a few.
+    - A scattering vector is known to a relative precision ``rel_res``, so
+      a node of index n is blurred by about rel_res * n.  A forbidden node
+      is "testable" under G only if every node inside that blur is
+      forbidden under G too; otherwise an allowed neighbour leaks into it.
+    - For each class G forbids, the net counts of its testable nodes are
+      compared with never-forbidden nodes of the same resolution.  G is
+      consistent if no class carries more than ``threshold`` of that.
+
+    Args:
+        nodes: NodeCounts
+        rotations: integer matrices on the Miller indices of ``nodes`` that
+            are symmetries (``LaueResult.rotations``).  Candidates are the
+            tabulated space-group settings (reference and others, such as
+            I 1 2 1) whose Laue group equals the one these generate, in
+            every axis assignment that makes it so.
+        laue: name of the Laue class (e.g. "m-3m"), used when ``rotations``
+            is None; axis orders that leave the cell unchanged are tried
+        sohncke: only groups a chiral molecule can crystallise in
+        rel_res: [-] relative precision of a scattering vector
+        threshold: [-] largest share of the allowed level a forbidden class
+            may carry
+        min_nodes: [-] fewest testable nodes for a class to be judged
+    Returns:
+        list of dicts, consistent hypotheses first and among them the most
+        restrictive first: ``space_groups`` (names sharing the absence
+        pattern), ``consistent``, ``forbidden_nodes``, ``tested_nodes``,
+        ``untestable_nodes``, ``worst_class_fraction``, ``classes``
+        (per-class evidence)
+    """
+    from scipy.ndimage import maximum_filter
+
+    if rotations is None and laue is None:
+        raise ValueError("Give the accepted rotations or the name of the Laue class.")
+    grid = nodes.grid
+    shape = nodes.net.shape
+    recip = np.linalg.inv(nodes.basis)  # rows are reciprocal vectors
+    d_all = 1.0 / np.maximum(np.linalg.norm(grid @ recip, axis=1), 1e-9)
+    cov = nodes.covered.ravel() & (d_all >= nodes.d_min)
+    netf, errf = nodes.net.ravel(), nodes.err.ravel()
+    cov_idx = np.flatnonzero(cov)
+    if len(cov_idx) == 0:
+        raise ValueError("No reciprocal-lattice node has data.")
+
+    if rotations is not None:
+        settings = _settings_from_rotations(rotations, sohncke)
+    else:
+        settings = _settings_from_laue(laue, nodes.basis, sohncke)
+    hyp = {}
+    for sg, P in settings:
+        forb = np.asarray(
+            sg.operations().systematic_absences((grid @ P.T).astype(np.int32)),
+            dtype=bool,
+        )
+        entry = hyp.setdefault(
+            forb[cov].tobytes(), {"forb": forb, "direct": [], "permuted": []}
+        )
+        name = sg.xhm()
+        if np.array_equal(P, IDENTITY):
+            if name not in entry["direct"]:
+                entry["direct"].append(name)
+        elif not any(n.startswith(name + " (") for n in entry["permuted"]):
+            entry["permuted"].append(f"{name} (axes {_axes_label(P)})")
+    for entry in hyp.values():
+        # A symbol that applies to the indices as they are is preferred; the
+        # same group with its axes renamed is listed only when there is none.
+        entry["names"] = entry["direct"] or entry["permuted"][:4]
+    hyps = list(hyp.values())
+    if not hyps:
+        raise ValueError(
+            "No space group matches the given point symmetry in this cell."
+        )
+
+    # elementary classes: nodes forbidden by the same set of hypotheses
+    F = np.stack([h["forb"][cov] for h in hyps], 1)
+    sig_keys, sig_inv = np.unique(F, axis=0, return_inverse=True)
+    sig_inv = sig_inv.ravel()
+
+    # reference level: never-forbidden nodes, by resolution
+    never = ~F.any(axis=1)
+    if not never.any():
+        raise ValueError("Every node with data is forbidden by some candidate.")
+    edges = np.quantile(d_all[cov_idx[never]], np.linspace(0, 1, 9))
+    edges[0], edges[-1] = 0.0, np.inf
+    which = np.clip(np.searchsorted(edges, d_all[cov_idx], side="right") - 1, 0, 7)
+    overall = netf[cov_idx[never]].mean()
+    ref_bin = np.array(
+        [
+            netf[cov_idx[never & (which == b)]].mean()
+            if (never & (which == b)).any()
+            else overall
+            for b in range(8)
+        ]
+    )
+    expect = ref_bin[which]
+
+    blur = np.rint(2.5 * rel_res * np.abs(grid)).astype(int)
+    blur_keys, blur_inv = np.unique(blur, axis=0, return_inverse=True)
+    blur_inv = blur_inv.ravel()
+
+    results = []
+    for h in hyps:
+        allowed3 = ~h["forb"].reshape(shape)
+        testable = np.zeros(len(grid), dtype=bool)
+        for j, b in enumerate(blur_keys):
+            m = (blur_inv == j) & h["forb"]
+            if not m.any():
+                continue
+            if not b.any():
+                testable[m] = True
+                continue
+            near_allowed = maximum_filter(
+                allowed3.astype(np.uint8),
+                size=tuple(2 * b + 1),
+                mode="constant",
+                cval=1,
+            )
+            testable[m] = near_allowed.ravel()[m] == 0
+        t_cov = testable[cov_idx]
+        f_cov = h["forb"][cov_idx]
+        worst, n_tested, n_untested, classes = 0.0, 0, 0, []
+        for s in np.unique(sig_inv[f_cov]):
+            cls = f_cov & (sig_inv == s)
+            use = cls & t_cov
+            top = grid[cov_idx[cls]][np.argsort(-netf[cov_idx[cls]])[:3]]
+            entry = {
+                "nodes": int(cls.sum()),
+                "testable": int(use.sum()),
+                "examples": [[int(v) for v in e] for e in top],
+                "also_forbidden_by": int(sig_keys[s].sum()),
+            }
+            classes.append(entry)
+            if use.sum() < min_nodes:
+                n_untested += int(cls.sum())
+                continue
+            n_tested += int(use.sum())
+            total = float(netf[cov_idx[use]].sum())
+            ratio = total / max(float(expect[use].sum()), 1e-9)
+            entry.update(
+                net_counts=total,
+                sigma=float(np.sqrt((errf[cov_idx[use]] ** 2).sum())),
+                expected_if_present=float(expect[use].sum()),
+                fraction_of_allowed=float(ratio),
+            )
+            worst = max(worst, ratio)
+        results.append(
+            {
+                "space_groups": h["names"],
+                "consistent": bool(worst < threshold),
+                "forbidden_nodes": int(f_cov.sum()),
+                "tested_nodes": n_tested,
+                "untestable_nodes": n_untested,
+                "worst_class_fraction": float(worst),
+                "classes": classes,
+            }
+        )
+    results.sort(
+        key=lambda r: (not r["consistent"], -r["tested_nodes"], -r["forbidden_nodes"])
+    )
+    return results
+
+
+def best_candidates(results):
+    """The most restrictive consistent hypotheses (ties included)."""
+    good = [r for r in results if r["consistent"]]
+    if not good:
+        return []
+    top = max(r["tested_nodes"] for r in good)
+    return [r for r in good if r["tested_nodes"] == top]
