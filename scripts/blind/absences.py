@@ -28,6 +28,7 @@ Usage:
 
 import argparse
 import itertools
+import json
 
 import gemmi
 import h5py
@@ -126,6 +127,9 @@ def main():
     ap.add_argument(
         "--sohncke", action="store_true", help="only groups a chiral molecule can take"
     )
+    ap.add_argument(
+        "--out", help="write every hypothesis with its per-class evidence as JSON"
+    )
     args = ap.parse_args()
 
     if args.solve:
@@ -217,7 +221,7 @@ def main():
 
     # elementary classes: nodes forbidden by the same set of hypotheses
     F = np.stack([h["forb"][cov] for h in hyps], 1)
-    _sig_keys, sig_inv = np.unique(F, axis=0, return_inverse=True)
+    sig_keys, sig_inv = np.unique(F, axis=0, return_inverse=True)
     sig_inv = sig_inv.ravel()
     cov_idx = np.flatnonzero(cov)
 
@@ -259,15 +263,30 @@ def main():
         t_cov = testable[cov_idx]
         f_cov = h["forb"][cov_idx]
         worst, worst_desc, n_tested, n_untested = 0.0, "", 0, 0
+        classes = []
         for s in np.unique(sig_inv[f_cov]):
             cls = f_cov & (sig_inv == s)
             use = cls & t_cov
+            top = grid[cov_idx[cls]][np.argsort(-netf[cov_idx[cls]])[:3]]
+            entry = {
+                "nodes": int(cls.sum()),
+                "testable": int(use.sum()),
+                "examples": [[int(v) for v in e] for e in top],
+                "also_forbidden_by": int(sig_keys[s].sum()),
+            }
+            classes.append(entry)
             if use.sum() < 3:
                 n_untested += int(cls.sum())
                 continue
             n_tested += int(use.sum())
             ratio = netf[cov_idx[use]].sum() / max(expect[use].sum(), 1e-9)
             z = netf[cov_idx[use]].sum() / np.sqrt((errf[cov_idx[use]] ** 2).sum())
+            entry.update(
+                net_counts=float(netf[cov_idx[use]].sum()),
+                sigma=float(np.sqrt((errf[cov_idx[use]] ** 2).sum())),
+                expected_if_present=float(expect[use].sum()),
+                fraction_of_allowed=float(ratio),
+            )
             if ratio > worst:
                 ex = grid[cov_idx[use]][np.argsort(-netf[cov_idx[use]])[:3]]
                 worst, worst_desc = (
@@ -283,6 +302,7 @@ def main():
                 "worst": worst,
                 "desc": worst_desc,
                 "ok": worst < args.threshold,
+                "classes": classes,
             }
         )
 
@@ -315,6 +335,31 @@ def main():
                     else ""
                 )
             )
+
+    if args.out:
+        doc = {
+            "laue_class": args.laue,
+            "cell": [float(v) for v in cell],
+            "d_min": float(d_min),
+            "threshold": args.threshold,
+            "relative_precision": args.rel_res,
+            "nodes_with_data": int(cov.sum()),
+            "hypotheses": [
+                {
+                    "space_groups": r["names"],
+                    "consistent": bool(r["ok"]),
+                    "forbidden_nodes": r["n_forb"],
+                    "tested_nodes": r["n_tested"],
+                    "untestable_nodes": r["n_untested"],
+                    "worst_class_fraction": float(r["worst"]),
+                    "classes": r["classes"],
+                }
+                for r in results
+            ],
+        }
+        with open(args.out, "w") as fh:
+            json.dump(doc, fh, indent=1)
+        print(f"\nwrote every hypothesis and its evidence to {args.out}")
 
 
 if __name__ == "__main__":

@@ -155,9 +155,16 @@ neighbouring reflections overlap.
 
 Both are correct. Things to know about these two results:
 
-- Garnet: the face-centred candidates fail at 60–160%. The class behind
-  the 4₁ screw (h00 with h = 4n+2, five nodes) carries 14.4%, a hair under
-  the threshold; with a 10% threshold the answer would have been Im-3m.
+- Garnet: the face-centred candidates fail at 60–230%. With one run, the
+  class behind the 4₁ screw (h00 with h = 4n+2, five nodes) carries 14.4%,
+  a hair under the threshold. With sixteen runs of the same rotation scan
+  (13318–13333, 3° steps) it carries 4.2% on ten nodes and the glide
+  classes 1.4–1.7%, so Ia-3d stands clear of the threshold. Those residues
+  are real counts (tens of standard deviations), not noise; multiple
+  scattering is a likely source and has not been checked.
+- `--out scores.json` writes every hypothesis with its per-class evidence
+  (nodes, testable nodes, net counts, error, fraction of the allowed
+  level), so a later stage or a person can pick a different candidate.
 - MANDI: only 18 of the 59 nodes P6₁22 forbids are testable (l = 6n+3,
   away from allowed neighbours), and they are empty. P6₂22/P6₄22 and
   P6₃22 forbid subsets none of which is testable here, so they are not
