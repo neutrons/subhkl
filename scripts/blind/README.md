@@ -174,6 +174,32 @@ Both are correct. Things to know about these two results:
   are set by hand, and the reference level is taken from nodes no
   candidate forbids.
 
+## One joint fit per image (integrator, not blind reduction)
+
+`panel_modes.py merged.h5 integrated_all.h5 --censored integrated.h5`
+
+Fits every reflection of a detector image at once in position and time
+(Gaussian spot times the stacked time profile, separable background from
+untouched voxels), and drops directions of the unit-diagonal information
+matrix with eigenvalue below 0.001 instead of censoring reflections.
+
+On 18 images of MANDI 11324–11338 (14 random, the 4 with most censoring;
+63,261 reflections):
+
+- 7 directions are dropped (0.01%), each spread over 3–4 reflections;
+  0.5% of eigenvalues are below 0.01 and 12% below 0.1. Today's gated
+  tile solve censors 30.8% of the same reflections (over 90% on the four
+  worst images). The difference is the model: today's tiles sum counts
+  over the time gate, so reflections that share pixels and differ by 1%
+  in time cannot be told apart.
+- Reflections censored today, refitted here, compared between two random
+  halves of the events: 2.5–3.0 Å CC 0.45 (kept today: 0.29), 2.2–2.5 Å
+  0.16 (0.24), 2.0–2.2 Å 0.16 (0.15). Most of them (80%) lie beyond 2 Å.
+- The two halves share the background model and the profiles, so that CC
+  is an upper bound on real signal. The test that counts, a merge across
+  symmetry mates, has not been run.
+- One CPU core, dense eigendecomposition: 2–50 s per image.
+
 ## Not done
 
 - The rest of the space group: other axes, glide planes, and a proper
