@@ -906,6 +906,77 @@ def align_runs(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
     )
 
 
+def goniometer_angles_for(rotations, axes, start):
+    """Motor angles that reproduce the given rotations.
+
+    The goniometer has three axes, so any rotation can be written as three
+    angles about them; they are found numerically from the nominal angles.
+    This is how a correction measured as a rotation is handed to code that
+    reads goniometer angles.
+
+    Args:
+        rotations: (n, 3, 3) target rotations
+        axes: goniometer axes as stored with the images (direction and sense)
+        start: (n, 3) nominal angles [degree]
+    Returns:
+        (angles [degree] (n, 3), largest remaining misfit [degree])
+    """
+    from scipy.optimize import least_squares
+
+    from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
+
+    rotations, start = (
+        np.asarray(rotations, dtype=float),
+        np.asarray(start, dtype=float),
+    )
+    out = np.array(start, dtype=float)
+    worst = 0.0
+    cache = {}
+    for i in range(len(rotations)):
+        key = (rotations[i].round(9).tobytes(), start[i].round(9).tobytes())
+        if key not in cache:
+
+            def resid(a, target=rotations[i]):
+                return (calc_goniometer_rotation_matrix(axes, a) - target).ravel()
+
+            fit = least_squares(resid, start[i], xtol=1e-12, ftol=1e-14, gtol=1e-14)
+            got = calc_goniometer_rotation_matrix(axes, fit.x)
+            cache[key] = (fit.x, _rotation_angle(got @ rotations[i].T))
+        out[i], miss = cache[key]
+        worst = max(worst, miss)
+    return out, worst
+
+
+def write_aligned_images(merged, rotations, out):
+    """An images file that links all data of ``merged`` and carries
+    goniometer angles reproducing ``rotations`` (from ``align_runs``), so
+    that every later step (cell search, refinement, prediction,
+    integration) starts from the corrected rotations.
+
+    Returns:
+        largest misfit [degree] between the rotations asked for and those
+        the written angles give
+    """
+    import os
+
+    merged = os.path.abspath(merged)
+    with h5py.File(merged, "r") as src:
+        axes = src["goniometer/axes"][()]
+        nominal = np.atleast_2d(src["goniometer/angles"][()])
+        angles, worst = goniometer_angles_for(rotations, axes, nominal)
+        with h5py.File(out, "w") as dst:
+            for key in src:
+                if key != "goniometer":
+                    dst[key] = h5py.ExternalLink(merged, "/" + key)
+            g = dst.create_group("goniometer")
+            for key in src["goniometer"]:
+                g[key] = angles if key == "angles" else src["goniometer"][key][()]
+            g["angles_nominal"] = nominal
+            for k, v in src.attrs.items():
+                dst.attrs[k] = v
+    return worst
+
+
 def write_seed(found, merged, instrument, out):
     """Store a ``BlindCell`` as a solve-style file without point symmetry.
 

@@ -42,6 +42,7 @@ from subhkl.search.blind_cell import (
     conventional_basis,
     find_cell,
     operations_in_basis,
+    write_aligned_images,
     write_seed,
 )
 from subhkl.search.space_group import (
@@ -115,16 +116,20 @@ def main():
         x_min=args.x_min,
         log=say,
     )
+    # From here on every step reads an images file that links the data and
+    # carries goniometer angles reproducing the corrected rotations.
+    images = str(work / "aligned.h5")
+    miss = write_aligned_images(args.merged, runs.rotations, images)
+    say(f"corrected goniometer angles written to {images} (misfit {miss:.4f} deg)")
     found = find_cell(
-        args.merged,
+        images,
         args.instrument,
         d_min=args.cell_d_min,
         grid=args.grid,
         x_min=args.x_min,
         log=say,
-        rotations=runs.rotations,
     )
-    band = write_seed(found, args.merged, args.instrument, seed)
+    band = write_seed(found, images, args.instrument, seed)
     # The refinement keeps the metric symmetry of the lattice (not of the
     # crystal, which is not known yet): the lattice group constrains the cell.
     cell_arg = ",".join(f"{v:.4f}" for v in found.setting_cell)
@@ -134,7 +139,7 @@ def main():
         cli(
             work / "solve.log",
             "solve",
-            args.merged,
+            images,
             refined,
             "--refinement",
             "band",
@@ -159,7 +164,7 @@ def main():
         cli(
             work / "predict.log",
             "peak-predictor",
-            args.merged,
+            images,
             args.instrument,
             refined,
             pred,
@@ -180,7 +185,7 @@ def main():
         cli(
             work / "integrate.log",
             "integrator",
-            args.merged,
+            images,
             args.instrument,
             pred,
             integrated,
@@ -244,9 +249,7 @@ def main():
         # (rhombohedral): the absences are tested in the conventional one.
         basis, T, mult = conventional_basis(basis)
         rotations = operations_in_basis(rotations, T)
-    nodes = event_node_counts(
-        args.merged, args.instrument, basis, frames, args.test_d_min
-    )
+    nodes = event_node_counts(images, args.instrument, basis, frames, args.test_d_min)
     results = space_group_candidates(nodes, rotations=rotations, sohncke=args.sohncke)
     print(
         "  conventional cell: a={:.2f} b={:.2f} c={:.2f} alpha={:.2f} beta={:.2f} gamma={:.2f}".format(
