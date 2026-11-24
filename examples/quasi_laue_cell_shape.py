@@ -25,6 +25,14 @@ The detector geometry used there came from an earlier solve (the nominal
 IMAGINE-X geometry is off by several percent), so this was not a fully
 blind run.
 
+On MANDI data with the time of flight ignored (band-summed images) and
+the refined geometry of a solve, it found the true primitive lattice of T4
+lysozyme (ratios 1 : 1.002 : 1.604, angles 89.4, 90.4, 119.9 against
+1 : 1 : 1.594 and 90, 90, 120) and of an I-centred monoclinic Mpro complex
+(15 of 16 poles are lattice directions in both).  With the nominal MANDI
+geometry it failed on both, for all runs together and for single runs: the
+zone axes need the geometry and the rotations to a few tenths of a degree.
+
 It failed on the second dataset tried, IMAGINE-X L1 MBL (fourteen runs,
 3,050 spots, a larger monoclinic cell and a weaker crystal): only 4 of the
 16 strongest poles were lattice directions, so step 2 already did not
