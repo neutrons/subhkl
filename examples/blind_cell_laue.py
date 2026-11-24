@@ -39,13 +39,25 @@ What the data cannot give: the overall scale when the band spans an octave
 (MANDI's 2 to 4 Angstrom).  Directions fix the shape; the size is in the
 band limits only, and with an octave every ray has a lattice point in
 every interval.  The script then reports the scale as undetermined and
-holds the median volume over the rounds (lengths good to about 10%).  With
+holds the median volume over the rounds (lengths good to about 10%),
+unless the scale is given: ``--volume`` or ``--length`` (one edge of the
+conventional cell), or ``--scale-from-events``, which takes the volume from
+the events of a single run of time-of-flight data (one run needs no
+goniometer).  With
 IMAGINE-X's band of 3.0 to 4.3 Angstrom the edges come out within about
 1%.
 
-The IMAGINE-X cases need a detector calibration (``--detectors``, any
-earlier solve of the instrument): its nominal geometry is several percent
-off.
+IMAGINE-X needs a detector calibration (``--detectors``, a solve of any
+crystal on the instrument).  Its nominal panel positions are 15 to 33 mm
+off at 355 to 600 mm from the sample, and not by a rotation: with them the
+chain finds a distorted lattice in the first round at best and then loses
+it.  The calibration carries over between crystals: L1 MBL with the
+detectors from the T4 lysozyme solve gives 70.3 99.1 92.4, beta 106.1 and
+orientations to 0.35 degrees (0.17 with its own).
+
+With the scale from the events of the first run, MANDI as Laue gives
+60.7 60.9 97.1 for T4 lysozyme and 55.2 81.4 88.5, beta 96.6 for the Mpro
+complex.
 
 Usage:
     python examples/blind_cell_laue.py merged.h5 CG4D 3.0 4.3 \\
@@ -79,6 +91,17 @@ def main():
     ap.add_argument(
         "--x-min", type=float, default=35.0, help="[Angstrom] shortest cell edge"
     )
+    ap.add_argument(
+        "--volume", type=float, help="[Angstrom^3] conventional cell volume, if known"
+    )
+    ap.add_argument(
+        "--length", type=float, help="[Angstrom] one conventional cell edge, if known"
+    )
+    ap.add_argument(
+        "--scale-from-events",
+        action="store_true",
+        help="take the cell volume from the events of the first run (time-of-flight data)",
+    )
     ap.add_argument("--out", help="images file with the refined goniometer angles")
     args = ap.parse_args()
 
@@ -94,6 +117,28 @@ def main():
         "wavelength": band,
     }
 
+    if args.scale_from_events:
+        # One run needs no goniometer: its events give a lattice at the true
+        # scale, whatever the rotation errors between runs.
+        import h5py
+
+        with h5py.File(args.merged, "r") as f:
+            offsets = f["file_offsets"][()].tolist() if "file_offsets" in f else [0]
+            n_first = (
+                offsets[1] if len(offsets) > 1 else f["images"].shape[0]
+            ) - offsets[0]
+        tof = find_cell(
+            args.merged, args.instrument, d_min=args.d_min, frames=range(n_first)
+        )
+        kw["volume"] = abs(np.linalg.det(tof.setting_basis))
+        print(
+            "from the events of the first run: "
+            + " ".join(f"{v:.2f}" for v in tof.conventional_cell)
+            + f"; conventional cell volume {kw['volume']:.0f} A^3"
+        )
+    elif args.volume or args.length:
+        kw.update(volume=args.volume, length=args.length)
+
     rotations = None  # the logged goniometer angles
     volumes, found = [], None
     for k in range(args.rounds + 1):
@@ -105,7 +150,11 @@ def main():
             + " ".join(f"{v:.2f}" for v in found.conventional_cell)
             + f"  {found.centring}, lattice group {found.lattice_group}; score {1e3 * d['ladder_score']:.1f}"
             f" (z {d['ladder_z']:.0f}); scale "
-            + ("from the band limits" if d["scale_determined"] else "undetermined")
+            + (
+                f"from the {d['scale_source']}"
+                if d["scale_determined"]
+                else "undetermined"
+            )
         )
         if k == args.rounds:
             break

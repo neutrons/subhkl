@@ -24,7 +24,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     centring. Where the band limits hold the scale (`laue_scale`: IMAGINE-X's
     3.0 to 4.3 Angstrom) the edges are within about 1%; with a band spanning
     an octave the data hold no scale and it is reported as undetermined
-    (about 10%).
+    (about 10%) unless given: `find_cell(volume=...)` or `length=...`, for
+    example from the events of one time-of-flight run.
   - `refine_run_rotations` finds each run's orientation against the shared
     lattice from Laue images: the band objective proposes a turn, the share
     of count bins the full lattice indexes (`indexed_share`) accepts it.

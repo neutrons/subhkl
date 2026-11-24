@@ -1164,6 +1164,8 @@ def find_cell(
     spectrum=None,
     min_z=8.0,
     weighting="maxima",
+    volume=None,
+    length=None,
 ):
     """Unit cell, scale and orientation from raw data, with nothing given.
 
@@ -1194,6 +1196,12 @@ def find_cell(
         spectrum: optional (wavelengths, relative weights) for Laue data
         min_z: [-] significance of a pixel for Laue data (weighting "maxima")
         weighting: "deviance" or "maxima" for Laue data, see ``laue_histogram``
+        volume: [Angstrom^3] for Laue data, the volume of the conventional
+            cell if known (for example from one time-of-flight run of the
+            same crystal form); sets the overall scale, which Laue data hold
+            only in their band limits (``laue_scale``)
+        length: [Angstrom] for Laue data, one edge of the conventional cell
+            if known; the edge closest to it is set to it
     Returns:
         BlindCell
     """
@@ -1247,6 +1255,23 @@ def find_cell(
         )
         scores, best, A, top, z = ladder_scores([c[0] for c in cands], obs)
         factor, contrast, scale_found = laue_scale(A, obs)
+        scale_source = "band limits" if scale_found else "map"
+        if volume is not None or length is not None:
+            conv = np.array(describe_lattice(A)["conventional_cell"])
+            if volume is not None:
+                al, be, ga = np.radians(conv[3:])
+                v = np.prod(conv[:3]) * np.sqrt(
+                    1
+                    - np.cos(al) ** 2
+                    - np.cos(be) ** 2
+                    - np.cos(ga) ** 2
+                    + 2 * np.cos(al) * np.cos(be) * np.cos(ga)
+                )
+                factor = float((volume / v) ** (1.0 / 3.0))
+            else:
+                edge = conv[:3][np.argmin(np.abs(np.log(conv[:3] / length)))]
+                factor = float(length / edge)
+            scale_found, scale_source = True, "given"
         A = factor * A
         order = np.argsort(-scores)
         other = next(
@@ -1272,6 +1297,7 @@ def find_cell(
             "scale_factor": factor,
             "scale_contrast": contrast,
             "scale_determined": scale_found,
+            "scale_source": scale_source,
             "events": n_events,
         }
         say(
@@ -1280,7 +1306,7 @@ def find_cell(
             f"{1e3 * other:.2f}; the map alone ranked it {best + 1}"
         )
         say(
-            f"scale from the band limits: factor {factor:.3f}, contrast {contrast:.2f}"
+            f"scale from the {scale_source}: factor {factor:.3f} (contrast of the band limits {contrast:.2f})"
             if scale_found
             else f"the band limits do not fix the scale (contrast {contrast:.2f}): the scale is the map's, good to about 10%"
         )
