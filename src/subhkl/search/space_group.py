@@ -661,3 +661,151 @@ def best_candidates(results):
         return []
     top = max(r["tested_nodes"] for r in good)
     return [r for r in good if r["tested_nodes"] == top]
+
+
+# ---------------------------------------------------------------------------
+# The same two tests on intensities merged without point symmetry
+# ---------------------------------------------------------------------------
+
+
+def _friedel_unique(hkl):
+    hkl = np.asarray(hkl, dtype=np.int64)
+    flip = (
+        (hkl[:, 2] < 0)
+        | ((hkl[:, 2] == 0) & (hkl[:, 1] < 0))
+        | ((hkl[:, 2] == 0) & (hkl[:, 1] == 0) & (hkl[:, 0] < 0))
+    )
+    return np.where(flip[:, None], -hkl, hkl)
+
+
+def laue_class_merged(
+    hkl, amplitude, d, operations, cc_half=None, d_min=3.0, level=0.5
+):
+    """Which lattice rotations are symmetries, from a merge in P 1.
+
+    For data without matched-wavelength repeats (a quasi-Laue rotation
+    scan), merge once without point symmetry so that the merge does the
+    wavelength normalisation, then correlate every reflection with its
+    mate under each rotation.  A symmetry correlates as well as two
+    independent measurements of one reflection; a non-symmetry correlates
+    like unrelated reflections of the same d, that is, not at all.
+
+    Args:
+        hkl: (N, 3) Miller indices of the merged reflections (Friedel mates
+            merged, either hemisphere)
+        amplitude: (N,) merged structure-factor amplitudes or intensities
+        d: [Angstrom] (N,) d-spacings
+        operations: integer matrices M on Miller indices, the lattice rotations
+        cc_half: [-] half-dataset correlation of the merge in the same
+            resolution range, if known; it sets what a true symmetry should
+            reach.  Without it the best rotation takes that role, provided
+            it stands clearly above unrelated reflections.
+        d_min: [Angstrom] reflections beyond this resolution are left out
+        level: [-] acceptance level between unrelated (0) and the reference (1)
+    Returns:
+        LaueResult; ``spread`` in its rows, ``same``, ``unrelated`` and
+        ``cut`` are correlation coefficients here (higher = more alike)
+    """
+    keep = np.isfinite(amplitude) & (np.asarray(d) > d_min)
+    hkl = _friedel_unique(np.asarray(hkl)[keep])
+    f = np.asarray(amplitude, dtype=float)[keep]
+    d = np.asarray(d, dtype=float)[keep]
+    if len(f) < 100:
+        raise ValueError("Too few merged reflections for the symmetry test.")
+    keys = _key(hkl)
+    order = np.argsort(keys)
+    ks = keys[order]
+    rng = np.random.default_rng(0)
+    shell = np.argsort(d)
+    pos = np.searchsorted(d[shell], d)
+    other = shell[np.clip(pos + rng.integers(5, 40, len(d)), 0, len(d) - 1)]
+    unrelated = float(np.corrcoef(f, f[other])[0, 1])
+    rows = []
+    for M in operations:
+        M = np.asarray(M, dtype=int)
+        if np.array_equal(M, IDENTITY):
+            continue
+        want = _key(_friedel_unique(hkl @ M.T))
+        p = np.clip(np.searchsorted(ks, want), 0, len(ks) - 1)
+        hit = (ks[p] == want) & (order[p] != np.arange(len(f)))
+        n = int(hit.sum())
+        cc = (
+            float(np.corrcoef(f[hit], f[order[p[hit]]])[0, 1])
+            if n > 30
+            else float("nan")
+        )
+        rows.append(
+            {
+                "name": describe_operation(M),
+                "matrix": M,
+                "pairs": n,
+                "strong": n,
+                "spread": cc,
+            }
+        )
+    tested = [r for r in rows if np.isfinite(r["spread"])]
+    if cc_half is not None:
+        reference = 2.0 * cc_half / (1.0 + cc_half)
+    else:
+        best = max(tested, key=lambda r: r["spread"], default=None)
+        clear = (
+            best is not None
+            and (best["spread"] - unrelated) * np.sqrt(best["pairs"]) > 8.0
+        )
+        reference = best["spread"] if clear else float("inf")
+    cut = unrelated + level * (reference - unrelated)
+    accepted, rejected = [], []
+    for r in rows:
+        if not np.isfinite(r["spread"]):
+            r["verdict"] = "too few pairs"
+        elif r["spread"] > cut:
+            r["verdict"] = "symmetry"
+            accepted.append(r["matrix"])
+        else:
+            r["verdict"] = "not a symmetry"
+            rejected.append(r["matrix"])
+    rotations = close_group(accepted)
+    have = {tuple(m.ravel()) for m in rotations}
+    conflicts = [describe_operation(M) for M in rejected if tuple(M.ravel()) in have]
+    for r in rows:
+        if r["verdict"] == "too few pairs" and tuple(r["matrix"].ravel()) in have:
+            r["verdict"] = "symmetry (implied)"
+    sg = _group_ops(rotations)
+    return LaueResult(
+        rows=rows,
+        same=float(reference),
+        unrelated=unrelated,
+        cut=float(cut),
+        rotations=rotations,
+        point_group=sg.point_group_hm() if sg else "unknown",
+        laue=sg.laue_str() if sg else "unknown",
+        symmorphic=sg.hm if sg else "unknown",
+        conflicts=conflicts,
+    )
+
+
+def merged_node_counts(hkl, intensity, sigma, basis, d_min):
+    """``NodeCounts`` from intensities merged in P 1, for
+    ``space_group_candidates`` (use ``rel_res=0``: the reflections are
+    already separated).  Friedel mates are filled in.
+
+    Args:
+        hkl: (N, 3) Miller indices
+        intensity, sigma: (N,) merged intensity and its standard error
+        basis: (3, 3) direct basis the indices refer to, columns [Angstrom]
+        d_min: [Angstrom] resolution limit of the test
+    """
+    hkl = np.asarray(hkl, dtype=np.int64)
+    ok = np.isfinite(intensity) & np.isfinite(sigma) & (np.asarray(sigma) > 0)
+    hkl = np.concatenate([hkl[ok], -hkl[ok]])
+    val = np.tile(np.asarray(intensity, dtype=float)[ok], 2)
+    err = np.tile(np.asarray(sigma, dtype=float)[ok], 2)
+    hmax = np.abs(hkl).max(axis=0)
+    shape = tuple(2 * hmax + 1)
+    net, errs, cov = np.zeros(shape), np.ones(shape), np.zeros(shape, dtype=bool)
+    idx = tuple((hkl + hmax).T)
+    net[idx], errs[idx], cov[idx] = val, err, True
+    cov[tuple(hmax)] = False
+    return NodeCounts(
+        hmax, net, errs, cov, np.asarray(basis, dtype=float), float(d_min), 0
+    )

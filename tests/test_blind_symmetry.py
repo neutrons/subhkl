@@ -25,6 +25,8 @@ from subhkl.search.space_group import (
     best_candidates,
     close_group,
     laue_class,
+    laue_class_merged,
+    merged_node_counts,
     space_group_candidates,
 )
 
@@ -356,3 +358,78 @@ def test_monoclinic_centred_setting_is_found_among_the_candidates():
     assert not any(n.startswith(("C", "A", "P")) for n in best[0]["space_groups"])
     rejected = {n for r in results if not r["consistent"] for n in r["space_groups"]}
     assert "C 1 2 1" in rejected and "A 1 2 1" in rejected
+
+
+def _merged(point_group, cell, rng, hmax=7, noise=0.3):
+    """Friedel-unique merged amplitudes with the symmetry of ``point_group``."""
+    ops = [s * m for m in _hkl_ops(point_group) for s in (1, -1)]
+    r = np.arange(-hmax, hmax + 1)
+    hkl = np.array(
+        [
+            (h, k, l)
+            for h in r
+            for k in r
+            for l in r
+            if (l > 0) or (l == 0 and (k > 0 or (k == 0 and h > 0)))
+        ]
+    )
+    orbit = np.stack([hkl @ m.T for m in ops], 1)
+    code = (
+        (orbit[..., 0] + 50) * 10000 + (orbit[..., 1] + 50) * 100 + orbit[..., 2] + 50
+    )
+    _, inv = np.unique(code.min(axis=1), return_inverse=True)
+    truth = rng.exponential(10.0, inv.max() + 1)[inv.ravel()]
+    d = 1.0 / np.linalg.norm(hkl @ np.linalg.inv(_basis(cell)), axis=1)
+    return hkl, truth * (1 + noise * rng.normal(size=len(truth))), d
+
+
+def test_merged_laue_test_for_data_without_matched_wavelengths():
+    """After a merge in P 1 the mates of a symmetry correlate, the others do not."""
+    cell = (62.0, 62.0, 97.0, 90.0, 90.0, 120.0)
+    mats, _name = lattice_operations(cell)
+    hkl, amp, d = _merged("P 3 2 1", cell, np.random.default_rng(21))
+    res = laue_class_merged(hkl, amp, d, mats, d_min=3.0)
+    assert res.point_group == "32" and res.symmorphic == "P 3 2 1"
+    assert len(res.rotations) == 6 and not res.conflicts
+    assert abs(res.unrelated) < 0.1
+    with_ref = laue_class_merged(hkl, amp, d, mats, cc_half=0.8, d_min=3.0)
+    assert with_ref.point_group == "32"
+
+    # no symmetry at all: nothing stands above unrelated reflections
+    hkl, amp, d = _merged("P 1", cell, np.random.default_rng(22))
+    none = laue_class_merged(hkl, amp, d, mats, d_min=3.0)
+    assert len(none.rotations) == 1 and none.point_group == "1"
+
+
+def test_merged_intensities_as_node_counts():
+    cell = (62.0, 62.0, 97.0, 90.0, 90.0, 120.0)
+    r = np.arange(-5, 6)
+    hkl = np.array(
+        [
+            (h, k, l)
+            for h in r
+            for k in r
+            for l in range(13)
+            if (h, k, l) != (0, 0, 0)
+        ]
+    )
+    absent = np.asarray(
+        gemmi.SpaceGroup("P 31 2 1")
+        .operations()
+        .systematic_absences(hkl.astype(np.int32)),
+        dtype=bool,
+    )
+    rng = np.random.default_rng(23)
+    inten = np.where(absent, 0.0, 150.0) + rng.normal(0, 3, len(hkl))
+    nodes = merged_node_counts(
+        hkl, inten, np.full(len(hkl), 3.0), _basis(cell), d_min=3.0
+    )
+    assert nodes.covered[
+        tuple(nodes.hmax + np.array([1, 0, -4]))
+    ]  # Friedel mate filled in
+    best = best_candidates(
+        space_group_candidates(
+            nodes, rotations=_hkl_ops("P 3 2 1"), sohncke=True, rel_res=0.0
+        )
+    )
+    assert set(best[0]["space_groups"]) == {"P 31 2 1", "P 32 2 1"}

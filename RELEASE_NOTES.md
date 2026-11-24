@@ -28,6 +28,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     a centred lattice is indexed and integrated in its conventional cell
     (`I 1`, `C 1`, ...). Candidates include non-reference settings such as
     `I 1 2 1`.
+  - For quasi-Laue data, which has no event times and hardly any symmetry
+    mates at matched wavelength, `laue_class_merged` and `merged_node_counts`
+    run the same two tests on intensities merged once in P 1
+    (`examples/blind_symmetry_quasi_laue.py`; the cell must be given). On
+    IMAGINE-X T4 lysozyme (IPTS-37331 runs 1808–1828, even) this gives point
+    group 32 in the 321 setting; the screw axis is left open because no 00l
+    reflection was measured.
   - Tried on four MANDI datasets: IPTS-30763 runs 11324–11338 (P6₁22 or
     P6₅22 found), a garnet from IPTS-34720 (Ia-3d found), T4 lysozyme,
     IPTS-34720 runs 13239–13245, a trigonal crystal in a hexagonal lattice
