@@ -14,6 +14,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     transform of the raw events, with no cell, peaks or space group given.
     `write_seed` stores the result as a P 1 solve file for
     `solve --refinement band --bootstrap`.
+  - `align_runs` measures the goniometer's rotation errors from the data,
+    with no cell and no model of the goniometer: each run on its own gives
+    the lattice in its nominal frame, and the rotation between the per-run
+    lattices is the error. The corrected rotations go to
+    `find_cell(rotations=...)`. On MANDI T4 lysozyme it reproduces the
+    corrections of the full refinement to within 0.06° (they reach 2.9° over a
+    60° scan) and reports the common rotation axis, 2.9° from the nominal one.
   - `subhkl.search.space_group.laue_class` tests every rotation of the lattice
     on intensities integrated once in P 1, comparing symmetry mates at matched
     wavelength, so no wavelength normalisation is needed. It returns the point

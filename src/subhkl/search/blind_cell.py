@@ -730,6 +730,253 @@ def find_cell(
     return BlindCell(**info, diagnostics=diag)
 
 
+def _nearest_rotation(M):
+    u, _s, vt = np.linalg.svd(M)
+    return u @ np.diag([1.0, 1.0, np.sign(np.linalg.det(u @ vt))]) @ vt
+
+
+def _rotation_angle(Rm):
+    return float(np.degrees(np.arccos(np.clip((np.trace(Rm) - 1.0) / 2.0, -1.0, 1.0))))
+
+
+def relate_lattices(basis, reference, tol=0.05):
+    """Rotation M with basis ~ M @ reference, for two bases of one lattice
+    that may differ by an integer change of basis and a small rotation.
+
+    Returns:
+        (M, ok): ok is False when no integer change of basis of determinant
+        +-1 relates them, or the lattices do not coincide after the rotation
+        to within ``tol`` of the shortest axis.
+    """
+    T = np.rint(np.linalg.solve(basis, reference))
+    if abs(round(float(np.linalg.det(T)))) != 1:
+        return np.eye(3), False
+    M = _nearest_rotation(basis @ T @ np.linalg.inv(reference))
+    resid = np.abs(M.T @ basis @ T - reference).max()
+    if resid > tol * np.linalg.norm(reference, axis=0).min():
+        return np.eye(3), False
+    return M, True
+
+
+@dataclass
+class RunAlignment:
+    """Result of ``align_runs``."""
+
+    rotations: np.ndarray  # (n_images, 3, 3) corrected goniometer rotations
+    corrections: list  # per run: rotation applied in the nominal sample frame
+    angles: list  # [degree] size of each correction
+    aligned: list  # per run: False where the run's lattice could not be related
+    cells: list  # per run: reduced cell found from that run alone
+    axis: (
+        np.ndarray | None
+    )  # lab-frame axis of the run-to-run rotations, if they share one
+    axis_nominal: np.ndarray | None
+    axis_tilt: float | None  # [degree] between the two
+
+
+def align_runs(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
+    """Goniometer corrections from the data, with no cell and no model of
+    the goniometer.
+
+    Combining runs needs the rotation between them, and a goniometer whose
+    axes are a few degrees off spoils that (the lattices of the runs no
+    longer coincide and the pooled cell search blurs).  But each run on its
+    own gives the lattice in its own nominal sample frame.  The same crystal
+    was measured throughout, so the rotation that carries the lattice of the
+    first run onto the lattice of run r is the error of run r's rotation
+    relative to the first.  The lattices may come out in equivalent bases;
+    the integer change of basis is found first, which works while the error
+    is small against the angles between lattice vectors.
+
+    Args:
+        merged: images file with pixel-sorted events, goniometer angles and
+            ``file_offsets`` (first image of each run)
+        instrument: instrument name
+        d_min, grid, x_min: as for ``find_cell``, applied to single runs
+        log: optional callable for progress lines
+    Returns:
+        RunAlignment.  ``rotations`` goes to ``find_cell(rotations=...)``.
+        When the run-to-run rotations share one axis, it is reported with
+        its tilt from the nominal axis: a goniometer calibration.
+    """
+    say = log or (lambda *_: None)
+    with h5py.File(merged, "r") as f:
+        n_img = f["images"].shape[0]
+        offsets = f["file_offsets"][()].tolist() if "file_offsets" in f else [0]
+        r_nom = Goniometer.from_h5_file(f).rotation
+    if r_nom.ndim == 2:
+        r_nom = np.broadcast_to(r_nom, (n_img, 3, 3))
+    r_nom = np.array(r_nom, dtype=float)
+    bounds = [*offsets, n_img]
+    runs = [range(bounds[r], bounds[r + 1]) for r in range(len(offsets))]
+
+    bases, cells = [], []
+    for r, frames in enumerate(runs):
+        try:
+            found = find_cell(
+                merged, instrument, d_min=d_min, grid=grid, x_min=x_min, frames=frames
+            )
+            bases.append(found.basis)
+            cells.append(found.cell)
+        except ValueError:
+            bases.append(None)
+            cells.append(None)
+    first = next((r for r, b in enumerate(bases) if b is not None), None)
+    if first is None:
+        raise ValueError("No run gave a lattice on its own.")
+    corrections, aligned = [], []
+    for r, basis in enumerate(bases):
+        ok, M = basis is not None, np.eye(3)
+        if ok and r != first:
+            M, ok = relate_lattices(basis, bases[first])
+        corrections.append(M)
+        aligned.append(bool(ok))
+        say(
+            f"run {r}: "
+            + (
+                f"correction {_rotation_angle(M):.2f} deg"
+                if ok
+                else "not aligned (its lattice does not match the first run's)"
+            )
+        )
+    rotations = r_nom.copy()
+    for r, frames in enumerate(runs):
+        for i in frames:
+            rotations[i] = r_nom[i] @ corrections[r]
+
+    # Do the corrected run-to-run rotations share one axis?  (lab frame)
+    def rel_axes(rot):
+        out = []
+        for r in range(len(runs)):
+            if r == first or not aligned[r]:
+                continue
+            rel = rot[runs[r][0]] @ rot[runs[first][0]].T
+            v = np.array(
+                [rel[2, 1] - rel[1, 2], rel[0, 2] - rel[2, 0], rel[1, 0] - rel[0, 1]]
+            )
+            if np.linalg.norm(v) > 0.03:  # more than about a degree apart
+                out.append(v / np.linalg.norm(v))
+        return np.array(out)
+
+    axis = axis_nom = tilt = None
+    ax, ax_n = rel_axes(rotations), rel_axes(r_nom)
+    if len(ax) >= 2 and len(ax) == len(ax_n):
+        ax = ax * np.sign(np.sum(ax * ax_n, axis=1))[:, None]  # same sense as nominal
+        mean, mean_n = ax.mean(0), ax_n.mean(0)
+        mean, mean_n = mean / np.linalg.norm(mean), mean_n / np.linalg.norm(mean_n)
+        scatter = np.degrees(np.arccos(np.clip(ax @ mean, -1, 1)))
+        scatter_n = np.degrees(np.arccos(np.clip(ax_n @ mean_n, -1, 1)))
+        if scatter.max() < 0.5 and scatter_n.max() < 0.5:
+            axis, axis_nom = mean, mean_n
+            tilt = float(np.degrees(np.arccos(np.clip(mean @ mean_n, -1, 1))))
+            say(
+                f"the runs rotate about one axis, [{mean[0]:+.3f} {mean[1]:+.3f} {mean[2]:+.3f}] "
+                f"in the lab frame, {tilt:.2f} deg from the nominal one"
+            )
+    if axis is not None and not all(aligned):
+        # A run that gave no lattice of its own is placed with the axis the
+        # other runs share, turned by its nominal angle from the first run.
+        from scipy.spatial.transform import Rotation
+
+        i0 = runs[first][0]
+        for r, frames in enumerate(runs):
+            if aligned[r]:
+                continue
+            rel = r_nom[frames[0]] @ r_nom[i0].T
+            v = np.array(
+                [rel[2, 1] - rel[1, 2], rel[0, 2] - rel[2, 0], rel[1, 0] - rel[0, 1]]
+            )
+            theta = np.radians(_rotation_angle(rel)) * np.sign(v @ axis_nom)
+            fixed = Rotation.from_rotvec(theta * axis).as_matrix() @ r_nom[i0]
+            corrections[r] = r_nom[frames[0]].T @ fixed
+            for i in frames:
+                rotations[i] = r_nom[i] @ corrections[r]
+            say(
+                f"run {r}: placed with the common axis ({_rotation_angle(corrections[r]):.2f} deg)"
+            )
+    return RunAlignment(
+        rotations=rotations,
+        corrections=corrections,
+        angles=[_rotation_angle(M) for M in corrections],
+        aligned=aligned,
+        cells=cells,
+        axis=axis,
+        axis_nominal=axis_nom,
+        axis_tilt=tilt,
+    )
+
+
+def goniometer_angles_for(rotations, axes, start):
+    """Motor angles that reproduce the given rotations.
+
+    The goniometer has three axes, so any rotation can be written as three
+    angles about them; they are found numerically from the nominal angles.
+    This is how a correction measured as a rotation is handed to code that
+    reads goniometer angles.
+
+    Args:
+        rotations: (n, 3, 3) target rotations
+        axes: goniometer axes as stored with the images (direction and sense)
+        start: (n, 3) nominal angles [degree]
+    Returns:
+        (angles [degree] (n, 3), largest remaining misfit [degree])
+    """
+    from scipy.optimize import least_squares
+
+    from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
+
+    rotations, start = (
+        np.asarray(rotations, dtype=float),
+        np.asarray(start, dtype=float),
+    )
+    out = np.array(start, dtype=float)
+    worst = 0.0
+    cache = {}
+    for i in range(len(rotations)):
+        key = (rotations[i].round(9).tobytes(), start[i].round(9).tobytes())
+        if key not in cache:
+
+            def resid(a, target=rotations[i]):
+                return (calc_goniometer_rotation_matrix(axes, a) - target).ravel()
+
+            fit = least_squares(resid, start[i], xtol=1e-12, ftol=1e-14, gtol=1e-14)
+            got = calc_goniometer_rotation_matrix(axes, fit.x)
+            cache[key] = (fit.x, _rotation_angle(got @ rotations[i].T))
+        out[i], miss = cache[key]
+        worst = max(worst, miss)
+    return out, worst
+
+
+def write_aligned_images(merged, rotations, out):
+    """An images file that links all data of ``merged`` and carries
+    goniometer angles reproducing ``rotations`` (from ``align_runs``), so
+    that every later step (cell search, refinement, prediction,
+    integration) starts from the corrected rotations.
+
+    Returns:
+        largest misfit [degree] between the rotations asked for and those
+        the written angles give
+    """
+    import os
+
+    merged = os.path.abspath(merged)
+    with h5py.File(merged, "r") as src:
+        axes = src["goniometer/axes"][()]
+        nominal = np.atleast_2d(src["goniometer/angles"][()])
+        angles, worst = goniometer_angles_for(rotations, axes, nominal)
+        with h5py.File(out, "w") as dst:
+            for key in src:
+                if key != "goniometer":
+                    dst[key] = h5py.ExternalLink(merged, "/" + key)
+            g = dst.create_group("goniometer")
+            for key in src["goniometer"]:
+                g[key] = angles if key == "angles" else src["goniometer"][key][()]
+            g["angles_nominal"] = nominal
+            for k, v in src.attrs.items():
+                dst.attrs[k] = v
+    return worst
+
+
 def write_seed(found, merged, instrument, out):
     """Store a ``BlindCell`` as a solve-style file without point symmetry.
 

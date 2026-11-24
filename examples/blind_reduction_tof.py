@@ -4,8 +4,10 @@ Starts from a merged images file with events (``reduce`` then
 ``merge-images``; the cell given to ``merge-images`` is a placeholder) and
 needs no cell, orientation or space group:
 
-1. cell, absolute scale and orientation from the 3D Fourier transform of
-   the raw events                        (subhkl.search.blind_cell.find_cell)
+1. the lattice of each run on its own, and from their differences the
+   rotation errors of the goniometer     (subhkl.search.blind_cell.align_runs);
+   then cell, absolute scale and orientation from the 3D Fourier transform
+   of the raw events of all runs                                (find_cell)
 2. detector geometry and per-run orientation from the existing refinement,
    seeded by step 1                      (solve --refinement band --bootstrap)
 3. one prediction and integration in P 1 (peak-predictor, integrator)
@@ -35,10 +37,12 @@ import h5py
 import numpy as np
 
 from subhkl.search.blind_cell import (
+    align_runs,
     cell_of,
     conventional_basis,
     find_cell,
     operations_in_basis,
+    write_aligned_images,
     write_seed,
 )
 from subhkl.search.space_group import (
@@ -103,15 +107,29 @@ def main():
     pred, integrated = work / "blind_pred.h5", work / "integrated_p1.h5"
 
     print("1. cell and orientation from raw events")
-    found = find_cell(
+    say = lambda m: print("  " + m)
+    runs = align_runs(
         args.merged,
         args.instrument,
         d_min=args.cell_d_min,
         grid=args.grid,
         x_min=args.x_min,
-        log=lambda m: print("  " + m),
+        log=say,
     )
-    band = write_seed(found, args.merged, args.instrument, seed)
+    # From here on every step reads an images file that links the data and
+    # carries goniometer angles reproducing the corrected rotations.
+    images = str(work / "aligned.h5")
+    miss = write_aligned_images(args.merged, runs.rotations, images)
+    say(f"corrected goniometer angles written to {images} (misfit {miss:.4f} deg)")
+    found = find_cell(
+        images,
+        args.instrument,
+        d_min=args.cell_d_min,
+        grid=args.grid,
+        x_min=args.x_min,
+        log=say,
+    )
+    band = write_seed(found, images, args.instrument, seed)
     # The refinement keeps the metric symmetry of the lattice (not of the
     # crystal, which is not known yet): the lattice group constrains the cell.
     cell_arg = ",".join(f"{v:.4f}" for v in found.setting_cell)
@@ -121,7 +139,7 @@ def main():
         cli(
             work / "solve.log",
             "solve",
-            args.merged,
+            images,
             refined,
             "--refinement",
             "band",
@@ -146,7 +164,7 @@ def main():
         cli(
             work / "predict.log",
             "peak-predictor",
-            args.merged,
+            images,
             args.instrument,
             refined,
             pred,
@@ -167,7 +185,7 @@ def main():
         cli(
             work / "integrate.log",
             "integrator",
-            args.merged,
+            images,
             args.instrument,
             pred,
             integrated,
@@ -231,9 +249,7 @@ def main():
         # (rhombohedral): the absences are tested in the conventional one.
         basis, T, mult = conventional_basis(basis)
         rotations = operations_in_basis(rotations, T)
-    nodes = event_node_counts(
-        args.merged, args.instrument, basis, frames, args.test_d_min
-    )
+    nodes = event_node_counts(images, args.instrument, basis, frames, args.test_d_min)
     results = space_group_candidates(nodes, rotations=rotations, sohncke=args.sohncke)
     print(
         "  conventional cell: a={:.2f} b={:.2f} c={:.2f} alpha={:.2f} beta={:.2f} gamma={:.2f}".format(
@@ -258,6 +274,9 @@ def main():
         "lattice_points_per_cell": int(mult),
         "lattice_group": found.lattice_group,
         "cell_search": found.diagnostics,
+        "run_corrections_deg": runs.angles,
+        "rotation_axis_lab": None if runs.axis is None else runs.axis.tolist(),
+        "rotation_axis_tilt_deg": runs.axis_tilt,
         "point_group": laue.point_group,
         "laue_class": laue.laue,
         "operations": [
