@@ -115,6 +115,205 @@ def reciprocal_histogram(merged, instrument, d_min, n, frames=None, rotations=No
     return grid.reshape(n, n, n), q_max, n_events
 
 
+LAUE_PIXEL_PAD = 1 << 13
+LAUE_SAMPLES = 64
+
+
+def _streak_impl(grid, weight, pos, rot, lam, shape, q_max, n):
+    """Add one image's significant pixels, each spread along its radial
+    streak over the wavelength samples, to the reciprocal-space histogram."""
+    import jax.numpy as jnp
+
+    l2 = jnp.linalg.norm(pos, axis=1)
+    q_dir = pos / l2[:, None] - jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
+    q_dir = q_dir @ rot  # lab -> sample; |q| lambda = 2 sin(theta) is its length
+    q = q_dir[:, None, :] / lam[None, :, None]
+    w = weight[:, None] * shape[None, :]
+    both = jnp.concatenate([q, -q], axis=0).reshape(-1, 3)  # Friedel mate too
+    w = jnp.concatenate([w, w], axis=0).ravel()
+    idx = jnp.floor((both + q_max) * (n / (2.0 * q_max))).astype(jnp.int32)
+    ok = (w > 0) & jnp.all((idx >= 0) & (idx < n), axis=1)
+    flat = jnp.where(ok, (idx[:, 0] * n + idx[:, 1]) * n + idx[:, 2], n * n * n)
+    return grid.at[flat].add(w, mode="drop")
+
+
+def laue_histogram(
+    merged,
+    instrument,
+    wavelength,
+    d_min,
+    n,
+    frames=None,
+    rotations=None,
+    spectrum=None,
+    min_z=4.0,
+):
+    """Reciprocal-space density for data without wavelengths.
+
+    A count on the detector fixes the direction of its scattering vector but
+    not its length, which lies between 2 sin(theta) / lam_max and
+    2 sin(theta) / lam_min.  Each significant pixel is therefore spread along
+    that radial streak, weighted by the spectrum.  The Fourier transform of
+    the result is the same direct-space map as for time-of-flight events
+    (``reciprocal_histogram``): Poisson summation with the unknown wavelength
+    integrated over the band.
+
+    A pixel counts when it is the local maximum of a patch standing
+    ``min_z`` standard errors above a smooth local background.  Maxima that
+    recur at the same place in three or more runs are left out: a reflection moves when
+    the crystal turns, a feature fixed in the laboratory does not.
+
+    Args:
+        merged: images file with goniometer angles (no events needed)
+        instrument: instrument name (pixel positions)
+        wavelength: [Angstrom] (lam_min, lam_max)
+        d_min: [Angstrom] the grid spans |q_i| <= 1 / d_min
+        n: [-] grid points per axis
+        frames: optional image indices to use
+        rotations: optional (n_images, 3, 3) goniometer rotations
+        spectrum: optional (wavelengths [Angstrom], relative weights) of the
+            scattered intensity; default a smooth bump over the band, which
+            avoids the ringing that sharp band edges cause in the map
+        min_z: [-] significance of a pixel
+    Returns:
+        (grid (n, n, n), q_max [1/Angstrom], number of pixels used)
+    """
+    import jax
+    import jax.numpy as jnp
+    from scipy.ndimage import gaussian_filter, maximum_filter
+
+    q_max = 1.0 / d_min
+    lam_lo, lam_hi = float(wavelength[0]), float(wavelength[1])
+    lam = lam_lo + (np.arange(LAUE_SAMPLES) + 0.5) * (lam_hi - lam_lo) / LAUE_SAMPLES
+    if spectrum is None:
+        shape = np.sin(np.pi * (np.arange(LAUE_SAMPLES) + 0.5) / LAUE_SAMPLES) ** 2
+    else:
+        shape = np.interp(
+            lam, np.asarray(spectrum[0]), np.asarray(spectrum[1]), left=0.0, right=0.0
+        )
+    shape = np.maximum(shape, 0.0) / shape.sum()
+    with h5py.File(merged, "r") as f:
+        n_img = f["images"].shape[0]
+        bank_ids = f["bank_ids"][()]
+        offsets = f["file_offsets"][()] if "file_offsets" in f else np.array([0])
+        rot = Goniometer.from_h5_file(f).rotation
+        if rot.ndim == 2:
+            rot = np.broadcast_to(rot, (n_img, 3, 3))
+        if rotations is not None:
+            rot = np.asarray(rotations)
+        use = list(range(n_img)) if frames is None else list(frames)
+        run_of = np.searchsorted(offsets, np.arange(n_img), side="right") - 1
+        # first pass: significant pixels of every image, and how often each
+        # detector position is significant across runs
+        picked = {}
+        seen = {}
+        for i in use:
+            img = f["images"][i].astype(np.float64)
+            fine, coarse = gaussian_filter(img, 1.5), gaussian_filter(img, 10.0)
+            excess = fine - coarse
+            z = excess / np.sqrt(np.maximum(coarse, 0.05) / (4.0 * np.pi * 1.5**2))
+            # one entry per reflection (the local maximum of a significant
+            # patch): with every pixel of a patch counted, broad and strong
+            # reflections outweigh the rest and the map loses the lattice
+            sig = (z > min_z) & (fine == maximum_filter(fine, size=9))
+            edge = max(4, img.shape[0] // 32)
+            sig[:edge], sig[-edge:], sig[:, :edge], sig[:, -edge:] = (
+                False,
+                False,
+                False,
+                False,
+            )
+            rr, cc = np.nonzero(sig)
+            picked[i] = (rr, cc, excess[rr, cc], img.shape)
+            key = (int(bank_ids[i]), img.shape)
+            runs = seen.setdefault(key, {})
+            near = np.zeros(img.shape, dtype=bool)
+            near[rr, cc] = True
+            near = maximum_filter(
+                near, size=5
+            )  # the same spot may peak a pixel or two away
+            prev = runs.setdefault(int(run_of[i]), np.zeros(img.shape, dtype=bool))
+            prev |= near
+    fixed = {}
+    for key, runs in seen.items():
+        if len(runs) >= 3:
+            fixed[key] = np.sum(list(runs.values()), axis=0) >= 3
+    # A few very strong reflections must not dominate the map: every lattice
+    # point counts, so the weights are capped at their 95th percentile.
+    every = np.concatenate([p_[2] for p_ in picked.values()] or [np.zeros(1)])
+    cap = float(np.quantile(every, 0.95)) if len(every) else 0.0
+    acc = jax.jit(_streak_impl, static_argnames=["n"])
+    grid = jnp.zeros(n * n * n, dtype=jnp.float32)
+    pos_cache = {}
+    n_used = 0
+    lam_j, shape_j = (
+        jnp.asarray(lam, dtype=jnp.float32),
+        jnp.asarray(shape, dtype=jnp.float32),
+    )
+    for i in use:
+        rr, cc, wgt, shp = picked[i]
+        wgt = np.minimum(wgt, cap)
+        bank = int(bank_ids[i])
+        mask = fixed.get((bank, shp))
+        if mask is not None and len(rr):
+            keep = ~mask[rr, cc]
+            rr, cc, wgt = rr[keep], cc[keep], wgt[keep]
+        if len(rr) == 0:
+            continue
+        if bank not in pos_cache:
+            pos_cache[bank] = pixel_positions(instrument, bank, shp)
+        xyz = pos_cache[bank][rr * shp[1] + cc]
+        n_used += len(rr)
+        for a in range(0, len(rr), LAUE_PIXEL_PAD):
+            w_p = np.zeros(LAUE_PIXEL_PAD, dtype=np.float32)
+            x_p = np.ones((LAUE_PIXEL_PAD, 3), dtype=np.float32)
+            m = min(LAUE_PIXEL_PAD, len(rr) - a)
+            w_p[:m] = wgt[a : a + m]
+            x_p[:m] = xyz[a : a + m]
+            grid = acc(
+                grid,
+                jnp.asarray(w_p),
+                jnp.asarray(x_p),
+                jnp.asarray(rot[i], dtype=jnp.float32),
+                lam_j,
+                shape_j,
+                jnp.float32(q_max),
+                n=n,
+            )
+    return grid.reshape(n, n, n), q_max, n_used
+
+
+def merge_radial_peaks(pos, height, angle_deg=2.0, rel_length=0.12):
+    """One peak per lattice vector.
+
+    In the map of a Laue pattern a lattice vector shows as two or three
+    maxima along its own direction (fringes of the average over the band).
+    Peaks within ``angle_deg`` in direction and ``rel_length`` in length are
+    replaced by their height-weighted mean.
+    """
+    if len(pos) == 0:
+        return pos, height
+    length = np.linalg.norm(pos, axis=1)
+    unit = pos / length[:, None]
+    used = np.zeros(len(pos), dtype=bool)
+    out_p, out_h = [], []
+    for i in range(len(pos)):
+        if used[i]:
+            continue
+        same = (
+            (~used)
+            & (unit @ unit[i] > np.cos(np.radians(angle_deg)))
+            & (np.abs(length / length[i] - 1.0) < rel_length)
+        )
+        used |= same
+        w = height[same]
+        out_p.append((pos[same] * w[:, None]).sum(0) / w.sum())
+        out_h.append(height[same].max())
+    out_p, out_h = np.array(out_p), np.array(out_h)
+    order = np.argsort(-out_h)
+    return out_p[order], out_h[order]
+
+
 def bragg_excess(grid, sigma=4.0, k=5.0):
     """Counts above the local background, zero elsewhere.
 
@@ -670,11 +869,24 @@ def find_cell(
     log=None,
     frames=None,
     rotations=None,
+    wavelength=None,
+    spectrum=None,
+    min_z=8.0,
 ):
-    """Unit cell, absolute scale and orientation from raw events.
+    """Unit cell, scale and orientation from raw data, with nothing given.
+
+    With events (time of flight) every count is a point in reciprocal
+    space.  Without them (``wavelength`` given) every significant pixel is
+    a radial streak over the band (``laue_histogram``).  From there the two
+    are the same: Fourier transform, peaks on the direct lattice, a basis
+    that indexes them, refinement on the data.
+
+    For Laue data the overall scale is only as good as the band and the
+    spectrum; the shape of the cell does not depend on them.
 
     Args:
-        merged: images file with pixel-sorted events and goniometer angles
+        merged: images file with goniometer angles, and pixel-sorted events
+            unless ``wavelength`` is given
         instrument: instrument name
         d_min: [Angstrom] resolution of the reciprocal-space histogram; the
             direct-space map then has voxels of d_min / 2
@@ -685,21 +897,44 @@ def find_cell(
         frames: optional image indices to use (for example one run)
         rotations: optional (n_images, 3, 3) goniometer rotations to use
             instead of the ones in the file
+        wavelength: [Angstrom] (lam_min, lam_max) of a Laue measurement; the
+            events are then not used
+        spectrum: optional (wavelengths, relative weights) for Laue data
+        min_z: [-] significance of a pixel for Laue data
     Returns:
         BlindCell
     """
     say = log or (lambda *_: None)
-    counts, q_max, n_events = reciprocal_histogram(
-        merged, instrument, d_min, grid, frames=frames, rotations=rotations
-    )
-    voxel = 1.0 / (2.0 * q_max)
-    density = bragg_excess(counts)
-    say(
-        f"{float(counts.sum()):.3g} of {n_events:.3g} events inside |q_i| <= {q_max:.3f} 1/A; "
-        f"{float(density.sum()):.3g} counts above the local background"
-    )
-    g = direct_space_map(density, voxel)
-    pos, height = find_peaks(g, voxel, x_min=x_min)
+    if wavelength is None:
+        counts, q_max, n_events = reciprocal_histogram(
+            merged, instrument, d_min, grid, frames=frames, rotations=rotations
+        )
+        voxel = 1.0 / (2.0 * q_max)
+        density = bragg_excess(counts)
+        say(
+            f"{float(counts.sum()):.3g} of {n_events:.3g} events inside |q_i| <= {q_max:.3f} 1/A; "
+            f"{float(density.sum()):.3g} counts above the local background"
+        )
+        g = direct_space_map(density, voxel)
+        pos, height = find_peaks(g, voxel, x_min=x_min)
+    else:
+        density, q_max, n_events = laue_histogram(
+            merged,
+            instrument,
+            wavelength,
+            d_min,
+            grid,
+            frames=frames,
+            rotations=rotations,
+            spectrum=spectrum,
+            min_z=min_z,
+        )
+        voxel = 1.0 / (2.0 * q_max)
+        say(
+            f"{n_events} significant pixels spread over {wavelength[0]:g}-{wavelength[1]:g} A"
+        )
+        g = direct_space_map(density, voxel, half_extent=0.5 * grid * voxel - 2 * voxel)
+        pos, height = merge_radial_peaks(*find_peaks(g, voxel, x_min=x_min, n_keep=300))
     if len(pos) < 3:
         raise ValueError(
             "Fewer than three peaks in the direct-space map: no lattice in the events."
@@ -712,8 +947,13 @@ def find_cell(
     )
     dens = np.array(density)
     nz = np.argwhere(dens > 0)
+    wts = dens[dens > 0]
+    if len(wts) > 400000:  # streaks fill many voxels: the heaviest carry the lattice
+        top = np.argsort(-wts)[:400000]
+        nz, wts = nz[top], wts[top]
     q_pts = (nz + 0.5) * (2.0 * q_max / grid) - q_max
-    A, before, after = refine_basis(A, q_pts, dens[dens > 0])
+    extent = 330.0 if wavelength is None else min(330.0, 0.45 * grid * voxel)
+    A, before, after = refine_basis(A, q_pts, wts, extent=extent)
     diag.update(fourier_sum_before=before, fourier_sum_after=after, events=n_events)
     info = describe_lattice(A)
     say(

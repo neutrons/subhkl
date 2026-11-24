@@ -14,6 +14,7 @@ from subhkl.search.blind_cell import (
     find_peaks,
     lattice_basis,
     lattice_operations,
+    merge_radial_peaks,
     operations_in_basis,
     reduce_basis,
     refine_basis,
@@ -190,3 +191,61 @@ def test_conventional_cell_of_centred_lattices(
     assert info["lattice_group"] == group
     assert info["p1_symbol"] == p1
     assert centring_of(info["to_conventional"])[0] == want_centring
+
+
+def test_merge_radial_peaks_keeps_one_peak_per_lattice_vector():
+    a, b = np.array([60.0, 0.0, 0.0]), np.array([0.0, 0.0, 97.0])
+    pos = np.array([0.96 * a, 1.05 * a, b, 2.0 * a, 1.04 * b])
+    height = np.array([1.0, 0.9, 0.5, 0.4, 0.3])
+    merged, h = merge_radial_peaks(pos, height)
+    assert len(merged) == 3  # a (two fringes), c (two fringes), 2a
+    assert np.allclose(h, [1.0, 0.5, 0.4])
+    assert np.linalg.norm(merged[0] - a) < 1.0  # weighted mean of the fringes
+    assert np.linalg.norm(merged[2] - 2.0 * a) < 1e-9
+
+
+def test_laue_streaks_transform_to_the_direct_lattice():
+    """Without wavelengths a reflection is a radial streak over the band;
+    the Fourier transform of the streaks still peaks on the direct lattice,
+    and the basis read off it has the right shape."""
+    rng = np.random.default_rng(5)
+    cell = (40.0, 52.0, 66.0, 90.0, 104.0, 90.0)
+    A_true = Rotation.from_euler(
+        "xyz", [12, -28, 47], degrees=True
+    ).as_matrix() @ _basis(cell)
+    recip = np.linalg.inv(A_true).T
+    r = np.arange(-14, 15)
+    hkl = np.array(
+        [(h, k, l) for h in r for k in r for l in r if (h, k, l) != (0, 0, 0)]
+    )
+    q = hkl @ recip.T
+    q = q[(np.linalg.norm(q, axis=1) < 0.30) & (rng.random(len(q)) < 0.5)]
+    # each reflection is seen at some wavelength of the band; only its
+    # direction and 2 sin(theta) = |q| lambda are known afterwards
+    lam_lo, lam_hi = 3.0, 4.3
+    lam_obs = rng.uniform(lam_lo, lam_hi, len(q))
+    two_sin = np.linalg.norm(q, axis=1) * lam_obs
+    unit = q / np.linalg.norm(q, axis=1)[:, None]
+    n, q_max = 160, 1.0 / 3.0
+    voxel = 1.0 / (2.0 * q_max)
+    lam = lam_lo + (np.arange(48) + 0.5) * (lam_hi - lam_lo) / 48
+    shape = np.sin(np.pi * (np.arange(48) + 0.5) / 48) ** 2
+    pts = (unit[:, None, :] * (two_sin[:, None] / lam[None, :])[:, :, None]).reshape(
+        -1, 3
+    )
+    w = np.tile(shape / shape.sum(), len(q))
+    pts, w = np.concatenate([pts, -pts]), np.concatenate([w, w])
+    idx = np.floor((pts + q_max) * (n / (2.0 * q_max))).astype(int)
+    ok = np.all((idx >= 0) & (idx < n), axis=1)
+    grid = np.zeros((n, n, n), dtype=np.float32)
+    np.add.at(grid, tuple(idx[ok].T), w[ok])
+
+    g = direct_space_map(grid, voxel, half_extent=0.5 * n * voxel - 2 * voxel)
+    pos, height = merge_radial_peaks(*find_peaks(g, voxel, x_min=25.0, n_keep=200))
+    A, _good, _diag = lattice_basis(pos, height, g, voxel)
+    found = np.array(cell_of(reduce_basis(A)))
+    want = np.array(cell_of(reduce_basis(A_true)))
+    # the shape is right; the scale follows the assumed spectrum
+    assert np.allclose(found[:3] / found[0], want[:3] / want[0], atol=0.04)
+    assert np.allclose(found[3:], want[3:], atol=2.0)
+    assert abs(found[0] / want[0] - 1.0) < 0.08

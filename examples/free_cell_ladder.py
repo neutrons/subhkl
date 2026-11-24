@@ -13,6 +13,10 @@ Observations: spot directions d_m (sample frame), sin(theta_m), weights.
 3. Lattice: three of the vectors (direction x length) that index the rest;
    least squares on all indexed vectors; reduction.
 
+Superseded by find_cell in Laue mode (examples/laue_poisson_summation.py),
+which does not need a zone to be populated; kept for the ladder-length
+estimate and the removal of spots fixed in the laboratory.
+
 Status (prototype, first step towards estimating the cell inside the
 ladder so that Laue and time-of-flight data share one path).  The length
 of each ladder comes from a two-level model of the spot density away from
