@@ -1509,6 +1509,7 @@ def run_rbf_integrator(
     tof_sideband_measure: str = "spectrum",
     tof_max_variance_inflation: float | None = 1000.0,
     tof_amplitude_ridge: str = "fixed",
+    tof_fit: str = "joint",
 ):
     """Integrate the predicted reflections.
 
@@ -1517,6 +1518,10 @@ def run_rbf_integrator(
     data, "lo,hi" sets its relative edges around the predicted time, and
     "off" integrates the images of the whole wavelength band as before.
     Files without events are always integrated that way.
+
+    ``tof_fit`` chooses how events are fitted: "joint" fits all
+    reflections of an image at once in position and time, "gated" fits
+    one time-gated tile per reflection.
     """
     apply_detector_calibration(integration_peaks_filename, instrument)
 
@@ -1600,8 +1605,8 @@ def run_rbf_integrator(
             event_store = None
         else:
             print(
-                f"Time-of-flight gated integration (L1 = {event_store.l1} m, "
-                f"gate: {tof_gate})"
+                f"Time-of-flight integration (L1 = {event_store.l1} m, "
+                f"gate: {tof_gate}, fit: {tof_fit})"
             )
 
     def _read_events(img_key):
@@ -1648,6 +1653,7 @@ def run_rbf_integrator(
         tof_sideband_measure=tof_sideband_measure,
         tof_max_variance_inflation=tof_max_variance_inflation,
         tof_amplitude_ridge=tof_amplitude_ridge,
+        tof_fit=tof_fit,
         tof_band=peaks_band,
     )
     if event_store is not None:
@@ -1685,6 +1691,7 @@ def run_rbf_integrator(
             if used.coverage is not None:
                 grp.attrs["coverage"] = used.coverage
             grp.attrs["L1"] = event_store.l1
+            grp.attrs["fit"] = result.tof_info.get("fit", "gated")
             grp["stack_edges"] = result.tof_info["stack_edges"]
             grp["stack_counts"] = result.tof_info["stack_hist"]
 

@@ -737,6 +737,7 @@ def integrate_peaks_rbf_ssn(
     tof_sideband_measure: str = "spectrum",
     tof_max_variance_inflation: float | None = 1000.0,
     tof_amplitude_ridge: str = "fixed",
+    tof_fit: str = "joint",
     tof_band: tuple[float, float] | None = None,
 ):
     """
@@ -754,6 +755,10 @@ def integrate_peaks_rbf_ssn(
         tof_l1: [m] moderator-to-sample distance
         tof_gate: a ``TofGate`` with relative edges, or None to measure
             the gate from the stacked time profile
+        tof_fit: "joint" fits all reflections of an image at once in
+            position and time (see ``subhkl.search.tof_joint``);
+            "gated" is the earlier fit of one time-gated tile per
+            reflection (see ``subhkl.search.tof_gate``)
         tof_band: [Angstrom] (min, max) wavelength band the reflections
             were predicted in; gates and sidebands are clipped to it.  None
             falls back to the band stored with the images.
@@ -1328,7 +1333,23 @@ def integrate_peaks_rbf_ssn(
             _frame_event_reader.event_store = event_reader.event_store
             _frame_event_reader.frame_img_keys = frame_img_keys
 
-        integrated_results, tof_info = integrate_reflections_tof_gated(
+        if tof_fit not in ("joint", "gated"):
+            raise ValueError(f"tof_fit must be 'joint' or 'gated', got {tof_fit!r}")
+        common = {
+            "var_us": all_var_u,
+            "var_vs": all_var_v,
+            "cov_uvs": all_cov_uv,
+            "gate": tof_gate,
+            "gate_coverage": tof_gate_coverage,
+            "gate_search": tof_gate_search,
+            "max_variance_inflation": tof_max_variance_inflation,
+            "static_valid": static_valid,
+            "profile": matrix_free_profile,
+            "border_width": border_width,
+            "allow_negative": allow_negative,
+            "show_progress": show_progress,
+        }
+        positional = (
             images_batch,
             _frame_event_reader,
             frames,
@@ -1337,23 +1358,23 @@ def integrate_peaks_rbf_ssn(
             tof_pred,
             predicted_tof(band_min, tof_l1, all_distances),
             predicted_tof(band_max, tof_l1, all_distances),
-            var_us=all_var_u,
-            var_vs=all_var_v,
-            cov_uvs=all_cov_uv,
-            gate=tof_gate,
-            gate_coverage=tof_gate_coverage,
-            gate_search=tof_gate_search,
-            sideband_factor=tof_sideband_factor,
-            sideband_measure=tof_sideband_measure,
-            max_variance_inflation=tof_max_variance_inflation,
-            amplitude_ridge=tof_amplitude_ridge,
-            static_valid=static_valid,
-            profile=matrix_free_profile,
-            fp_target=matrix_free_fp_target,
-            border_width=border_width,
-            allow_negative=allow_negative,
-            show_progress=show_progress,
         )
+        if tof_fit == "joint":
+            from subhkl.search.tof_joint import integrate_reflections_tof_joint
+
+            integrated_results, tof_info = integrate_reflections_tof_joint(
+                *positional, **common
+            )
+        else:
+            integrated_results, tof_info = integrate_reflections_tof_gated(
+                *positional,
+                sideband_factor=tof_sideband_factor,
+                sideband_measure=tof_sideband_measure,
+                amplitude_ridge=tof_amplitude_ridge,
+                fp_target=matrix_free_fp_target,
+                **common,
+            )
+        tof_info["fit"] = tof_fit
         res.tof_info = tof_info
     else:
         integrated_results = integrate_reflections_matrix_free(
