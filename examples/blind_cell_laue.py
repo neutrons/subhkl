@@ -47,13 +47,20 @@ goniometer).  With
 IMAGINE-X's band of 3.0 to 4.3 Angstrom the edges come out within about
 1%.
 
-IMAGINE-X needs a detector calibration (``--detectors``, a solve of any
-crystal on the instrument).  Its nominal panel positions are 15 to 33 mm
-off at 355 to 600 mm from the sample, and not by a rotation: with them the
-chain finds a distorted lattice in the first round at best and then loses
-it.  The calibration carries over between crystals: L1 MBL with the
-detectors from the T4 lysozyme solve gives 70.3 99.1 92.4, beta 106.1 and
-orientations to 0.35 degrees (0.17 with its own).
+IMAGINE-X's nominal geometry is too far off for the cell search: pixel
+directions are wrong by 1.7 degrees (median), and the lattice is lost.
+Nearly all of it is a translation of the detector against the sample of
+about 10 mm, different for each crystal mount; the panels also sit 5 to 7%
+further out than nominal.  Two ways around it:
+
+- ``--detectors``: the calibration of any earlier solve on the instrument.
+  L1 MBL with the detectors from the T4 lysozyme solve gives 70.3 99.1
+  92.4, beta 106.1 and orientations to 0.35 degrees.
+- ``--radial 0.065 --axial 0.05 --search-shift``: the panels moved outwards
+  and the translation searched on the lattice score
+  (``search_detector_shift``, about 30 cell searches).  From nominal
+  geometry: T4 lysozyme 60.3 60.5 95.5, gamma 119.5, orientations to 0.19
+  degrees; L1 MBL 68.9 96.2 89.7, beta 106.1, orientations to 0.34 degrees.
 
 With the scale from the events of the first run, MANDI as Laue gives
 60.7 60.9 97.1 for T4 lysozyme and 55.2 81.4 88.5, beta 96.6 for the Mpro
@@ -72,6 +79,8 @@ from subhkl.search.blind_cell import (
     describe_lattice,
     find_cell,
     refine_run_rotations,
+    scaled_detectors,
+    search_detector_shift,
     write_aligned_images,
 )
 
@@ -90,6 +99,17 @@ def main():
     ap.add_argument("--grid", type=int, default=384)
     ap.add_argument(
         "--x-min", type=float, default=35.0, help="[Angstrom] shortest cell edge"
+    )
+    ap.add_argument(
+        "--radial", type=float, default=0.0, help="[-] panels moved outwards in x, z"
+    )
+    ap.add_argument(
+        "--axial", type=float, default=None, help="[-] panels moved outwards in y"
+    )
+    ap.add_argument(
+        "--search-shift",
+        action="store_true",
+        help="search the translation of the detector against the sample (+-10 mm)",
     )
     ap.add_argument(
         "--volume", type=float, help="[Angstrom^3] conventional cell volume, if known"
@@ -139,38 +159,53 @@ def main():
     elif args.volume or args.length:
         kw.update(volume=args.volume, length=args.length)
 
-    rotations = None  # the logged goniometer angles
-    volumes, found = [], None
-    for k in range(args.rounds + 1):
-        found = find_cell(args.merged, args.instrument, rotations=rotations, **kw)
-        d = found.diagnostics
-        volumes.append(abs(np.linalg.det(found.basis)))
-        print(
-            f"round {k}: "
-            + " ".join(f"{v:.2f}" for v in found.conventional_cell)
-            + f"  {found.centring}, lattice group {found.lattice_group}; score {1e3 * d['ladder_score']:.1f}"
-            f" (z {d['ladder_z']:.0f}); scale "
-            + (
-                f"from the {d['scale_source']}"
-                if d["scale_determined"]
-                else "undetermined"
-            )
-        )
-        if k == args.rounds:
-            break
-        rotations, angles, stats = refine_run_rotations(
+    shift = (0.0, 0.0, 0.0)
+    if args.search_shift:
+        shift, top, _tried = search_detector_shift(
             args.merged,
             args.instrument,
-            found.basis,
             band,
-            rotations=rotations,
-            d_min=args.d_min,
+            radial=args.radial,
+            axial=args.axial,
+            log=lambda line: print("   " + line, flush=True),
+            **{k: v for k, v in kw.items() if k != "wavelength"},
         )
         print(
-            "   runs turned by [deg]: "
-            + " ".join(f"{a:.2f}" for a in angles)
-            + f";  bins indexed {100 * np.nanmedian(stats[:, 2]):.0f}% -> {100 * np.nanmedian(stats[:, 3]):.0f}%"
+            f"detector shift [mm] {np.round(1e3 * np.array(shift), 1).tolist()} (score {1e3 * top:.1f})"
         )
+    with scaled_detectors(args.instrument, args.radial, args.axial, shift=shift):
+        rotations = None  # the logged goniometer angles
+        volumes, found = [], None
+        for k in range(args.rounds + 1):
+            found = find_cell(args.merged, args.instrument, rotations=rotations, **kw)
+            d = found.diagnostics
+            volumes.append(abs(np.linalg.det(found.basis)))
+            print(
+                f"round {k}: "
+                + " ".join(f"{v:.2f}" for v in found.conventional_cell)
+                + f"  {found.centring}, lattice group {found.lattice_group}; score {1e3 * d['ladder_score']:.1f}"
+                f" (z {d['ladder_z']:.0f}); scale "
+                + (
+                    f"from the {d['scale_source']}"
+                    if d["scale_determined"]
+                    else "undetermined"
+                )
+            )
+            if k == args.rounds:
+                break
+            rotations, angles, stats = refine_run_rotations(
+                args.merged,
+                args.instrument,
+                found.basis,
+                band,
+                rotations=rotations,
+                d_min=args.d_min,
+            )
+            print(
+                "   runs turned by [deg]: "
+                + " ".join(f"{a:.2f}" for a in angles)
+                + f";  bins indexed {100 * np.nanmedian(stats[:, 2]):.0f}% -> {100 * np.nanmedian(stats[:, 3]):.0f}%"
+            )
 
     basis = found.basis
     if not found.diagnostics["scale_determined"]:

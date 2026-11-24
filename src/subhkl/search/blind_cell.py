@@ -14,6 +14,7 @@ is assumed.
 solve-style file in space group P 1 that seeds ``solve --bootstrap``.
 """
 
+import contextlib
 from dataclasses import dataclass, field
 
 import gemmi
@@ -353,6 +354,46 @@ def merge_radial_peaks(pos, height, angle_deg=2.0, rel_length=0.12):
     out_p, out_h = np.array(out_p), np.array(out_h)
     order = np.argsort(-out_h)
     return out_p[order], out_h[order]
+
+
+@contextlib.contextmanager
+def scaled_detectors(instrument, radial=0.0, axial=None, shift=(0.0, 0.0, 0.0)):
+    """Temporarily move every panel of an instrument outwards.
+
+    The panel midpoints are scaled by ``1 + radial`` across the beam axis
+    plane (x, z) and by ``1 + axial`` along y, the panels keep their size and
+    orientation: the two leading terms of an uncalibrated geometry, in the
+    parametrisation of the blind orientation search
+    (``blind_band.discover``).
+
+    Args:
+        radial: [-] relative change of the panel distances in x and z
+        axial: [-] relative change in y; default the same as ``radial``
+        shift: [m] translation of all panels, i.e. minus the displacement of
+            the sample from the nominal centre
+    """
+    from subhkl.config import beamlines
+
+    axial = radial if axial is None else axial
+    saved = {}
+    scale = np.array([1.0 + radial, 1.0 + axial, 1.0 + radial])
+    for bank, cfg in beamlines[instrument].items():
+        if not isinstance(cfg, dict) or "center" not in cfg:
+            continue
+        saved[bank] = list(cfg["center"])
+        half = 0.5 * cfg["width"] * np.array(cfg["uhat"]) + 0.5 * cfg[
+            "height"
+        ] * np.array(cfg["vhat"])
+        cfg["center"] = (
+            (np.array(cfg["center"]) + half) * scale
+            - half
+            + np.asarray(shift, dtype=float)
+        ).tolist()
+    try:
+        yield
+    finally:
+        for bank, center in saved.items():
+            beamlines[instrument][bank]["center"] = center
 
 
 def laue_observations(
@@ -1767,6 +1808,155 @@ def refine_run_rotations(
             f"bins indexed {100 * share0:.0f}% -> {100 * share:.0f}%"
         )
     return out, angles, np.array(gains)
+
+
+def has_events(merged):
+    """Whether an images file carries time-of-flight events."""
+    try:
+        with h5py.File(merged, "r") as f:
+            first = f["images"][0]
+        with EventStore(merged) as store:
+            store.image_events(0, first)
+    except (KeyError, OSError, ValueError, IndexError):
+        return False
+    return True
+
+
+def search_detector_shift(
+    merged, instrument, wavelength, radial=0.0, axial=None, step=0.010, log=None, **kw
+):
+    """Translation of the detector against the sample from the lattice score.
+
+    The cell search needs pixel directions good to well under a degree.  A
+    sample 10 mm from the nominal centre turns them by 1.5 degrees at 0.4 m,
+    and the lattice is lost.  The score of the best lattice
+    (``find_cell(...).diagnostics["ladder_score"]``) falls off with the
+    error, so it is scanned: a grid of ``step`` in x and z and half of it in
+    y, then two rounds of half steps around the best.
+
+    Args:
+        radial, axial: [-] as for ``scaled_detectors``
+        step: [m] grid step
+        kw: passed to ``find_cell``
+    Returns:
+        (shift [m] (3,), score, {shift: score})
+    """
+    say = log or (lambda *_: None)
+
+    def score(shift):
+        with scaled_detectors(instrument, radial, axial, shift=shift):
+            try:
+                d = find_cell(
+                    merged, instrument, wavelength=wavelength, **kw
+                ).diagnostics
+            except ValueError:
+                return 0.0
+        say(
+            f"shift [mm] {np.round(1e3 * np.array(shift), 1).tolist()}: "
+            f"score {1e3 * d['ladder_score']:.1f} (z {d['ladder_z']:.0f})"
+        )
+        return d["ladder_score"] if d["ladder_z"] >= 8 else 0.0
+
+    tried = {}
+    for x in (-step, 0.0, step):
+        for y in (0.0, 0.5 * step):
+            for z in (-step, 0.0, step):
+                tried[(x, y, z)] = score((x, y, z))
+    best = max(tried, key=tried.get)
+    for h in (0.5 * step, 0.25 * step):
+        for axis in range(3):
+            for sign in (-1.0, 1.0):
+                t = list(best)
+                t[axis] += sign * h
+                t = tuple(round(v, 5) for v in t)
+                if t not in tried:
+                    tried[t] = score(t)
+        best = max(tried, key=tried.get)
+    return np.array(best), tried[best], tried
+
+
+def determine_cell(
+    merged,
+    instrument,
+    wavelength=None,
+    rounds=3,
+    d_min=3.0,
+    grid=None,
+    x_min=None,
+    volume=None,
+    length=None,
+    log=None,
+):
+    """Cell and per-run rotations with nothing given: the whole chain.
+
+    With events (``wavelength`` None): ``align_runs`` for the rotation
+    errors between runs, then ``find_cell`` on all runs.  Without
+    (``wavelength`` the band): ``find_cell`` in Laue mode alternated with
+    ``refine_run_rotations`` for ``rounds`` rounds, starting from the logged
+    goniometer angles.
+
+    Returns:
+        (BlindCell, rotations (n_images, 3, 3))
+    """
+    say = log or (lambda *_: None)
+    if wavelength is None:
+        kw = {"d_min": d_min, "grid": grid or 768, "x_min": x_min or 12.0}
+        runs = align_runs(merged, instrument, log=log, **kw)
+        return find_cell(
+            merged, instrument, rotations=runs.rotations, log=log, **kw
+        ), runs.rotations
+    kw = {
+        "d_min": d_min,
+        "grid": grid or 384,
+        "x_min": x_min or 35.0,
+        "wavelength": wavelength,
+        "volume": volume,
+        "length": length,
+    }
+    rotations, found, volumes = None, None, []
+    for k in range(rounds + 1):
+        found = find_cell(merged, instrument, rotations=rotations, **kw)
+        d = found.diagnostics
+        volumes.append(abs(np.linalg.det(found.basis)))
+        say(
+            f"round {k}: "
+            + " ".join(f"{v:.2f}" for v in found.conventional_cell)
+            + f"  {found.centring}, {found.lattice_group}; score {1e3 * d['ladder_score']:.1f}"
+            f" (z {d['ladder_z']:.0f}); scale from the {d['scale_source']}"
+        )
+        if k == rounds:
+            break
+        rotations, angles, stats = refine_run_rotations(
+            merged,
+            instrument,
+            found.basis,
+            wavelength,
+            rotations=rotations,
+            d_min=d_min,
+        )
+        say(
+            "   runs turned by [deg]: "
+            + " ".join(f"{a:.2f}" for a in angles)
+            + f";  bins indexed {100 * np.nanmedian(stats[:, 2]):.0f}% -> "
+            f"{100 * np.nanmedian(stats[:, 3]):.0f}%"
+        )
+    if not found.diagnostics["scale_determined"] and len(volumes) > 2:
+        # No scale in the data: hold the median volume of the rounds.
+        later = volumes[1:]
+        factor = (np.median(later) / volumes[-1]) ** (1.0 / 3.0)
+        spread = (max(later) / min(later)) ** (1.0 / 3.0) - 1.0
+        say(
+            f"the band limits do not fix the scale: median volume of the rounds taken, "
+            f"lengths spread {100 * spread:.0f}% between rounds"
+        )
+        diagnostics = dict(found.diagnostics, scale_spread=float(spread))
+        found = BlindCell(
+            diagnostics=diagnostics, **describe_lattice(factor * found.basis)
+        )
+    if rotations is None:
+        with h5py.File(merged, "r") as f:
+            rotations = np.array(Goniometer.from_h5_file(f).rotation, dtype=float)
+    return found, rotations
 
 
 def goniometer_angles_for(rotations, axes, start):
