@@ -25,6 +25,7 @@ eigendecomposition that leaves out the directions the data do not
 determine; reflections with a share in those directions are censored.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import numpy as np
@@ -40,14 +41,23 @@ BINS_PER_PROFILE = 20  # time bins across the support of the time profile
 MAX_TIME_BINS = 1024
 MIN_HALF, MAX_HALF = 4, 12  # [Pixel] half-size of a reflection's window
 SPOT_REACH = 3.0  # [-] window half-size in units of the spot's major sigma
-PAIR_BATCH = 64  # reflections whose neighbour overlaps are evaluated together
+PAIR_BATCH = 64  # retained for compatibility
 N_SCORING = 4  # Fisher-scoring steps
 BG_BLUR = 6.0  # [Pixel] smoothing of the background map
 MIN_SPOT_MASS = 0.65  # [-] share of the spot on usable pixels
 MIN_TIME_MASS = 0.5  # [-] share of the time profile inside the band
 LEVERAGE_LIMIT = 0.01  # [-] share in undetermined directions that censors a reflection
-PEAK_QUANTUM = 1024
+PEAK_QUANTUM = 512
 EVENT_QUANTUM = 1 << 20
+DEFAULT_NBR_PAD = (
+    32  # initial GPU neighbour slots per reflection (escalates if exceeded)
+)
+NBR_ROW_CHUNK = 512  # row tile when n_pad > 2048 to bound temporary overlap memory
+MAX_BATCH_IMAGES = 8  # images solved simultaneously on GPU via vmap
+DEFAULT_BATCH_EVENTS = 16 << 20  # target events per multi-image slab (64 MiB float32)
+MAX_BATCH_EVENTS = 32 << 20  # upper bound on automatic slab sizing (128 MiB float32)
+TARGET_BATCH_VRAM_BYTES = 5 << 30  # ~5 GiB ceiling for transient multi-image cubes
+PREFETCH_SLOTS = 4  # host ring-buffer slots (2 prefetch + H2D staging + in-flight GPU)
 
 _JIT = {}
 
@@ -95,8 +105,69 @@ def _blur(x, sigma):
     )(xp)
 
 
-def _fit_image_impl(
-    events,
+def _bin_cutoffs_f32(l0: float, dl: float, nt: int) -> np.ndarray:
+    """IEEE-754 exact float32 lower-bound cutoffs for log-time bins ``0..nt``."""
+    b_idx = np.arange(nt + 1, dtype=np.int64)
+    c = np.exp(l0 + b_idx * dl).astype(np.float32)
+
+    def _tb(val_f32: np.ndarray) -> np.ndarray:
+        return np.floor(
+            (np.log(np.maximum(val_f32.astype(np.float64), 1e-6)) - l0) / dl
+        ).astype(np.int64)
+
+    for _ in range(4):
+        prev_c = np.nextafter(c, np.float32(-np.inf))
+        step_down = (c > np.float32(0.0)) & (_tb(prev_c) >= b_idx)
+        if not np.any(step_down):
+            break
+        c = np.where(step_down, prev_c, c)
+    for _ in range(4):
+        step_up = _tb(c) < b_idx
+        if not np.any(step_up):
+            break
+        c = np.where(step_up, np.nextafter(c, np.float32(np.inf)), c)
+    return c
+
+
+def _gpu_neighbour_list(r0, c0, b0, real, *, nb, half, k_pad):
+    """Build padded ``(n, k_pad)`` overlapping neighbour table on GPU (self first)."""
+    import jax.numpy as jnp
+    from jax import lax
+
+    n = r0.shape[0]
+    cols = jnp.arange(n, dtype=jnp.int32)
+
+    def _query_rows(q_idx):
+        ov = (
+            real[q_idx, None]
+            & real[None, :]
+            & (jnp.abs(r0[q_idx, None] - r0[None, :]) <= 2 * half)
+            & (jnp.abs(c0[q_idx, None] - c0[None, :]) <= 2 * half)
+            & (jnp.abs(b0[q_idx, None] - b0[None, :]) < nb)
+        )
+        deg_q = jnp.sum(ov.astype(jnp.int32), axis=1)
+        scores = jnp.where(
+            ov,
+            jnp.where(q_idx[:, None] == cols[None, :], jnp.int32(2), jnp.int32(1)),
+            jnp.int32(0),
+        )
+        top_vals, top_idx = lax.top_k(scores, k_pad)
+        nbr_q = jnp.where(top_vals > 0, top_idx, jnp.int32(n))
+        return nbr_q, deg_q
+
+    if n <= 2048 or n % NBR_ROW_CHUNK != 0:
+        nbr, deg = _query_rows(cols)
+    else:
+        nbr_b, deg_b = lax.map(_query_rows, cols.reshape(-1, NBR_ROW_CHUNK))
+        nbr = nbr_b.reshape(n, k_pad)
+        deg = deg_b.reshape(n)
+
+    max_deg = jnp.max(jnp.where(real, deg, jnp.int32(0)))
+    return nbr, max_deg
+
+
+def _fit_from_counts_impl(
+    N_2d,
     valid_px,
     r0,
     c0,
@@ -108,40 +179,19 @@ def _fit_image_impl(
     T,
     b0,
     real,
-    nbr,
     trunk,
     eig_floor,
     *,
     nt,
     half,
+    k_pad,
     truncate,
 ):
-    """Fit one image.
-
-    Args:
-        events: [-] (E,) flat voxel index (pixel * nt + bin) per event;
-            out-of-range values are padding
-        valid_px: [-] (H, W), 1 = usable pixel
-        r0, c0: [Pixel] (n,) window centres (rounded positions)
-        pr, pc: [Pixel] (n,) predicted positions
-        vu, vv, cuv: [Pixel^2] (n,) projected spot covariance
-        T: [-] (n, nb) share of the time profile in each of the
-            reflection's time bins
-        b0: [-] (n,) first time bin of each reflection
-        real: [-] (n,) False for padding
-        nbr: [-] (n, K) neighbour list including the reflection itself;
-            values >= n are padding
-        trunk: None, or (u, f, norm): measured radial profile in model
-            sigmas and its integral of f(m) m dm
-        eig_floor: [-] smallest eigenvalue kept when ``truncate``
-    Returns:
-        flux [photons], sigma [photons], variance inflation [-], share in
-        dropped directions [-], number of dropped directions, fitted
-        mask, background under the profile at the centre [photons/Pixel]
-    """
+    """Joint position-and-time Poisson fit of one image from ``(H*W, nt)`` counts."""
+    import jax
     import jax.numpy as jnp
     from jax import lax
-    from jax.scipy.linalg import cho_solve
+    from jax.scipy.linalg import cho_solve, solve_triangular
 
     H_, W_ = valid_px.shape
     n, nb = T.shape
@@ -149,11 +199,14 @@ def _fit_image_impl(
     f32 = jnp.float32
     valid_flat = valid_px.ravel().astype(f32)
 
-    o = jnp.arange(-half, half + 1)
+    nbr, max_deg = _gpu_neighbour_list(r0, c0, b0, real, nb=nb, half=half, k_pad=k_pad)
+
+    o = jnp.arange(-half, half + 1, dtype=jnp.int32)
     rr = (r0[:, None, None] + o[None, :, None] + 0 * o[None, None, :]).reshape(n, -1)
     cc = (c0[:, None, None] + 0 * o[None, :, None] + o[None, None, :]).reshape(n, -1)
     inb = (rr >= 0) & (rr < H_) & (cc >= 0) & (cc < W_)
     pflat = jnp.where(inb, rr * W_ + cc, 0)
+    pix_ok = (inb & (valid_flat[pflat] > 0)).astype(f32)
 
     def spot(dv, du, vu_, vv_, cuv_):
         det = jnp.maximum(vu_ * vv_ - cuv_**2, 1e-6)
@@ -164,147 +217,338 @@ def _fit_image_impl(
         g = jnp.interp(jnp.sqrt(m2), u, f, left=f[0], right=0.0)
         return g / (2.0 * jnp.pi * jnp.sqrt(det) * norm)
 
-    P = spot(rr - pr[:, None], cc - pc[:, None], vu[:, None], vv[:, None], cuv[:, None])
-    P = (P * inb * valid_flat[pflat]).astype(f32)
+    P = (
+        spot(rr - pr[:, None], cc - pc[:, None], vu[:, None], vv[:, None], cuv[:, None])
+        * pix_ok
+    ).astype(f32)
     active = real & (P.sum(1) >= MIN_SPOT_MASS) & (T.sum(1) >= MIN_TIME_MASS)
     act = active.astype(f32)
 
-    tbk = b0[:, None] + jnp.arange(nb)[None, :]
+    tbk = b0[:, None] + jnp.arange(nb, dtype=jnp.int32)[None, :]
     tbc = jnp.clip(tbk, 0, nt - 1)
+    tb_ok = ((tbk >= 0) & (tbk < nt)).astype(f32)
     vox = pflat[:, :, None] * nt + tbc[:, None, :]
     a = P[:, :, None] * T[:, None, :]
-    N = jnp.zeros(size, f32).at[events].add(1.0, mode="drop")
-    valid_vox = jnp.repeat(valid_flat, nt)
 
     # Background: a pixel map times one time spectrum, from the voxels no
     # predicted reflection touches.
     occupied = (a > 0) & real[:, None, None]
-    cover = jnp.zeros(size, f32).at[vox].add(occupied.astype(f32)) > 0
-    free = ((~cover) & (valid_vox > 0)).reshape(H_ * W_, nt).astype(f32)
-    Nf = N.reshape(H_ * W_, nt) * free
-    spectrum = Nf.sum(0) / jnp.maximum(free.sum(0), 1.0)
-    spectrum = jnp.convolve(spectrum, jnp.ones(5, f32) / 5.0, mode="same")
-    weight = (free * spectrum[None, :]).sum(1).reshape(H_, W_)
-    bmap = _blur(Nf.sum(1).reshape(H_, W_), BG_BLUR) / jnp.maximum(
-        _blur(weight, BG_BLUR), 1e-9
+    cover = (
+        jnp.zeros(size, jnp.int32)
+        .at[vox]
+        .add(occupied.astype(jnp.int32))
+        .reshape(H_ * W_, nt)
+        > 0
     )
-    mu_bg = jnp.maximum((bmap.reshape(-1, 1) * spectrum[None, :]).ravel(), 1e-4)
+    free = (~cover) & (valid_flat[:, None] > 0)
+    n_free_t = jnp.sum(free, axis=0, dtype=f32)
+    nf_t = jnp.sum(jnp.where(free, N_2d, f32(0.0)), axis=0)
+    nf_p = jnp.sum(jnp.where(free, N_2d, f32(0.0)), axis=1)
+    spectrum = nf_t / jnp.maximum(n_free_t, f32(1.0))
+    spectrum = jnp.convolve(spectrum, jnp.ones(5, f32) / f32(5.0), mode="same")
+    weight = jnp.sum(jnp.where(free, spectrum[None, :], f32(0.0)), axis=1).reshape(
+        H_, W_
+    )
+    bmap = _blur(nf_p.reshape(H_, W_), BG_BLUR) / jnp.maximum(
+        _blur(weight, BG_BLUR), f32(1e-9)
+    )
+    bmap_flat = bmap.ravel()
+
+    # Gather window counts and background once; Fisher scoring operates purely on
+    # compact (n, P_win, nb) windows and precomputed (n, k_pad, .) pair factors.
+    N_win = N_2d[pflat[:, :, None], tbc[:, None, :]]
+    bg_win = jnp.maximum(
+        bmap_flat[pflat][:, :, None] * spectrum[tbc][:, None, :], f32(1e-4)
+    )
+    val_win = pix_ok[:, :, None] * tb_ok[:, None, :]
 
     nbr_c = jnp.clip(nbr, 0, n - 1)
-    nbr_ok = nbr < n
+    nbr_act = (nbr < n).astype(f32) * act[nbr_c]
 
-    def expected(amp):
-        model = jnp.zeros(size, f32).at[vox].add((amp * act)[:, None, None] * a)
-        return jnp.maximum(mu_bg + model, 0.3 * mu_bg)
+    def _prep_pair(k):
+        j = nbr_c[k]
+        pj = spot(
+            rr[k][None, :] - pr[j][:, None],
+            cc[k][None, :] - pc[j][:, None],
+            vu[j][:, None],
+            vv[j][:, None],
+            cuv[j][:, None],
+        )
+        in_j = (jnp.abs(rr[k][None, :] - r0[j][:, None]) <= half) & (
+            jnp.abs(cc[k][None, :] - c0[j][:, None]) <= half
+        )
+        rel = tbk[k][None, :] - b0[j][:, None]
+        tj = jnp.take_along_axis(T[j], jnp.clip(rel, 0, nb - 1), axis=1)
+        tj = tj * ((rel >= 0) & (rel < nb)) * tb_ok[k][None, :]
+        return (
+            (pj * in_j * pix_ok[k][None, :]).astype(f32),
+            (tj * nbr_act[k][:, None]).astype(f32),
+        )
 
-    def information(mu):
-        w2 = (valid_vox / mu).reshape(H_ * W_, nt)
+    pj_all, tj_all = jax.vmap(_prep_pair)(jnp.arange(n, dtype=jnp.int32))
+    t_pair = tj_all * T[:, None, :]
+    prec = lax.Precision.HIGHEST
 
-        def row(k):
-            wk = w2[pflat[k]][:, tbc[k]]  # (pixels, bins) of k's window
-            j = nbr_c[k]
-            pj = spot(
-                rr[k][None, :] - pr[j][:, None],
-                cc[k][None, :] - pc[j][:, None],
-                vu[j][:, None],
-                vv[j][:, None],
-                cuv[j][:, None],
-            )
-            in_j = (jnp.abs(rr[k][None, :] - r0[j][:, None]) <= half) & (
-                jnp.abs(cc[k][None, :] - c0[j][:, None]) <= half
-            )
-            rel = tbk[k][None, :] - b0[j][:, None]
-            tj = jnp.take_along_axis(T[j], jnp.clip(rel, 0, nb - 1), axis=1)
-            tj = tj * ((rel >= 0) & (rel < nb))
-            x = jnp.einsum("jp,pt->jt", pj * in_j * P[k][None, :], wk)
-            return jnp.sum(x * tj * T[k][None, :], axis=1) * nbr_ok[k] * act[k] * act[j]
-
-        rows = lax.map(row, jnp.arange(n), batch_size=PAIR_BATCH)
+    def _eval_fisher(amp):
+        amp_j = amp[nbr_c]
+        model_win = jnp.einsum(
+            "kjt,kjp->kpt", amp_j[:, :, None] * tj_all, pj_all, precision=prec
+        )
+        mu_win = jnp.maximum(bg_win + model_win, f32(0.3) * bg_win)
+        inv_mu = val_win / mu_win
+        sc = jnp.sum(a * ((N_win - mu_win) * inv_mu), axis=(1, 2)) * act
+        x = jnp.einsum("kjp,kpt->kjt", pj_all, inv_mu * P[:, :, None], precision=prec)
+        rows = jnp.sum(x * t_pair, axis=2) * act[:, None]
         Hm = (
             jnp.zeros((n, n), f32)
-            .at[jnp.arange(n)[:, None], nbr]
+            .at[jnp.arange(n, dtype=jnp.int32)[:, None], nbr]
             .add(rows, mode="drop")
         )
-        Hm = 0.5 * (Hm + Hm.T)
-        return Hm + jnp.diag(1.0 - act)
+        Hm = f32(0.5) * (Hm + Hm.T) + jnp.diag(f32(1.0) - act)
+        return Hm, sc
 
-    def score(mu):
-        ratio = (N - mu) / mu * valid_vox
-        return jnp.sum(a * ratio[vox], axis=(1, 2)) * act
-
-    def solver(Hm):
-        d = jnp.sqrt(jnp.maximum(jnp.diag(Hm), 1e-30))
+    def _solver(Hm, need_infl: bool):
+        d = jnp.sqrt(jnp.maximum(jnp.diag(Hm), f32(1e-30)))
         R = Hm / jnp.outer(d, d)
         if truncate:
             lam, V = jnp.linalg.eigh(R)
             kept = lam > eig_floor
-            inv = jnp.where(kept, 1.0 / jnp.where(kept, lam, 1.0), 0.0)
+            inv = jnp.where(kept, f32(1.0) / jnp.where(kept, lam, f32(1.0)), f32(0.0))
 
             def solve(rhs):
                 return V @ ((V.T @ rhs) * inv)
 
-            infl = jnp.sum(V**2 * inv[None, :], axis=1)
-            lev = jnp.sum(jnp.where(kept[None, :], 0.0, V**2), axis=1)
+            infl = jnp.sum(V**2 * inv[None, :], axis=1) if need_infl else None
+            lev = (
+                jnp.sum(jnp.where(kept[None, :], f32(0.0), V**2), axis=1)
+                if need_infl
+                else None
+            )
             return d, solve, infl, lev, jnp.sum(~kept)
         L = jnp.linalg.cholesky(R)
 
         def solve(rhs):
             return cho_solve((L, True), rhs)
 
-        return d, solve, None, None, 0
+        if need_infl:
+            linv = solve_triangular(L, jnp.eye(n, dtype=f32), lower=True)
+            infl = jnp.sum(linv * linv, axis=0)
+            lev = jnp.zeros(n, f32)
+        else:
+            infl, lev = None, None
+        return d, solve, infl, lev, jnp.int32(0)
 
-    def step(_, amp):
-        mu = expected(amp)
-        d, solve, *_ = solver(information(mu))
-        return amp + solve(score(mu) / d) / d
+    def _step(_, amp):
+        Hm, sc = _eval_fisher(amp)
+        d, solve, *_ = _solver(Hm, False)
+        return amp + solve(sc / d) / d
 
-    amp = lax.fori_loop(0, N_SCORING, step, jnp.zeros(n, f32))
-    mu = expected(amp)
-    d, solve, infl, lev, dropped = solver(information(mu))
-    if not truncate:
-        infl = jnp.diag(solve(jnp.eye(n, dtype=f32)))
-        lev = jnp.zeros(n, f32)
-    sigma = jnp.sqrt(jnp.maximum(infl, 0.0)) / d * act
+    amp = lax.fori_loop(0, N_SCORING, _step, jnp.zeros(n, f32))
+    Hm, _ = _eval_fisher(amp)
+    d, _, infl, lev, dropped = _solver(Hm, True)
+    sigma = jnp.sqrt(jnp.maximum(infl, f32(0.0))) / d * act
     centre = jnp.clip(r0, 0, H_ - 1) * W_ + jnp.clip(c0, 0, W_ - 1)
     bg_centre = jnp.sum(
-        mu_bg.reshape(H_ * W_, nt)[centre[:, None], tbc] * (T > 0), axis=1
+        jnp.maximum(bmap_flat[centre][:, None] * spectrum[tbc], f32(1e-4)) * (T > 0),
+        axis=1,
     )
-    return amp * act, sigma, infl, lev, dropped, active, bg_centre
+    return amp * act, sigma, infl, lev, dropped, active, bg_centre, max_deg
 
 
-def _fit_fn(nt, half, truncate, has_trunk):
-    key = (nt, half, truncate, has_trunk)
+def _scatter_batch_events(tof_slab, off_batch, cuts_f32, *, nt):
+    """Bin sorted slab events of ``M`` images into ``(M, n_pix, nt)`` float32 counts."""
+    import jax.numpy as jnp
+
+    M, n_pix_p1 = off_batch.shape
+    n_pix = n_pix_p1 - 1
+    ev_start = off_batch[0, 0]
+    ev_end = off_batch[-1, -1]
+    ev_idx = jnp.arange(tof_slab.shape[0], dtype=jnp.int32)
+    in_sub = (ev_idx >= ev_start) & (ev_idx < ev_end)
+    flat_ends = off_batch[:, 1:].ravel()
+    sp = jnp.searchsorted(flat_ends, jnp.where(in_sub, ev_idx, ev_start), side="right")
+    tb = jnp.searchsorted(
+        cuts_f32, jnp.where(in_sub, tof_slab, jnp.float32(-1.0)), side="right"
+    ) - jnp.int32(1)
+    ok = in_sub & (tb >= 0) & (tb < nt)
+    dump = M * n_pix * nt
+    if dump < (1 << 30):
+        vox = jnp.where(ok, sp * jnp.int32(nt) + tb, jnp.int32(dump))
+    else:
+        vox = jnp.where(
+            ok,
+            sp.astype(jnp.int64) * np.int64(nt) + tb.astype(jnp.int64),
+            np.int64(dump),
+        )
+    counts = jnp.zeros(dump + 1, dtype=jnp.float32).at[vox].add(1.0)
+    return counts[:dump].reshape(M, n_pix, nt)
+
+
+def _fit_batch_impl(
+    tof_slab,
+    off_batch,
+    cuts_f32,
+    valid_batch,
+    r0_b,
+    c0_b,
+    pr_b,
+    pc_b,
+    vu_b,
+    vv_b,
+    cuv_b,
+    T_b,
+    b0_b,
+    real_b,
+    trunk,
+    eig_floor,
+    *,
+    nt,
+    half,
+    k_pad,
+):
+    """Fit a static batch of ``M`` images in parallel on GPU."""
+    import jax
+
+    N_batch = _scatter_batch_events(tof_slab, off_batch, cuts_f32, nt=nt)
+    single = partial(
+        _fit_from_counts_impl,
+        trunk=trunk,
+        eig_floor=eig_floor,
+        nt=nt,
+        half=half,
+        k_pad=k_pad,
+        truncate=False,
+    )
+    return jax.vmap(single)(
+        N_batch,
+        valid_batch,
+        r0_b,
+        c0_b,
+        pr_b,
+        pc_b,
+        vu_b,
+        vv_b,
+        cuv_b,
+        T_b,
+        b0_b,
+        real_b,
+    )
+
+
+def _fit_single_slab_impl(
+    tof_slab,
+    off_1d,
+    cuts_f32,
+    valid_px,
+    r0,
+    c0,
+    pr,
+    pc,
+    vu,
+    vv,
+    cuv,
+    T,
+    b0,
+    real,
+    trunk,
+    eig_floor,
+    *,
+    nt,
+    half,
+    k_pad,
+    truncate,
+):
+    """Single-image fallback for eigendecomposition truncation or dense overlaps."""
+    N_2d = _scatter_batch_events(tof_slab, off_1d[None, :], cuts_f32, nt=nt)[0]
+    return _fit_from_counts_impl(
+        N_2d,
+        valid_px,
+        r0,
+        c0,
+        pr,
+        pc,
+        vu,
+        vv,
+        cuv,
+        T,
+        b0,
+        real,
+        trunk,
+        eig_floor,
+        nt=nt,
+        half=half,
+        k_pad=k_pad,
+        truncate=truncate,
+    )
+
+
+def _fit_batch_fn(nt, half, k_pad, has_trunk):
+    key = ("batch", nt, half, k_pad, has_trunk)
     if key not in _JIT:
         from jax import jit
 
-        _JIT[key] = jit(partial(_fit_image_impl, nt=nt, half=half, truncate=truncate))
+        _JIT[key] = jit(partial(_fit_batch_impl, nt=nt, half=half, k_pad=k_pad))
     return _JIT[key]
 
 
-def _neighbour_list(r0, c0, b0, nb, half, n_pad):
-    """Padded (n_pad, K) list of reflections whose windows overlap, self first."""
-    from scipy.spatial import cKDTree
+def _fit_single_fn(nt, half, k_pad, truncate, has_trunk):
+    key = ("single", nt, half, k_pad, truncate, has_trunk)
+    if key not in _JIT:
+        from jax import jit
 
-    n = len(r0)
-    tree = cKDTree(np.stack([r0, c0], 1).astype(float))
-    pairs = tree.query_pairs(2 * half + 0.5, p=np.inf, output_type="ndarray")
-    pairs = pairs[np.abs(b0[pairs[:, 0]] - b0[pairs[:, 1]]) < nb]
-    src = np.concatenate([np.arange(n), pairs[:, 0], pairs[:, 1]])
-    dst = np.concatenate([np.arange(n), pairs[:, 1], pairs[:, 0]])
-    order = np.argsort(src, kind="stable")
-    src, dst = src[order], dst[order]
-    count = np.bincount(src, minlength=n)
-    k_pad = max(16, int(2 ** np.ceil(np.log2(count.max()))))
-    nbr = np.full((n_pad, k_pad), n_pad, dtype=np.int32)
-    slot = np.arange(len(src)) - np.repeat(np.cumsum(count) - count, count)
-    nbr[src, slot] = dst
-    return nbr
+        _JIT[key] = jit(
+            partial(
+                _fit_single_slab_impl,
+                nt=nt,
+                half=half,
+                k_pad=k_pad,
+                truncate=truncate,
+            )
+        )
+    return _JIT[key]
 
 
-def _pad(x, n_pad, fill=0):
-    out = np.full((n_pad, *x.shape[1:]), fill, dtype=x.dtype)
-    out[: len(x)] = x
-    return out
+def _choose_n_pad(max_n: int) -> int:
+    if max_n <= 512:
+        return max(16, 1 << int(np.ceil(np.log2(max(max_n, 1)))))
+    return -(-max_n // PEAK_QUANTUM) * PEAK_QUANTUM
+
+
+def _precompute_time_shares(
+    b0_all: np.ndarray,
+    lt: np.ndarray,
+    tof_lim_lo: np.ndarray,
+    tof_lim_hi: np.ndarray,
+    prof_l: np.ndarray,
+    prof_cdf: np.ndarray,
+    l0: float,
+    dl: float,
+    nt: int,
+    nb: int,
+) -> np.ndarray:
+    """Vectorised ``(n_peaks, nb)`` float32 profile time shares cut at band edges."""
+    n_peaks = len(b0_all)
+    T_all = np.empty((n_peaks, nb), dtype=np.float32)
+    bins = np.arange(nb + 1, dtype=np.int64)[None, :]
+    chunk = 65536
+    for lo in range(0, n_peaks, chunk):
+        hi = min(lo + chunk, n_peaks)
+        be = b0_all[lo:hi, None] + bins
+        t_edges = l0 + be * dl
+        cdf = np.interp(
+            t_edges - lt[lo:hi, None], prof_l, prof_cdf, left=0.0, right=1.0
+        )
+        lo_l = np.log(tof_lim_lo[lo:hi])[:, None]
+        hi_l = np.log(tof_lim_hi[lo:hi])[:, None]
+        inside = np.clip(
+            (np.minimum(t_edges[:, 1:], hi_l) - np.maximum(t_edges[:, :-1], lo_l)) / dl,
+            0.0,
+            1.0,
+        )
+        T_all[lo:hi] = (
+            np.diff(cdf, axis=1) * inside * ((be[:, :-1] >= 0) & (be[:, :-1] < nt))
+        ).astype(np.float32)
+    return T_all
 
 
 def integrate_reflections_tof_joint(
@@ -453,14 +697,15 @@ def integrate_reflections_tof_joint(
     )
     nt = int(np.ceil(np.log(t_span[1] / t_span[0]) / dl))
     nb = int(np.ceil((prof_l[-1] - prof_l[0]) / dl)) + 1
-    size = H * W * nt
+    n_pix = H * W
     sig_major = np.sqrt(np.maximum(var_us, var_vs))
     half = int(
         np.clip(np.ceil(SPOT_REACH * np.percentile(sig_major, 99)), MIN_HALF, MAX_HALF)
     )
 
+    has_trunk = profile not in (None, "gaussian", "auto")
     trunk = None
-    if profile not in (None, "gaussian", "auto"):
+    if has_trunk:
         import json
 
         with open(profile, encoding="utf-8") as fh:
@@ -472,11 +717,21 @@ def integrate_reflections_tof_joint(
             jnp.float32(np.trapezoid(f_ * u_, u_)),
         )
     eig_floor = 1.0 / max_variance_inflation if max_variance_inflation else 0.0
+    eig_floor_f32 = np.float32(eig_floor)
 
-    # Time bins of every reflection and the share of its profile in each,
-    # cut at the band edges.
+    # Precompute per-reflection coordinates and time-profile shares once on CPU.
     lt = np.log(tof_pred)
     b0_all = np.floor((lt + prof_l[0] - l0) / dl).astype(np.int64)
+    T_all = _precompute_time_shares(
+        b0_all, lt, tof_lim_lo, tof_lim_hi, prof_l, prof_cdf, l0, dl, nt, nb
+    )
+    r0_all = np.rint(rs).astype(np.int32)
+    c0_all = np.rint(cs).astype(np.int32)
+    rs_f32 = rs.astype(np.float32)
+    cs_f32 = cs.astype(np.float32)
+    b0_i32 = b0_all.astype(np.int32)
+    cuts_dev = jax.device_put(_bin_cutoffs_f32(l0, dl, nt))
+
     out = np.zeros((n_peaks, 5), dtype=np.float64)
     out[:, 1], out[:, 2] = rs, cs
     out[:, 3] = np.sqrt(np.sqrt(np.maximum(var_us * var_vs - cov_uvs**2, 1e-6)))
@@ -486,95 +741,342 @@ def integrate_reflections_tof_joint(
 
     order = np.argsort(frames, kind="stable")
     bounds = np.searchsorted(frames[order], np.arange(B + 1))
-    pbar = tqdm(
-        total=n_peaks, desc="Joint time-resolved fit", disable=not show_progress
-    )
-    for f in range(B):
-        ix = order[bounds[f] : bounds[f + 1]]
-        n = len(ix)
-        if n == 0:
-            continue
-        tof, off = reader(f)
-        tof = np.asarray(tof, dtype=np.float64)
-        tb = np.floor((np.log(np.maximum(tof, 1e-6)) - l0) / dl).astype(np.int64)
-        pix = np.repeat(np.arange(H * W, dtype=np.int64), np.diff(off))
-        ev = np.where((tb >= 0) & (tb < nt), pix * nt + tb, size).astype(np.int32)
-        ev_pad = np.full(
-            max(EVENT_QUANTUM, -(-len(ev) // EVENT_QUANTUM) * EVENT_QUANTUM),
-            size,
-            dtype=np.int32,
-        )
-        ev_pad[: len(ev)] = ev
+    frame_ix = [order[bounds[f] : bounds[f + 1]] for f in range(B)]
+    active_frames = [f for f in range(B) if len(frame_ix[f]) > 0]
 
-        b0 = b0_all[ix]
-        be = b0[:, None] + np.arange(nb + 1)[None, :]
-        t_edges = l0 + be * dl
-        cdf = np.interp(t_edges - lt[ix, None], prof_l, prof_cdf, left=0.0, right=1.0)
-        lo_l, hi_l = np.log(tof_lim_lo[ix])[:, None], np.log(tof_lim_hi[ix])[:, None]
-        # share of each bin inside the band, by linear interpolation of its edges
-        inside = np.clip(
-            (np.minimum(t_edges[:, 1:], hi_l) - np.maximum(t_edges[:, :-1], lo_l)) / dl,
-            0.0,
-            1.0,
+    if active_frames:
+        max_n = max(len(frame_ix[f]) for f in active_frames)
+        n_pad = _choose_n_pad(max_n)
+        k_pad = min(n_pad, DEFAULT_NBR_PAD)
+        p_win = (2 * half + 1) ** 2
+        per_img_bytes = max(
+            n_pix * nt * 8,
+            n_pad * k_pad * p_win * 16 + n_pad * n_pad * 16,
+            1,
         )
-        T = np.diff(cdf, axis=1) * inside * ((be[:, :-1] >= 0) & (be[:, :-1] < nt))
-
-        n_pad = -(-n // PEAK_QUANTUM) * PEAK_QUANTUM
-        r0 = np.rint(rs[ix]).astype(np.int32)
-        c0 = np.rint(cs[ix]).astype(np.int32)
-        nbr = _neighbour_list(r0, c0, b0, nb, half, n_pad)
-        real = np.zeros(n_pad, dtype=bool)
-        real[:n] = True
-        args = (
-            ev_pad,
-            static_valid[f],
-            _pad(r0, n_pad),
-            _pad(c0, n_pad),
-            _pad(rs[ix].astype(np.float32), n_pad),
-            _pad(cs[ix].astype(np.float32), n_pad),
-            _pad(var_us[ix], n_pad, 1.0),
-            _pad(var_vs[ix], n_pad, 1.0),
-            _pad(cov_uvs[ix], n_pad),
-            _pad(T.astype(np.float32), n_pad),
-            _pad(b0.astype(np.int32), n_pad),
-            real,
-            nbr,
-        )
-        dev = jax.device_put(args)
-        res = _fit_fn(nt, half, False, trunk is not None)(
-            *dev, trunk, np.float32(eig_floor)
-        )
-        amp, sig, infl, lev, dropped, active, bg_c = (np.asarray(r) for r in res)
-        fitted = active[:n]
-        bad = not np.all(np.isfinite(amp[:n][fitted])) or not np.all(
-            np.isfinite(sig[:n][fitted])
-        )
-        over = (
-            eig_floor > 0
-            and fitted.any()
-            and infl[:n][fitted].max() > max_variance_inflation
-        )
-        if bad or over:
-            # Some direction is not determined: leave it out instead of
-            # letting it set the amplitudes.
-            floor = eig_floor if eig_floor > 0 else 1e-6
-            res = _fit_fn(nt, half, True, trunk is not None)(
-                *dev, trunk, np.float32(floor)
+        batch_imgs = int(
+            np.clip(
+                TARGET_BATCH_VRAM_BYTES // per_img_bytes,
+                1,
+                min(MAX_BATCH_IMAGES, len(active_frames)),
             )
-            amp, sig, infl, lev, dropped, active, bg_c = (np.asarray(r) for r in res)
-            fitted = active[:n]
-            dropped_total += int(dropped)
-            redone += 1
-        keep = (
-            fitted & (lev[:n] < LEVERAGE_LIMIT) & np.isfinite(amp[:n]) & (sig[:n] > 0)
         )
-        flux = amp[:n] if allow_negative else np.maximum(amp[:n], 0.0)
-        out[ix, 0] = np.where(keep, flux, 0.0)
-        out[ix, 4] = np.where(keep, sig[:n], 0.0)
-        inflation[ix] = np.where(fitted, infl[:n], 0.0)
-        bg_out[ix] = bg_c[:n]
-        pbar.update(n)
-    pbar.close()
+
+        event_store = getattr(reader, "event_store", None)
+        frame_img_keys = getattr(reader, "frame_img_keys", None)
+        use_store = event_store is not None
+
+        if use_store:
+            img_ev_counts = [
+                event_store.image_event_count(
+                    int(frame_img_keys[f]) if frame_img_keys is not None else int(f)
+                )
+                for f in active_frames
+            ]
+        else:
+            img_ev_counts = [
+                max(int(np.rint(images_batch[f]).sum()), 0) for f in active_frames
+            ]
+        total_est_ev = int(sum(img_ev_counts))
+        max_single_ev = max(img_ev_counts) if img_ev_counts else 0
+        p95_ev = int(np.ceil(np.percentile(img_ev_counts, 95))) if img_ev_counts else 0
+        target_ev = min(
+            MAX_BATCH_EVENTS, max(DEFAULT_BATCH_EVENTS, p95_ev * batch_imgs)
+        )
+        if total_est_ev <= target_ev:
+            batch_ev_cap = max(1024, 1 << int(np.ceil(np.log2(max(total_est_ev, 1)))))
+        else:
+            batch_ev_cap = max(
+                target_ev,
+                1 << int(np.ceil(np.log2(max(max_single_ev, 1)))),
+            )
+            batch_ev_cap = 1 << int(np.ceil(np.log2(max(batch_ev_cap, 1))))
+
+        # Allocate ring-buffer slots so HDF5 decompression, H2D transfer, and GPU
+        # multi-image execution overlap continuously without host-device stalls.
+        slots = [
+            {
+                "tof": np.zeros(batch_ev_cap, dtype=np.float32),
+                "off": np.zeros((batch_imgs, n_pix + 1), dtype=np.int32),
+                "val": np.zeros((batch_imgs, H, W), dtype=np.float32),
+                "r0": np.zeros((batch_imgs, n_pad), dtype=np.int32),
+                "c0": np.zeros((batch_imgs, n_pad), dtype=np.int32),
+                "pr": np.zeros((batch_imgs, n_pad), dtype=np.float32),
+                "pc": np.zeros((batch_imgs, n_pad), dtype=np.float32),
+                "vu": np.ones((batch_imgs, n_pad), dtype=np.float32),
+                "vv": np.ones((batch_imgs, n_pad), dtype=np.float32),
+                "cuv": np.zeros((batch_imgs, n_pad), dtype=np.float32),
+                "T": np.zeros((batch_imgs, n_pad, nb), dtype=np.float32),
+                "b0": np.zeros((batch_imgs, n_pad), dtype=np.int32),
+                "real": np.zeros((batch_imgs, n_pad), dtype=bool),
+            }
+            for _ in range(PREFETCH_SLOTS)
+        ]
+
+        def _stage_peaks(buf, batch_frames):
+            buf["val"].fill(0.0)
+            buf["r0"].fill(0)
+            buf["c0"].fill(0)
+            buf["pr"].fill(0.0)
+            buf["pc"].fill(0.0)
+            buf["vu"].fill(1.0)
+            buf["vv"].fill(1.0)
+            buf["cuv"].fill(0.0)
+            buf["T"].fill(0.0)
+            buf["b0"].fill(0)
+            buf["real"].fill(False)
+            for i, f in enumerate(batch_frames):
+                ix = frame_ix[f]
+                n = len(ix)
+                buf["val"][i] = static_valid[f]
+                buf["r0"][i, :n] = r0_all[ix]
+                buf["c0"][i, :n] = c0_all[ix]
+                buf["pr"][i, :n] = rs_f32[ix]
+                buf["pc"][i, :n] = cs_f32[ix]
+                buf["vu"][i, :n] = var_us[ix]
+                buf["vv"][i, :n] = var_vs[ix]
+                buf["cuv"][i, :n] = cov_uvs[ix]
+                buf["T"][i, :n] = T_all[ix]
+                buf["b0"][i, :n] = b0_i32[ix]
+                buf["real"][i, :n] = True
+
+        def _iter_batches():
+            if use_store:
+                batches = []
+                cur = []
+                cur_ev = 0
+                for f, ev_f in zip(active_frames, img_ev_counts):
+                    if cur and (len(cur) >= batch_imgs or cur_ev + ev_f > batch_ev_cap):
+                        batches.append(cur)
+                        cur = []
+                        cur_ev = 0
+                    cur.append(int(f))
+                    cur_ev += ev_f
+                if cur:
+                    batches.append(cur)
+
+                def _load_store(b_idx: int):
+                    buf = slots[b_idx % PREFETCH_SLOTS]
+                    b_frames = batches[b_idx]
+                    m = len(b_frames)
+                    img_keys = [
+                        int(frame_img_keys[f]) if frame_img_keys is not None else f
+                        for f in b_frames
+                    ]
+                    _, _, total_ev = event_store.read_slab(
+                        img_keys,
+                        images_batch[b_frames],
+                        out_tof=buf["tof"],
+                        out_pix_offsets=buf["off"],
+                    )
+                    if m < batch_imgs:
+                        buf["off"][m:] = total_ev
+                    _stage_peaks(buf, b_frames)
+                    return b_frames, buf
+
+                n_batches = len(batches)
+                n_prefetch = min(2, n_batches)
+                with ThreadPoolExecutor(max_workers=n_prefetch) as pool:
+                    in_flight = [pool.submit(_load_store, k) for k in range(n_prefetch)]
+                    next_submit = n_prefetch
+                    while in_flight:
+                        res = in_flight.pop(0).result()
+                        if next_submit < n_batches:
+                            in_flight.append(pool.submit(_load_store, next_submit))
+                            next_submit += 1
+                        yield res
+                return
+
+            state = {"ptr": 0, "carry": None}
+
+            def _load_callable(slot_idx: int):
+                ptr = state["ptr"]
+                carry = state["carry"]
+                if ptr >= len(active_frames) and carry is None:
+                    return None
+                buf = slots[slot_idx]
+                tof_buf = buf["tof"]
+                off_buf = buf["off"]
+                b_frames = []
+                cursor = 0
+                while len(b_frames) < batch_imgs:
+                    if carry is not None:
+                        f_int, tof_f, off_f = carry
+                        carry = None
+                    elif ptr < len(active_frames):
+                        f_int = int(active_frames[ptr])
+                        ptr += 1
+                        tof_raw, off_raw = reader(f_int)
+                        tof_f = np.asarray(tof_raw, dtype=np.float32)
+                        off_f = np.asarray(off_raw, dtype=np.int64)
+                    else:
+                        break
+                    ev_f = len(tof_f)
+                    if b_frames and cursor + ev_f > len(tof_buf):
+                        carry = (f_int, tof_f, off_f)
+                        break
+                    if ev_f > len(tof_buf):
+                        cap_big = 1 << int(np.ceil(np.log2(ev_f)))
+                        tof_buf = np.zeros(cap_big, dtype=np.float32)
+                        buf["tof"] = tof_buf
+                    i = len(b_frames)
+                    if ev_f > 0:
+                        tof_buf[cursor : cursor + ev_f] = tof_f
+                    off_buf[i] = (off_f + cursor).astype(np.int32)
+                    b_frames.append(f_int)
+                    cursor += ev_f
+                if len(b_frames) < batch_imgs:
+                    off_buf[len(b_frames) :] = cursor
+                _stage_peaks(buf, b_frames)
+                state["ptr"] = ptr
+                state["carry"] = carry
+                return b_frames, buf
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                slot_idx = 0
+                fut = pool.submit(_load_callable, slot_idx)
+                while True:
+                    res = fut.result()
+                    if res is None:
+                        break
+                    slot_idx = (slot_idx + 1) % PREFETCH_SLOTS
+                    fut = pool.submit(_load_callable, slot_idx)
+                    yield res
+
+        batch_fn = _fit_batch_fn(nt, half, k_pad, has_trunk)
+        pbar = tqdm(
+            total=n_peaks, desc="Joint time-resolved fit", disable=not show_progress
+        )
+
+        def _launch_gpu(b_frames, buf):
+            dev_args = jax.device_put(
+                (
+                    buf["tof"],
+                    buf["off"],
+                    buf["val"],
+                    buf["r0"],
+                    buf["c0"],
+                    buf["pr"],
+                    buf["pc"],
+                    buf["vu"],
+                    buf["vv"],
+                    buf["cuv"],
+                    buf["T"],
+                    buf["b0"],
+                    buf["real"],
+                )
+            )
+            gpu_res = batch_fn(
+                dev_args[0],
+                dev_args[1],
+                cuts_dev,
+                *dev_args[2:],
+                trunk,
+                eig_floor_f32,
+            )
+            return b_frames, dev_args, gpu_res
+
+        def _retire_gpu(pending):
+            nonlocal dropped_total, redone
+            b_frames, dev_args, gpu_res = pending
+            (
+                amp_b,
+                sig_b,
+                infl_b,
+                lev_b,
+                _dropped_b,
+                active_b,
+                bg_b,
+                max_deg_b,
+            ) = jax.device_get(gpu_res)
+
+            for i, f in enumerate(b_frames):
+                ix = frame_ix[f]
+                n = len(ix)
+                amp_i = amp_b[i]
+                sig_i = sig_b[i]
+                infl_i = infl_b[i]
+                lev_i = lev_b[i]
+                active_i = active_b[i]
+                bg_i = bg_b[i]
+                k_req = k_pad
+
+                if int(max_deg_b[i]) > k_pad:
+                    k_req = min(n_pad, 1 << int(np.ceil(np.log2(int(max_deg_b[i])))))
+                    single_res = _fit_single_fn(nt, half, k_req, False, has_trunk)(
+                        dev_args[0],
+                        dev_args[1][i],
+                        cuts_dev,
+                        *(d[i] for d in dev_args[2:]),
+                        trunk,
+                        eig_floor_f32,
+                    )
+                    (
+                        amp_i,
+                        sig_i,
+                        infl_i,
+                        lev_i,
+                        _dropped_i,
+                        active_i,
+                        bg_i,
+                        _,
+                    ) = jax.device_get(single_res)
+
+                fitted = active_i[:n]
+                bad = not np.all(np.isfinite(amp_i[:n][fitted])) or not np.all(
+                    np.isfinite(sig_i[:n][fitted])
+                )
+                over = (
+                    eig_floor > 0
+                    and fitted.any()
+                    and infl_i[:n][fitted].max() > max_variance_inflation
+                )
+                if bad or over:
+                    floor = eig_floor if eig_floor > 0 else 1e-6
+                    trunc_res = _fit_single_fn(nt, half, k_req, True, has_trunk)(
+                        dev_args[0],
+                        dev_args[1][i],
+                        cuts_dev,
+                        *(d[i] for d in dev_args[2:]),
+                        trunk,
+                        np.float32(floor),
+                    )
+                    (
+                        amp_i,
+                        sig_i,
+                        infl_i,
+                        lev_i,
+                        dropped_i,
+                        active_i,
+                        bg_i,
+                        _,
+                    ) = jax.device_get(trunc_res)
+                    fitted = active_i[:n]
+                    dropped_total += int(dropped_i)
+                    redone += 1
+
+                keep = (
+                    fitted
+                    & (lev_i[:n] < LEVERAGE_LIMIT)
+                    & np.isfinite(amp_i[:n])
+                    & (sig_i[:n] > 0)
+                )
+                flux = amp_i[:n] if allow_negative else np.maximum(amp_i[:n], 0.0)
+                out[ix, 0] = np.where(keep, flux, 0.0)
+                out[ix, 4] = np.where(keep, sig_i[:n], 0.0)
+                inflation[ix] = np.where(fitted, infl_i[:n], 0.0)
+                bg_out[ix] = bg_i[:n]
+                pbar.update(n)
+
+        pending = None
+        for b_frames, buf in _iter_batches():
+            nxt = _launch_gpu(b_frames, buf)
+            if pending is not None:
+                _retire_gpu(pending)
+            pending = nxt
+        if pending is not None:
+            _retire_gpu(pending)
+        pbar.close()
 
     info["tof"] = tof_pred * (1.0 + 0.5 * (gate.lo + gate.hi))
     info["bg"] = bg_out

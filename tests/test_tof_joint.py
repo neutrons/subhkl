@@ -175,3 +175,132 @@ def test_joint_fit_with_a_given_gate_and_band_edge():
     assert abs(got[0] - 600.0) < 5.0 * sig[0] + 30.0
     assert abs(got[1] - 300.0) < 5.0 * sig[1] + 15.0
     assert sig[2] == 0.0
+
+
+def test_joint_fit_multi_image_event_store_matches_callable(tmp_path):
+    """Multi-image EventStore slab batching (spanning full + partial tail
+    batches and an empty image) matches the callable reader path."""
+    import h5py
+
+    from subhkl.io.events import EventStore, write_events
+
+    rng = np.random.default_rng(21)
+    n_imgs = 11  # exceeds MAX_BATCH_IMAGES=8 -> full batch + partial tail batch
+    shape = (64, 64)
+    band = (15000.0, 30000.0)
+    sigma_px, sigma_rel = 1.4, 0.002
+
+    images, tofs = [], []
+    frames, rs, cs, tpreds, truth_flux = [], [], [], [], []
+    for f in range(n_imgs):
+        peaks_f = []
+        if f != 5:  # leave one image without predicted reflections
+            for p in range(6):
+                r = 12.0 + 7.5 * p
+                c = 14.0 + 7.0 * ((p + f) % 6)
+                t = 16500.0 + 1800.0 * p
+                flx = float(300 + 80 * p)
+                peaks_f.append((r, c, t, flx))
+                frames.append(f)
+                rs.append(r)
+                cs.append(c)
+                tpreds.append(t)
+                truth_flux.append(flx)
+        im, tf = _events(rng, shape, band, 20.0, peaks_f, sigma_px, sigma_rel)
+        images.append(im)
+        tofs.append(tf)
+
+    images_arr = np.stack(images).astype(np.float32)
+    offsets = [np.concatenate([[0], np.cumsum(im.ravel())]) for im in images]
+    h5_path = tmp_path / "multi_events.h5"
+    with h5py.File(h5_path, "w") as hf:
+        hf.create_dataset("images", data=images_arr)
+        write_events(hf, tofs, l1=30.0)
+
+    n = len(frames)
+    var = np.full(n, sigma_px**2 + 1.0 / 12.0, dtype=np.float32)
+    common = {
+        "var_us": var,
+        "var_vs": var,
+        "cov_uvs": np.zeros(n, dtype=np.float32),
+        "gate": TofGate(lo=-0.01, hi=0.01),
+        "allow_negative": True,
+    }
+    args = (
+        images_arr,
+        np.array(frames, dtype=int),
+        np.array(rs),
+        np.array(cs),
+        np.array(tpreds),
+        np.full(n, band[0]),
+        np.full(n, band[1]),
+    )
+
+    rows_call, info_call = integrate_reflections_tof_joint(
+        args[0], lambda f: (tofs[f], offsets[f]), *args[1:], **common
+    )
+    with EventStore(h5_path) as store:
+        # Also verify non-contiguous + tail chunk reads match image_events bit-for-bit.
+        pick = [0, 3, 4, 10]
+        tof_slab, off_slab, total_ev = store.read_slab(pick, images_arr[pick])
+        cur = 0
+        for k, idx in enumerate(pick):
+            t_ref, o_ref = store.image_events(idx, images_arr[idx])
+            assert np.array_equal(tof_slab[cur : cur + len(t_ref)], t_ref)
+            assert np.array_equal(off_slab[k], o_ref + cur)
+            cur += len(t_ref)
+        assert cur == total_ev
+
+        def store_reader(f):
+            return store.image_events(int(f), images_arr[int(f)])
+
+        store_reader.event_store = store
+        rows_store, info_store = integrate_reflections_tof_joint(
+            args[0], store_reader, *args[1:], **common
+        )
+
+    np.testing.assert_allclose(rows_store, rows_call, rtol=1e-5, atol=1e-4)
+    np.testing.assert_allclose(info_store["bg"], info_call["bg"], rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_less(
+        np.abs(rows_store[:, 0] - np.array(truth_flux)),
+        5.0 * rows_store[:, 4] + 0.05 * np.array(truth_flux),
+    )
+
+
+def test_joint_fit_escalates_when_cluster_exceeds_default_nbr_pad():
+    """When more than DEFAULT_NBR_PAD reflections mutually overlap on one
+    image, the GPU neighbour cap escalates cleanly without dropping active
+    neighbours."""
+    from subhkl.search.tof_joint import DEFAULT_NBR_PAD
+
+    rng = np.random.default_rng(33)
+    band = (15000.0, 31000.0)
+    sigma_px, sigma_rel = 1.6, 0.002
+    n_cluster = DEFAULT_NBR_PAD + 6
+    cluster = [
+        (
+            32.0 + (i % 6 - 2.5) * 1.1,
+            32.0 + (i // 6 - 2.5) * 1.1,
+            21000.0 * (1.0 + 0.0025 * ((i % 7) - 3)),
+            250.0,
+        )
+        for i in range(n_cluster)
+    ]
+    isolated = [(12.0, 12.0, 17000.0, 700.0), (52.0, 52.0, 27000.0, 500.0)]
+    truth = cluster + isolated
+    image, tof = _events(rng, (64, 64), band, 25.0, truth, sigma_px, sigma_rel)
+    rows, _info = _integrate(
+        image,
+        tof,
+        truth,
+        band,
+        sigma_px,
+        gate=TofGate(lo=-0.008, hi=0.008),
+    )
+    assert np.all(np.isfinite(rows[:, 0]))
+    assert np.all(np.isfinite(rows[:, 4]))
+    # Total recovered cluster flux and isolated fluxes match truth.
+    cluster_sum = rows[:n_cluster, 0].sum()
+    assert abs(cluster_sum - 250.0 * n_cluster) < 0.15 * (250.0 * n_cluster)
+    assert abs(rows[-2, 0] - 700.0) < 5.0 * rows[-2, 4] + 35.0
+    assert abs(rows[-1, 0] - 500.0) < 5.0 * rows[-1, 4] + 25.0
