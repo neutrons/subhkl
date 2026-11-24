@@ -2103,13 +2103,13 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
 
     assert _get_instrument_default_wavelength("MANDI") == (2.0, 4.0)
     assert _get_instrument_default_wavelength("TOPAZ") == (0.4, 3.5)
-    assert _get_instrument_default_wavelength("CG4D") == (3.1, 4.3)
+    assert _get_instrument_default_wavelength("CG4D") == (2.8, 4.5)
     fresh_cg4d = SubhklGalaxyModel()
-    assert fresh_cg4d.data.wavelength_min == 3.1
-    assert fresh_cg4d.data.wavelength_max == 4.3
-    assert fresh_cg4d.data.d_min == 1.55
-    assert fresh_cg4d.payload["wavelength_range"] == [3.1, 4.3]
-    assert fresh_cg4d.payload["d_min"] == 1.55
+    assert fresh_cg4d.data.wavelength_min == 2.8
+    assert fresh_cg4d.data.wavelength_max == 4.5
+    assert fresh_cg4d.data.d_min == 1.4
+    assert fresh_cg4d.payload["wavelength_range"] == [2.8, 4.5]
+    assert fresh_cg4d.payload["d_min"] == 1.4
     assert 'id="wl-interval-slider"' in html_doc
     assert 'id="slider-wl-min"' in html_doc
     assert 'id="slider-wl-max"' in html_doc
@@ -12641,9 +12641,9 @@ def test_careless_merge_respects_dmin_and_stamps_extrapolated_asu_lookup(
 
 
 def test_cg4d_bandpass_single_slider_blue_alpha_overlap_and_snap(tmp_path):
-    """Verify CG4D [3.1, 4.3] Å default, deactivated Colorscale slider in Color: λ/Zone,
-    blue integrated WL band + alpha-modulated rainbow overlap on #wl-interval-slider,
-    magnetic [ ] edge snapping, and bivariate spot alpha/fill."""
+    """Verify CG4D [2.8, 4.5] Å wide default, active Colorscale Crossover in Color: λ/Zone,
+    quantile wavelength histogram + overlap visualization on #wl-interval-slider,
+    and magnetic [ ] edge snapping onto empirical [3.1, 4.3] Å bandpass."""
     import importlib.resources
     import math
     import re
@@ -12661,8 +12661,8 @@ def test_cg4d_bandpass_single_slider_blue_alpha_overlap_and_snap(tmp_path):
         .joinpath("reduction_settings.json")
         .read_text(encoding="utf-8")
     )
-    assert settings_data["CG4D"]["Wavelength"] == [3.1, 4.3]
-    assert _get_instrument_default_wavelength("CG4D") == (3.1, 4.3)
+    assert settings_data["CG4D"]["Wavelength"] == [2.8, 4.5]
+    assert _get_instrument_default_wavelength("CG4D") == (2.8, 4.5)
 
     # Synthetic wide-band [2.50, 5.00] Å predicted-peak integration on CG4D where
     # physical neutron bandpass is [3.10, 4.30] Å, contaminated in off-band wings by:

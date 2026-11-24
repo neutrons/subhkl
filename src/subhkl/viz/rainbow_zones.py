@@ -84,7 +84,7 @@ SPHERICAL_INSTRUMENTS = {"MANDI", "TOPAZ", "SNS_MANDI", "CORELLI"}
 
 _FALLBACK_INSTRUMENT_WAVELENGTHS: dict[str, tuple[float, float]] = {
     "IMAGINE": (2.0, 4.0),
-    "CG4D": (3.1, 4.3),
+    "CG4D": (2.8, 4.5),
     "SNAP": (1.0, 4.0),
     "CORELLI": (0.6, 2.5),
     "TOPAZ": (0.4, 3.5),
@@ -14176,7 +14176,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   const INSTRUMENT_WAVELENGTH_DEFAULTS = {{
     IMAGINE: [2.0, 4.0],
-    CG4D: [3.1, 4.3],
+    CG4D: [2.8, 4.5],
     SNAP: [1.0, 4.0],
     CORELLI: [0.6, 2.5],
     TOPAZ: [0.4, 3.5],
