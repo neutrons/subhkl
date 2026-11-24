@@ -1286,6 +1286,8 @@ def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str
         return "mtz"
     if base.endswith(".json"):
         return "json"
+    if base.endswith(".csv"):
+        return "csv"
     if base.endswith((".html", ".htm")):
         return "html"
     if base.endswith(".png"):
@@ -1298,6 +1300,14 @@ def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str
         return "dat"
     if base.endswith((".log", ".txt")):
         return "txt"
+    if base.endswith("_mtz") or base == "mtz":
+        return "mtz"
+    if base.endswith(("_json", "_ref")):
+        return "json"
+    if base.endswith("_csv"):
+        return "csv"
+    if base.endswith(("_html", "_htm")):
+        return "html"
     ext = str(raw_ext or "").strip().lower().lstrip(".")
     return ext or "data"
 
@@ -3429,7 +3439,7 @@ def _extract_from_h5(
         )
 
         merge_metrics: dict[str, Any] | None = None
-        if has_careless_peak_data:
+        if has_careless_peak_data or "careless/metrics_json" in f:
             if "careless/metrics_json" in f:
                 with contextlib.suppress(
                     OSError, RuntimeError, ValueError, TypeError, KeyError
@@ -3442,7 +3452,7 @@ def _extract_from_h5(
                         or doc_m.get("cc_half_bins")
                     ):
                         merge_metrics = _normalize_merge_metrics(doc_m)
-            if merge_metrics is None and "peaks" in f:
+            if merge_metrics is None and has_careless_peak_data and "peaks" in f:
                 sib_m = Path(h5_path).parent / "careless_metrics.json"
                 if sib_m.is_file():
                     with (
@@ -3462,7 +3472,10 @@ def _extract_from_h5(
         if var_u is not None and var_v is not None:
             artifact_kind = (
                 "merged_careless"
-                if (merge_metrics is not None and has_careless_peak_data)
+                if (
+                    merge_metrics is not None
+                    and (has_careless_peak_data or "careless/asu_hkl" in f)
+                )
                 else "integrator"
             )
             if len(var_u) > 0:
@@ -3486,6 +3499,10 @@ def _extract_from_h5(
             else:
                 is_iso = True
             peak_shape_mode = "isotropic_circle" if is_iso else "anisotropic_ellipse"
+        elif merge_metrics is not None and (
+            has_careless_peak_data or "careless/asu_hkl" in f
+        ):
+            artifact_kind = "merged_careless"
         elif "peaks/pixel_r" in f:
             artifact_kind = "finder"
             peak_shape_mode = "isotropic_circle"
@@ -27395,20 +27412,37 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   function startHydrationJobPoll(hJob) {{
     if (!hJob || !hJob.job_id) return;
-    if (galaxyBridge.hydratingJobId === hJob.job_id && galaxyBridge.hydratingPromise) {{
+    const hydClientId = String(hJob.client_job_id || hJob.job_id);
+    if (
+      (galaxyBridge.hydratingClientId === hydClientId || galaxyBridge.hydratingJobId === String(hJob.job_id)) &&
+      galaxyBridge.hydratingPromise
+    ) {{
       return galaxyBridge.hydratingPromise;
     }}
     if (galaxyBridge.pollTimer) {{
       clearInterval(galaxyBridge.pollTimer);
       galaxyBridge.pollTimer = null;
     }}
-    const hydJobId = String(hJob.job_id);
+    let hydJobId = String(hJob.job_id);
     galaxyBridge.hydratingJobId = hydJobId;
+    galaxyBridge.hydratingClientId = hydClientId;
+    const cellSummary = document.getElementById("cell-summary");
     state.runningStageIdx = 0;
     startStepStopwatch(
       "reduce",
       typeof hJob.elapsed_ms === "number" && hJob.elapsed_ms > 0 ? hJob.elapsed_ms : 0
     );
+    const syncHydrationHostDisplay = (rec) => {{
+      const rHost = (rec && rec.runner_host && String(rec.runner_host).trim())
+        ? String(rec.runner_host).trim().toUpperCase()
+        : ((String(`${{(rec && rec.stdout) || ""}}\n${{(rec && rec.stderr) || ""}}`).match(/\\[(?:pulsar|subhkl|careless)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
+      const hostTag = rHost || ((rec && rec.mode === "galaxy") ? "PULSAR" : "SUBHKL");
+      const stateTag = String((rec && rec.state) || "running").toUpperCase();
+      if (cellSummary) {{
+        cellSummary.textContent = `[${{hostTag}}] ${{stateTag}}`;
+      }}
+    }};
+    syncHydrationHostDisplay(hJob);
     renderPipeline();
     if (hJob.stdout || hJob.stderr) {{
       appendTerminalLog(
@@ -27417,9 +27451,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       );
     }}
     galaxyBridge.hydratingPromise = new Promise((resolveHyd) => {{
+      galaxyBridge.resolveHydrating = resolveHyd;
       let pollBusy = false;
       galaxyBridge.pollTimer = setInterval(async () => {{
-        if (galaxyBridge.hydratingJobId !== hydJobId) {{
+        if (galaxyBridge.hydratingClientId !== hydClientId) {{
           clearInterval(galaxyBridge.pollTimer);
           galaxyBridge.pollTimer = null;
           resolveHyd(false);
@@ -27443,18 +27478,41 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
             renderFilesDrawer();
           }}
           const aj = sdoc.active_job;
-          if (!aj || (aj.job_id && String(aj.job_id) !== hydJobId)) {{
+          const sameHydJob = Boolean(
+            aj &&
+            aj.hydrate_only &&
+            (
+              (aj.client_job_id && String(aj.client_job_id) === hydClientId) ||
+              String(aj.job_id || "") === hydJobId ||
+              hydJobId.startsWith("nova-")
+            )
+          );
+          if (!sameHydJob) {{
             clearInterval(galaxyBridge.pollTimer);
             galaxyBridge.pollTimer = null;
             galaxyBridge.hydratingJobId = null;
+            galaxyBridge.hydratingClientId = null;
             galaxyBridge.hydratingPromise = null;
-            if (state.runningStageIdx === 0) {{
+            if (
+              state.stepTimings &&
+              state.stepTimings.reduce &&
+              state.stepTimings.reduce.status === "running" &&
+              (!aj || aj.stage_id !== "reduce")
+            ) {{
+              finishStepStopwatch("reduce", "stopped");
+            }}
+            if (state.runningStageIdx === 0 && (!aj || aj.stage_id !== "reduce")) {{
               state.runningStageIdx = -1;
               renderPipeline();
             }}
             resolveHyd(true);
             return;
           }}
+          if (aj.job_id) {{
+            hydJobId = String(aj.job_id);
+            galaxyBridge.hydratingJobId = hydJobId;
+          }}
+          syncHydrationHostDisplay(aj);
           const outText = (aj.stdout || "") + (aj.stderr ? `\\n[stderr]\\n${{aj.stderr}}` : "");
           if (outText) appendTerminalLog(outText, true);
           const isCancelled = aj.state === "deleted" || Boolean(aj.cancel_requested);
@@ -27464,6 +27522,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
             clearInterval(galaxyBridge.pollTimer);
             galaxyBridge.pollTimer = null;
             galaxyBridge.hydratingJobId = null;
+            galaxyBridge.hydratingClientId = null;
             galaxyBridge.hydratingPromise = null;
             if (state.runningStageIdx === 0) {{
               state.runningStageIdx = -1;
@@ -27473,8 +27532,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
               finishedOk ? "done" : (isCancelled ? "stopped" : "error"),
               typeof aj.elapsed_ms === "number" ? aj.elapsed_ms : null
             );
+            if (cellSummary) {{
+              cellSummary.textContent = finishedOk ? "DONE" : (isCancelled ? "STOPPED" : "ERROR");
+            }}
             renderPipeline();
             if (finishedOk) {{
+              let reloadedHydrated = false;
               try {{
                 const pr = await fetch(
                   `api/payload?frame=${{curFrame}}&preserve_params=1${{getRenderBinningQuery()}}`,
@@ -27482,11 +27545,28 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
                 );
                 if (pr.ok) {{
                   const hydratedPayload = await pr.json();
+                  if (hydratedPayload && typeof hydratedPayload === "object") {{
+                    delete hydratedPayload.hydration_job;
+                  }}
                   if (hydratedPayload && (Array.isArray(hydratedPayload.panels) || Array.isArray(hydratedPayload.peaks))) {{
                     recomputeBoundsAndReload(hydratedPayload, {{ preserveParams: true }});
+                    reloadedHydrated = true;
                   }}
                 }}
               }} catch (_he) {{}}
+              if (reloadedHydrated) {{
+                setStatusLine(
+                  "[FRAMES HYDRATED]",
+                  "Detector image frames hydrated from raw NeXus — full 2D detector intensity view ready."
+                );
+              }}
+              probeGalaxyConnection();
+            }} else {{
+              const errDetail = escTxt(String(aj.error || (isCancelled ? "Hydration job stopped." : "Failed to hydrate detector frames.")));
+              setStatusLine(
+                isCancelled ? "[HYDRATION STOPPED]" : "[HYDRATION ERROR]",
+                `<span style="color:${{isCancelled ? "var(--accent-gold)" : "#f87171"}};">${{errDetail}}</span>`
+              );
             }}
             resolveHyd(finishedOk);
           }}
@@ -27599,7 +27679,13 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const stageId = st.stage_id || "solve";
     state.workflowRunSeq = (state.workflowRunSeq || 0) + 1;
     galaxyBridge.hydratingJobId = null;
+    galaxyBridge.hydratingClientId = null;
     galaxyBridge.hydratingPromise = null;
+    if (typeof galaxyBridge.resolveHydrating === "function") {{
+      const resFn = galaxyBridge.resolveHydrating;
+      galaxyBridge.resolveHydrating = null;
+      resFn(false);
+    }}
     if (galaxyBridge.pollTimer) {{
       clearInterval(galaxyBridge.pollTimer);
       galaxyBridge.pollTimer = null;
@@ -27868,8 +27954,19 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
                 );
               }}
               if (finishedOk) {{
-                const h5Outs = Array.isArray(aj.outputs)
-                  ? aj.outputs.filter(o => o && o.id && (!o.extension || o.extension === "h5" || o.extension === "hdf5"))
+                const h5Outs = stageId !== "merge" && Array.isArray(aj.outputs)
+                  ? aj.outputs.filter(o => {{
+                      if (!o || !o.id) return false;
+                      const ext = String(o.extension || "").toLowerCase();
+                      const nm = String(o.name || o.output_name || "").toLowerCase();
+                      if (
+                        nm.endsWith(".mtz") || nm.endsWith(".json") || nm.endsWith(".csv") || nm.endsWith(".html")
+                        || nm.includes("mtz") || nm.includes("metrics") || nm.includes("merge_table")
+                      ) {{
+                        return false;
+                      }}
+                      return !ext || ext === "h5" || ext === "hdf5";
+                    }})
                   : [];
                 if (selGalaxyH5 && h5Outs.length > 0) {{
                   selGalaxyH5.value = h5Outs[0].id;

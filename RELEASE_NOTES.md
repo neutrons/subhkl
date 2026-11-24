@@ -4,7 +4,7 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.7.3]
 
 ### Changed
 
@@ -35,6 +35,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     integrator takes about three minutes on one GPU.
   - The fit relies on the spot shape: with the nominal one-pixel spot
     (no `--anisotropic` shape fit) the 2.5–2.2 Å shell drops to 0.19.
+### Fixed
+
+- **Galaxy History derived-HDF5 (`...integrated.h5` / `...solve.h5`) background frame hydration completion (`rainbow_zones`, `nova_rainbow_view`, `nova_app`)**:
+  - Preserved a stable `client_job_id` across `submit_galaxy_stage`'s
+    placeholder `nova-<timestamp>` ID -> Galaxy/Pulsar `job_id` transition so
+    `startHydrationJobPoll` no longer aborts polling early while leaving the
+    Step 1 stopwatch running indefinitely.
+  - Kept hydration `work_dir` aligned with staged derived datasets (including
+    dot-suffixed `.integrated.h5` / `.solve.h5` names), surfaced live runner
+    host status during hydration, and cleared completed `hydration_job`
+    descriptors from cached `/api/payload` responses.
+
+## [1.7.2]
+
+### Fixed
+
+- **NDIP/Galaxy Stage 4 (`imaginex_subhkl_merge`) Careless output handling and UI completion (`nova_rainbow_view`, `rainbow_zones`, `nova_app`)**:
+  - Fixed a post-job `h5py.File` failure (`Unable to synchronously open file
+    (file signature not found)`) when `imaginex_subhkl_merge` completed on
+    Galaxy/Pulsar: `h5_outs` is now skipped completely on `stage_id == "merge"`,
+    and Galaxy output descriptors are normalized and reconciled against
+    `/api/jobs/{id}` without mislabeling non-HDF5 datasets (`metrics_json`,
+    `merge_table_csv`, `merge_table_html`, `*_mtz`) as `h5`.
+  - Materialized a local writable `integrated.h5` before stamping Careless
+    merge metrics and per-observation residuals so read-only shared `/scratch`
+    symlinks are never modified in place, supported both separate
+    `peaks/{h,k,l}` and packed `peaks/hkl` arrays during residual stamping, and
+    added state rollback guards if payload reload fails.
 
 ## [1.7.1]
 
@@ -48,13 +76,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     in Pro mode).
   - Implemented a two-phase `/api/pipeline/exit` lifecycle (`prepare` on modal
     open, `confirm` on **`CLOSE TAB`** / tab unload):
-    - In **Galaxy/NDIP** mode, `prepare` immediately sweeps Tier 1 staging and
-      Tier 2 shared intermediates (locally or via `imaginex_subhkl_cleanup_shared`)
-      while keeping the Trame/HTTP server alive so **`GO BACK`** restores the
-      previous step and hydrates reduced detector frames on the fly from Galaxy
-      History.
-    - In **Local** mode, intermediate file deletion is deferred until `confirm`
-      or process finalization so **`GO BACK`** preserves local state intact.
+  - In **Galaxy/NDIP** mode, `prepare` immediately sweeps Tier 1 staging and
+    Tier 2 shared intermediates (locally or via `imaginex_subhkl_cleanup_shared`)
+    while keeping the Trame/HTTP server alive so **`GO BACK`** restores the
+    previous step and hydrates reduced detector frames on the fly from Galaxy
+    History.
+  - In **Local** mode, intermediate file deletion is deferred until `confirm`
+    or process finalization so **`GO BACK`** preserves local state intact.
 - **Execution host reporting for Careless variational merge (`nova_rainbow_view`, `rainbow_zones`)**:
   - Surfaced the active execution host (`runner_host`, resolved from local
     container headers, `[pulsar] Runner host:` console output, or Galaxy
@@ -91,21 +119,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Separated intermediate and persistent data across three storage tiers so
     interactive `subhkl-nova-app` sessions release GPUs to job runners without
     moving multi-GB HDF5 files through Galaxy/Pulsar object-storage caches:
-    - **Tier 1 (`SUBHKL_STAGING_DIR` / `TMPDIR`)**: fast node-local NVMe scratch
-      for step-local work (`reduce-batch` per-run files, local HDF5 assembly,
-      and Careless scratch).
-    - **Tier 2 (`SUBHKL_SHARED_DIR`, mandatory when `SUBHKL_EXEC_MODE=galaxy`)**:
-      network filesystem exchanging compact `subhkl_shared_pointer/v1` JSON
-      sideband pointers (`--shared-pointer-out`) for large cross-step HDF5
-      artifacts (`merged.h5`, `predictor.h5`, `integrated.h5`), with automatic
-      `/proc/self/mountinfo` canonical network-path translation across
-      heterogeneous runner mounts (e.g. `/scratch` on `imaginex-{1,2}` vs.
-      `/gpfs/neutronsfs/scratch` on `analysis.sns.gov`) and deterministic
-      cleanup (`subhkl cleanup-shared` and app exit hooks).
-    - **Tier 3 (Galaxy Object Storage / History)**: persists thin crystallography
-      artifacts (`solve.h5`, `reflections.mtz`, `merged.mtz`, `xval.mtz`,
-      `careless_metrics.json`, `merge_table.{csv,html}`), reconstructing reduced
-      detector data on the fly when restarting from a History `solve.h5`.
+  - **Tier 1 (`SUBHKL_STAGING_DIR` / `TMPDIR`)**: fast node-local NVMe scratch
+    for step-local work (`reduce-batch` per-run files, local HDF5 assembly,
+    and Careless scratch).
+  - **Tier 2 (`SUBHKL_SHARED_DIR`, mandatory when `SUBHKL_EXEC_MODE=galaxy`)**:
+    network filesystem exchanging compact `subhkl_shared_pointer/v1` JSON
+    sideband pointers (`--shared-pointer-out`) for large cross-step HDF5
+    artifacts (`merged.h5`, `predictor.h5`, `integrated.h5`), with automatic
+    `/proc/self/mountinfo` canonical network-path translation across
+    heterogeneous runner mounts (e.g. `/scratch` on `imaginex-{1,2}` vs.
+    `/gpfs/neutronsfs/scratch` on `analysis.sns.gov`) and deterministic
+    cleanup (`subhkl cleanup-shared` and app exit hooks).
+  - **Tier 3 (Galaxy Object Storage / History)**: persists thin crystallography
+    artifacts (`solve.h5`, `reflections.mtz`, `merged.mtz`, `xval.mtz`,
+    `careless_metrics.json`, `merge_table.{csv,html}`), reconstructing reduced
+    detector data on the fly when restarting from a History `solve.h5`.
   - Hardened Tier 2 sideband publication for lockless/non-atomic NFS mounts:
     allocates fresh 128-bit UUIDv4 filenames (`subhkl_shared_<32hex>_<artifact>`)
     opened via `O_WRONLY | O_CREAT | O_EXCL` with zero pre-creation `stat`

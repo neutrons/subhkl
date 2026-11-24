@@ -706,6 +706,24 @@ class MainApp:
                             self.view_model.model.subhkl.payload,
                             frame_index=f_idx,
                         )
+                    cur_pl = self.view_model.model.subhkl.payload
+                    if not refreshed and "hydration_job" in cur_pl:
+                        aj_cur = self.pipeline_runner.active_job
+                        if (
+                            cur_pl.get("intensity_source") == "raw_h5"
+                            or not isinstance(aj_cur, dict)
+                            or not aj_cur.get("hydrate_only")
+                            or aj_cur.get("state") not in ("running", "queued", "new")
+                        ):
+                            cur_pl.pop("hydration_job", None)
+                        else:
+                            cur_pl["hydration_job"] = {
+                                **cur_pl["hydration_job"],
+                                "job_id": aj_cur.get("job_id"),
+                                "client_job_id": aj_cur.get("client_job_id")
+                                or aj_cur.get("job_id"),
+                                "state": aj_cur.get("state"),
+                            }
                     if fast_frame_only:
                         from subhkl.viz.rainbow_zones import build_frame_only_response
 
@@ -904,6 +922,10 @@ class MainApp:
                             data.wavelength_max = float(params["wavelength_max"])
                         if "d_min" in params:
                             data.d_min = float(params["d_min"])
+                    prev_frame = self.view_model.model.subhkl.frame_index
+                    prev_runner_frame = self.pipeline_runner.current_frame_index
+                    prev_images_file = self.view_model.model.subhkl.data.images_file
+                    prev_peaks_file = self.view_model.model.subhkl.data.peaks_file
                     if is_reduce_out:
                         self.view_model.model.subhkl.frame_index = 0
                         self.pipeline_runner.current_frame_index = 0
@@ -914,10 +936,17 @@ class MainApp:
                             self.pipeline_runner.current_frame_index or 0
                         )
                         self.view_model.model.subhkl.data.peaks_file = new_h5_path
-                    self.view_model.model.subhkl.refresh_payload(
-                        frame_index=self.view_model.model.subhkl.frame_index,
-                        preserve_params=not is_reduce_out,
-                    )
+                    try:
+                        self.view_model.model.subhkl.refresh_payload(
+                            frame_index=self.view_model.model.subhkl.frame_index,
+                            preserve_params=not is_reduce_out,
+                        )
+                    except Exception:
+                        self.view_model.model.subhkl.frame_index = prev_frame
+                        self.pipeline_runner.current_frame_index = prev_runner_frame
+                        self.view_model.model.subhkl.data.images_file = prev_images_file
+                        self.view_model.model.subhkl.data.peaks_file = prev_peaks_file
+                        raise
 
             try:
                 res = self.pipeline_runner.submit_galaxy_stage(

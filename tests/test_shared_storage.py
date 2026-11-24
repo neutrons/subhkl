@@ -1412,3 +1412,661 @@ def test_careless_merge_reports_runner_host_local_and_galaxy(
         job_rec["stdout"]
     )
     assert "[pulsar] Runner host: gpu-worker-07" in str(job_rec["stdout"])
+
+
+def test_galaxy_careless_merge_completes_without_h5_signature_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: NDIP ``imaginex_subhkl_merge`` must not feed ``metrics_json`` to ``h5py.File``."""
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        infer_dataset_extension,
+        render_rainbow_html,
+    )
+
+    assert infer_dataset_extension("merge_table.csv", None) == "csv"
+    assert infer_dataset_extension("merge_table_csv", None) == "csv"
+    assert infer_dataset_extension("metrics_json", None) == "json"
+    assert infer_dataset_extension("merged_mtz", None) == "mtz"
+
+    html = render_rainbow_html(
+        {
+            "instrument": "CG4D",
+            "space_group": "I a -3 d",
+            "peaks": [],
+            "zones": [],
+            "panels": [],
+        }
+    )
+    assert 'stageId !== "merge" && Array.isArray(aj.outputs)' in html
+
+    # Build a read-only shared integrated.h5 and symlink it into work_dir/integrated.h5
+    shared_ro_dir = tmp_path / "shared_ro"
+    shared_ro_dir.mkdir()
+    shared_int_h5 = shared_ro_dir / "integrated_shared.h5"
+    with h5py.File(shared_int_h5, "w") as hf:
+        hf["instrument"] = b"CG4D"
+        hf["wavelengths"] = np.array([2.0, 4.0], dtype=np.float64)
+        sgrp = hf.create_group("sample")
+        sgrp["space_group"] = b"I a -3 d"
+        sgrp["cell"] = np.array(
+            [11.93, 11.93, 11.93, 90.0, 90.0, 90.0], dtype=np.float64
+        )
+        sgrp["B"] = np.diag([1.0 / 11.93, 1.0 / 11.93, 1.0 / 11.93])
+        sgrp["U"] = np.eye(3, dtype=np.float64)
+        ggrp = hf.create_group("goniometer")
+        ggrp["R"] = np.eye(3, dtype=np.float64)[None, :, :]
+        pgrp = hf.create_group("peaks")
+        pgrp["xyz"] = np.array([[0.25, 0.0, -1.0], [0.0, 0.25, -1.0]], dtype=np.float64)
+        pgrp["h"] = np.array([2, 0], dtype=np.int32)
+        pgrp["k"] = np.array([0, 2], dtype=np.int32)
+        pgrp["l"] = np.array([0, 0], dtype=np.int32)
+        pgrp["intensity"] = np.array([120.0, 95.0], dtype=np.float64)
+        pgrp["sigma"] = np.array([6.0, 5.0], dtype=np.float64)
+        pgrp["run_index"] = np.array([0, 0], dtype=np.int32)
+        pgrp["wavelength"] = np.array([2.4, 2.8], dtype=np.float64)
+        pgrp["two_theta"] = np.array([0.35, 0.35], dtype=np.float64)
+        pgrp["azimuthal"] = np.array([0.0, 1.57], dtype=np.float64)
+        pgrp["var_u"] = np.array([2.25, 2.25], dtype=np.float64)
+        pgrp["var_v"] = np.array([2.25, 2.25], dtype=np.float64)
+    shared_int_h5.chmod(0o444)
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    work_int_h5 = work_dir / "integrated.h5"
+    work_int_h5.symlink_to(shared_int_h5)
+
+    # Create valid minimal MTZ binaries via gemmi for merged.mtz, predictions.mtz, xval.mtz
+    mtz_build_dir = tmp_path / "mtz_src"
+    mtz_build_dir.mkdir()
+
+    def _make_merged_mtz(dest: Path) -> bytes:
+        mtz = gemmi.Mtz(with_base=True)
+        mtz.spacegroup = gemmi.find_spacegroup_by_name("I a -3 d")
+        mtz.set_cell_for_all(gemmi.UnitCell(11.93, 11.93, 11.93, 90, 90, 90))
+        mtz.add_dataset("crystal")
+        mtz.add_column("I", "J")
+        mtz.add_column("SigI", "Q")
+        mtz.add_column("N", "I")
+        mtz.set_data(
+            np.array(
+                [
+                    [2.0, 0.0, 0.0, 118.0, 5.5, 2.0],
+                    [0.0, 2.0, 0.0, 96.0, 5.0, 2.0],
+                ],
+                dtype=np.float32,
+            )
+        )
+        mtz.write_to_file(str(dest))
+        return dest.read_bytes()
+
+    def _make_pred_mtz(dest: Path) -> bytes:
+        mtz = gemmi.Mtz(with_base=True)
+        mtz.spacegroup = gemmi.find_spacegroup_by_name("I a -3 d")
+        mtz.set_cell_for_all(gemmi.UnitCell(11.93, 11.93, 11.93, 90, 90, 90))
+        mtz.add_dataset("crystal")
+        for lbl, ctype in (
+            ("Batch", "B"),
+            ("Iobs", "J"),
+            ("SigIobs", "Q"),
+            ("Ipred", "J"),
+            ("SigIpred", "Q"),
+            ("Scale", "R"),
+        ):
+            mtz.add_column(lbl, ctype)
+        mtz.set_data(
+            np.array(
+                [
+                    [2.0, 0.0, 0.0, 1.0, 120.0, 6.0, 117.5, 5.2, 1.02],
+                    [0.0, 2.0, 0.0, 1.0, 95.0, 5.0, 96.2, 4.8, 0.99],
+                ],
+                dtype=np.float32,
+            )
+        )
+        mtz.write_to_file(str(dest))
+        return dest.read_bytes()
+
+    merged_bytes = _make_merged_mtz(mtz_build_dir / "merged.mtz")
+    pred_bytes = _make_pred_mtz(mtz_build_dir / "predictions.mtz")
+    xval_bytes = merged_bytes
+    metrics_payload = {
+        "cc_half": 0.964,
+        "cc_pred": 0.981,
+        "r_pim": 0.042,
+        "r_meas": 0.061,
+        "i_over_sigma": 18.5,
+        "completeness": 0.945,
+        "multiplicity": 4.2,
+        "n_unique": 2,
+        "n_observations": 2,
+    }
+    metrics_bytes = json.dumps(metrics_payload).encode("utf-8")
+    csv_bytes = b"shell,d_max,d_min,cc_half\nall,10.0,1.0,0.964\n"
+    html_bytes = b"<html><body><table><tr><td>CC1/2</td><td>0.964</td></tr></table></body></html>"
+
+    dataset_blobs = {
+        "ds_merged": merged_bytes,
+        "ds_pred": pred_bytes,
+        "ds_xval": xval_bytes,
+        "ds_metrics": metrics_bytes,
+        "ds_csv": csv_bytes,
+        "ds_html": html_bytes,
+    }
+
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://galaxy.example.org",
+        galaxy_api_key="fake-api-key",
+        history_id="6644e5c0e8a790e1",
+    )
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    monkeypatch.setattr(runner, "_upload_compact_ndip_artifact", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner, "get_datastore", lambda *_a, **_k: object())
+
+    # Simulate Galaxy's run_tool response where file_ext can be empty or 'json'
+    raw_run_tool_outputs = [
+        {
+            "id": "ds_merged",
+            "output_name": "merged_mtz",
+            "name": "merged.mtz",
+            "file_ext": "",
+        },
+        {
+            "id": "ds_pred",
+            "output_name": "predictions_mtz",
+            "name": "predictions.mtz",
+            "file_ext": "mtz",
+        },
+        {
+            "id": "ds_xval",
+            "output_name": "xval_mtz",
+            "name": "xval.mtz",
+            "file_ext": "mtz",
+        },
+        {
+            "id": "ds_metrics",
+            "output_name": "metrics_json",
+            "name": "careless_metrics.json",
+            "file_ext": "json",
+        },
+        {
+            "id": "ds_csv",
+            "output_name": "merge_table_csv",
+            "name": "merge_table.csv",
+            "file_ext": "",
+        },
+        {
+            "id": "ds_html",
+            "output_name": "merge_table_html",
+            "name": "merge_table.html",
+            "file_ext": "html",
+        },
+    ]
+    norm_outputs = runner._normalize_galaxy_job_outputs(
+        raw_run_tool_outputs, stage_id="merge"
+    )
+    assert [o["extension"] for o in norm_outputs] == [
+        "mtz",
+        "mtz",
+        "mtz",
+        "json",
+        "csv",
+        "html",
+    ]
+
+    def _fake_api(
+        method: str, path: str, payload: object = None, **kwargs: object
+    ) -> object:
+        _ = (method, payload)
+        if kwargs.get("raw"):
+            for dsid, blob in dataset_blobs.items():
+                if f"/api/datasets/{dsid}/display" in path:
+                    return blob
+            raise AssertionError(f"Unexpected raw dataset request: {path}")
+        if "/console_output" in path:
+            return {
+                "stdout": "[pulsar] Runner host: IMAGINEX-2\nCareless version 0.5.4\n",
+                "stderr": "Merging repeat 1 half 2: 100%\n",
+            }
+        if path.startswith("/api/jobs/"):
+            return {
+                "state": "ok",
+                "command_line": "careless poly ...",
+                "outputs": {
+                    "merged_mtz": {"id": "ds_merged", "src": "hda"},
+                    "predictions_mtz": {"id": "ds_pred", "src": "hda"},
+                    "xval_mtz": {"id": "ds_xval", "src": "hda"},
+                    "metrics_json": {"id": "ds_metrics", "src": "hda"},
+                    "merge_table_csv": {"id": "ds_csv", "src": "hda"},
+                    "merge_table_html": {"id": "ds_html", "src": "hda"},
+                },
+            }
+        return {}
+
+    monkeypatch.setattr(runner, "_api_request", _fake_api)
+
+    completed_paths: list[str] = []
+    reloaded_payloads: list[dict[str, object]] = []
+
+    def _on_complete(h5_path: str) -> None:
+        completed_paths.append(h5_path)
+        reloaded_payloads.append(
+            build_rainbow_zone_payload(replay_h5=h5_path, frame_index=0)
+        )
+
+    job_rec: dict[str, object] = {
+        "job_id": "5af8bc9400aa8f53",
+        "stage_id": "merge",
+        "mode": "galaxy",
+        "state": "running",
+        "stdout": "[galaxy -> pulsar] Dispatched imaginex_subhkl_merge (Galaxy job_id=5af8bc9400aa8f53) -> Pulsar GPU queue\n",
+        "stderr": "",
+        "outputs": norm_outputs,
+        "params": {
+            "instrument": "CG4D",
+            "space_group": "I a -3 d",
+            "cell": [11.93, 11.93, 11.93, 90.0, 90.0, 90.0],
+            "wavelength_range": [2.0, 4.0],
+            "d_min": 1.0,
+            "peaks_file": str(work_int_h5),
+        },
+    }
+
+    runner._poll_galaxy_job(
+        job_rec,
+        on_complete_h5=_on_complete,
+        final_step=True,
+        work_dir=str(work_dir),
+    )
+
+    stdout_txt = str(job_rec["stdout"])
+    assert "Warning fetching job output" not in stdout_txt
+    assert "file signature not found" not in stdout_txt
+    assert job_rec["state"] == "ok"
+    assert job_rec["runner_host"] == "IMAGINEX-2"
+    assert job_rec.get("updated_payload_ready") is True
+    assert job_rec.get("output_h5_path") == str(work_int_h5)
+    assert completed_paths == [str(work_int_h5)]
+
+    # All 6 Careless artifacts must be downloaded into work_dir
+    for fname in (
+        "merged.mtz",
+        "predictions.mtz",
+        "xval.mtz",
+        "careless_metrics.json",
+        "merge_table.csv",
+        "merge_table.html",
+    ):
+        assert (work_dir / fname).is_file(), f"Missing {fname} in {work_dir}"
+
+    # Read-only shared target must remain untouched while work_dir/integrated.h5 is materialized & stamped
+    assert not work_int_h5.is_symlink()
+    with h5py.File(shared_int_h5, "r") as hf_ro:
+        assert "careless" not in hf_ro
+    with h5py.File(work_int_h5, "r") as hf_stamped:
+        assert "careless/metrics_json" in hf_stamped
+
+    assert len(reloaded_payloads) == 1
+    payload = reloaded_payloads[0]
+    assert payload["artifact_kind"] == "merged_careless"
+    assert isinstance(payload.get("merge_metrics"), dict)
+    assert payload["merge_metrics"]["cc_half"] == pytest.approx(0.964)
+    assert payload["merge_metrics"]["r_pim"] == pytest.approx(0.042)
+
+
+def test_galaxy_history_integrated_h5_hydrate_reduce_completes_across_job_id_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening ``...integrated.h5`` from Galaxy History must poll hydration through ``nova-<ts>`` -> Galaxy ``job_id`` transition and stop the timer."""
+    import re
+    import shutil
+    import subprocess
+    import threading
+    from types import SimpleNamespace
+
+    from subhkl.io.shared_storage import (
+        allocate_shared_artifact_path,
+        write_shared_pointer,
+    )
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import _discover_images_h5, render_rainbow_html
+
+    nvme_dir = tmp_path / "nvme_staging"
+    shared_dir = tmp_path / "shared_scratch"
+    nvme_dir.mkdir()
+    shared_dir.mkdir()
+    monkeypatch.setenv("SUBHKL_EXEC_MODE", "galaxy")
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(nvme_dir))
+    monkeypatch.setenv("SUBHKL_SHARED_DIR", str(shared_dir))
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    # 1. Create a dot-suffixed History dataset `CG4D_2638.integrated.h5` whose raw NeXus lives only on remote /HFIR
+    gx_dl_int = nvme_dir / "subhkl_gx_deadbeef_CG4D_2638.integrated.h5"
+    dt_str = h5py.string_dtype(encoding="utf-8")
+    with h5py.File(gx_dl_int, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf.create_dataset(
+            "source_files",
+            data=np.array(
+                ["/HFIR/CG4D/IPTS-37331/nexus/CG4D_2638.nxs.h5"], dtype=object
+            ),
+            dtype=dt_str,
+        )
+        hf.create_dataset("instrument/wavelength", data=np.array([2.0, 4.0]))
+        hf.create_dataset(
+            "sample/cell", data=np.array([11.93, 11.93, 11.93, 90.0, 90.0, 90.0])
+        )
+        hf.create_dataset("sample/space_group", data=b"I a -3 d")
+        hf.create_dataset("sample/U", data=np.eye(3))
+        hf.create_dataset(
+            "sample/B", data=np.diag([1.0 / 11.93, 1.0 / 11.93, 1.0 / 11.93])
+        )
+        hf.create_dataset("goniometer/R", data=np.eye(3)[None, ...])
+        pgrp = hf.create_group("peaks")
+        pgrp["xyz"] = np.array([[0.25, 0.0, -1.0]], dtype=np.float64)
+        pgrp["hkl"] = np.array([[2, 0, 0]], dtype=np.int32)
+        pgrp["intensity"] = np.array([120.0], dtype=np.float64)
+        pgrp["sigma"] = np.array([6.0], dtype=np.float64)
+        pgrp["run_index"] = np.array([0], dtype=np.int32)
+        pgrp["wavelength"] = np.array([2.4], dtype=np.float64)
+
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://galaxy.example.org",
+        galaxy_api_key="fake-api-key",
+        history_id="6644e5c0e8a790e1",
+    )
+
+    # Dot-suffixed `.integrated.h5` must resolve cleanly to `subhkl_work_CG4D_2638`
+    work_d, staged_int = runner.stage_derived_h5_in_work_dir(
+        str(gx_dl_int), name_hint="CG4D_2638.integrated.h5"
+    )
+    assert os.path.basename(work_d) == "subhkl_work_CG4D_2638"
+    assert os.path.abspath(staged_int) == os.path.abspath(
+        os.path.join(work_d, "integrated.h5")
+    )
+
+    # Prepare shared merged.h5 + scan_ref.json pointer returned by imaginex_subhkl_prepare_peaks
+    shared_merged_local, _ = allocate_shared_artifact_path("merged.h5", tag="CG4D_2638")
+    with h5py.File(shared_merged_local, "w") as mhf:
+        mhf.attrs["instrument"] = "CG4D"
+        mhf.create_dataset("images", data=np.ones((1, 8, 8), dtype=np.float32))
+    scan_ptr_file = tmp_path / "scan_ref.json"
+    write_shared_pointer(
+        scan_ptr_file,
+        shared_merged_local,
+        artifact="merged.h5",
+        metadata={
+            "instrument": "CG4D",
+            "source_files": ["/HFIR/CG4D/IPTS-37331/nexus/CG4D_2638.nxs.h5"],
+        },
+    )
+
+    dispatch_ready = threading.Event()
+    allow_dispatch_proceed = threading.Event()
+
+    class _FakeTools:
+        def run_tool(
+            self, history_id: str, tool_id: str, tool_inputs: dict[str, object]
+        ):
+            _ = (history_id, tool_inputs)
+            assert tool_id == "imaginex_subhkl_prepare_peaks"
+            dispatch_ready.set()
+            allow_dispatch_proceed.wait(timeout=5.0)
+            return {
+                "jobs": [{"id": "86783c5f32a38590"}],
+                "outputs": [
+                    {
+                        "id": "ds_scan_ptr_hyd",
+                        "output_name": "output",
+                        "name": "scan_ref.json",
+                        "file_ext": "json",
+                    }
+                ],
+            }
+
+    fake_store = SimpleNamespace(
+        history_id="6644e5c0e8a790e1",
+        nova_connection=SimpleNamespace(
+            galaxy_instance=SimpleNamespace(tools=_FakeTools())
+        ),
+    )
+    monkeypatch.setattr(runner, "get_datastore", lambda *_a, **_k: fake_store)
+    monkeypatch.setattr(runner, "_has_tool_on_galaxy", lambda _tid: True)
+    monkeypatch.setattr(
+        runner,
+        "browse_oncat_catalog",
+        lambda _p: {"runs": [{"run": 2638}]},
+    )
+
+    def _fake_api(
+        method: str, path: str, payload: object = None, **kwargs: object
+    ) -> object:
+        _ = (method, payload)
+        if kwargs.get("raw") and "/api/datasets/ds_scan_ptr_hyd/display" in path:
+            return scan_ptr_file.read_bytes()
+        if "/console_output" in path:
+            return {
+                "stdout": "[pulsar] Runner host: IMAGINEX-2\nSaved 55 banks\n",
+                "stderr": "",
+            }
+        if path.startswith("/api/jobs/86783c5f32a38590"):
+            return {
+                "state": "ok",
+                "command_line": "subhkl prepare-peaks ...",
+                "outputs": {"output": {"id": "ds_scan_ptr_hyd", "src": "hda"}},
+            }
+        return {}
+
+    monkeypatch.setattr(runner, "_api_request", _fake_api)
+
+    refreshed_calls: list[tuple[int, bool, str]] = []
+    vm_data = SimpleNamespace(peaks_file=staged_int, images_file="")
+    vm = SimpleNamespace(
+        data=vm_data,
+        frame_index=0,
+        payload={"intensity_source": "synthetic", "panels": [], "peaks": []},
+        refresh_payload=lambda frame_index=0, preserve_params=True: (
+            refreshed_calls.append(
+                (int(frame_index), bool(preserve_params), str(vm_data.images_file))
+            ),
+            vm.payload.update({"intensity_source": "raw_h5"}),
+        ),
+    )
+    vm_lock = threading.RLock()
+
+    hyd_doc = runner._maybe_trigger_hydrate_reduce(
+        vm, vm_lock, staged_int, ds_info={"name": "CG4D_2638.integrated.h5"}
+    )
+    assert hyd_doc is not None
+    initial_job_id = str(hyd_doc["job_id"])
+    initial_client_id = str(hyd_doc["client_job_id"])
+    assert initial_job_id.startswith("nova-")
+    assert initial_client_id == initial_job_id
+    assert hyd_doc["hydrate_only"] is True
+
+    assert dispatch_ready.wait(timeout=5.0)
+    allow_dispatch_proceed.set()
+
+    # Wait for background Galaxy hydration thread to finish
+    for _ in range(100):
+        aj_now = runner.active_job
+        if isinstance(aj_now, dict) and aj_now.get("state") in ("ok", "error"):
+            break
+        threading.Event().wait(0.02)
+
+    aj_final = runner.active_job
+    assert isinstance(aj_final, dict)
+    assert aj_final["state"] == "ok"
+    assert aj_final["job_id"] == "86783c5f32a38590"
+    assert aj_final["client_job_id"] == initial_client_id
+    assert len(refreshed_calls) == 1
+    assert os.path.isfile(vm_data.images_file)
+    assert os.path.dirname(os.path.abspath(vm_data.images_file)) == os.path.abspath(
+        work_d
+    )
+    assert _discover_images_h5(staged_int) is not None
+
+    # 2. Execute the actual rendered `startHydrationJobPoll` JS across `nova-<ts>` -> `86783c5f32a38590` -> `ok`
+    node_bin = shutil.which("node")
+    assert node_bin is not None
+    html = render_rainbow_html(
+        {
+            "instrument": "CG4D",
+            "space_group": "I a -3 d",
+            "peaks": [],
+            "zones": [],
+            "panels": [],
+        }
+    )
+    m_fn = re.search(
+        r"(function startHydrationJobPoll\(hJob\)\s*\{.*?\n  \})\n\n  async function probeGalaxyConnection",
+        html,
+        flags=re.DOTALL,
+    )
+    assert m_fn is not None, (
+        "Could not extract startHydrationJobPoll from rendered HTML"
+    )
+    fn_src = m_fn.group(1)
+
+    js_harness = f"""
+const logs = [];
+const statusLines = [];
+const cellEl = {{ textContent: "" }};
+const document = {{ getElementById: (id) => (id === "cell-summary" ? cellEl : null) }};
+const state = {{
+  runningStageIdx: -1,
+  selectedFrameIndex: 0,
+  stepTimings: {{ reduce: {{ status: "idle", elapsedMs: 0 }} }},
+}};
+const DATA = {{ frame_index: 0 }};
+const galaxyBridge = {{
+  pollTimer: null,
+  hydratingJobId: null,
+  hydratingClientId: null,
+  hydratingPromise: null,
+  resolveHydrating: null,
+  datasets: [],
+  stepArtifacts: null,
+}};
+let finishArgs = null;
+let reloadedArgs = null;
+let probed = 0;
+function startStepStopwatch(stage, ms) {{
+  state.stepTimings[stage] = {{ status: "running", elapsedMs: ms || 0 }};
+}}
+function finishStepStopwatch(stage, status, ms) {{
+  state.stepTimings[stage] = {{ status, elapsedMs: ms }};
+  finishArgs = {{ stage, status, ms }};
+}}
+function renderPipeline() {{}}
+function appendTerminalLog(txt) {{ logs.push(txt); }}
+function populateGalaxyH5Selector() {{}}
+function renderFilesDrawer() {{}}
+function getRenderBinningQuery() {{ return "&render_binning=4"; }}
+function recomputeBoundsAndReload(pl, opts) {{ reloadedArgs = {{ pl, opts }}; }}
+function setStatusLine(tag, body) {{ statusLines.push({{ tag, body }}); }}
+function probeGalaxyConnection() {{ probed += 1; }}
+function escTxt(s) {{ return String(s); }}
+
+let statusCall = 0;
+async function fetch(url) {{
+  if (url.startsWith("api/pipeline/status")) {{
+    statusCall += 1;
+    if (statusCall === 1) {{
+      return {{
+        ok: true,
+        json: async () => ({{
+          active_job: {{
+            job_id: "86783c5f32a38590",
+            client_job_id: "nova-1795472980",
+            hydrate_only: true,
+            mode: "galaxy",
+            state: "running",
+            runner_host: "IMAGINEX-2",
+            stdout: "[pulsar] Runner host: IMAGINEX-2\\nReducing...",
+            stderr: "",
+          }},
+        }}),
+      }};
+    }}
+    return {{
+      ok: true,
+      json: async () => ({{
+        active_job: {{
+          job_id: "86783c5f32a38590",
+          client_job_id: "nova-1795472980",
+          hydrate_only: true,
+          mode: "galaxy",
+          state: "ok",
+          runner_host: "IMAGINEX-2",
+          elapsed_ms: 4320,
+          stdout: "[pulsar] Runner host: IMAGINEX-2\\nSaved 55 banks",
+          stderr: "",
+        }},
+      }}),
+    }};
+  }}
+  if (url.startsWith("api/payload")) {{
+    return {{
+      ok: true,
+      json: async () => ({{
+        intensity_source: "raw_h5",
+        panels: [{{ bank: 1 }}],
+        peaks: [{{ h: 2, k: 0, l: 0 }}],
+        hydration_job: {{ job_id: "stale" }},
+      }}),
+    }};
+  }}
+  throw new Error("Unexpected URL: " + url);
+}}
+
+const _origSetInterval = globalThis.setInterval;
+globalThis.setInterval = (fn, _ms) => _origSetInterval(fn, 10);
+
+{fn_src}
+
+(async () => {{
+  const ok = await startHydrationJobPoll({{
+    job_id: "nova-1795472980",
+    client_job_id: "nova-1795472980",
+    mode: "galaxy",
+    state: "queued",
+    hydrate_only: true,
+    n_runs: 1,
+  }});
+  console.log(JSON.stringify({{
+    ok,
+    statusCall,
+    runningStageIdx: state.runningStageIdx,
+    stepTiming: state.stepTimings.reduce,
+    finishArgs,
+    cellText: cellEl.textContent,
+    hasHydrationJobInReload: Boolean(reloadedArgs && reloadedArgs.pl && reloadedArgs.pl.hydration_job),
+    reloadedIntensity: reloadedArgs && reloadedArgs.pl && reloadedArgs.pl.intensity_source,
+    lastStatusTag: statusLines.length ? statusLines[statusLines.length - 1].tag : "",
+    probed,
+  }}));
+}})();
+"""
+    proc = subprocess.run(
+        [node_bin, "-e", js_harness],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
+    js_res = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert js_res["ok"] is True
+    assert js_res["statusCall"] == 2
+    assert js_res["runningStageIdx"] == -1
+    assert js_res["stepTiming"] == {"status": "done", "elapsedMs": 4320}
+    assert js_res["finishArgs"] == {"stage": "reduce", "status": "done", "ms": 4320}
+    assert js_res["cellText"] == "DONE"
+    assert js_res["hasHydrationJobInReload"] is False
+    assert js_res["reloadedIntensity"] == "raw_h5"
+    assert js_res["lastStatusTag"] == "[FRAMES HYDRATED]"
+    assert js_res["probed"] == 1

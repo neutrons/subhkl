@@ -2980,7 +2980,7 @@ class NovaGalaxyPipelineRunner:
                                 tag = m_wd.group(1)
                             else:
                                 src_bn = _re.sub(
-                                    r"(_merged|_solve|_integrated|_predictor)?\.(h5|hdf5|dat)$",
+                                    r"([._](?:merged|solve|integrated|integrator|predictor))?\.(h5|hdf5|dat)$",
                                     "",
                                     os.path.basename(src_str),
                                     flags=_re.IGNORECASE,
@@ -2995,7 +2995,7 @@ class NovaGalaxyPipelineRunner:
                                     tag = src_bn
         if not tag:
             bn = _re.sub(
-                r"(_merged|_solve|_integrated|_integrator|_predictor)?\.(h5|hdf5|dat)$",
+                r"([._](?:merged|solve|integrated|integrator|predictor))?\.(h5|hdf5|dat)$",
                 "",
                 clean_bn,
                 flags=_re.IGNORECASE,
@@ -4007,8 +4007,10 @@ class NovaGalaxyPipelineRunner:
         if not self._is_local_staging_mode():
             self.require_shared_dir_for_galaxy_mode()
 
+        init_job_id = f"nova-{int(time.time())}"
         job_record: dict[str, Any] = {
-            "job_id": f"nova-{int(time.time())}",
+            "job_id": init_job_id,
+            "client_job_id": init_job_id,
             "tool_id": self.STAGE_TOOLS[stage_id][0],
             "stage_id": stage_id,
             "mode": "galaxy",
@@ -4673,6 +4675,8 @@ class NovaGalaxyPipelineRunner:
             ) == os.path.abspath(work_d):
                 return {
                     "job_id": aj.get("job_id"),
+                    "client_job_id": aj.get("client_job_id") or aj.get("job_id"),
+                    "mode": aj.get("mode"),
                     "state": aj.get("state"),
                     "n_runs": int(aj.get("n_runs") or len(recipe["nexus_files"])),
                     "hydrate_only": True,
@@ -4744,11 +4748,250 @@ class NovaGalaxyPipelineRunner:
                 )
             return {
                 "job_id": job_rec.get("job_id"),
+                "client_job_id": job_rec.get("client_job_id") or job_rec.get("job_id"),
+                "mode": job_rec.get("mode"),
                 "state": job_rec.get("state", "running"),
                 "n_runs": len(recipe["nexus_files"]),
                 "hydrate_only": True,
             }
         return None
+
+    def _normalize_galaxy_job_outputs(
+        self,
+        raw_outputs: list[Any],
+        stage_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Normalize Galaxy ``run_tool`` output descriptors without mislabeling non-HDF5 datasets as ``h5``."""
+        from subhkl.viz.rainbow_zones import infer_dataset_extension
+
+        norm: list[dict[str, Any]] = []
+        st_low = str(stage_id or "").strip().lower()
+        for d in raw_outputs or []:
+            if not isinstance(d, dict):
+                continue
+            out_name = str(d.get("output_name") or "").strip()
+            label = str(d.get("name") or "").strip()
+            primary_name = out_name or label
+            raw_ext = d.get("file_ext") or d.get("extension")
+            ext = infer_dataset_extension(label or out_name, raw_ext)
+            if ext == "data" and out_name and out_name != label:
+                ext = infer_dataset_extension(out_name, raw_ext)
+            if ext == "data" and not raw_ext and st_low != "merge":
+                ext = "h5"
+            norm.append(
+                {
+                    "id": d.get("id"),
+                    "name": primary_name,
+                    "output_name": out_name or primary_name,
+                    "label": label or primary_name,
+                    "extension": ext,
+                }
+            )
+        return norm
+
+    def _reconcile_galaxy_job_outputs(
+        self,
+        current_outputs: list[Any],
+        jinfo_outputs: Any,
+        stage_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Merge ``/api/jobs/{id}`` output-name mappings into ``job_record['outputs']``."""
+        from subhkl.viz.rainbow_zones import infer_dataset_extension
+
+        st_low = str(stage_id or "").strip().lower()
+        merged: list[dict[str, Any]] = []
+        by_id: dict[str, dict[str, Any]] = {}
+        for item in current_outputs or []:
+            if not isinstance(item, dict):
+                continue
+            entry = dict(item)
+            oid = str(entry.get("id") or "").strip()
+            nm = str(
+                entry.get("label")
+                or entry.get("name")
+                or entry.get("output_name")
+                or ""
+            ).strip()
+            raw_ext = entry.get("extension")
+            if (
+                st_low == "merge"
+                and raw_ext == "h5"
+                and not nm.lower().endswith((".h5", ".hdf5"))
+            ):
+                raw_ext = None
+            inferred = infer_dataset_extension(nm, raw_ext)
+            if inferred == "data" and entry.get("output_name"):
+                inferred = infer_dataset_extension(
+                    str(entry.get("output_name")), raw_ext
+                )
+            if inferred != "data" or not raw_ext:
+                entry["extension"] = (
+                    "h5"
+                    if (inferred == "data" and not raw_ext and st_low != "merge")
+                    else inferred
+                )
+            merged.append(entry)
+            if oid:
+                by_id[oid] = entry
+
+        if isinstance(jinfo_outputs, dict):
+            for out_key, out_val in jinfo_outputs.items():
+                if not isinstance(out_val, dict):
+                    continue
+                oid = str(out_val.get("id") or "").strip()
+                key_s = str(out_key or "").strip()
+                if not oid or not key_s:
+                    continue
+                key_ext = infer_dataset_extension(key_s, None)
+                if oid in by_id:
+                    existing = by_id[oid]
+                    if not existing.get("output_name"):
+                        existing["output_name"] = key_s
+                    if not existing.get("name"):
+                        existing["name"] = key_s
+                    cur_ext = str(existing.get("extension") or "").lower()
+                    if key_ext != "data" and (
+                        cur_ext in ("", "data", "auto", "binary")
+                        or (st_low == "merge" and cur_ext == "h5")
+                    ):
+                        existing["extension"] = key_ext
+                else:
+                    ext_new = (
+                        "h5" if (key_ext == "data" and st_low != "merge") else key_ext
+                    )
+                    new_entry = {
+                        "id": oid,
+                        "name": key_s,
+                        "output_name": key_s,
+                        "label": key_s,
+                        "extension": ext_new,
+                    }
+                    merged.append(new_entry)
+                    by_id[oid] = new_entry
+        return merged
+
+    @staticmethod
+    def _match_careless_merge_output_name(out_d: dict[str, Any]) -> str | None:
+        """Map a Galaxy ``imaginex_subhkl_merge`` output descriptor to its canonical local filename."""
+        candidates = [
+            str(out_d.get("output_name") or "").strip().lower(),
+            str(out_d.get("label") or "").strip().lower(),
+            str(out_d.get("name") or "").strip().lower(),
+        ]
+        exact_map = {
+            "merged_mtz": "merged.mtz",
+            "merged.mtz": "merged.mtz",
+            "predictions_mtz": "predictions.mtz",
+            "predictions.mtz": "predictions.mtz",
+            "xval_mtz": "xval.mtz",
+            "xval.mtz": "xval.mtz",
+            "metrics_json": "careless_metrics.json",
+            "careless_metrics_json": "careless_metrics.json",
+            "careless_metrics.json": "careless_metrics.json",
+            "merge_table_csv": "merge_table.csv",
+            "merge_table.csv": "merge_table.csv",
+            "merge_table_html": "merge_table.html",
+            "merge_table.html": "merge_table.html",
+        }
+        for tok in candidates:
+            if tok in exact_map:
+                return exact_map[tok]
+        for tok in candidates:
+            if not tok:
+                continue
+            if "careless_metrics" in tok or tok.endswith("metrics_json"):
+                return "careless_metrics.json"
+            for canon in (
+                "merged.mtz",
+                "predictions.mtz",
+                "xval.mtz",
+                "merge_table.csv",
+                "merge_table.html",
+            ):
+                if canon in tok or canon.replace(".", "_") in tok:
+                    return canon
+        return None
+
+    def _prepare_writable_merge_h5_target(
+        self,
+        work_dir: str,
+        job_record: dict[str, Any],
+    ) -> str | None:
+        """Ensure ``work_dir/integrated.h5`` is a local writable HDF5 file before Careless stamping."""
+        import shutil as _shutil
+
+        int_target = os.path.join(work_dir, "integrated.h5")
+        if os.path.islink(int_target) and not os.path.isfile(int_target):
+            with contextlib.suppress(OSError):
+                os.unlink(int_target)
+
+        params = job_record.get("params") or {}
+        if not os.path.isfile(int_target):
+            for cand in (
+                os.path.join(work_dir, "integrator.h5"),
+                str(params.get("peaks_file") or ""),
+                os.path.join(work_dir, "solve.h5"),
+            ):
+                if (
+                    cand
+                    and os.path.isfile(cand)
+                    and not cand.lower().endswith(
+                        (".mtz", ".json", ".csv", ".html", ".txt", ".log")
+                    )
+                ):
+                    with contextlib.suppress(OSError):
+                        _shutil.copy2(os.path.realpath(cand), int_target)
+                        _chmod_world_rw(int_target, is_dir=False)
+                        break
+
+        if os.path.isfile(int_target) and (
+            os.path.islink(int_target) or not os.access(int_target, os.W_OK)
+        ):
+            src_real = os.path.realpath(int_target)
+            tmp_int = os.path.join(work_dir, f".integrated_merge_{os.getpid()}.h5.tmp")
+            try:
+                _shutil.copy2(src_real, tmp_int)
+                _chmod_world_rw(tmp_int, is_dir=False)
+                os.replace(tmp_int, int_target)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    if os.path.exists(tmp_int):
+                        os.unlink(tmp_int)
+
+        if not os.path.isfile(int_target):
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py
+                import numpy as np
+
+                inst_s = str(params.get("instrument") or "CG4D")
+                sg_s = str(params.get("space_group") or "P 1")
+                cell_raw = params.get("cell") or [10.0, 10.0, 10.0, 90.0, 90.0, 90.0]
+                wl_raw = params.get("wavelength_range") or [1.0, 4.5]
+                merged_mtz_p = os.path.join(work_dir, "merged.mtz")
+                if os.path.isfile(merged_mtz_p):
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                        import gemmi
+
+                        mtz_c = gemmi.read_mtz_file(merged_mtz_p)
+                        cell_raw = [
+                            float(mtz_c.cell.a),
+                            float(mtz_c.cell.b),
+                            float(mtz_c.cell.c),
+                            float(mtz_c.cell.alpha),
+                            float(mtz_c.cell.beta),
+                            float(mtz_c.cell.gamma),
+                        ]
+                        if mtz_c.spacegroup is not None:
+                            sg_s = mtz_c.spacegroup.xhm()
+                with h5py.File(int_target, "w") as hf:
+                    hf["instrument"] = inst_s.encode("utf-8")
+                    hf["wavelengths"] = np.asarray(wl_raw, dtype=np.float64)
+                    sg_grp = hf.require_group("sample")
+                    sg_grp["space_group"] = sg_s.encode("utf-8")
+                    sg_grp["cell"] = np.asarray(cell_raw, dtype=np.float64)
+                _chmod_world_rw(int_target, is_dir=False)
+
+        return int_target if os.path.isfile(int_target) else None
 
     def _stamp_careless_merge_into_h5(
         self,
@@ -5049,141 +5292,148 @@ class NovaGalaxyPipelineRunner:
                 data=np.bytes_(metrics_raw.encode("utf-8")),
             )
 
+            merged_map: dict[tuple[int, int, int], tuple[float, float]] = {}
+            if os.path.isfile(merged_mtz_path):
+                mtz_m = gemmi.read_mtz_file(merged_mtz_path)
+                mcols = {c.label: np.array(c, dtype=np.float64) for c in mtz_m.columns}
+                mI = mcols.get("I", mcols.get("I(+)", np.zeros(mtz_m.nreflections)))
+                mS = mcols.get(
+                    "SIGI",
+                    mcols.get(
+                        "SigI",
+                        mcols.get(
+                            "SIGI(+)",
+                            mcols.get("SigI(+)", np.ones(mtz_m.nreflections)),
+                        ),
+                    ),
+                )
+                for j in range(mtz_m.nreflections):
+                    mkey = (
+                        int(mcols["H"][j]),
+                        int(mcols["K"][j]),
+                        int(mcols["L"][j]),
+                    )
+                    merged_map[mkey] = (float(mI[j]), float(mS[j]))
+                if merged_map:
+                    asu_keys_arr = np.asarray(list(merged_map.keys()), dtype=np.int32)
+                    asu_i_arr = np.asarray(
+                        [v[0] for v in merged_map.values()], dtype=np.float64
+                    )
+                    asu_sigi_arr = np.asarray(
+                        [v[1] for v in merged_map.values()], dtype=np.float64
+                    )
+                    for c_ds_name, c_arr in (
+                        ("asu_hkl", asu_keys_arr),
+                        ("merged_i", asu_i_arr),
+                        ("merged_sigi", asu_sigi_arr),
+                    ):
+                        if c_ds_name in cgrp:
+                            del cgrp[c_ds_name]
+                        cgrp.create_dataset(c_ds_name, data=c_arr)
+
             if "peaks" in hf and os.path.isfile(pred_mtz_path):
                 pgrp = hf["peaks"]
-                ph = np.asarray(pgrp["h"][()], dtype=int)
-                pk = np.asarray(pgrp["k"][()], dtype=int)
-                pl = np.asarray(pgrp["l"][()], dtype=int)
-                pI = np.asarray(pgrp["intensity"][()], dtype=float)
-                pS = np.asarray(pgrp["sigma"][()], dtype=float)
-                n_peaks = len(ph)
+                ph: Any = None
+                pk: Any = None
+                pl: Any = None
+                if all(k in pgrp for k in ("h", "k", "l")):
+                    ph = np.asarray(pgrp["h"][()], dtype=int)
+                    pk = np.asarray(pgrp["k"][()], dtype=int)
+                    pl = np.asarray(pgrp["l"][()], dtype=int)
+                elif "hkl" in pgrp:
+                    hkl_mat = np.asarray(pgrp["hkl"][()], dtype=int)
+                    if hkl_mat.ndim == 2 and hkl_mat.shape[1] >= 3:
+                        ph, pk, pl = hkl_mat[:, 0], hkl_mat[:, 1], hkl_mat[:, 2]
+                if ph is not None and "intensity" in pgrp and "sigma" in pgrp:
+                    pI = np.asarray(pgrp["intensity"][()], dtype=float)
+                    pS = np.asarray(pgrp["sigma"][()], dtype=float)
+                    n_peaks = len(ph)
 
-                mtz_pred = gemmi.read_mtz_file(pred_mtz_path)
-                sg = mtz_pred.spacegroup or gemmi.find_spacegroup_by_name("P 1")
-                asu = gemmi.ReciprocalAsu(sg)
-                ops = sg.operations()
-                pcols = {
-                    c.label: np.array(c, dtype=np.float64) for c in mtz_pred.columns
-                }
-                pred_map: dict[
-                    tuple[int, int, int],
-                    list[tuple[float, float, float, float, float]],
-                ] = {}
-                # Pull the columns out once.  Looking them up per row with an
-                # array-valued default allocated five full-length arrays on
-                # every iteration: quadratic, ~3 ms per row, most of an hour
-                # for a million observations.
-                n_pred = mtz_pred.nreflections
-                pred_cols = [
-                    pcols.get(name, np.full(n_pred, default)).tolist()
-                    for name, default in (
-                        ("Iobs", 0.0),
-                        ("SigIobs", 1.0),
-                        ("Ipred", 0.0),
-                        ("SigIpred", 1.0),
-                        ("Scale", 1.0),
-                    )
-                ]
-                pred_keys = zip(
-                    pcols["H"].astype(int).tolist(),
-                    pcols["K"].astype(int).tolist(),
-                    pcols["L"].astype(int).tolist(),
-                )
-                for key, row in zip(pred_keys, zip(*pred_cols)):
-                    pred_map.setdefault(key, []).append(row)
-
-                merged_map: dict[tuple[int, int, int], tuple[float, float]] = {}
-                if os.path.isfile(merged_mtz_path):
-                    mtz_m = gemmi.read_mtz_file(merged_mtz_path)
-                    mcols = {
-                        c.label: np.array(c, dtype=np.float64) for c in mtz_m.columns
+                    mtz_pred = gemmi.read_mtz_file(pred_mtz_path)
+                    sg = mtz_pred.spacegroup or gemmi.find_spacegroup_by_name("P 1")
+                    asu = gemmi.ReciprocalAsu(sg)
+                    ops = sg.operations()
+                    pcols = {
+                        c.label: np.array(c, dtype=np.float64) for c in mtz_pred.columns
                     }
-                    mI = mcols.get("I", mcols.get("I(+)", np.zeros(mtz_m.nreflections)))
-                    mS = mcols.get(
-                        "SIGI",
-                        mcols.get(
-                            "SigI",
-                            mcols.get(
-                                "SIGI(+)",
-                                mcols.get("SigI(+)", np.ones(mtz_m.nreflections)),
-                            ),
-                        ),
+                    pred_map: dict[
+                        tuple[int, int, int],
+                        list[tuple[float, float, float, float, float]],
+                    ] = {}
+                    # Pull the columns out once.  Looking them up per row with an
+                    # array-valued default allocated five full-length arrays on
+                    # every iteration: quadratic, ~3 ms per row, most of an hour
+                    # for a million observations.
+                    n_pred = mtz_pred.nreflections
+                    pred_cols = [
+                        pcols.get(name, np.full(n_pred, default)).tolist()
+                        for name, default in (
+                            ("Iobs", 0.0),
+                            ("SigIobs", 1.0),
+                            ("Ipred", 0.0),
+                            ("SigIpred", 1.0),
+                            ("Scale", 1.0),
+                        )
+                    ]
+                    pred_keys = zip(
+                        pcols["H"].astype(int).tolist(),
+                        pcols["K"].astype(int).tolist(),
+                        pcols["L"].astype(int).tolist(),
                     )
-                    for j in range(mtz_m.nreflections):
-                        mkey = (
-                            int(mcols["H"][j]),
-                            int(mcols["K"][j]),
-                            int(mcols["L"][j]),
-                        )
-                        merged_map[mkey] = (float(mI[j]), float(mS[j]))
-                    # Persist full merged ASU lookup (including Bayesian-extrapolated
-                    # harmonics when d_min < d_{min,integrated}) under /careless.
-                    if merged_map:
-                        asu_keys_arr = np.asarray(
-                            list(merged_map.keys()), dtype=np.int32
-                        )
-                        asu_i_arr = np.asarray(
-                            [v[0] for v in merged_map.values()], dtype=np.float64
-                        )
-                        asu_sigi_arr = np.asarray(
-                            [v[1] for v in merged_map.values()], dtype=np.float64
-                        )
-                        for c_ds_name, c_arr in (
-                            ("asu_hkl", asu_keys_arr),
-                            ("merged_i", asu_i_arr),
-                            ("merged_sigi", asu_sigi_arr),
-                        ):
-                            if c_ds_name in cgrp:
-                                del cgrp[c_ds_name]
-                            cgrp.create_dataset(c_ds_name, data=c_arr)
+                    for key, row in zip(pred_keys, zip(*pred_cols)):
+                        pred_map.setdefault(key, []).append(row)
 
-                residuals = np.full(n_peaks, np.nan, dtype=np.float64)
-                scales = np.full(n_peaks, np.nan, dtype=np.float64)
-                ipreds = np.full(n_peaks, np.nan, dtype=np.float64)
-                merged_i = np.full(n_peaks, np.nan, dtype=np.float64)
-                merged_sigi = np.full(n_peaks, np.nan, dtype=np.float64)
-                asu_hkl_arr = np.zeros((n_peaks, 3), dtype=np.int32)
+                    residuals = np.full(n_peaks, np.nan, dtype=np.float64)
+                    scales = np.full(n_peaks, np.nan, dtype=np.float64)
+                    ipreds = np.full(n_peaks, np.nan, dtype=np.float64)
+                    merged_i = np.full(n_peaks, np.nan, dtype=np.float64)
+                    merged_sigi = np.full(n_peaks, np.nan, dtype=np.float64)
+                    asu_hkl_arr = np.zeros((n_peaks, 3), dtype=np.int32)
 
-                for i in range(n_peaks):
-                    h_asu, _ = asu.to_asu([int(ph[i]), int(pk[i]), int(pl[i])], ops)
-                    key = (int(h_asu[0]), int(h_asu[1]), int(h_asu[2]))
-                    asu_hkl_arr[i] = key
-                    if key in merged_map:
-                        merged_i[i], merged_sigi[i] = merged_map[key]
-                    cands = pred_map.get(key)
-                    if cands:
-                        best = min(
-                            cands,
-                            key=lambda c: abs(c[0] - pI[i]) + abs(c[1] - pS[i]),
-                        )
-                        iobs, sigiobs, ipred, sigipred, scale = best
-                        sig_o = (
-                            float(sigiobs)
-                            if np.isfinite(sigiobs) and sigiobs > 0.0
-                            else 0.0
-                        )
-                        sig_p = (
-                            float(sigipred)
-                            if np.isfinite(sigipred) and sigipred > 0.0
-                            else 0.0
-                        )
-                        denom = float(np.hypot(sig_o, 0.5 * sig_p))
-                        if denom > 1e-6 and np.isfinite(iobs) and np.isfinite(ipred):
-                            residuals[i] = (iobs - ipred) / denom
-                        scales[i] = scale
-                        ipreds[i] = ipred
+                    for i in range(n_peaks):
+                        h_asu, _ = asu.to_asu([int(ph[i]), int(pk[i]), int(pl[i])], ops)
+                        key = (int(h_asu[0]), int(h_asu[1]), int(h_asu[2]))
+                        asu_hkl_arr[i] = key
+                        if key in merged_map:
+                            merged_i[i], merged_sigi[i] = merged_map[key]
+                        cands = pred_map.get(key)
+                        if cands:
+                            best = min(
+                                cands,
+                                key=lambda c: abs(c[0] - pI[i]) + abs(c[1] - pS[i]),
+                            )
+                            iobs, sigiobs, ipred, sigipred, scale = best
+                            sig_o = (
+                                float(sigiobs)
+                                if np.isfinite(sigiobs) and sigiobs > 0.0
+                                else 0.0
+                            )
+                            sig_p = (
+                                float(sigipred)
+                                if np.isfinite(sigipred) and sigipred > 0.0
+                                else 0.0
+                            )
+                            denom = float(np.hypot(sig_o, 0.5 * sig_p))
+                            if (
+                                denom > 1e-6
+                                and np.isfinite(iobs)
+                                and np.isfinite(ipred)
+                            ):
+                                residuals[i] = (iobs - ipred) / denom
+                            scales[i] = scale
+                            ipreds[i] = ipred
 
-                for ds_name, arr in (
-                    ("careless_residual", residuals),
-                    ("careless_scale", scales),
-                    ("careless_ipred", ipreds),
-                    ("merged_i", merged_i),
-                    ("merged_sigi", merged_sigi),
-                    ("asu_hkl", asu_hkl_arr),
-                ):
-                    if ds_name in pgrp:
-                        del pgrp[ds_name]
-                    pgrp.create_dataset(ds_name, data=arr)
+                    for ds_name, arr in (
+                        ("careless_residual", residuals),
+                        ("careless_scale", scales),
+                        ("careless_ipred", ipreds),
+                        ("merged_i", merged_i),
+                        ("merged_sigi", merged_sigi),
+                        ("asu_hkl", asu_hkl_arr),
+                    ):
+                        if ds_name in pgrp:
+                            del pgrp[ds_name]
+                        pgrp.create_dataset(ds_name, data=arr)
 
         if metrics_doc:
             cc_val = metrics_doc.get("cc_half")
@@ -5677,6 +5927,9 @@ class NovaGalaxyPipelineRunner:
                     str(params.get("peaks_file"))
                 )
                 merged_path = ""
+            elif params.get("work_dir") and os.path.isdir(str(params.get("work_dir"))):
+                work_dir = os.path.abspath(str(params.get("work_dir")))
+                merged_path = ""
             else:
                 work_dir, merged_path = (_get_staging_root(), "")
             if not params.get("hydrate_only"):
@@ -5824,7 +6077,14 @@ class NovaGalaxyPipelineRunner:
                     raise RuntimeError(
                         f"Using pre-merged scan {os.path.basename(merged_path)} (no raw *.nxs.h5 specified or in {work_dir})"
                     )
-                work_dir, merged_label = self._work_dir_for_reduce(raw_nxs, work_dir)
+                cand_wd, merged_label = self._work_dir_for_reduce(raw_nxs, work_dir)
+                if not (
+                    params.get("hydrate_only")
+                    and params.get("work_dir")
+                    and os.path.isdir(str(params.get("work_dir")))
+                ):
+                    work_dir = cand_wd
+                job_record["work_dir"] = work_dir
                 job_record["raw_nxs"] = raw_nxs
                 job_record["instrument"] = inst
                 job_record["merged_label"] = merged_label
@@ -6383,15 +6643,9 @@ class NovaGalaxyPipelineRunner:
             job_id = results["jobs"][0]["id"]
             job_record["job_id"] = job_id
             job_record.setdefault("galaxy_job_ids", []).append(job_id)
-            job_record["outputs"] = [
-                {
-                    "id": d.get("id"),
-                    "name": d.get("output_name") or d.get("name"),
-                    "extension": d.get("file_ext") or d.get("extension") or "h5",
-                }
-                for d in (results.get("outputs") or [])
-                if isinstance(d, dict)
-            ]
+            job_record["outputs"] = self._normalize_galaxy_job_outputs(
+                results.get("outputs") or [], stage_id=stage_id
+            )
             step_lbl = "Step 1/2 " if is_two_step_integrate else ""
             job_record["stdout"] += (
                 f"[galaxy -> pulsar] Dispatched {step_lbl}{primary_tool} (Galaxy job_id={job_id}) -> Pulsar GPU queue\n"
@@ -6437,17 +6691,9 @@ class NovaGalaxyPipelineRunner:
                     int_job_id = int_results["jobs"][0]["id"]
                     job_record["job_id"] = int_job_id
                     job_record.setdefault("galaxy_job_ids", []).append(int_job_id)
-                    job_record["outputs"] = [
-                        {
-                            "id": d.get("id"),
-                            "name": d.get("output_name") or d.get("name"),
-                            "extension": d.get("file_ext")
-                            or d.get("extension")
-                            or "h5",
-                        }
-                        for d in (int_results.get("outputs") or [])
-                        if isinstance(d, dict)
-                    ]
+                    job_record["outputs"] = self._normalize_galaxy_job_outputs(
+                        int_results.get("outputs") or [], stage_id="integrate"
+                    )
                     job_record["stdout"] += (
                         f"\n[galaxy -> pulsar] Dispatched Step 2/2 {int_tool} (Galaxy job_id={int_job_id}) -> Pulsar GPU queue\n"
                     )
@@ -7977,6 +8223,9 @@ class NovaGalaxyPipelineRunner:
             work_dir, merged_path = self._resolve_work_dir_and_merged(
                 os.path.abspath(str(params.get("peaks_file")))
             )
+        elif params.get("work_dir") and os.path.isdir(str(params.get("work_dir"))):
+            work_dir = os.path.abspath(str(params.get("work_dir")))
+            merged_path = os.path.join(work_dir, "merged.h5")
         else:
             work_dir, merged_path = self._resolve_work_dir_and_merged(
                 os.path.join(staging_root, "merged.h5")
@@ -8040,9 +8289,15 @@ class NovaGalaxyPipelineRunner:
                     f"Local NeXus file(s) not found or unreadable on /SNS or /HFIR: {missing_sample}"
                 )
             if raw_nxs_local:
-                work_dir, merged_label = self._work_dir_for_reduce(
+                cand_wd, merged_label = self._work_dir_for_reduce(
                     raw_nxs_local, work_dir
                 )
+                if not (
+                    preserve_downstream
+                    and params.get("work_dir")
+                    and os.path.isdir(str(params.get("work_dir")))
+                ):
+                    work_dir = cand_wd
                 solve_dest = os.path.join(work_dir, "solve.h5")
                 pred_dest = os.path.join(work_dir, "predictor.h5")
                 integrated_dest = os.path.join(work_dir, "integrated.h5")
@@ -8704,6 +8959,7 @@ class NovaGalaxyPipelineRunner:
         else:
             job_record = {
                 "job_id": job_id,
+                "client_job_id": job_id,
                 "container_name": container_name,
                 "tool_id": f"subhkl::{stage_id}",
                 "stage_id": stage_id,
@@ -9363,33 +9619,56 @@ class NovaGalaxyPipelineRunner:
                 if state in ("ok", "error", "deleted", "paused"):
                     if state == "ok":
                         try:
+                            st_id_cur = str(job_record.get("stage_id") or "")
+                            job_record["outputs"] = self._reconcile_galaxy_job_outputs(
+                                job_record.get("outputs") or [],
+                                jinfo.get("outputs"),
+                                stage_id=st_id_cur,
+                            )
                             job_record["ladder_rung_idx"] = (
-                                0 if job_record.get("stage_id") == "reduce" else 4
+                                0 if st_id_cur == "reduce" else 4
                             )
                             if not final_step:
                                 job_record["stdout"] += (
                                     f"\n[galaxy -> pulsar] Step job {job_id} finished.\n"
                                 )
-                            h5_outs = [
-                                o
-                                for o in job_record.get("outputs", [])
-                                if o.get("extension")
-                                in (
-                                    "h5",
-                                    "hdf5",
-                                    "json",
-                                    "data",
-                                    "auto",
-                                    "binary",
-                                    None,
-                                )
-                                and not str(o.get("name", ""))
-                                .lower()
-                                .endswith((".mtz", ".png", ".pdf", ".log", ".html"))
-                                and "mtz" not in str(o.get("name", "")).lower()
-                                and "careless_metrics"
-                                not in str(o.get("name", "")).lower()
-                            ]
+                            h5_outs = (
+                                []
+                                if st_id_cur == "merge"
+                                else [
+                                    o
+                                    for o in job_record.get("outputs", [])
+                                    if o.get("extension")
+                                    in (
+                                        "h5",
+                                        "hdf5",
+                                        "json",
+                                        "data",
+                                        "auto",
+                                        "binary",
+                                        None,
+                                    )
+                                    and not str(o.get("name", ""))
+                                    .lower()
+                                    .endswith(
+                                        (
+                                            ".mtz",
+                                            ".png",
+                                            ".pdf",
+                                            ".log",
+                                            ".html",
+                                            ".csv",
+                                        )
+                                    )
+                                    and "mtz" not in str(o.get("name", "")).lower()
+                                    and "careless_metrics"
+                                    not in str(o.get("name", "")).lower()
+                                    and "metrics_json"
+                                    not in str(o.get("name", "")).lower()
+                                    and "merge_table"
+                                    not in str(o.get("name", "")).lower()
+                                ]
+                            )
                             mtz_outs = [
                                 o
                                 for o in job_record.get("outputs", [])
@@ -9794,6 +10073,26 @@ class NovaGalaxyPipelineRunner:
                                     if callable(on_complete_h5):
                                         on_complete_h5(tmp_path)
                                         job_record["updated_payload_ready"] = True
+                            if final_step and job_record.get("stage_id") == "merge":
+                                pf_cand = str(
+                                    (job_record.get("params") or {}).get("peaks_file")
+                                    or ""
+                                )
+                                if not work_dir:
+                                    cand_dir = (
+                                        os.path.dirname(os.path.abspath(pf_cand))
+                                        if pf_cand and os.path.isfile(pf_cand)
+                                        else ""
+                                    )
+                                    if cand_dir and os.access(cand_dir, os.W_OK):
+                                        work_dir = cand_dir
+                                    else:
+                                        work_dir = tempfile.mkdtemp(
+                                            prefix="subhkl_galaxy_merge_"
+                                        )
+                                        register_temp_artifact(work_dir)
+                                with contextlib.suppress(OSError):
+                                    os.makedirs(work_dir, exist_ok=True)
                             if (
                                 final_step
                                 and job_record.get("stage_id") == "merge"
@@ -9802,40 +10101,27 @@ class NovaGalaxyPipelineRunner:
                             ):
                                 for out_d in job_record.get("outputs", []):
                                     oid = out_d.get("id")
-                                    oname = str(out_d.get("name") or "")
                                     if not oid:
                                         continue
-                                    dest_name = None
-                                    if (
-                                        oname
-                                        in ("metrics_json", "careless_metrics_json")
-                                        or "careless_metrics" in oname
-                                    ):
-                                        dest_name = "careless_metrics.json"
-                                    else:
-                                        for cand in (
-                                            "merged.mtz",
-                                            "predictions.mtz",
-                                            "xval.mtz",
-                                            "careless_metrics.json",
-                                            "merge_table.csv",
-                                            "merge_table.html",
-                                        ):
-                                            if cand in oname or oname == cand.replace(
-                                                ".", "_"
-                                            ):
-                                                dest_name = cand
-                                                break
+                                    dest_name = self._match_careless_merge_output_name(
+                                        out_d
+                                    )
                                     if dest_name:
-                                        with contextlib.suppress(
-                                            *_NOVA_RECOVERABLE_ERRORS
-                                        ):
-                                            bdata = self._api_request(
-                                                "GET",
-                                                f"/api/datasets/{oid}/display?to_ext=data",
-                                                raw=True,
-                                                timeout=90.0,
-                                            )
+                                        try:
+                                            try:
+                                                bdata = self._api_request(
+                                                    "GET",
+                                                    f"/api/datasets/{oid}/display?to_ext=data",
+                                                    raw=True,
+                                                    timeout=90.0,
+                                                )
+                                            except _NOVA_RECOVERABLE_ERRORS:
+                                                bdata = self._api_request(
+                                                    "GET",
+                                                    f"/api/datasets/{oid}/display",
+                                                    raw=True,
+                                                    timeout=90.0,
+                                                )
                                             dest_p = os.path.join(work_dir, dest_name)
                                             with open(dest_p, "wb") as f:
                                                 f.write(bdata)
@@ -9849,21 +10135,14 @@ class NovaGalaxyPipelineRunner:
                                             job_record["stdout"] += (
                                                 f"[careless] Saved {dest_name} -> {dest_p}\n"
                                             )
-                                int_target = os.path.join(work_dir, "integrated.h5")
-                                if not os.path.isfile(int_target):
-                                    pf_cand = str(
-                                        (job_record.get("params") or {}).get(
-                                            "peaks_file"
-                                        )
-                                        or ""
-                                    )
-                                    if pf_cand and os.path.isfile(pf_cand):
-                                        import shutil as _shutil
-
-                                        with contextlib.suppress(OSError):
-                                            _shutil.copy2(pf_cand, int_target)
-                                            _chmod_world_rw(int_target, is_dir=False)
-                                if os.path.isfile(int_target):
+                                        except _NOVA_RECOVERABLE_ERRORS as dl_exc:
+                                            job_record["stdout"] += (
+                                                f"[careless] Warning downloading {dest_name}: {dl_exc}\n"
+                                            )
+                                int_target = self._prepare_writable_merge_h5_target(
+                                    work_dir, job_record
+                                )
+                                if int_target and os.path.isfile(int_target):
                                     self._stamp_careless_merge_into_h5(
                                         int_target, work_dir, job_record
                                     )
@@ -9876,9 +10155,7 @@ class NovaGalaxyPipelineRunner:
                                     def _bg_upload_merge_tables(
                                         _wdir: str = work_dir,
                                     ) -> None:
-                                        with contextlib.suppress(
-                                            *_NOVA_RECOVERABLE_ERRORS
-                                        ):
+                                        with contextlib.suppress(Exception):
                                             store_t = self.get_datastore(
                                                 "IMAGINE-X SubHKL"
                                             )
@@ -10564,6 +10841,27 @@ def serve_rainbow_zones(
                 vm.pipeline_runner.apply_active_solve_overlay(
                     vm.payload, frame_index=f_idx
                 )
+            if (
+                not reloaded
+                and isinstance(vm.payload, dict)
+                and "hydration_job" in vm.payload
+            ):
+                aj_cur = vm.pipeline_runner.active_job
+                if (
+                    vm.payload.get("intensity_source") == "raw_h5"
+                    or not isinstance(aj_cur, dict)
+                    or not aj_cur.get("hydrate_only")
+                    or aj_cur.get("state") not in ("running", "queued", "new")
+                ):
+                    vm.payload.pop("hydration_job", None)
+                else:
+                    vm.payload["hydration_job"] = {
+                        **vm.payload["hydration_job"],
+                        "job_id": aj_cur.get("job_id"),
+                        "client_job_id": aj_cur.get("client_job_id")
+                        or aj_cur.get("job_id"),
+                        "state": aj_cur.get("state"),
+                    }
             if fast_frame_only and isinstance(vm.payload, dict):
                 from subhkl.viz.rainbow_zones import build_frame_only_response
 
@@ -11078,6 +11376,10 @@ def serve_rainbow_zones(
 
                     def _on_complete(new_h5_path: str) -> None:
                         with vm_lock:
+                            prev_replay_h5 = vm.replay_h5
+                            prev_kwargs = dict(vm.payload_kwargs)
+                            prev_mtz_path = vm.mtz_overlay_path
+                            prev_mtz_info = vm.mtz_overlay_info
                             new_base_low = os.path.basename(new_h5_path).lower()
                             is_reduce_out = stage_id == "reduce" or (
                                 "merged" in new_base_low
@@ -11097,7 +11399,14 @@ def serve_rainbow_zones(
                                 if params.get("d_min"):
                                     vm.payload_kwargs["d_min"] = float(params["d_min"])
                             vm.replay_h5 = new_h5_path
-                            vm.reload()
+                            try:
+                                vm.reload()
+                            except Exception:
+                                vm.replay_h5 = prev_replay_h5
+                                vm.payload_kwargs = prev_kwargs
+                                vm.mtz_overlay_path = prev_mtz_path
+                                vm.mtz_overlay_info = prev_mtz_info
+                                raise
                             if stage_id != "reduce":
                                 if params.get("wavelength_range"):
                                     wl_r = params["wavelength_range"]
