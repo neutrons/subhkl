@@ -8,15 +8,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Blind unit cell for time-of-flight data (`blind_cell`)**:
+- **Blind cell and space-group determination for time-of-flight data (`blind_cell`, `space_group`, `examples/blind_reduction_tof.py`)**:
   - `subhkl.search.blind_cell.find_cell` finds the unit cell with its absolute
     scale, the orientation and the lattice symmetry from the 3D Fourier
     transform of the raw events, with no cell, peaks or space group given.
     `write_seed` stores the result as a P 1 solve file for
     `solve --refinement band --bootstrap`.
-  - The conventional cell and centring are derived for every lattice type
-    from the lattice's own rotation axes, and a centred lattice is seeded in
-    its conventional cell (`I 1`, `C 1`, ...).
+  - `subhkl.search.space_group.laue_class` tests every rotation of the lattice
+    on intensities integrated once in P 1, comparing symmetry mates at matched
+    wavelength, so no wavelength normalisation is needed. It returns the point
+    group and its setting.
+  - `laue_class_presence` decides the point group without any scaling or
+    wavelength matching: under a symmetry the mate of a strong reflection must
+    be present, so only a strong reflection with an absent mate counts against
+    a rotation. It is the default in the time-of-flight example, with the
+    matched-wavelength comparison as a cross-check. On the four MANDI crystals
+    true symmetries leave 1–9% of mates absent and other rotations 36–49%.
+  - `space_group_candidates` scores every space group of that point symmetry
+    by its systematic absences on raw event counts at the reciprocal-lattice
+    nodes (`event_node_counts`), and returns all hypotheses with their
+    evidence. Enantiomorphic pairs are reported together.
+  - `examples/blind_reduction_tof.py` chains these with the existing `solve`,
+    `peak-predictor` and `integrator` commands.
+  - The conventional cell and centring are derived for every lattice type, and
+    a centred lattice is indexed and integrated in its conventional cell
+    (`I 1`, `C 1`, ...). Candidates include non-reference settings such as
+    `I 1 2 1`.
+  - Tried on four MANDI datasets: IPTS-30763 runs 11324–11338 (P6₁22 or
+    P6₅22 found), a garnet from IPTS-34720 (Ia-3d found), T4 lysozyme,
+    IPTS-34720 runs 13239–13245, a trigonal crystal in a hexagonal lattice
+    (point group 32 in the 321 setting, then P3₁21 or P3₂21 found), and an
+    Mpro complex, IPTS-36185 runs 13171–13188, with a body-centred monoclinic
+    lattice (I 1 2 1 found).
 
 ## [1.7.3]
 
