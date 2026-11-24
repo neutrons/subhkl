@@ -10,8 +10,10 @@ assuming it:
 2. predict and integrate once in P 1      (peak-predictor, integrator)
 3. merge in P 1, which does the wavelength normalisation
    (mtz-exporter, careless poly)
-4. correlate every merged reflection with its mate under each lattice
-   rotation                 (subhkl.search.space_group.laue_class_merged)
+4. divide every observation by the scale the merge learned for it and
+   compare symmetry mates pairwise    (Observations.scaled, laue_class);
+   as a cross-check, correlate every merged reflection with its mate
+   under each lattice rotation                    (laue_class_merged)
 5. score the space groups of that point symmetry by their absences on the
    merged intensities       (merged_node_counts, space_group_candidates)
 
@@ -20,7 +22,12 @@ axes can only be judged if axial reflections were measured; where they
 were not, the groups that differ only by a screw axis are reported together.
 
 Usage:
-    python blind_symmetry_quasi_laue.py careless_0.mtz [--xval careless_xval_0.mtz] [--d-min 3.0] [--sohncke]
+    python blind_symmetry_quasi_laue.py careless_0.mtz --predictions careless_predictions_0.mtz \
+        [--xval careless_xval_0.mtz] [--d-min 3.0] [--sohncke]
+
+The pairwise test on scaled observations decides (it involves no merged
+amplitudes, so the merge's prior cannot bias it); without --predictions the
+merged-amplitude test is used alone.
 """
 
 import argparse
@@ -30,7 +37,9 @@ import numpy as np
 
 from subhkl.search.blind_cell import lattice_operations
 from subhkl.search.space_group import (
+    Observations,
     best_candidates,
+    laue_class,
     laue_class_merged,
     merged_node_counts,
     space_group_candidates,
@@ -71,6 +80,10 @@ def main():
     )
     ap.add_argument("merged", help="P 1 merge (MTZ with H, K, L, F, SigF)")
     ap.add_argument(
+        "--predictions",
+        help="per-observation output of the same merge (MTZ with Iobs, SigIobs, Scale, image_id)",
+    )
+    ap.add_argument(
         "--xval", help="half-dataset merges of the same run (MTZ with a 'half' column)"
     )
     ap.add_argument(
@@ -95,17 +108,51 @@ def main():
     if cc_half is not None:
         print(f"half-dataset CC of the P 1 merge to {args.d_min} A: {cc_half:.3f}")
 
-    res = laue_class_merged(hkl, col["F"], d, mats, cc_half=cc_half, d_min=args.d_min)
-    print(
-        f"point group: unrelated reflections correlate {res.unrelated:.3f}; a symmetry should reach {res.same:.3f}; accept above {res.cut:.3f}"
+    merged = laue_class_merged(
+        hkl, col["F"], d, mats, cc_half=cc_half, d_min=args.d_min
     )
-    for row in res.rows:
+    res = merged
+    if args.predictions:
+        _pmtz, p, phkl, pd = columns(args.predictions)
+        obs = Observations.scaled(
+            phkl,
+            p["Iobs"],
+            p["SigIobs"],
+            p["Scale"],
+            pd,
+            p["image_id"].astype(int),
+            d_min=args.d_min,
+        )
+        res = laue_class(obs, mats)
+        print(
+            f"point group, from {len(obs.I)} observations divided by their learned scale: "
+            f"same reflection twice {res.same:.2f}, unrelated {res.unrelated:.2f}, accept below {res.cut:.2f}"
+        )
+        for row in res.rows:
+            print(
+                f"  {row['name']:28s} {row['strong']:6d} strong pairs  spread {row['spread']:6.2f}  {row['verdict']}"
+            )
+        print(
+            f"  point group {res.point_group}, Laue class {res.laue} ({len(res.rotations)} of {len(mats)} lattice rotations)"
+        )
+    print(
+        f"{'cross-check' if args.predictions else 'point group'}, from merged amplitudes: unrelated reflections correlate "
+        f"{merged.unrelated:.3f}; a symmetry should reach {merged.same:.3f}; accept above {merged.cut:.3f}"
+    )
+    for row in merged.rows:
         print(
             f"  {row['name']:28s} {row['pairs']:6d} pairs  CC {row['spread']:6.3f}  {row['verdict']}"
         )
     print(
-        f"  point group {res.point_group}, Laue class {res.laue} ({len(res.rotations)} of {len(mats)} lattice rotations)"
+        f"  point group {merged.point_group}, Laue class {merged.laue} ({len(merged.rotations)} of {len(mats)} lattice rotations)"
     )
+    same_group = {tuple(m.ravel()) for m in res.rotations} == {
+        tuple(m.ravel()) for m in merged.rotations
+    }
+    if not same_group:
+        print(
+            "  WARNING: the two tests disagree; the pairwise test on scaled observations is used below"
+        )
     if res.conflicts:
         print(
             "  WARNING: rejected operations that the accepted ones imply: "

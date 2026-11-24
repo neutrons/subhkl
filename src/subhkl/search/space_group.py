@@ -112,15 +112,32 @@ class Observations:
         d: [Angstrom] (N,) d-spacing
         group: (N,) integer label of the measurement (run and bank); a pair
             from the same label is the same spot and is not used
-        match: [-] largest |log wavelength ratio| of a matched pair
+        match: [-] largest |log wavelength ratio| of a matched pair; None
+            compares pairs at any wavelength, which is only valid for
+            intensities that have been divided by a scale function
         min_isigi: [-] a pair counts as strong if either member exceeds this
+        friedel_merged: the indices are only known up to inversion (as
+            after mapping to the asymmetric unit of P 1); mates are then
+            looked up up to inversion as well
     """
 
     def __init__(
-        self, hkl, intensity, sigma, wavelength, d, group, match=0.02, min_isigi=5.0
+        self,
+        hkl,
+        intensity,
+        sigma,
+        wavelength,
+        d,
+        group,
+        match=0.02,
+        min_isigi=5.0,
+        friedel_merged=False,
     ):
         ok = np.asarray(sigma) > 0
+        self.friedel_merged = friedel_merged
         self.hkl = np.asarray(hkl, dtype=np.int64)[ok]
+        if friedel_merged:
+            self.hkl = _friedel_unique(self.hkl)
         self.I = np.asarray(intensity, dtype=float)[ok]
         self.sig = np.asarray(sigma, dtype=float)[ok]
         self.lam = np.asarray(wavelength, dtype=float)[ok]
@@ -165,7 +182,8 @@ class Observations:
     def mate_pairs(self, M, max_pairs=300000):
         """Pairs (i, j): observation j is of M.h_i, at matched wavelength,
         from a different measurement."""
-        want = _key(self.hkl @ np.asarray(M).T)
+        mate = self.hkl @ np.asarray(M).T
+        want = _key(_friedel_unique(mate) if self.friedel_merged else mate)
         lo = np.searchsorted(self.keys, want, side="left")
         hi = np.searchsorted(self.keys, want, side="right")
         cnt = hi - lo
@@ -178,7 +196,8 @@ class Observations:
             return np.empty(0, int), np.empty(0, int)
         i, j = np.concatenate(i_all), np.concatenate(j_all)
         keep = (i != j) & (self.group[i] != self.group[j])
-        keep &= np.abs(np.log(self.lam[i] / self.lam[j])) < self.match
+        if self.match is not None:
+            keep &= np.abs(np.log(self.lam[i] / self.lam[j])) < self.match
         i, j = i[keep], j[keep]
         if len(i) > max_pairs:
             s = np.random.default_rng(0).choice(len(i), max_pairs, replace=False)
@@ -192,10 +211,45 @@ class Observations:
         shell = np.argsort(self.d)
         pos = np.searchsorted(self.d[shell], self.d[i])
         j = shell[np.clip(pos + rng.integers(-50, 51, n), 0, len(self.I) - 1)]
-        keep = (np.abs(np.log(self.lam[i] / self.lam[j])) < self.match) & np.any(
-            self.hkl[i] != self.hkl[j], axis=1
-        )
+        keep = np.any(self.hkl[i] != self.hkl[j], axis=1)
+        if self.match is not None:
+            keep &= np.abs(np.log(self.lam[i] / self.lam[j])) < self.match
         return i[keep], j[keep]
+
+    @classmethod
+    def scaled(cls, hkl, intensity, sigma, scale, d, group, d_min=3.0, **kwargs):
+        """Observations divided by a learned scale function.
+
+        For data without matched-wavelength repeats: a merge without point
+        symmetry learns the scale of every observation (incident spectrum,
+        Lorentz factor, absorption, exposure) as a function of its
+        metadata.  Dividing each observed intensity by its scale makes
+        observations at different wavelengths comparable while keeping
+        them independent measurements; no merged amplitude enters, so the
+        prior of the merge does not bias the comparison.
+
+        Args:
+            hkl: (N, 3) Miller indices, Friedel mates not distinguished
+            intensity, sigma: (N,) observed intensity and standard error
+            scale: (N,) scale of each observation (intensity = scale x F^2)
+            d: [Angstrom] (N,) d-spacings
+            group: (N,) label of the image the observation is from
+            d_min: [Angstrom] observations beyond this resolution are left out
+        """
+        scale = np.asarray(scale, dtype=float)
+        ok = np.isfinite(scale) & (scale > 0.05 * np.nanmedian(scale[scale > 0]))
+        ok &= (np.asarray(sigma) > 0) & (np.asarray(d) > d_min)
+        return cls(
+            np.asarray(hkl)[ok],
+            np.asarray(intensity, dtype=float)[ok] / scale[ok],
+            np.asarray(sigma, dtype=float)[ok] / scale[ok],
+            np.ones(int(ok.sum())),
+            np.asarray(d)[ok],
+            np.asarray(group)[ok],
+            match=None,
+            friedel_merged=True,
+            **kwargs,
+        )
 
     def statistic(self, i, j):
         """(pairs, strong pairs, spread of (I1 - I2) / sigma over the strong pairs)."""

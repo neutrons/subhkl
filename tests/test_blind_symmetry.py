@@ -405,13 +405,7 @@ def test_merged_intensities_as_node_counts():
     cell = (62.0, 62.0, 97.0, 90.0, 90.0, 120.0)
     r = np.arange(-5, 6)
     hkl = np.array(
-        [
-            (h, k, l)
-            for h in r
-            for k in r
-            for l in range(13)
-            if (h, k, l) != (0, 0, 0)
-        ]
+        [(h, k, l) for h in r for k in r for l in range(13) if (h, k, l) != (0, 0, 0)]
     )
     absent = np.asarray(
         gemmi.SpaceGroup("P 31 2 1")
@@ -433,3 +427,36 @@ def test_merged_intensities_as_node_counts():
         )
     )
     assert set(best[0]["space_groups"]) == {"P 31 2 1", "P 32 2 1"}
+
+
+def test_scaled_observations_are_compared_at_any_wavelength():
+    """Observations with different scales (wavelengths) agree once divided
+    by the scale; the indices are only known up to inversion."""
+    rng = np.random.default_rng(31)
+    cell = (62.0, 62.0, 97.0, 90.0, 90.0, 120.0)
+    mats, _name = lattice_operations(cell)
+    hkl, truth, d = _merged("P 3 2 1", cell, rng, hmax=6, noise=0.0)
+    truth = truth**2
+    rows, inten, sig, scale, dd, image = [], [], [], [], [], []
+    for rep in range(3):
+        k = rng.uniform(0.2, 5.0, len(hkl))  # e.g. the spectrum at each wavelength
+        s = 0.03 * k * truth + 2.0
+        flip = rng.random(len(hkl)) < 0.5  # either Friedel mate
+        rows.append(np.where(flip[:, None], -hkl, hkl))
+        inten.append(k * truth + s * rng.normal(size=len(hkl)))
+        sig.append(s)
+        scale.append(k)
+        dd.append(d)
+        image.append(np.full(len(hkl), rep))
+    obs = Observations.scaled(
+        np.concatenate(rows),
+        np.concatenate(inten),
+        np.concatenate(sig),
+        np.concatenate(scale),
+        np.concatenate(dd),
+        np.concatenate(image),
+        d_min=3.0,
+    )
+    res = laue_class(obs, mats)
+    assert res.point_group == "32" and len(res.rotations) == 6 and not res.conflicts
+    assert res.same < 2.0 < res.unrelated
