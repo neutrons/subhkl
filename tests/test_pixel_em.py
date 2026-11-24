@@ -776,3 +776,41 @@ def test_band_table_dense_coalescing_matches_exact_quadrature():
     p_got = P[int(np.argmax(got_np[0]))]
     p_ref = P[int(np.argmax(ref_np[0]))]
     assert abs(float(np.dot(p_got, p_ref))) > 0.999
+
+
+def test_peer_ring_backscattering_shadow_masks_whole_panel():
+    """Cross-bank same-2theta peer ring catches a whole-panel shadow (~0.30x peers) without false positives."""
+    rng = np.random.default_rng(36185)
+    # 8 MANDI banks including high-angle backscattering ring peers around 2theta ~ 140-160 deg
+    banks = [10, 13, 20, 22, 23, 33, 42, 53]
+    runs = [0, 1, 2, 3]
+    hb = wb = 32
+    y_rb, good_rb = {}, {}
+    for r in runs:
+        for bk in banks:
+            rate = 400.0 if bk == 33 else (820.0 if bk == 23 else 1500.0)
+            y_rb[(r, bk)] = rng.poisson(rate, size=(hb, wb)).astype(np.float64)
+            good_rb[(r, bk)] = np.ones((hb, wb), dtype=bool)
+
+    clf = PixelEMClassifier(
+        instrument="MANDI",
+        n_rows=256,
+        n_cols=256,
+        binning=8,
+        border_width=15,
+        sel_runs=runs,
+        obs_banks=banks,
+        y_rb=y_rb,
+        good_rb=good_rb,
+        rr_rb={},
+        cc_rb={},
+        bad_px_bank={},
+        R_by_run={r: np.eye(3) for r in runs},
+        cell=[55.16, 81.19, 88.7, 90.0, 96.3, 90.0],
+        space_group="I 1 2 1",
+        wavelength=(2.0, 4.0),
+        d_min=2.3,
+    )
+    assert float((clf.gamma_dark[33] > 0.5).mean()) > 0.98
+    assert float((clf.gamma_dark[23] > 0.5).mean()) > 0.90
+    assert float((clf.gamma_dark[20] > 0.5).mean()) == 0.0

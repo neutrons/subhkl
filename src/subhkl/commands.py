@@ -1157,6 +1157,8 @@ def run_peak_predictor(
     wavel_min: float | None = None,
     wavel_max: float | None = None,
     max_workers: int = 16,
+    rel_border_width: float = 0.0,
+    static_mask_file: str | None = None,
 ):
     apply_detector_calibration(indexed_hdf5_filename, instrument)
 
@@ -1349,30 +1351,62 @@ def run_peak_predictor(
         harmonic_rot=harmonic_rot,
     )
 
-    if em_mask_by_bank:
+    if static_mask_file:
+        from subhkl.search.static_mask import load_mask_for_banks
+
+        first_im = next(iter(peaks.image.ims.values()), None)
+        if first_im is not None:
+            uniq_banks = sorted({int(b) for b in peaks.image.bank_mapping.values()})
+            ext_masks = load_mask_for_banks(
+                static_mask_file, uniq_banks, first_im.shape
+            )
+            for idx_b, bid_b in enumerate(uniq_banks):
+                valid_ext = ext_masks[idx_b] > 0.5
+                if bid_b in em_mask_by_bank:
+                    em_mask_by_bank[bid_b] = em_mask_by_bank[bid_b] & valid_ext
+                else:
+                    em_mask_by_bank[bid_b] = valid_ext
+
+    rel_bw = max(0.0, float(rel_border_width or 0.0))
+    if em_mask_by_bank or rel_bw > 0.0:
         n_rej_dark = 0
         n_rej_bright = 0
         n_rej_other = 0
+        n_rej_border = 0
         filtered_map = {}
         for img_key, (i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr) in results_map.items():
-            phys_bank = int(peaks.image.bank_mapping.get(img_key, img_key))
-            if phys_bank not in em_mask_by_bank or len(i_arr) == 0:
+            if len(i_arr) == 0:
                 filtered_map[img_key] = (i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr)
                 continue
-            valid_px = em_mask_by_bank[phys_bank]
-            n_r_px, n_c_px = valid_px.shape
-            ri = np.clip(np.round(i_arr).astype(int), 0, n_r_px - 1)
-            ci = np.clip(np.round(j_arr).astype(int), 0, n_c_px - 1)
-            keep = valid_px[ri, ci]
-            if not np.all(keep):
-                rej = ~keep
-                if phys_bank in em_class_by_bank:
-                    rej_cls = em_class_by_bank[phys_bank][ri[rej], ci[rej]]
-                    n_rej_dark += int(np.sum(rej_cls == 1))
-                    n_rej_bright += int(np.sum(rej_cls == 2))
-                    n_rej_other += int(np.sum((rej_cls != 1) & (rej_cls != 2)))
-                else:
-                    n_rej_other += int(np.sum(rej))
+            phys_bank = int(peaks.image.bank_mapping.get(img_key, img_key))
+            im_shape = peaks.image.ims[img_key].shape
+            n_r_px, n_c_px = int(im_shape[0]), int(im_shape[1])
+            keep = np.ones(len(i_arr), dtype=bool)
+            if rel_bw > 0.0:
+                bw = int(rel_bw * min(n_r_px, n_c_px))
+                if bw > 0:
+                    hi_r = n_r_px - 1 - bw
+                    hi_c = n_c_px - 1 - bw
+                    in_border = (
+                        (i_arr >= bw) & (i_arr < hi_r) & (j_arr >= bw) & (j_arr < hi_c)
+                    )
+                    n_rej_border += int(np.sum(~in_border))
+                    keep &= in_border
+            if phys_bank in em_mask_by_bank:
+                valid_px = em_mask_by_bank[phys_bank]
+                ri = np.clip(np.round(i_arr).astype(int), 0, valid_px.shape[0] - 1)
+                ci = np.clip(np.round(j_arr).astype(int), 0, valid_px.shape[1] - 1)
+                px_ok = valid_px[ri, ci]
+                rej = keep & (~px_ok)
+                if np.any(rej):
+                    if phys_bank in em_class_by_bank:
+                        rej_cls = em_class_by_bank[phys_bank][ri[rej], ci[rej]]
+                        n_rej_dark += int(np.sum(rej_cls == 1))
+                        n_rej_bright += int(np.sum(rej_cls == 2))
+                        n_rej_other += int(np.sum((rej_cls != 1) & (rej_cls != 2)))
+                    else:
+                        n_rej_other += int(np.sum(rej))
+                keep &= px_ok
             if np.any(keep):
                 filtered_map[img_key] = (
                     i_arr[keep],
@@ -1382,11 +1416,13 @@ def run_peak_predictor(
                     l_arr[keep],
                     wl_arr[keep],
                 )
-        n_rej_tot = n_rej_dark + n_rej_bright + n_rej_other
-        print(
-            f"Filtered {n_rej_tot} predicted peaks via detector/pixel_mask "
-            f"({n_rej_dark} dark/shadowed, {n_rej_bright} static-bright)."
-        )
+        n_rej_mask = n_rej_dark + n_rej_bright + n_rej_other
+        if em_mask_by_bank or n_rej_border > 0:
+            print(
+                f"Filtered {n_rej_mask + n_rej_border} predicted peaks "
+                f"({n_rej_border} border, {n_rej_dark} dark/shadowed, "
+                f"{n_rej_bright} static-bright, {n_rej_other} masked)."
+            )
         results_map = filtered_map
 
     print(f"Saving predictions to {integration_peaks_filename}")
@@ -1455,17 +1491,33 @@ def run_rbf_integrator(
     mosaicity_radial: bool = False,
     shape_spherical: bool = False,
     mosaicity_bound_mrad: float = 10.0,
-    shape_fit_min_snr: float = 0.0,
+    shape_fit_min_snr: float = 5.0,
     shape_fit_normalized: bool = False,
     matrix_free_profile: str = "gaussian",
     matrix_free_fp_target: float | None = None,
     static_mask_file: str | None = None,
     rel_border_width: float = 0.03,
+    allow_negative: bool = False,
     show_progress: bool = True,
     create_visualizations: bool = False,
     chunk_size: int = 256,
     max_workers: int | None = None,
+    tof_gate: str = "auto",
+    tof_gate_coverage: float = 0.95,
+    tof_gate_search: float = 0.05,
+    tof_sideband_factor: float = 4.0,
+    tof_sideband_measure: str = "spectrum",
+    tof_max_variance_inflation: float | None = 1000.0,
+    tof_amplitude_ridge: str = "fixed",
 ):
+    """Integrate the predicted reflections.
+
+    ``tof_gate`` selects time-of-flight gating when the images file carries
+    events (see ``subhkl.io.events``): "auto" measures the gate from the
+    data, "lo,hi" sets its relative edges around the predicted time, and
+    "off" integrates the images of the whole wavelength band as before.
+    Files without events are always integrated that way.
+    """
     apply_detector_calibration(integration_peaks_filename, instrument)
 
     import h5py
@@ -1502,6 +1554,14 @@ def run_rbf_integrator(
             else None
         )
 
+        # The band the reflections were predicted in; the images file only
+        # carries the instrument default from reduce time.
+        peaks_band = (
+            tuple(float(v) for v in f["instrument/wavelength"][()])
+            if "instrument/wavelength" in f
+            else None
+        )
+
         for key in f["banks"]:
             img_idx = int(key)
             grp = f[f"banks/{key}"]
@@ -1522,6 +1582,34 @@ def run_rbf_integrator(
     one_image = next(iter(peaks.image.ims.values()))
     border_width = int(rel_border_width * min(one_image.shape[0], one_image.shape[1]))
 
+    from subhkl.io.events import EventStore, has_events
+    from subhkl.search.tof_gate import parse_gate
+
+    event_store = None
+    gate = None
+    if str(tof_gate).strip().lower() != "off" and has_events(filename):
+        event_store = EventStore(filename)
+        gate = parse_gate(tof_gate)
+        if event_store.l1 is None:
+            from subhkl.config import reduction_settings
+
+            event_store.l1 = reduction_settings.get(instrument, {}).get("L1")
+        if event_store.l1 is None:
+            print("Events found but no moderator distance L1; integrating in 2D.")
+            event_store.close()
+            event_store = None
+        else:
+            print(
+                f"Time-of-flight gated integration (L1 = {event_store.l1} m, "
+                f"gate: {tof_gate})"
+            )
+
+    def _read_events(img_key):
+        return event_store.image_events(int(img_key), peaks.image.ims[img_key])
+
+    if event_store is not None:
+        _read_events.event_store = event_store
+
     result = integrate_peaks_rbf_ssn(
         peak_dict=peak_dict,
         peaks_obj=peaks,  # Pass the full Peaks object
@@ -1541,6 +1629,7 @@ def run_rbf_integrator(
         matrix_free_fp_target=matrix_free_fp_target,
         static_mask_file=static_mask_file,
         border_width=border_width,
+        allow_negative=allow_negative,
         chunk_size=chunk_size,
         create_visualizations=create_visualizations,
         file_prefix=filename,
@@ -1550,7 +1639,19 @@ def run_rbf_integrator(
         gonio_offsets=gonio_offsets,
         per_run_trans=per_run_trans,
         frame_to_run=frame_to_run,
+        event_reader=_read_events if event_store is not None else None,
+        tof_l1=event_store.l1 if event_store is not None else None,
+        tof_gate=gate,
+        tof_gate_coverage=tof_gate_coverage,
+        tof_gate_search=tof_gate_search,
+        tof_sideband_factor=tof_sideband_factor,
+        tof_sideband_measure=tof_sideband_measure,
+        tof_max_variance_inflation=tof_max_variance_inflation,
+        tof_amplitude_ridge=tof_amplitude_ridge,
+        tof_band=peaks_band,
     )
+    if event_store is not None:
+        event_store.close()
 
     print(f"Saving RBF integrated peaks to {output_filename}")
     with h5py.File(output_filename, "w") as f:
@@ -1570,6 +1671,22 @@ def run_rbf_integrator(
         f["peaks/pixel_r"], f["peaks/pixel_c"] = result.peak_rows, result.peak_cols
         f["peaks/var_u"], f["peaks/var_v"] = result.var_u, result.var_v
         f["peaks/cov_uv"] = result.cov_uv
+
+        # Time-of-flight gating: every row is one reflection measured inside
+        # its own time window, so harmonics are separate rows with their own
+        # intensities instead of one multiplet intensity repeated.
+        if result.tof_info is not None:
+            used = result.tof_info["gate"]
+            f["peaks/tof"] = result.tof
+            f["peaks/tof_background"] = result.tof_bg
+            grp = f.create_group("tof_gate")
+            grp.attrs["lo"], grp.attrs["hi"] = used.lo, used.hi
+            grp.attrs["source"] = used.source
+            if used.coverage is not None:
+                grp.attrs["coverage"] = used.coverage
+            grp.attrs["L1"] = event_store.l1
+            grp["stack_edges"] = result.tof_info["stack_edges"]
+            grp["stack_counts"] = result.tof_info["stack_hist"]
 
         # Copy metadata
         copy_keys = [
@@ -1592,8 +1709,14 @@ def run_rbf_integrator(
             for key in copy_keys:
                 if key in f_in:
                     f_in.copy(f_in[key], f, key)
-            for k in ["goniometer/axes", "goniometer/names"]:
-                if k in f_in:
+            for k in [
+                "goniometer/axes",
+                "goniometer/names",
+                "goniometer/angles",
+                "goniometer/R",
+                "goniometer/harmonics",
+            ]:
+                if k in f_in and k not in f:
                     f_in.copy(f_in[k], f, k)
             # The refined panels travel with the peaks they positioned: the
             # predictor already carries the group forward, and without the
@@ -1632,13 +1755,27 @@ def run_reduce(
     instrument: str,
     wavelength_min: float | None = None,
     wavelength_max: float | None = None,
+    store_events: bool | None = None,
 ):
+    """Collapse a NeXus event file to one image per detector bank.
+
+    ``store_events`` keeps the event times of flight next to the images,
+    sorted by pixel (see ``subhkl.io.events``), so the integrator can gate
+    each reflection in time.  None (the default) stores them for
+    instruments whose settings give a moderator distance ``L1``.
+    """
+    from subhkl.config import reduction_settings
+
+    l1 = reduction_settings.get(instrument, {}).get("L1")
+    if store_events is None:
+        store_events = l1 is not None
     print(f"Reducing {nexus_filename} -> {output_filename}")
     peaks_handler = Peaks(
         nexus_filename,
         instrument,
         wavelength_min=wavelength_min,
         wavelength_max=wavelength_max,
+        load_events=store_events,
     )
 
     if not peaks_handler.image.ims:
@@ -1680,19 +1817,36 @@ def run_reduce(
         )
         f.attrs["instrument"] = instrument
 
+        events = peaks_handler.image.events
+        if store_events and events is not None:
+            from subhkl.io.events import write_events
+
+            write_events(f, [events[b] for b in sorted_banks], l1=l1)
+            print(f"  stored {sum(len(events[b]) for b in sorted_banks)} events")
+        elif store_events:
+            print("  no event times found; storing images only")
+
     print(f"Saved {n_images} banks to {output_filename}")
 
 
 def _reduce_worker(
-    task: tuple[str, str, str, float | None, float | None],
+    task: tuple[str, str, str, float | None, float | None, bool | None],
 ) -> str:
-    nexus_filename, output_filename, instrument, wavelength_min, wavelength_max = task
+    (
+        nexus_filename,
+        output_filename,
+        instrument,
+        wavelength_min,
+        wavelength_max,
+        store_events,
+    ) = task
     run_reduce(
         nexus_filename,
         output_filename,
         instrument,
         wavelength_min=wavelength_min,
         wavelength_max=wavelength_max,
+        store_events=store_events,
     )
     return output_filename
 
@@ -1703,6 +1857,7 @@ def run_reduce_batch(
     wavelength_min: float | None = None,
     wavelength_max: float | None = None,
     max_workers: int | None = None,
+    store_events: bool | None = None,
 ) -> list[str]:
     """Reduce multiple (nexus_filename, output_filename) pairs in parallel across CPU cores."""
     import concurrent.futures
@@ -1718,13 +1873,14 @@ def run_reduce_batch(
             instrument,
             wavelength_min=wavelength_min,
             wavelength_max=wavelength_max,
+            store_events=store_events,
         )
         return [out_f]
 
     cpu_cnt = os.cpu_count() or 4
     workers = min(len(tasks), max_workers or min(cpu_cnt, 16))
     worker_args = [
-        (nxs_f, out_f, instrument, wavelength_min, wavelength_max)
+        (nxs_f, out_f, instrument, wavelength_min, wavelength_max, store_events)
         for nxs_f, out_f in tasks
     ]
     print(f"Reducing {len(tasks)} runs in parallel across {workers} CPU workers...")

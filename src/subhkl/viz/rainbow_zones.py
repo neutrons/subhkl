@@ -26,9 +26,11 @@ import contextlib
 import glob
 import io
 import json
+import math
 import os
 import re
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -138,11 +140,26 @@ def _get_instrument_default_wavelength(instrument: str | None) -> tuple[float, f
     return _FALLBACK_INSTRUMENT_WAVELENGTHS.get(key, (2.0, 4.5))
 
 
+ANGER_CAMERA_INSTRUMENTS = {"MANDI", "TOPAZ", "SNAP"}
+
+
 def default_projection_for_instrument(instrument: str | None) -> str:
     """Return ``'spherical'`` for spherical instruments (e.g. MANDI) and ``'cylindrical'`` for cylindrical ones (e.g. CG4D)."""
     if instrument and str(instrument).strip().upper() in SPHERICAL_INSTRUMENTS:
         return "spherical"
     return "cylindrical"
+
+
+def default_rel_border_for_instrument(instrument: str | None) -> float:
+    """Return default fractional detector-panel border mask width.
+
+    Anger-camera area detectors (MANDI, TOPAZ, SNAP) exhibit dead outer rims
+    plus PMT edge-reflection pileup out to ~15 px on 256x256 panels (~6%),
+    whereas image-plate / tube banks only need ~3%.
+    """
+    if instrument and str(instrument).strip().upper() in ANGER_CAMERA_INSTRUMENTS:
+        return 0.06
+    return 0.03
 
 
 _UNIT_CELL_NUM_PAT = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?"
@@ -311,7 +328,12 @@ def _build_space_group_symmetry_lookup_json() -> str:
                     code = "monoclinic_b"
             else:
                 code = cs
-            for k in (sg.xhm(), sg.hm, sg.short_name()):
+            key_candidates = (
+                (sg.xhm(), f"{sg.short_name()}:R")
+                if code == "trigonal_r"
+                else (sg.xhm(), sg.hm, sg.short_name())
+            )
+            for k in key_candidates:
                 norm = k.lower().replace(" ", "")
                 if norm:
                     groups.setdefault(code, set()).add(norm)
@@ -335,7 +357,9 @@ def _decode_str(val: Any, default: str = "") -> str:
 
 
 def _load_detectors_from_h5(
-    f: h5py.File | None, instrument: str | None
+    f: h5py.File | None,
+    instrument: str | None,
+    fallback_h5_paths: tuple[str | None, ...] = (),
 ) -> dict[int, Any]:
     """Load calibrated or nominal detector banks from ``subhkl.config.beamlines`` + HDF5 calibration."""
     from subhkl.config import beamlines
@@ -356,8 +380,7 @@ def _load_detectors_from_h5(
         ):
             detectors[bank_id] = Detector(cfg)
 
-    if f is not None and "detector_calibration" in f:
-        cal_grp = f["detector_calibration"]
+    def _apply_cal_group(cal_grp: Any) -> None:
         for name in cal_grp:
             if not name.startswith("bank_"):
                 continue
@@ -367,12 +390,18 @@ def _load_detectors_from_h5(
                 continue
             g = cal_grp[name]
             cfg = dict(
-                base_configs.get(bank_id, {"panel_type": "flat", "m": 256, "n": 256})
+                base_configs.get(
+                    bank_id,
+                    {"panel": "flat", "panel_type": "flat", "m": 256, "n": 256},
+                )
             )
-            for field in ("center", "uhat", "vhat"):
+            if "panel" not in cfg:
+                pt = str(cfg.get("panel_type", "flat"))
+                cfg["panel"] = "curved" if pt in ("curved", "cylindrical") else "flat"
+            for field in ("center", "uhat", "vhat", "rhat"):
                 if field in g:
                     cfg[field] = np.asarray(g[field][()], dtype=float).tolist()
-            for field in ("width", "height"):
+            for field in ("width", "height", "radius"):
                 if field in g:
                     cfg[field] = float(g[field][()])
             with contextlib.suppress(
@@ -380,70 +409,114 @@ def _load_detectors_from_h5(
             ):
                 detectors[bank_id] = Detector(cfg)
 
+    if f is not None and "detector_calibration" in f:
+        _apply_cal_group(f["detector_calibration"])
+    else:
+        for fb_path in fallback_h5_paths:
+            if not fb_path or not os.path.isfile(fb_path):
+                continue
+            applied = False
+            with (
+                contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ),
+                h5py.File(fb_path, "r") as f_cal,
+            ):
+                if "detector_calibration" in f_cal:
+                    _apply_cal_group(f_cal["detector_calibration"])
+                    applied = True
+            if applied:
+                break
+
     return detectors
+
+
+def _candidate_staging_roots() -> list[Path]:
+    """Return deduplicated local staging/temp directories where ``subhkl_work_<tag>`` caches live."""
+    roots: list[Path] = []
+    seen: set[str] = set()
+    env_dir = (os.environ.get("SUBHKL_STAGING_DIR") or "").strip()
+    cands = [env_dir] if env_dir else []
+    cands.extend(["/scratch-local/tmp-subhkl", tempfile.gettempdir()])
+    for raw in cands:
+        if not raw:
+            continue
+        p = Path(raw)
+        if not p.is_dir():
+            continue
+        key = str(p.resolve())
+        if key not in seen:
+            seen.add(key)
+            roots.append(p)
+    return roots
 
 
 def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
     """Auto-discover an accompanying ``*.im.h5`` or ``merged.h5`` (or ``attrs['source']``)."""
+    import re as _re
+
     if replay_h5 is None:
         return None
     p = Path(replay_h5).resolve()
     if not p.exists():
         return None
+    staging_roots = _candidate_staging_roots()
+
+    def _probe_tag_in_staging(tag_val: str) -> str | None:
+        if not tag_val:
+            return None
+        safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag_val)
+        if not safe_tag or safe_tag.lower() in (
+            "solve",
+            "integrated",
+            "integrator",
+            "predictor",
+            "dataset",
+        ):
+            return None
+        for root_p in staging_roots:
+            for m_fn in (f"{safe_tag}_merged.h5", "merged.h5"):
+                work_cand = root_p / f"subhkl_work_{safe_tag}" / m_fn
+                if work_cand.is_file():
+                    with (
+                        contextlib.suppress(OSError, RuntimeError, KeyError),
+                        h5py.File(work_cand, "r") as wf,
+                    ):
+                        if "images" in wf:
+                            return str(work_cand.resolve())
+            for gx_cand in sorted(
+                glob.glob(str(root_p / f"subhkl_gx_*_{safe_tag}_merged.h5"))
+            ):
+                if os.path.isfile(gx_cand):
+                    with (
+                        contextlib.suppress(OSError, RuntimeError, KeyError),
+                        h5py.File(gx_cand, "r") as gf,
+                    ):
+                        if "images" in gf:
+                            return str(Path(gx_cand).resolve())
+        return None
+
     with (
         contextlib.suppress(OSError, RuntimeError, ValueError, TypeError, KeyError),
         h5py.File(p, "r") as f,
     ):
         if "images" in f:
             return str(p)
-        if "files" in f:
+        for ds_key in ("source_files", "files"):
+            if ds_key not in f:
+                continue
             with contextlib.suppress(
                 OSError, RuntimeError, ValueError, TypeError, KeyError
             ):
-                raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
+                raw_files = [_decode_str(x, "") for x in list(f[ds_key][()])]
                 raw_files = [x for x in raw_files if x]
                 if raw_files:
                     first_stem = os.path.basename(raw_files[0]).split(".")[0]
                     last_stem = os.path.basename(raw_files[-1]).split(".")[0]
-                    for tag in (
-                        f"{first_stem}_{last_stem}",
-                        first_stem,
-                    ):
-                        safe_tag = "".join(
-                            c if (c.isalnum() or c in "._-") else "_" for c in tag
-                        )
-                        for m_fn in (f"{safe_tag}_merged.h5", "merged.h5"):
-                            work_cand = (
-                                Path(tempfile.gettempdir())
-                                / f"subhkl_work_{safe_tag}"
-                                / m_fn
-                            )
-                            if work_cand.is_file():
-                                with (
-                                    contextlib.suppress(
-                                        OSError, RuntimeError, KeyError
-                                    ),
-                                    h5py.File(work_cand, "r") as wf,
-                                ):
-                                    if "images" in wf:
-                                        return str(work_cand.resolve())
-                        for gx_cand in sorted(
-                            glob.glob(
-                                os.path.join(
-                                    tempfile.gettempdir(),
-                                    f"subhkl_gx_*_{safe_tag}_merged.h5",
-                                )
-                            )
-                        ):
-                            if os.path.isfile(gx_cand):
-                                with (
-                                    contextlib.suppress(
-                                        OSError, RuntimeError, KeyError
-                                    ),
-                                    h5py.File(gx_cand, "r") as gf,
-                                ):
-                                    if "images" in gf:
-                                        return str(Path(gx_cand).resolve())
+                    for tag in (f"{first_stem}_{last_stem}", first_stem):
+                        hit = _probe_tag_in_staging(tag)
+                        if hit:
+                            return hit
         src_attr = _decode_str(f.attrs.get("source"), "")
         if not src_attr and "scan_refinement" in f:
             src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
@@ -465,9 +538,34 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                     ):
                         if "images" in sf:
                             return str(cand_src.resolve())
+            m_wd = _re.search(r"subhkl_work_([A-Za-z0-9._-]+)", str(src_attr))
+            if m_wd:
+                hit = _probe_tag_in_staging(m_wd.group(1))
+                if hit:
+                    return hit
+            src_bn = _re.sub(
+                r"(_merged|_solve|_integrated|_predictor)?\.(h5|hdf5|dat)$",
+                "",
+                src_p.name,
+                flags=_re.IGNORECASE,
+            )
+            hit = _probe_tag_in_staging(src_bn)
+            if hit:
+                return hit
+
+    clean_name = _re.sub(r"^subhkl_gx_[0-9a-fA-F]+_", "", p.name)
+    name_tag = _re.sub(
+        r"(_merged|_solve|_integrated|_integrator|_predictor)?\.(h5|hdf5|dat)$",
+        "",
+        clean_name,
+        flags=_re.IGNORECASE,
+    )
+    hit_from_name = _probe_tag_in_staging(name_tag)
+    if hit_from_name:
+        return hit_from_name
 
     parent = p.parent
-    if parent.resolve() == Path(tempfile.gettempdir()).resolve():
+    if parent.resolve() in {r.resolve() for r in staging_roots}:
         return None
     candidates = sorted(glob.glob(str(parent / "*.im.h5"))) + sorted(
         glob.glob(str(parent / "*merged*.h5"))
@@ -479,6 +577,87 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
         ):
             if "images" in f and "bank_ids" in f:
                 return cand
+    return None
+
+
+def _discover_predictor_h5(replay_h5: str | os.PathLike | None) -> str | None:
+    """Auto-discover the companion ``predictor.h5`` generated by ``subhkl peak-predictor``."""
+    if replay_h5 is None:
+        return None
+    p = Path(replay_h5).resolve()
+    if not p.is_file():
+        return None
+
+    ref_U: np.ndarray | None = None
+    ref_B: np.ndarray | None = None
+    candidate_paths: list[Path] = []
+    tmp_dir = Path(tempfile.gettempdir()).resolve()
+    if p.parent.resolve() != tmp_dir:
+        for sib_name in ("predictor.h5", "peak_predictor.h5"):
+            candidate_paths.append(p.parent / sib_name)
+
+    with (
+        contextlib.suppress(OSError, RuntimeError, ValueError, TypeError, KeyError),
+        h5py.File(p, "r") as f,
+    ):
+        if "banks" in f and "peaks" not in f:
+            return str(p)
+        if "sample/U" in f:
+            ref_U = np.asarray(f["sample/U"][()], dtype=float)
+        if "sample/B" in f:
+            ref_B = np.asarray(f["sample/B"][()], dtype=float)
+        if "files" in f:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
+                raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
+                raw_files = [x for x in raw_files if x]
+                if raw_files:
+                    first_stem = os.path.basename(raw_files[0]).split(".")[0]
+                    last_stem = os.path.basename(raw_files[-1]).split(".")[0]
+                    for tag in (f"{first_stem}_{last_stem}", first_stem):
+                        safe_tag = "".join(
+                            c if (c.isalnum() or c in "._-") else "_" for c in tag
+                        )
+                        for p_fn in ("predictor.h5", "peak_predictor.h5"):
+                            candidate_paths.append(
+                                tmp_dir / f"subhkl_work_{safe_tag}" / p_fn
+                            )
+
+    gx_preds = sorted(
+        glob.glob(os.path.join(str(tmp_dir), "subhkl_gx_*predict*.h5")),
+        key=lambda fp: os.path.getmtime(fp) if os.path.isfile(fp) else 0.0,
+        reverse=True,
+    )
+    for gx_fp in gx_preds:
+        candidate_paths.append(Path(gx_fp))
+
+    seen_cands: set[Path] = set()
+    for cand_p in candidate_paths:
+        with contextlib.suppress(OSError):
+            rp = cand_p.resolve()
+            if rp == p or rp in seen_cands or not rp.is_file():
+                continue
+            seen_cands.add(rp)
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, TypeError, KeyError),
+            h5py.File(cand_p, "r") as pf,
+        ):
+            if "banks" not in pf:
+                continue
+            if ref_U is not None and "sample/U" in pf:
+                u_cand = np.asarray(pf["sample/U"][()], dtype=float)
+                if u_cand.shape == ref_U.shape and not np.allclose(
+                    u_cand, ref_U, atol=1e-3
+                ):
+                    continue
+            if ref_B is not None and "sample/B" in pf:
+                b_cand = np.asarray(pf["sample/B"][()], dtype=float)
+                if b_cand.shape == ref_B.shape and not np.allclose(
+                    b_cand, ref_B, atol=1e-3
+                ):
+                    continue
+            return str(cand_p.resolve())
     return None
 
 
@@ -512,6 +691,16 @@ def _load_pixel_class_from_h5(
         elif "valid" in hf and "bank_ids" in hf:
             # Legacy static-mask HDF5 fallback (`valid`: 1=keep, 0=masked -> dark=1)
             val_arr = np.asarray(hf["valid"][()], dtype=np.uint8)
+            b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
+            if val_arr.ndim == 3 and len(b_ids) == val_arr.shape[0]:
+                for b_id, v2d in zip(b_ids, val_arr):
+                    out[int(b_id)] = np.where(v2d == 0, np.uint8(1), np.uint8(0))
+        elif (
+            _decode_str(hf.attrs.get("kind"), "") == "static-mask"
+            and "images" in hf
+            and "bank_ids" in hf
+        ):
+            val_arr = np.asarray(hf["images"][()], dtype=np.uint8)
             b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
             if val_arr.ndim == 3 and len(b_ids) == val_arr.shape[0]:
                 for b_id, v2d in zip(b_ids, val_arr):
@@ -564,6 +753,62 @@ def _load_pixel_class_from_h5(
     return by_bank, summary
 
 
+def _encode_pixel_valid_masks_for_js(
+    pixel_class_by_bank: dict[int, np.ndarray] | None,
+    em_mask_summary: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Pack native 1x per-bank pixel validity masks as compact bitsets for client JS raycasting."""
+    out: dict[str, dict[str, Any]] = {}
+    dead_set = {int(x) for x in ((em_mask_summary or {}).get("dead_banks") or ())}
+    if pixel_class_by_bank:
+        for bk, cls_im in sorted(pixel_class_by_bank.items()):
+            if cls_im is None or cls_im.ndim != 2 or cls_im.size == 0:
+                continue
+            h_px, w_px = int(cls_im.shape[0]), int(cls_im.shape[1])
+            if int(bk) in dead_set or not np.any(cls_im == 0):
+                out[str(int(bk))] = {"h": h_px, "w": w_px, "dead": True}
+                continue
+            if not np.any(cls_im != 0):
+                continue
+            bits = np.packbits(np.asarray(cls_im == 0, dtype=np.uint8).ravel())
+            out[str(int(bk))] = {
+                "h": h_px,
+                "w": w_px,
+                "b64": base64.b64encode(bits.tobytes()).decode("ascii"),
+            }
+    for dead_bk in sorted(dead_set):
+        if str(dead_bk) not in out:
+            out[str(dead_bk)] = {"h": 0, "w": 0, "dead": True}
+    return out
+
+
+def _decode_pixel_valid_masks_from_js(
+    pixel_mask_bits: dict[str, Any] | None,
+) -> dict[int, np.ndarray] | None:
+    """Reconstruct per-bank uint8 class arrays (0=valid, 1=masked) from payload['pixel_mask_bits']."""
+    if not isinstance(pixel_mask_bits, dict) or not pixel_mask_bits:
+        return None
+    out: dict[int, np.ndarray] = {}
+    for bk_str, entry in pixel_mask_bits.items():
+        if not isinstance(entry, dict):
+            continue
+        with contextlib.suppress(ValueError, TypeError):
+            bk = int(bk_str)
+            h_px = int(entry.get("h") or 0)
+            w_px = int(entry.get("w") or 0)
+            if entry.get("dead"):
+                out[bk] = np.ones((max(h_px, 1), max(w_px, 1)), dtype=np.uint8)
+                continue
+            b64_s = entry.get("b64")
+            if h_px > 0 and w_px > 0 and isinstance(b64_s, str) and b64_s:
+                raw_bytes = np.frombuffer(base64.b64decode(b64_s), dtype=np.uint8)
+                valid_bits = np.unpackbits(raw_bytes)[: h_px * w_px].reshape(
+                    (h_px, w_px)
+                )
+                out[bk] = np.where(valid_bits > 0, np.uint8(0), np.uint8(1))
+    return out or None
+
+
 def _encode_panel_textures(
     detectors: dict[int, Any],
     bank_arr: np.ndarray | None,
@@ -576,6 +821,7 @@ def _encode_panel_textures(
     frame_slice: tuple[int, int] | None = None,
     *,
     encode_images: bool = True,
+    include_geometry: bool = True,
     pixel_class_by_bank: dict[int, np.ndarray] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Build cylindrical + spherical detector panel geometries and base64 log-intensity PNG textures.
@@ -628,26 +874,58 @@ def _encode_panel_textures(
                                 f0 = int(offsets[best_r])
                                 f1 = int(offsets[best_r] + counts[best_r])
                         b = max(1, int(render_binning))
-                        for idx in range(f0, f1):
-                            bk = int(b_ids_all[idx])
-                            im = np.asarray(ims[idx], dtype=np.float32)
-                            if im.ndim != 2:
-                                continue
-                            n2, m2 = (im.shape[0] // b) * b, (im.shape[1] // b) * b
-                            if n2 > 0 and m2 > 0:
-                                imb = (
-                                    im[:n2, :m2]
-                                    .reshape(n2 // b, b, m2 // b, b)
-                                    .mean(axis=(1, 3))
-                                )
+                        if f1 > f0:
+                            ims_slab = np.asarray(ims[f0:f1], dtype=np.float32)
+                            if ims_slab.ndim == 3:
+                                n2 = (ims_slab.shape[1] // b) * b
+                                m2 = (ims_slab.shape[2] // b) * b
+                                if b > 1 and n2 > 0 and m2 > 0:
+                                    binned_slab = (
+                                        ims_slab[:, :n2, :m2]
+                                        .reshape(
+                                            ims_slab.shape[0],
+                                            n2 // b,
+                                            b,
+                                            m2 // b,
+                                            b,
+                                        )
+                                        .mean(axis=(2, 4))
+                                    )
+                                else:
+                                    binned_slab = ims_slab
+                                for rel_i, idx in enumerate(range(f0, f1)):
+                                    bk = int(b_ids_all[idx])
+                                    imb = binned_slab[rel_i]
+                                    if bk in raw_bank_images:
+                                        raw_bank_images[bk] = np.maximum(
+                                            raw_bank_images[bk], imb
+                                        )
+                                    else:
+                                        raw_bank_images[bk] = imb
                             else:
-                                imb = im
-                            if bk in raw_bank_images:
-                                raw_bank_images[bk] = np.maximum(
-                                    raw_bank_images[bk], imb
-                                )
-                            else:
-                                raw_bank_images[bk] = imb
+                                for idx in range(f0, f1):
+                                    bk = int(b_ids_all[idx])
+                                    im = np.asarray(ims[idx], dtype=np.float32)
+                                    if im.ndim != 2:
+                                        continue
+                                    n2, m2 = (
+                                        (im.shape[0] // b) * b,
+                                        (im.shape[1] // b) * b,
+                                    )
+                                    if b > 1 and n2 > 0 and m2 > 0:
+                                        imb = (
+                                            im[:n2, :m2]
+                                            .reshape(n2 // b, b, m2 // b, b)
+                                            .mean(axis=(1, 3))
+                                        )
+                                    else:
+                                        imb = im
+                                    if bk in raw_bank_images:
+                                        raw_bank_images[bk] = np.maximum(
+                                            raw_bank_images[bk], imb
+                                        )
+                                    else:
+                                        raw_bank_images[bk] = imb
                         if raw_bank_images:
                             intensity_source = "raw_h5"
         except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
@@ -660,7 +938,7 @@ def _encode_panel_textures(
         and bank_arr is not None
         and len(bank_arr) > 0
     ):
-        grid_size = 96
+        grid_size = 256 if int(render_binning) <= 1 else 96
         yy, xx = np.meshgrid(
             np.arange(grid_size, dtype=np.float32),
             np.arange(grid_size, dtype=np.float32),
@@ -723,64 +1001,65 @@ def _encode_panel_textures(
     t_grid = np.linspace(0.0, 1.0, grid_n + 1)
     for bk, det in sorted(detectors.items()):
         try:
-            # 4 canonical corners: C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
-            rr_c = np.array([0, det.n - 1, det.n - 1, 0], dtype=float)
-            cc_c = np.array([0, 0, det.m - 1, det.m - 1], dtype=float)
-            xyz_corners = det.pixel_to_lab(rr_c, cc_c)
-            x_c, y_c = _unrolled(xyz_corners)
-            _, el_c = _spherical_angles(xyz_corners)
+            if include_geometry:
+                # 4 canonical corners: C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
+                rr_c = np.array([0, det.n - 1, det.n - 1, 0], dtype=float)
+                cc_c = np.array([0, 0, det.m - 1, det.m - 1], dtype=float)
+                xyz_corners = det.pixel_to_lab(rr_c, cc_c)
+                x_c, y_c = _unrolled(xyz_corners)
+                _, el_c = _spherical_angles(xyz_corners)
 
-            # Dense 48-point perimeter along all 4 edges for curved spherical/cylindrical borders
-            rr_e = np.concatenate(
-                [
-                    t_edge * (det.n - 1),
-                    np.full_like(t_edge, det.n - 1),
-                    (1.0 - t_edge) * (det.n - 1),
-                    np.zeros_like(t_edge),
-                ]
-            )
-            cc_e = np.concatenate(
-                [
-                    np.zeros_like(t_edge),
-                    t_edge * (det.m - 1),
-                    np.full_like(t_edge, det.m - 1),
-                    (1.0 - t_edge) * (det.m - 1),
-                ]
-            )
-            xyz_edge = det.pixel_to_lab(rr_e, cc_e)
-            x_e, y_e = _unrolled(xyz_edge)
-            _, el_e = _spherical_angles(xyz_edge)
+                # Dense 48-point perimeter along all 4 edges for curved spherical/cylindrical borders
+                rr_e = np.concatenate(
+                    [
+                        t_edge * (det.n - 1),
+                        np.full_like(t_edge, det.n - 1),
+                        (1.0 - t_edge) * (det.n - 1),
+                        np.zeros_like(t_edge),
+                    ]
+                )
+                cc_e = np.concatenate(
+                    [
+                        np.zeros_like(t_edge),
+                        t_edge * (det.m - 1),
+                        np.full_like(t_edge, det.m - 1),
+                        (1.0 - t_edge) * (det.m - 1),
+                    ]
+                )
+                xyz_edge = det.pixel_to_lab(rr_e, cc_e)
+                x_e, y_e = _unrolled(xyz_edge)
+                _, el_e = _spherical_angles(xyz_edge)
 
-            # Curvilinear (grid_n + 1) x (grid_n + 1) interior/boundary mesh so high-elevation
-            # panels (such as MANDI's bottom-plane banks) warp accurately to their curved outlines
-            rr_m_grid, cc_m_grid = np.meshgrid(
-                t_grid * (det.n - 1), t_grid * (det.m - 1), indexing="ij"
-            )
-            xyz_mesh = det.pixel_to_lab(rr_m_grid.ravel(), cc_m_grid.ravel())
-            x_m, y_m = _unrolled(xyz_mesh)
-            _, el_m = _spherical_angles(xyz_mesh)
+                # Curvilinear (grid_n + 1) x (grid_n + 1) interior/boundary mesh so high-elevation
+                # panels (such as MANDI's bottom-plane banks) warp accurately to their curved outlines
+                rr_m_grid, cc_m_grid = np.meshgrid(
+                    t_grid * (det.n - 1), t_grid * (det.m - 1), indexing="ij"
+                )
+                xyz_mesh = det.pixel_to_lab(rr_m_grid.ravel(), cc_m_grid.ravel())
+                x_m, y_m = _unrolled(xyz_mesh)
+                _, el_m = _spherical_angles(xyz_mesh)
 
-            # Unwrap azimuth across the +-180 deg seam (e.g., MANDI Bank 5 straddling +-180 deg)
-            x_all = np.concatenate([x_c, x_e, x_m])
-            if np.ptp(x_all) > 180.0:
-                x_all_u = np.where(x_all < 0.0, x_all + 360.0, x_all)
-                if np.ptp(x_all_u) <= 180.0:
-                    x_c = np.where(x_c < 0.0, x_c + 360.0, x_c)
-                    x_e = np.where(x_e < 0.0, x_e + 360.0, x_e)
-                    x_m = np.where(x_m < 0.0, x_m + 360.0, x_m)
-                else:
-                    continue
+                # Unwrap azimuth across the +-180 deg seam (e.g., MANDI Bank 5 straddling +-180 deg)
+                x_all = np.concatenate([x_c, x_e, x_m])
+                if np.ptp(x_all) > 180.0:
+                    x_all_u = np.where(x_all < 0.0, x_all + 360.0, x_all)
+                    if np.ptp(x_all_u) <= 180.0:
+                        x_c = np.where(x_c < 0.0, x_c + 360.0, x_c)
+                        x_e = np.where(x_e < 0.0, x_e + 360.0, x_e)
+                        x_m = np.where(x_m < 0.0, x_m + 360.0, x_m)
+                    else:
+                        continue
 
-            az_min = float(min(np.min(x_e), np.min(x_m)))
-            az_max = float(max(np.max(x_e), np.max(x_m)))
-            y_min = float(min(np.min(y_e), np.min(y_m)))
-            y_max = float(max(np.max(y_e), np.max(y_m)))
-            el_min = float(min(np.min(el_e), np.min(el_m)))
-            el_max = float(max(np.max(el_e), np.max(el_m)))
+                az_min = float(min(np.min(x_e), np.min(x_m)))
+                az_max = float(max(np.max(x_e), np.max(x_m)))
+                y_min = float(min(np.min(y_e), np.min(y_m)))
+                y_max = float(max(np.max(y_e), np.max(y_m)))
+                el_min = float(min(np.min(el_e), np.min(el_m)))
+                el_max = float(max(np.max(el_e), np.max(el_m)))
 
-            x_m_2d = x_m.reshape(grid_n + 1, grid_n + 1)
-            y_m_2d = y_m.reshape(grid_n + 1, grid_n + 1)
-            el_m_2d = el_m.reshape(grid_n + 1, grid_n + 1)
+                x_m_2d = x_m.reshape(grid_n + 1, grid_n + 1)
+                y_m_2d = y_m.reshape(grid_n + 1, grid_n + 1)
+                el_m_2d = el_m.reshape(grid_n + 1, grid_n + 1)
 
             tex_b64 = None
             im = raw_bank_images.get(int(bk))
@@ -790,7 +1069,7 @@ def _encode_panel_textures(
                 norm = np.clip((log_im - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
                 u8 = (norm * 255.0).astype(np.uint8)
                 buf = io.BytesIO()
-                Image.fromarray(u8, mode="L").save(buf, format="PNG", optimize=True)
+                Image.fromarray(u8, mode="L").save(buf, format="PNG", compress_level=1)
                 tex_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
             mask_b64 = None
@@ -821,13 +1100,27 @@ def _encode_panel_textures(
                     )
                     mbuf = io.BytesIO()
                     Image.fromarray(m_u8, mode="L").save(
-                        mbuf, format="PNG", optimize=True
+                        mbuf, format="PNG", compress_level=1
                     )
                     mask_b64 = base64.b64encode(mbuf.getvalue()).decode("ascii")
+
+            if not include_geometry:
+                panels_payload.append(
+                    {
+                        "bank": int(bk),
+                        "n_rows": int(det.n),
+                        "n_cols": int(det.m),
+                        "texture_b64": tex_b64,
+                        "mask_b64": mask_b64,
+                    }
+                )
+                continue
 
             panels_payload.append(
                 {
                     "bank": int(bk),
+                    "n_rows": int(det.n),
+                    "n_cols": int(det.m),
                     "az_min": round(az_min, 3),
                     "az_max": round(az_max, 3),
                     "y_min": round(y_min, 4),
@@ -888,6 +1181,97 @@ def _encode_panel_textures(
     return panels_payload, intensity_source
 
 
+def build_rainbow_panel_textures_only(
+    replay_h5: str | os.PathLike | None = None,
+    *,
+    images_h5: str | os.PathLike | None = None,
+    instrument: str = "IMAGINE",
+    render_binning: int = 1,
+    frame_index: int | None = None,
+) -> dict[str, Any]:
+    """Encode only per-bank detector intensity/mask PNGs without raycasting HKLs or rebuilding zones."""
+    rb = max(1, int(render_binning))
+    primary_h5 = (
+        str(replay_h5)
+        if replay_h5 is not None and os.path.exists(replay_h5)
+        else (
+            str(images_h5)
+            if images_h5 is not None and os.path.exists(images_h5)
+            else None
+        )
+    )
+    if primary_h5 is None:
+        detectors = _load_detectors_from_h5(None, instrument or "IMAGINE")
+        panels_payload, intensity_source = _encode_panel_textures(
+            detectors,
+            None,
+            None,
+            None,
+            None,
+            None,
+            images_h5=None,
+            render_binning=rb,
+            frame_slice=None,
+            encode_images=True,
+            include_geometry=False,
+        )
+        return {
+            "render_binning": rb,
+            "frame_index": int(frame_index or 0),
+            "intensity_source": intensity_source,
+            "panels": panels_payload,
+        }
+
+    extracted = _extract_from_h5(
+        primary_h5,
+        images_h5=images_h5,
+        frame_index=frame_index,
+        include_peaks=False,
+        default_instrument=instrument or "IMAGINE",
+    )
+    src_h5 = extracted.get("images_h5")
+    has_raw_images = False
+    if src_h5 and os.path.exists(src_h5):
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError),
+            h5py.File(src_h5, "r") as f_chk,
+        ):
+            has_raw_images = "images" in f_chk
+    if not has_raw_images:
+        extracted = _extract_from_h5(
+            primary_h5,
+            images_h5=images_h5,
+            frame_index=frame_index,
+            include_peaks=True,
+            include_all_runs_peaks=False,
+            default_instrument=instrument or "IMAGINE",
+        )
+
+    detectors = extracted.get("detectors") or _load_detectors_from_h5(
+        None, extracted.get("instrument") or instrument or "IMAGINE"
+    )
+    panels_payload, intensity_source = _encode_panel_textures(
+        detectors,
+        extracted.get("bank"),
+        extracted.get("pixel_r"),
+        extracted.get("pixel_c"),
+        extracted.get("intensity"),
+        extracted.get("sigma"),
+        images_h5=extracted.get("images_h5"),
+        render_binning=rb,
+        frame_slice=extracted.get("frame_slice"),
+        encode_images=True,
+        include_geometry=False,
+        pixel_class_by_bank=extracted.get("pixel_class_by_bank"),
+    )
+    return {
+        "render_binning": rb,
+        "frame_index": int(extracted.get("active_frame", frame_index or 0)),
+        "intensity_source": intensity_source,
+        "panels": panels_payload,
+    }
+
+
 def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str:
     """Infer canonical dataset file extension from filename first, falling back to Galaxy metadata."""
     import re as _re
@@ -902,6 +1286,8 @@ def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str
         return "mtz"
     if base.endswith(".json"):
         return "json"
+    if base.endswith(".csv"):
+        return "csv"
     if base.endswith((".html", ".htm")):
         return "html"
     if base.endswith(".png"):
@@ -914,6 +1300,14 @@ def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str
         return "dat"
     if base.endswith((".log", ".txt")):
         return "txt"
+    if base.endswith("_mtz") or base == "mtz":
+        return "mtz"
+    if base.endswith(("_json", "_ref")):
+        return "json"
+    if base.endswith("_csv"):
+        return "csv"
+    if base.endswith(("_html", "_htm")):
+        return "html"
     ext = str(raw_ext or "").strip().lower().lstrip(".")
     return ext or "data"
 
@@ -992,6 +1386,16 @@ def validate_subhkl_ingestible_dataset(
         raise ValueError(
             f"Cannot ingest Galaxy dataset {ds_label}: dataset file is empty or missing."
         )
+    from subhkl.io.shared_storage import read_shared_pointer, resolve_input_h5_path
+
+    if read_shared_pointer(p) is not None:
+        try:
+            resolved_p, _ = resolve_input_h5_path(p, must_exist=True)
+            p = Path(resolved_p)
+        except (FileNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"Cannot ingest shared intermediate {ds_label}: its shared file in SUBHKL_SHARED_DIR was already cleaned up after use ({exc})."
+            ) from exc
     if ext == "mtz" or str(p).lower().endswith(".mtz"):
         if not has_active_geometry:
             raise ValueError(
@@ -1040,20 +1444,581 @@ def validate_subhkl_ingestible_dataset(
         ) from exc
 
 
+def _u_from_ub(ub_matrix: Any) -> np.ndarray:
+    """Extract proper orthogonal orientation matrix U from UB = U @ B (B upper-triangular, diag > 0)."""
+    ub = np.asarray(ub_matrix, dtype=float)
+    if ub.shape != (3, 3):
+        raise ValueError("ub_matrix must have shape (3, 3)")
+    q_mat, r_mat = np.linalg.qr(ub)
+    signs = np.sign(np.diag(r_mat))
+    signs[signs == 0.0] = 1.0
+    u_mat = q_mat * signs[None, :]
+    if np.linalg.det(u_mat) < 0.0:
+        u_mat[:, -1] *= -1.0
+    return u_mat
+
+
+def _reconstruct_detectors_from_payload(payload: dict[str, Any]) -> dict[int, Any]:
+    """Rebuild active Detector objects from payload['detector_configs'] or instrument defaults."""
+    from subhkl.instrument.detector import Detector
+
+    panel_banks = {
+        int(p["bank"])
+        for p in (payload.get("panels") or [])
+        if isinstance(p, dict) and "bank" in p
+    }
+
+    def _normalize_det_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+        raw_pt = str(cfg.get("panel") or cfg.get("panel_type") or "flat")
+        panel_norm = "curved" if raw_pt in ("curved", "cylindrical") else "flat"
+        return {
+            "m": 256,
+            "n": 256,
+            **cfg,
+            "panel": panel_norm,
+            "panel_type": panel_norm,
+        }
+
+    detectors: dict[int, Any] = {}
+    det_cfgs = payload.get("detector_configs")
+    if isinstance(det_cfgs, dict) and det_cfgs:
+        for bk_s, cfg in det_cfgs.items():
+            try:
+                bid = int(bk_s)
+            except (ValueError, TypeError):
+                continue
+            if panel_banks and bid not in panel_banks:
+                continue
+            if isinstance(cfg, dict) and (
+                all(k in cfg for k in ("center", "uhat", "vhat", "width", "height"))
+                or str(cfg.get("panel") or cfg.get("panel_type") or "")
+                in ("curved", "cylindrical")
+            ):
+                full_cfg = _normalize_det_cfg(cfg)
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ):
+                    detectors[bid] = Detector(full_cfg)
+    if not detectors:
+        inst = str(payload.get("instrument") or "CG4D")
+        bl_map = (payload.get("beamline_detectors") or {}).get(inst)
+        if isinstance(bl_map, dict) and bl_map:
+            for bk_s, cfg in bl_map.items():
+                try:
+                    bid = int(bk_s)
+                except (ValueError, TypeError):
+                    continue
+                if panel_banks and bid not in panel_banks:
+                    continue
+                if isinstance(cfg, dict):
+                    full_cfg = _normalize_det_cfg(cfg)
+                    with contextlib.suppress(
+                        OSError, RuntimeError, ValueError, TypeError, KeyError
+                    ):
+                        detectors[bid] = Detector(full_cfg)
+        if not detectors:
+            loaded = _load_detectors_from_h5(None, inst)
+            for bid, det in loaded.items():
+                if not panel_banks or int(bid) in panel_banks:
+                    detectors[int(bid)] = det
+    return detectors
+
+
+def _raycast_hkl_on_detectors(
+    hkl_cand: np.ndarray,
+    U_mat: np.ndarray,
+    B_mat: np.ndarray,
+    R_run: np.ndarray,
+    detectors: dict[int, Any],
+    wavelength_range: tuple[float, float] | list[float],
+    *,
+    ki: Any = (0.0, 0.0, 1.0),
+    sample_offset_lab: Any = None,
+    active_bids: set[int] | None = None,
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
+    inten_cand: np.ndarray | None = None,
+    sigma_cand: np.ndarray | None = None,
+    bank_imgs: dict[int, np.ndarray] | None = None,
+    margin_frac: float = 0.0,
+    G_cryst: np.ndarray | None = None,
+    qn_cryst: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Forward-project candidate Miller indices onto calibrated detector panels in Laue geometry."""
+    empty = {
+        "peaks_xyz": np.zeros((0, 3), dtype=float),
+        "hkl": np.zeros((0, 3), dtype=int),
+        "wavelength": np.zeros(0, dtype=float),
+        "bank": np.zeros(0, dtype=int),
+        "pixel_r": np.zeros(0, dtype=float),
+        "pixel_c": np.zeros(0, dtype=float),
+        "intensity": np.zeros(0, dtype=float),
+        "sigma": np.zeros(0, dtype=float),
+    }
+    if hkl_cand is None or len(hkl_cand) == 0 or not detectors:
+        return empty
+
+    hkl_arr = np.asarray(hkl_cand, dtype=int)
+    ki_vec = np.asarray(ki, dtype=float)
+    ki_vec = ki_vec / max(float(np.linalg.norm(ki_vec)), 1e-12)
+    wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
+
+    R_mat = np.asarray(R_run, dtype=float)
+    if (
+        G_cryst is not None
+        and qn_cryst is not None
+        and len(G_cryst) == len(hkl_arr)
+        and len(qn_cryst) == len(hkl_arr)
+    ):
+        qn = qn_cryst
+        ki_cryst = R_mat.T @ ki_vec
+        sth = -(G_cryst @ ki_cryst) / np.maximum(qn, 1e-12)
+        lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
+        keep_wl = (
+            (qn > 1e-8) & (sth > 1e-5) & (lam_pred >= wl_min) & (lam_pred <= wl_max)
+        )
+        if not np.any(keep_wl):
+            return empty
+        hkl_b = hkl_arr[keep_wl]
+        lam_b = lam_pred[keep_wl]
+        G_b = G_cryst[keep_wl] @ R_mat.T
+    else:
+        RUB = R_mat @ np.asarray(U_mat, dtype=float) @ np.asarray(B_mat, dtype=float)
+        G = hkl_arr.astype(float) @ RUB.T
+        qn = np.linalg.norm(G, axis=1)
+        sth = -(G @ ki_vec) / np.maximum(qn, 1e-12)
+        lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
+        keep_wl = (
+            (qn > 1e-8) & (sth > 1e-5) & (lam_pred >= wl_min) & (lam_pred <= wl_max)
+        )
+        if not np.any(keep_wl):
+            return empty
+        hkl_b = hkl_arr[keep_wl]
+        lam_b = lam_pred[keep_wl]
+        G_b = G[keep_wl]
+    inten_b = (
+        np.asarray(inten_cand, dtype=float)[keep_wl]
+        if inten_cand is not None and len(inten_cand) == len(hkl_arr)
+        else None
+    )
+    sig_b = (
+        np.asarray(sigma_cand, dtype=float)[keep_wl]
+        if sigma_cand is not None and len(sigma_cand) == len(hkl_arr)
+        else None
+    )
+    kf = ki_vec[None, :] + lam_b[:, None] * G_b
+    kf /= np.maximum(np.linalg.norm(kf, axis=1, keepdims=True), 1e-12)
+
+    s_lab = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None
+        else np.zeros(3, dtype=float)
+    )
+    mf = max(0.0, float(margin_frac))
+    xyz_l, hkl_l, lam_l, bank_l, pr_l, pc_l, inten_l, sig_l = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
+
+    cand_dets = [
+        (int(bid), det)
+        for bid, det in sorted(detectors.items())
+        if active_bids is None or int(bid) in active_bids
+    ]
+    if not cand_dets:
+        return empty
+
+    all_flat = all(
+        "curved" not in str(getattr(det, "panel_type", "")).lower()
+        and int(getattr(det, "n", 0)) > 1
+        and int(getattr(det, "m", 0)) > 1
+        and hasattr(det, "center")
+        and hasattr(det, "uhat")
+        and hasattr(det, "vhat")
+        and hasattr(det, "width")
+        and hasattr(det, "height")
+        for _, det in cand_dets
+    )
+
+    if all_flat:
+        flat_bids = np.array([bid_i for bid_i, _ in cand_dets], dtype=int)
+        C_arr = np.array(
+            [np.asarray(det.center, dtype=float) for _, det in cand_dets], dtype=float
+        )
+        uhat_arr = np.array(
+            [np.asarray(det.uhat, dtype=float) for _, det in cand_dets], dtype=float
+        )
+        vhat_arr = np.array(
+            [np.asarray(det.vhat, dtype=float) for _, det in cand_dets], dtype=float
+        )
+        norm_arr = np.cross(uhat_arr, vhat_arr)
+        n_arr = np.array([int(det.n) for _, det in cand_dets], dtype=float)
+        m_arr = np.array([int(det.m) for _, det in cand_dets], dtype=float)
+        dw_arr = np.array([float(det.width) for _, det in cand_dets], dtype=float) / (
+            m_arr - 1.0
+        )
+        dh_arr = np.array([float(det.height) for _, det in cand_dets], dtype=float) / (
+            n_arr - 1.0
+        )
+
+        n_b = len(cand_dets)
+        c_minus_s = C_arr - s_lab[None, :]
+        c_minus_s_dot_n = np.sum(c_minus_s * norm_arr, axis=1)
+        s_minus_c_u = -np.sum(c_minus_s * uhat_arr, axis=1)
+        s_minus_c_v = -np.sum(c_minus_s * vhat_arr, axis=1)
+
+        proj_mat = np.hstack([norm_arr.T, uhat_arr.T, vhat_arr.T])
+        dots = kf @ proj_mat
+        d_dot_n = dots[:, :n_b]
+        kf_u = dots[:, n_b : 2 * n_b]
+        kf_v = dots[:, 2 * n_b :]
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t_mat = c_minus_s_dot_n[None, :] / d_dot_n
+            row_mat = (s_minus_c_v[None, :] + t_mat * kf_v) / dh_arr[None, :]
+            col_mat = (s_minus_c_u[None, :] + t_mat * kf_u) / dw_arr[None, :]
+
+        hit_mat = (
+            (t_mat > 0.0)
+            & (row_mat >= 0.0)
+            & (row_mat < n_arr[None, :])
+            & (col_mat >= 0.0)
+            & (col_mat < m_arr[None, :])
+        )
+        if mf > 0.0:
+            bw_arr = np.floor(mf * np.minimum(n_arr, m_arr))
+            hi_r_arr = np.where(bw_arr > 0.0, n_arr - 1.0 - bw_arr, n_arr)
+            hi_c_arr = np.where(bw_arr > 0.0, m_arr - 1.0 - bw_arr, m_arr)
+            hit_mat &= (
+                (row_mat >= bw_arr[None, :])
+                & (row_mat < hi_r_arr[None, :])
+                & (col_mat >= bw_arr[None, :])
+                & (col_mat < hi_c_arr[None, :])
+            )
+
+        b_hits, k_hits = np.nonzero(hit_mat.T)
+        if len(b_hits) == 0:
+            return empty
+
+        for b_pos in np.unique(b_hits):
+            sel_b = b_hits == b_pos
+            idx_h = k_hits[sel_b]
+            bid_i = int(flat_bids[b_pos])
+            pr_hit = row_mat[idx_h, b_pos]
+            pc_hit = col_mat[idx_h, b_pos]
+            if pixel_class_by_bank is not None:
+                cls_b = pixel_class_by_bank.get(bid_i)
+                if cls_b is not None and cls_b.ndim == 2:
+                    rm = np.clip(np.round(pr_hit).astype(int), 0, cls_b.shape[0] - 1)
+                    cm = np.clip(np.round(pc_hit).astype(int), 0, cls_b.shape[1] - 1)
+                    valid_m = cls_b[rm, cm] == 0
+                    if not np.any(valid_m):
+                        continue
+                    idx_h = idx_h[valid_m]
+                    pr_hit = pr_hit[valid_m]
+                    pc_hit = pc_hit[valid_m]
+            xyz_hit = (
+                C_arr[b_pos][None, :]
+                + (pc_hit * dw_arr[b_pos])[:, None] * uhat_arr[b_pos][None, :]
+                + (pr_hit * dh_arr[b_pos])[:, None] * vhat_arr[b_pos][None, :]
+            )
+            if inten_b is not None:
+                iv_hit = inten_b[idx_h]
+            elif bank_imgs is not None and bid_i in bank_imgs:
+                im_b = bank_imgs[bid_i]
+                r_i = np.clip(
+                    np.round(pr_hit).astype(int), 2, max(2, im_b.shape[0] - 3)
+                )
+                c_i = np.clip(
+                    np.round(pc_hit).astype(int), 2, max(2, im_b.shape[1] - 3)
+                )
+                iv_hit = np.maximum(
+                    np.maximum.reduce(
+                        [
+                            im_b[r_i + dr, c_i + dc]
+                            for dr in (-1, 0, 1)
+                            for dc in (-1, 0, 1)
+                        ]
+                    ),
+                    1.0,
+                )
+            else:
+                iv_hit = np.full(len(idx_h), 150.0, dtype=float)
+            sv_hit = (
+                sig_b[idx_h]
+                if sig_b is not None
+                else np.full(len(idx_h), 3.0, dtype=float)
+            )
+            xyz_l.append(xyz_hit)
+            hkl_l.append(hkl_b[idx_h])
+            lam_l.append(lam_b[idx_h])
+            bank_l.append(np.full(len(idx_h), bid_i, dtype=int))
+            pr_l.append(pr_hit)
+            pc_l.append(pc_hit)
+            inten_l.append(iv_hit)
+            sig_l.append(sv_hit)
+    else:
+        for bid_i, det in cand_dets:
+            idx_h = np.zeros(0, dtype=int)
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+            ):
+                if hasattr(det, "reflections_mask") and hasattr(det, "pixel_to_lab"):
+                    is_curv_det = (
+                        "curved" in str(getattr(det, "panel_type", "")).lower()
+                    )
+                    s_off_use = (
+                        s_lab[None, :]
+                        if is_curv_det
+                        else (s_lab if float(np.linalg.norm(s_lab)) > 1e-12 else None)
+                    )
+                    mask_c, row_c, col_c = det.reflections_mask(
+                        kf[:, 0], kf[:, 1], kf[:, 2], sample_offset=s_off_use
+                    )
+                    if mf > 0.0 and np.any(mask_c):
+                        bw_px = int(mf * min(int(det.n), int(det.m)))
+                        if bw_px > 0:
+                            hi_r_px = int(det.n) - 1 - bw_px
+                            hi_c_px = int(det.m) - 1 - bw_px
+                            mask_c = (
+                                mask_c
+                                & (row_c >= bw_px)
+                                & (row_c < hi_r_px)
+                                & (col_c >= bw_px)
+                                & (col_c < hi_c_px)
+                            )
+                    if np.any(mask_c):
+                        idx_h = np.flatnonzero(mask_c)
+                        pr_hit = np.asarray(row_c[idx_h], dtype=float)
+                        pc_hit = np.asarray(col_c[idx_h], dtype=float)
+                        xyz_hit = np.asarray(
+                            det.pixel_to_lab(pr_hit, pc_hit), dtype=float
+                        )
+                        if xyz_hit.ndim == 1:
+                            xyz_hit = xyz_hit[None, :]
+                else:
+                    cen = np.asarray(det.center, dtype=float)
+                    uh = np.asarray(det.uhat, dtype=float)
+                    vh = np.asarray(det.vhat, dtype=float)
+                    w_d, h_d = float(det.width), float(det.height)
+                    nrm = np.cross(uh, vh)
+                    dn = kf @ nrm
+                    t_ray = np.dot(cen - s_lab, nrm) / np.where(
+                        np.abs(dn) < 1e-9, -1.0, dn
+                    )
+                    hit = t_ray > 0
+                    if np.any(hit):
+                        cand_h = np.flatnonzero(hit)
+                        p_hit = (
+                            s_lab[None, :]
+                            + t_ray[cand_h, None] * kf[cand_h]
+                            - cen[None, :]
+                        )
+                        um = p_hit @ uh
+                        vm = p_hit @ vh
+                        pr_all = vm / max(h_d, 1e-6) * max(int(det.n) - 1, 1)
+                        pc_all = um / max(w_d, 1e-6) * max(int(det.m) - 1, 1)
+                        bw_fb = int(mf * min(int(det.n), int(det.m))) if mf > 0.0 else 0
+                        hi_r_fb = int(det.n) - 1 - bw_fb if bw_fb > 0 else int(det.n)
+                        hi_c_fb = int(det.m) - 1 - bw_fb if bw_fb > 0 else int(det.m)
+                        in_b = (
+                            (pr_all >= bw_fb)
+                            & (pr_all < hi_r_fb)
+                            & (pc_all >= bw_fb)
+                            & (pc_all < hi_c_fb)
+                        )
+                        if np.any(in_b):
+                            idx_h = cand_h[in_b]
+                            um, vm = um[in_b], vm[in_b]
+                            pr_hit = pr_all[in_b]
+                            pc_hit = pc_all[in_b]
+                            xyz_hit = (
+                                cen[None, :]
+                                + um[:, None] * uh[None, :]
+                                + vm[:, None] * vh[None, :]
+                            )
+            if len(idx_h) == 0:
+                continue
+            if pixel_class_by_bank is not None:
+                cls_b = pixel_class_by_bank.get(bid_i)
+                if cls_b is not None and cls_b.ndim == 2:
+                    rm = np.clip(np.round(pr_hit).astype(int), 0, cls_b.shape[0] - 1)
+                    cm = np.clip(np.round(pc_hit).astype(int), 0, cls_b.shape[1] - 1)
+                    valid_m = cls_b[rm, cm] == 0
+                    if not np.any(valid_m):
+                        continue
+                    idx_h = idx_h[valid_m]
+                    xyz_hit = xyz_hit[valid_m]
+                    pr_hit, pc_hit = pr_hit[valid_m], pc_hit[valid_m]
+            if inten_b is not None:
+                iv_hit = inten_b[idx_h]
+            elif bank_imgs is not None and bid_i in bank_imgs:
+                im_b = bank_imgs[bid_i]
+                r_i = np.clip(
+                    np.round(pr_hit).astype(int), 2, max(2, im_b.shape[0] - 3)
+                )
+                c_i = np.clip(
+                    np.round(pc_hit).astype(int), 2, max(2, im_b.shape[1] - 3)
+                )
+                iv_hit = np.maximum(
+                    np.maximum.reduce(
+                        [
+                            im_b[r_i + dr, c_i + dc]
+                            for dr in (-1, 0, 1)
+                            for dc in (-1, 0, 1)
+                        ]
+                    ),
+                    1.0,
+                )
+            else:
+                iv_hit = np.full(len(idx_h), 150.0, dtype=float)
+            sv_hit = (
+                sig_b[idx_h]
+                if sig_b is not None
+                else np.full(len(idx_h), 3.0, dtype=float)
+            )
+
+            xyz_l.append(xyz_hit)
+            hkl_l.append(hkl_b[idx_h])
+            lam_l.append(lam_b[idx_h])
+            bank_l.append(np.full(len(idx_h), bid_i, dtype=int))
+            pr_l.append(pr_hit)
+            pc_l.append(pc_hit)
+            inten_l.append(iv_hit)
+            sig_l.append(sv_hit)
+
+    if not xyz_l:
+        return empty
+    return {
+        "peaks_xyz": np.concatenate(xyz_l, axis=0),
+        "hkl": np.concatenate(hkl_l, axis=0),
+        "wavelength": np.concatenate(lam_l, axis=0),
+        "bank": np.concatenate(bank_l, axis=0),
+        "pixel_r": np.concatenate(pr_l, axis=0),
+        "pixel_c": np.concatenate(pc_l, axis=0),
+        "intensity": np.concatenate(inten_l, axis=0),
+        "sigma": np.concatenate(sig_l, axis=0),
+    }
+
+
 def apply_mtz_to_payload(
     payload: dict[str, Any],
     mtz_path: str | os.PathLike,
     ds_info: dict[str, Any] | None = None,
+    *,
+    select_mtz_color: bool = True,
 ) -> dict[str, Any]:
-    """Overlay reference spots / merged intensities from an MTZ file onto an existing detector geometry payload."""
+    """Attach external MTZ I/SIGI data columns onto active UB reflection peaks without modifying B or U."""
     import gemmi
 
-    mtz = gemmi.read_mtz_file(str(mtz_path))
-    sg = mtz.spacegroup or gemmi.find_spacegroup_by_name(
-        str(payload.get("space_group") or "P 1")
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+
+    if payload.get("u_matrix") is not None and payload.get("b_matrix") is not None:
+        U_curr = np.asarray(payload["u_matrix"], dtype=float)
+        B_curr = np.asarray(payload["b_matrix"], dtype=float)
+        UB_curr = U_curr @ B_curr
+    elif payload.get("ub_matrix") is not None:
+        UB_curr = np.asarray(payload["ub_matrix"], dtype=float)
+        U_curr = (
+            np.asarray(payload["u_matrix"], dtype=float)
+            if payload.get("u_matrix") is not None
+            else _u_from_ub(UB_curr)
+        )
+        B_curr = U_curr.T @ UB_curr
+    elif payload.get("u_matrix") is not None and (
+        payload.get("cell") and len(payload["cell"]) == 6
+    ):
+        U_curr = np.asarray(payload["u_matrix"], dtype=float)
+        c_act = [float(x) for x in payload["cell"]]
+        B_curr, _ = cartesian_matrix_metric_tensor(
+            c_act[0],
+            c_act[1],
+            c_act[2],
+            *np.deg2rad(c_act[3:6]),
+        )
+        UB_curr = U_curr @ B_curr
+    else:
+        raise ValueError(
+            "Cannot load MTZ without an active UB geometry: run Solve or load an indexed HDF5 dataset first."
+        )
+
+    active_cell = (
+        [float(x) for x in payload["cell"]]
+        if payload.get("cell") and len(payload["cell"]) == 6
+        else list(_cell_from_B(B_curr))
     )
-    asu = gemmi.ReciprocalAsu(sg)
-    ops = sg.operations()
+    active_sg_name = str(payload.get("space_group") or "P 1")
+    active_sg = (
+        gemmi.find_spacegroup_by_name(active_sg_name)
+        or gemmi.find_spacegroup_by_name("P 1")
+        or gemmi.SpaceGroup("P 1")
+    )
+
+    mtz = gemmi.read_mtz_file(str(mtz_path))
+    mtz_sg_raw = mtz.spacegroup
+    mtz_sg = mtz_sg_raw or active_sg
+    mtz_sg_label = mtz_sg_raw.xhm() if mtz_sg_raw is not None else None
+    same_sg = mtz_sg_raw is None or (
+        mtz_sg.number == active_sg.number and mtz_sg.xhm() == active_sg.xhm()
+    )
+    mtz_cell_vals: list[float] | None = None
+    if (
+        getattr(mtz, "cell", None) is not None
+        and float(mtz.cell.a) > 0.5
+        and float(mtz.cell.b) > 0.5
+        and float(mtz.cell.c) > 0.5
+    ):
+        mtz_cell_vals = [
+            round(float(mtz.cell.a), 4),
+            round(float(mtz.cell.b), 4),
+            round(float(mtz.cell.c), 4),
+            round(float(mtz.cell.alpha), 3),
+            round(float(mtz.cell.beta), 3),
+            round(float(mtz.cell.gamma), 3),
+        ]
+    cell_mismatch = False
+    if mtz_cell_vals is not None and len(active_cell) == 6:
+        edge_rel = max(
+            abs(mtz_cell_vals[i] - active_cell[i]) / max(abs(active_cell[i]), 1e-3)
+            for i in range(3)
+        )
+        ang_abs = max(abs(mtz_cell_vals[i] - active_cell[i]) for i in range(3, 6))
+        cell_mismatch = (edge_rel > 0.015) or (ang_abs > 0.75)
+
+    def _fmt_cell_info(c_v: list[float]) -> str:
+        return (
+            f"{c_v[0]:.2f}, {c_v[1]:.2f}, {c_v[2]:.2f} Å; "
+            f"{c_v[3]:.1f}, {c_v[4]:.1f}, {c_v[5]:.1f}°"
+        )
+
+    mtz_overlay_warning: str | None = None
+    if not same_sg and cell_mismatch and mtz_cell_vals is not None:
+        mtz_overlay_warning = (
+            f"Symmetry & unit cell differ: MTZ header is {mtz_sg_label} "
+            f"({_fmt_cell_info(mtz_cell_vals)}) vs active solve {active_sg.xhm()} "
+            f"({_fmt_cell_info(active_cell)}) — projecting pure HKL indices with "
+            f"active U, B & geometry unchanged."
+        )
+    elif not same_sg:
+        mtz_overlay_warning = (
+            f"Symmetry differs: MTZ header is {mtz_sg_label} vs active solve "
+            f"{active_sg.xhm()} — projecting pure HKL indices with active U, B & "
+            f"geometry unchanged."
+        )
+    elif cell_mismatch and mtz_cell_vals is not None:
+        mtz_overlay_warning = (
+            f"Unit cell differs: MTZ header ({_fmt_cell_info(mtz_cell_vals)}) vs "
+            f"active solve ({_fmt_cell_info(active_cell)}) — projecting pure HKL "
+            f"indices with active U, B & geometry unchanged."
+        )
+
+    asu = gemmi.ReciprocalAsu(mtz_sg)
+    ops = mtz_sg.operations()
     cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}
     if not all(k in cols for k in ("H", "K", "L")):
         raise ValueError("MTZ file does not contain H, K, L columns.")
@@ -1064,11 +2029,13 @@ def apply_mtz_to_payload(
     i_col = None
     s_col = None
     for ic, sc in (
+        ("I", "SIGI"),
         ("I", "SigI"),
         ("IMEAN", "SIGIMEAN"),
         ("Iobs", "SigIobs"),
         ("Ipred", "SigIpred"),
         ("I(+)", "SIGI(+)"),
+        ("FP", "SIGFP"),
         ("F", "SIGF"),
     ):
         if ic in cols:
@@ -1079,7 +2046,8 @@ def apply_mtz_to_payload(
         val_cols = [
             c.label
             for c in mtz.columns
-            if c.label not in ("H", "K", "L", "M/ISYM", "BATCH", "half")
+            if c.label
+            not in ("H", "K", "L", "M/ISYM", "BATCH", "half", "WAVEL", "THETA", "PHI")
         ]
         if val_cols:
             i_col = cols[val_cols[0]]
@@ -1088,51 +2056,563 @@ def apply_mtz_to_payload(
             i_col = np.full(len(h_col), 100.0, dtype=np.float64)
             s_col = np.ones(len(h_col), dtype=np.float64)
 
+    i_arr = np.asarray(i_col, dtype=np.float64)
+    s_arr = (
+        np.asarray(s_col, dtype=np.float64)
+        if s_col is not None
+        else np.ones_like(i_arr)
+    )
+    valid_m = np.isfinite(i_arr) & ((h_col != 0) | (k_col != 0) | (l_col != 0))
+    hkl_valid = np.column_stack((h_col[valid_m], k_col[valid_m], l_col[valid_m]))
+    i_valid = i_arr[valid_m]
+    s_raw = s_arr[valid_m]
+    s_valid = np.maximum(np.where(np.isfinite(s_raw), s_raw, 1.0), 1e-3)
+
+    if len(hkl_valid) > 0:
+        ord_abs = np.argsort(-np.abs(i_valid), kind="mergesort")
+        hkl_s = hkl_valid[ord_abs]
+        i_s = i_valid[ord_abs]
+        s_s = s_valid[ord_abs]
+        lit_hkl, lit_first = np.unique(hkl_s, axis=0, return_index=True)
+        lit_i = i_s[lit_first]
+        lit_s = s_s[lit_first]
+    else:
+        lit_hkl = np.zeros((0, 3), dtype=int)
+        lit_i = np.zeros(0, dtype=np.float64)
+        lit_s = np.zeros(0, dtype=np.float64)
+
     asu_map: dict[tuple[int, int, int], tuple[float, float]] = {}
-    raw_hkl_list: list[tuple[int, int, int, float, float]] = []
-    for idx in range(len(h_col)):
-        iv = float(i_col[idx])
-        sv = float(s_col[idx]) if s_col is not None else 1.0
-        if not np.isfinite(iv):
-            continue
-        hh, kk, ll = int(h_col[idx]), int(k_col[idx]), int(l_col[idx])
-        if hh == 0 and kk == 0 and ll == 0:
-            continue
+    for u_idx in range(len(lit_hkl)):
+        hh, kk, ll = (
+            int(lit_hkl[u_idx, 0]),
+            int(lit_hkl[u_idx, 1]),
+            int(lit_hkl[u_idx, 2]),
+        )
+        iv, sv_clean = float(lit_i[u_idx]), float(lit_s[u_idx])
         asu_hkl, _ = asu.to_asu([hh, kk, ll], ops)
         key = (int(asu_hkl[0]), int(asu_hkl[1]), int(asu_hkl[2]))
-        if key not in asu_map or iv > asu_map[key][0]:
-            asu_map[key] = (iv, max(sv, 1e-3))
-        raw_hkl_list.append((hh, kk, ll, iv, max(sv, 1e-3)))
+        if key not in asu_map or abs(iv) > abs(asu_map[key][0]):
+            asu_map[key] = (iv, sv_clean)
+
+    # Expand merged ASU MTZs across symmetry + Friedel mates carrying (I, SIGI) directly in NumPy.
+    # Symmetry matrices operate purely on integer (H, K, L) indices; mtz.cell is never used to rescale B.
+    is_unmerged_mtz = "BATCH" in cols
+    exp_hkl_blocks: list[np.ndarray] = []
+    exp_i_blocks: list[np.ndarray] = []
+    exp_s_blocks: list[np.ndarray] = []
+    if len(lit_hkl) > 0:
+        exp_hkl_blocks.append(lit_hkl)
+        exp_i_blocks.append(lit_i)
+        exp_s_blocks.append(lit_s)
+    if not is_unmerged_mtz and asu_map:
+        asu_arr = np.asarray(list(asu_map.keys()), dtype=int)
+        asu_vals = np.asarray(list(asu_map.values()), dtype=np.float64)
+        asu_i = asu_vals[:, 0]
+        asu_s = asu_vals[:, 1]
+        for op in ops.sym_ops:
+            rot_m = np.asarray(op.rot, dtype=float) / float(op.DEN)
+            h_rot = np.rint(asu_arr @ rot_m).astype(int)
+            exp_hkl_blocks.append(h_rot)
+            exp_i_blocks.append(asu_i)
+            exp_s_blocks.append(asu_s)
+            exp_hkl_blocks.append(-h_rot)
+            exp_i_blocks.append(asu_i)
+            exp_s_blocks.append(asu_s)
+
+    if exp_hkl_blocks:
+        cat_hkl = np.concatenate(exp_hkl_blocks, axis=0)
+        cat_i = np.concatenate(exp_i_blocks, axis=0)
+        cat_s = np.concatenate(exp_s_blocks, axis=0)
+        nonzero_m = np.any(cat_hkl != 0, axis=1)
+        cat_hkl, cat_i, cat_s = cat_hkl[nonzero_m], cat_i[nonzero_m], cat_s[nonzero_m]
+        ord_e = np.argsort(-np.abs(cat_i), kind="mergesort")
+        cat_hkl, cat_i, cat_s = cat_hkl[ord_e], cat_i[ord_e], cat_s[ord_e]
+        hkl_exp, exp_first = np.unique(cat_hkl, axis=0, return_index=True)
+        inten_exp = cat_i[exp_first]
+        sigma_exp = cat_s[exp_first]
+    else:
+        hkl_exp = np.zeros((0, 3), dtype=int)
+        inten_exp = np.zeros(0, dtype=float)
+        sigma_exp = np.zeros(0, dtype=float)
+
+    exact_hkl_map: dict[tuple[int, int, int], tuple[float, float]] = {
+        (int(hkl_exp[idx_e, 0]), int(hkl_exp[idx_e, 1]), int(hkl_exp[idx_e, 2])): (
+            float(inten_exp[idx_e]),
+            float(sigma_exp[idx_e]),
+        )
+        for idx_e in range(len(hkl_exp))
+    }
 
     out = dict(payload)
-    matched_count = 0
-    for list_key in ("peaks", "sample_peaks"):
+
+    # Strip any prior synthetic mtz_only reflections so loading a second MTZ starts clean
+    for pred_key in ("predicted_peaks", "predicted_sample_peaks"):
+        pk_prev = out.get(pred_key)
+        if isinstance(pk_prev, list):
+            out[pred_key] = [
+                p for p in pk_prev if isinstance(p, dict) and not p.get("mtz_only")
+            ]
+
+    # Restrict MTZ projections strictly to detector panels on which predicted peaks also project
+    pred_panel_banks: set[int] = {
+        int(pk["bank"])
+        for pred_key in ("predicted_peaks", "predicted_sample_peaks")
+        for pk in (out.get(pred_key) or [])
+        if isinstance(pk, dict) and "bank" in pk
+    }
+    has_real_panel_images = out.get("intensity_source") == "raw_h5"
+    panel_image_banks: set[int] = (
+        {
+            int(pan["bank"])
+            for pan in (out.get("panels") or [])
+            if isinstance(pan, dict)
+            and "bank" in pan
+            and (pan.get("texture_b64") or pan.get("image_b64"))
+        }
+        if has_real_panel_images
+        else set()
+    )
+    if pred_panel_banks:
+        active_panel_banks = (
+            (pred_panel_banks & panel_image_banks)
+            if (panel_image_banks and (pred_panel_banks & panel_image_banks))
+            else pred_panel_banks
+        )
+    elif panel_image_banks:
+        active_panel_banks = panel_image_banks
+    else:
+        active_panel_banks = {
+            int(pan["bank"])
+            for pan in (out.get("panels") or [])
+            if isinstance(pan, dict) and "bank" in pan
+        }
+
+    had_existing_pred = bool(out.get("predicted_peaks"))
+    had_existing_samp = bool(out.get("predicted_sample_peaks"))
+
+    # Forward-project ONLY MTZ HKLs not already present in predicted_peaks / predicted_sample_peaks,
+    # strictly onto active_panel_banks (never onto panels where predicted peaks do not project).
+    # When full predictions are already loaded, existing_pred_hkls / existing_samp_hkls already cover
+    # every in-band reflection on active_panel_banks, so this stays near-instant with zero duplicates.
+    if len(hkl_exp) > 0:
+        detectors_all = _reconstruct_detectors_from_payload(out)
+        if not active_panel_banks:
+            active_panel_banks = {int(k) for k in detectors_all}
+
+        wl_range = out.get("wavelength_range") or [1.5, 4.5]
+        wl_min, wl_max = float(wl_range[0]), float(wl_range[1])
+        R_single = (
+            np.asarray(out["goniometer_R"], dtype=float)
+            if out.get("goniometer_R") is not None
+            else np.eye(3)
+        )
+        s_lab_single = (
+            np.asarray(out["sample_offset_lab"], dtype=float).ravel()[:3]
+            if out.get("sample_offset_lab") is not None
+            else np.zeros(3, dtype=float)
+        )
+        s_lab_per_run_raw = out.get("sample_offset_lab_per_run") or {}
+        active_frame = int(out.get("frame_index") or 0)
+        ki_hat = np.asarray(out.get("ki") or [0.0, 0.0, 1.0], dtype=float)
+        ki_hat = ki_hat / max(float(np.linalg.norm(ki_hat)), 1e-12)
+        q_max_bragg = (2.0 / max(wl_min, 0.05)) + 1e-5
+
+        raw_zones_curr: list[dict[str, Any]] = []
+        for z_p in out.get("zones") or []:
+            if isinstance(z_p, dict) and isinstance(z_p.get("axis_xyz"), list):
+                ax_lab = np.asarray(z_p["axis_xyz"], dtype=float)
+                ax_cryst = (
+                    np.asarray(z_p["axis_crystal_xyz"], dtype=float)
+                    if isinstance(z_p.get("axis_crystal_xyz"), list)
+                    else (R_single.T @ ax_lab)
+                )
+                raw_zones_curr.append(
+                    {
+                        "zone_id": z_p.get("zone_id"),
+                        "uvw": z_p.get("uvw", [1, 0, 0]),
+                        "axis_xyz": ax_lab,
+                        "axis_crystal_xyz": ax_cryst,
+                        "order": int(z_p.get("order") or 1),
+                    }
+                )
+
+        existing_pred_hkls: set[tuple[int, int, int]] = {
+            (int(pk["hkl"][0]), int(pk["hkl"][1]), int(pk["hkl"][2]))
+            for pk in (out.get("predicted_peaks") or [])
+            if isinstance(pk, dict)
+            and isinstance(pk.get("hkl"), list)
+            and len(pk["hkl"]) == 3
+        }
+        if existing_pred_hkls:
+            keep_miss = np.array(
+                [
+                    (
+                        int(hkl_exp[idx_m, 0]),
+                        int(hkl_exp[idx_m, 1]),
+                        int(hkl_exp[idx_m, 2]),
+                    )
+                    not in existing_pred_hkls
+                    for idx_m in range(len(hkl_exp))
+                ],
+                dtype=bool,
+            )
+            hkl_miss = hkl_exp[keep_miss]
+            inten_miss = inten_exp[keep_miss]
+            sigma_miss = sigma_exp[keep_miss]
+        else:
+            hkl_miss = hkl_exp
+            inten_miss = inten_exp
+            sigma_miss = sigma_exp
+
+        eff_mtz_border = (
+            float(out["rel_border_width"])
+            if isinstance(out.get("rel_border_width"), (int, float))
+            else default_rel_border_for_instrument(str(out.get("instrument") or ""))
+        )
+        mtz_pixel_class = _decode_pixel_valid_masks_from_js(out.get("pixel_mask_bits"))
+        extra_pred: list[dict[str, Any]] = []
+        if len(hkl_miss) > 0 and detectors_all and active_panel_banks:
+            G_cryst_all = hkl_miss.astype(float) @ UB_curr.T
+            qn_cryst_all = np.linalg.norm(G_cryst_all, axis=1)
+            bragg_m = (qn_cryst_all > 1e-8) & (qn_cryst_all <= q_max_bragg)
+            hkl_miss = hkl_miss[bragg_m]
+            inten_miss = inten_miss[bragg_m]
+            sigma_miss = sigma_miss[bragg_m]
+            G_cryst_miss = G_cryst_all[bragg_m]
+            qn_cryst_miss = qn_cryst_all[bragg_m]
+
+            if len(hkl_miss) > 0:
+                cast_frame = _raycast_hkl_on_detectors(
+                    hkl_miss,
+                    U_curr,
+                    B_curr,
+                    R_single,
+                    detectors_all,
+                    (wl_min, wl_max),
+                    ki=ki_hat,
+                    sample_offset_lab=s_lab_single,
+                    active_bids=active_panel_banks,
+                    inten_cand=inten_miss,
+                    sigma_cand=sigma_miss,
+                    pixel_class_by_bank=mtz_pixel_class,
+                    margin_frac=eff_mtz_border,
+                    G_cryst=G_cryst_miss,
+                    qn_cryst=qn_cryst_miss,
+                )
+                pts_miss = cast_frame["peaks_xyz"]
+                if not raw_zones_curr and len(pts_miss) > 0:
+                    raw_zones_curr, _ = _compute_zones_payload_for_geometry(
+                        pts_miss,
+                        ub_matrix=UB_curr,
+                        R_gonio=R_single,
+                        R_single=R_single,
+                        ki_hat=ki_hat,
+                        detectors=detectors_all,
+                        sample_offset_lab=s_lab_single,
+                    )
+                if len(pts_miss) > 0:
+                    extra_pred = _serialize_peak_entries(
+                        pts_miss,
+                        bank_arr=cast_frame["bank"],
+                        pixel_r_arr=cast_frame["pixel_r"],
+                        pixel_c_arr=cast_frame["pixel_c"],
+                        intensity_arr=None,
+                        sigma_arr=None,
+                        var_u_arr=None,
+                        var_v_arr=None,
+                        cov_uv_arr=None,
+                        hkl_arr=cast_frame["hkl"],
+                        lam_arr=cast_frame["wavelength"],
+                        ub_matrix=UB_curr,
+                        R_gonio=R_single,
+                        ki_hat=ki_hat,
+                        sample_offset_lab=s_lab_single,
+                        wavelength_range=(wl_min, wl_max),
+                        space_group=active_sg_name,
+                        cell=active_cell,
+                        detectors=detectors_all,
+                        raw_zones=raw_zones_curr,
+                        active_frame=active_frame,
+                        max_peaks=12000,
+                        peak_source="predicted",
+                        d_min=float(out.get("d_min") or 0.0),
+                    )
+                    base_id = len(out.get("predicted_peaks") or [])
+                    for off_i, ep in enumerate(extra_pred):
+                        ep["id"] = base_id + off_i
+                        if had_existing_pred and not same_sg:
+                            ep["mtz_only"] = True
+                    out["predicted_peaks"] = (
+                        list(out.get("predicted_peaks") or []) + extra_pred
+                    )
+
+        # Multi-run sample peaks for missing HKLs (restricted strictly to active_panel_banks)
+        frames_meta = out.get("frames") or []
+        r_per_run_raw = out.get("goniometer_R_per_run") or {}
+        if (
+            detectors_all
+            and active_panel_banks
+            and len(frames_meta) > 1
+            and isinstance(r_per_run_raw, dict)
+            and r_per_run_raw
+        ):
+            existing_samp_hkls: set[tuple[int, int, int]] = {
+                (int(pk["hkl"][0]), int(pk["hkl"][1]), int(pk["hkl"][2]))
+                for pk in (out.get("predicted_sample_peaks") or [])
+                if isinstance(pk, dict)
+                and isinstance(pk.get("hkl"), list)
+                and len(pk["hkl"]) == 3
+            }
+            if existing_samp_hkls:
+                keep_smiss = np.array(
+                    [
+                        (
+                            int(hkl_exp[idx_s, 0]),
+                            int(hkl_exp[idx_s, 1]),
+                            int(hkl_exp[idx_s, 2]),
+                        )
+                        not in existing_samp_hkls
+                        for idx_s in range(len(hkl_exp))
+                    ],
+                    dtype=bool,
+                )
+                hkl_smiss = hkl_exp[keep_smiss]
+                inten_smiss = inten_exp[keep_smiss]
+                sigma_smiss = sigma_exp[keep_smiss]
+            else:
+                hkl_smiss = hkl_exp
+                inten_smiss = inten_exp
+                sigma_smiss = sigma_exp
+
+            if len(hkl_smiss) > 0:
+                G_smiss_all = hkl_smiss.astype(float) @ UB_curr.T
+                qn_smiss_all = np.linalg.norm(G_smiss_all, axis=1)
+                bragg_sm = (qn_smiss_all > 1e-8) & (qn_smiss_all <= q_max_bragg)
+                hkl_smiss = hkl_smiss[bragg_sm]
+                inten_smiss = inten_smiss[bragg_sm]
+                sigma_smiss = sigma_smiss[bragg_sm]
+                G_smiss = G_smiss_all[bragg_sm]
+                qn_smiss = qn_smiss_all[bragg_sm]
+
+            if len(hkl_smiss) > 0:
+                all_xyz, all_hkl, all_lam, all_bnk, all_int, all_sig, all_run = (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                r_per_run_np: dict[int, np.ndarray] = {}
+                s_per_run_np: dict[int, np.ndarray] = {}
+                for r_k, r_mat_v in sorted(
+                    r_per_run_raw.items(), key=lambda kv: int(kv[0])
+                ):
+                    r_i = int(r_k)
+                    R_r = np.asarray(r_mat_v, dtype=float)
+                    r_per_run_np[r_i] = R_r
+                    s_r_raw = (
+                        s_lab_per_run_raw.get(str(r_i))
+                        if isinstance(s_lab_per_run_raw, dict)
+                        else None
+                    )
+                    s_r = (
+                        np.asarray(s_r_raw, dtype=float).ravel()[:3]
+                        if s_r_raw is not None
+                        else s_lab_single
+                    )
+                    s_per_run_np[r_i] = s_r
+                    c_r = _raycast_hkl_on_detectors(
+                        hkl_smiss,
+                        U_curr,
+                        B_curr,
+                        R_r,
+                        detectors_all,
+                        (wl_min, wl_max),
+                        ki=ki_hat,
+                        sample_offset_lab=s_r,
+                        active_bids=active_panel_banks,
+                        inten_cand=inten_smiss,
+                        sigma_cand=sigma_smiss,
+                        pixel_class_by_bank=mtz_pixel_class,
+                        margin_frac=eff_mtz_border,
+                        G_cryst=G_smiss,
+                        qn_cryst=qn_smiss,
+                    )
+                    if len(c_r["peaks_xyz"]) > 0:
+                        all_xyz.append(c_r["peaks_xyz"])
+                        all_hkl.append(c_r["hkl"])
+                        all_lam.append(c_r["wavelength"])
+                        all_bnk.append(c_r["bank"])
+                        all_int.append(c_r["intensity"])
+                        all_sig.append(c_r["sigma"])
+                        all_run.append(np.full(len(c_r["peaks_xyz"]), r_i, dtype=int))
+                if all_xyz:
+                    pts_all_m = np.concatenate(all_xyz, axis=0)
+                    hkl_all_m = np.concatenate(all_hkl, axis=0)
+                    lam_all_m = np.concatenate(all_lam, axis=0)
+                    bnk_all_m = np.concatenate(all_bnk, axis=0)
+                    int_all_m = np.concatenate(all_int, axis=0)
+                    sig_all_m = np.concatenate(all_sig, axis=0)
+                    run_all_m = np.concatenate(all_run, axis=0)
+                    # Prioritize active_frame hits so any reflection visible on the current frame keeps run_index == active_frame
+                    prio_m = np.argsort(
+                        np.where(run_all_m == active_frame, 0, 1), kind="mergesort"
+                    )
+                    pts_all_m = pts_all_m[prio_m]
+                    hkl_all_m = hkl_all_m[prio_m]
+                    lam_all_m = lam_all_m[prio_m]
+                    bnk_all_m = bnk_all_m[prio_m]
+                    int_all_m = int_all_m[prio_m]
+                    sig_all_m = sig_all_m[prio_m]
+                    run_all_m = run_all_m[prio_m]
+                    _, u_first = np.unique(hkl_all_m, axis=0, return_index=True)
+                    u_keep = np.sort(u_first)[:8000]
+                    extra_samp = _serialize_sample_peaks(
+                        {
+                            "peaks_xyz": pts_all_m[u_keep],
+                            "hkl": hkl_all_m[u_keep],
+                            "wavelength": lam_all_m[u_keep],
+                            "intensity": None,
+                            "sigma": None,
+                            "bank": bnk_all_m[u_keep],
+                            "run_index": run_all_m[u_keep],
+                            "R_per_run": r_per_run_np,
+                            "s_lab_per_run": s_per_run_np,
+                        },
+                        fallback_peaks=extra_pred,
+                        n_frames=len(frames_meta),
+                        ki_hat=ki_hat,
+                        R_single=R_single,
+                        sample_offset_lab=s_lab_single,
+                        wavelength_range=(wl_min, wl_max),
+                        space_group=active_sg_name,
+                        cell=active_cell,
+                        peak_source="predicted",
+                        d_min=float(out.get("d_min") or 0.0),
+                    )
+                    for esp in extra_samp:
+                        if had_existing_samp and not same_sg:
+                            esp["mtz_only"] = True
+                    out["predicted_sample_peaks"] = (
+                        list(out.get("predicted_sample_peaks") or []) + extra_samp
+                    )
+        elif not out.get("predicted_sample_peaks"):
+            out["predicted_sample_peaks"] = list(out.get("predicted_peaks") or [])
+
+    # Annotate predicted & integrated peak sets with mtz_i / mtz_sigi / mtz_isigi data columns
+    # (filtering to active_panel_banks when panel banks are known) without altering U, B, UB, cell, or zones.
+    asu_lookup_cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    matched_counts: dict[str, int] = {}
+    for list_key in (
+        "predicted_peaks",
+        "predicted_sample_peaks",
+        "integrated_peaks",
+        "integrated_sample_peaks",
+    ):
         pk_list = out.get(list_key)
         if not isinstance(pk_list, list):
             continue
         new_list = []
+        n_hit = 0
         for pk in pk_list:
+            if not isinstance(pk, dict):
+                continue
+            if (
+                active_panel_banks
+                and "bank" in pk
+                and int(pk["bank"]) not in active_panel_banks
+            ):
+                continue
             pk_copy = dict(pk)
+            pk_copy.pop("mtz_i", None)
+            pk_copy.pop("mtz_sigi", None)
+            pk_copy.pop("mtz_isigi", None)
+            hit: tuple[float, float] | None = None
             hkl_v = pk_copy.get("hkl")
             if isinstance(hkl_v, list) and len(hkl_v) == 3:
-                asu_k, _ = asu.to_asu(
-                    [int(hkl_v[0]), int(hkl_v[1]), int(hkl_v[2])], ops
-                )
-                hit = asu_map.get((int(asu_k[0]), int(asu_k[1]), int(asu_k[2])))
-                if hit is not None:
-                    pk_copy["merged_i"] = round(hit[0], 2)
-                    pk_copy["merged_sigi"] = round(hit[1], 2)
-                    if list_key == "peaks":
-                        matched_count += 1
+                hk_key = (int(hkl_v[0]), int(hkl_v[1]), int(hkl_v[2]))
+                hit = exact_hkl_map.get(hk_key)
+                if hit is None and not is_unmerged_mtz:
+                    asu_pre = pk_copy.get("asu_hkl") if same_sg else None
+                    if isinstance(asu_pre, list) and len(asu_pre) == 3:
+                        ak_t = (int(asu_pre[0]), int(asu_pre[1]), int(asu_pre[2]))
+                    else:
+                        ak_t = asu_lookup_cache.get(hk_key)
+                        if ak_t is None:
+                            asu_k, _ = asu.to_asu(list(hk_key), ops)
+                            ak_t = (int(asu_k[0]), int(asu_k[1]), int(asu_k[2]))
+                            asu_lookup_cache[hk_key] = ak_t
+                    hit = asu_map.get(ak_t)
+            if hit is not None:
+                iv_m, sv_m = float(hit[0]), max(float(hit[1]), 1e-6)
+                pk_copy["mtz_i"] = round(iv_m, 2)
+                pk_copy["mtz_sigi"] = round(sv_m, 2)
+                pk_copy["mtz_isigi"] = round(iv_m / sv_m, 3)
+                pk_copy["merged_i"] = round(iv_m, 2)
+                pk_copy["merged_sigi"] = round(sv_m, 2)
+                n_hit += 1
             new_list.append(pk_copy)
         out[list_key] = new_list
+        matched_counts[list_key] = n_hit
+
+    has_integ = bool(out.get("integrated_peaks"))
+    has_pred = bool(out.get("predicted_peaks"))
+    prev_src = str(out.get("default_peak_source") or "").lower()
+    art_kind = str(out.get("artifact_kind") or "").lower()
+    if prev_src == "integrated" and has_integ:
+        active_src = "integrated"
+    elif prev_src == "predicted" and has_pred:
+        active_src = "predicted"
+    elif art_kind in ("integrator", "merged_careless") and has_integ:
+        active_src = "integrated"
+    elif has_pred:
+        active_src = "predicted"
+    elif has_integ:
+        active_src = "integrated"
+    else:
+        active_src = "predicted"
+
+    out.pop("mtz_peaks", None)
+    out.pop("mtz_sample_peaks", None)
+    out["default_peak_source"] = active_src
+    if select_mtz_color or not out.get("default_color_mode"):
+        out["default_color_mode"] = "mtz_isigi"
+    out["mtz_fresh_overlay"] = bool(select_mtz_color)
+    if active_src == "integrated":
+        out["peaks"] = out.get("integrated_peaks") or []
+        out["sample_peaks"] = out.get("integrated_sample_peaks") or out["peaks"]
+    else:
+        out["peaks"] = out.get("predicted_peaks") or []
+        out["sample_peaks"] = out.get("predicted_sample_peaks") or out["peaks"]
 
     info = ds_info or {}
     mtz_name = str(info.get("name") or os.path.basename(str(mtz_path)))
     out["mtz_overlay_name"] = mtz_name
     out["mtz_overlay_reflections"] = len(asu_map)
-    out["mtz_overlay_matched"] = matched_count
+    if len(asu_map) <= 120000:
+        out["mtz_asu_lookup"] = {
+            f"{k[0]},{k[1]},{k[2]}": [round(float(v[0]), 2), round(float(v[1]), 2)]
+            for k, v in asu_map.items()
+        }
+    if is_unmerged_mtz and len(exact_hkl_map) <= 120000:
+        out["mtz_exact_lookup"] = {
+            f"{k[0]},{k[1]},{k[2]}": [round(float(v[0]), 2), round(float(v[1]), 2)]
+            for k, v in exact_hkl_map.items()
+        }
+    out["mtz_overlay_matched"] = max(
+        matched_counts.get("predicted_peaks", 0),
+        matched_counts.get("integrated_peaks", 0),
+    )
+    out["mtz_overlay_space_group"] = mtz_sg_label
+    out["mtz_overlay_cell"] = mtz_cell_vals
+    out["mtz_overlay_warning"] = mtz_overlay_warning
     return out
+
+
+_HKL_GEN_CACHE: dict[tuple[Any, ...], np.ndarray] = {}
+_MULTI_RUN_SOLVE_CACHE: dict[tuple[Any, ...], tuple[np.ndarray, ...]] = {}
 
 
 def _extract_from_h5(
@@ -1141,6 +2621,7 @@ def _extract_from_h5(
     frame_index: int | None = None,
     *,
     include_peaks: bool = True,
+    include_all_runs_peaks: bool = True,
     default_instrument: str = "IMAGINE",
     d_min: float | None = None,
 ) -> dict[str, Any]:
@@ -1175,6 +2656,20 @@ def _extract_from_h5(
         )
         if is_pure_merged:
             sib_solve_path = None
+        pred_cand_init = (
+            _discover_predictor_h5(h5_path)
+            if (not is_pure_merged and not is_blind_h5)
+            else None
+        )
+        pred_h5_aux = (
+            str(pred_cand_init)
+            if (
+                pred_cand_init
+                and os.path.isfile(pred_cand_init)
+                and Path(pred_cand_init).resolve() != Path(h5_path).resolve()
+            )
+            else None
+        )
         pixel_class_by_bank, em_mask_summary = _load_pixel_class_from_h5(
             f, sib_solve_path=None if is_pure_merged else sib_solve_path
         )
@@ -1187,6 +2682,27 @@ def _extract_from_h5(
                 float(x)
                 for x in np.asarray(f["beam/ki_vec"][()], dtype=float).ravel()[:3]
             )
+        else:
+            for k_aux in (sib_solve_path, pred_h5_aux):
+                if not k_aux or not os.path.isfile(k_aux):
+                    continue
+                got_ki = False
+                with (
+                    contextlib.suppress(
+                        OSError, RuntimeError, ValueError, TypeError, KeyError
+                    ),
+                    h5py.File(k_aux, "r") as kf_aux,
+                ):
+                    if "beam/ki_vec" in kf_aux:
+                        ki = tuple(
+                            float(x)
+                            for x in np.asarray(
+                                kf_aux["beam/ki_vec"][()], dtype=float
+                            ).ravel()[:3]
+                        )
+                        got_ki = True
+                if got_ki:
+                    break
 
         wavelength_range: tuple[float, float] | None = None
         if "scan_refinement/band_wavelength" in f:
@@ -1334,71 +2850,11 @@ def _extract_from_h5(
         if wavelength_range is None:
             wavelength_range = _get_instrument_default_wavelength(instrument)
 
-        detectors = _load_detectors_from_h5(f, instrument)
-
-        bank = np.asarray(f["bank"][()], dtype=int) if "bank" in f else None
-        if "peaks/bank" in f and bank is None:
-            bank = np.asarray(f["peaks/bank"][()], dtype=int)
-
-        pixel_r = (
-            np.asarray(f["peaks/pixel_r"][()], dtype=float)
-            if "peaks/pixel_r" in f
-            else None
+        detectors = _load_detectors_from_h5(
+            f, instrument, fallback_h5_paths=(sib_solve_path, pred_h5_aux)
         )
-        pixel_c = (
-            np.asarray(f["peaks/pixel_c"][()], dtype=float)
-            if "peaks/pixel_c" in f
-            else None
-        )
-        peaks_xyz = (
-            np.asarray(f["peaks/xyz"][()], dtype=float) if "peaks/xyz" in f else None
-        )
-        if (
-            peaks_xyz is None
-            and pixel_r is not None
-            and pixel_c is not None
-            and len(pixel_r) > 0
-            and len(pixel_c) == len(pixel_r)
-        ):
-            n_pk_raw = len(pixel_r)
-            xyz_rec = np.zeros((n_pk_raw, 3), dtype=float)
-            filled_mask = np.zeros(n_pk_raw, dtype=bool)
-            if bank is not None and len(bank) == n_pk_raw and detectors:
-                for ub_id in np.unique(bank):
-                    det_b = detectors.get(int(ub_id))
-                    if det_b is None:
-                        continue
-                    mb = bank == ub_id
-                    with contextlib.suppress(
-                        RuntimeError, ValueError, TypeError, IndexError
-                    ):
-                        xyz_rec[mb] = det_b.pixel_to_lab(pixel_r[mb], pixel_c[mb])
-                        filled_mask[mb] = True
-            if (
-                not np.all(filled_mask)
-                and "peaks/two_theta" in f
-                and "peaks/azimuthal" in f
-            ):
-                with contextlib.suppress(
-                    OSError, RuntimeError, ValueError, TypeError, IndexError
-                ):
-                    tt_arr = np.asarray(f["peaks/two_theta"][()], dtype=float)
-                    az_arr = np.asarray(f["peaks/azimuthal"][()], dtype=float)
-                    if len(tt_arr) == n_pk_raw and len(az_arr) == n_pk_raw:
-                        rem = ~filled_mask
-                        st = np.sin(tt_arr[rem])
-                        xyz_rec[rem] = np.column_stack(
-                            [
-                                st * np.cos(az_arr[rem]),
-                                st * np.sin(az_arr[rem]),
-                                np.cos(tt_arr[rem]),
-                            ]
-                        )
-                        filled_mask[rem] = True
-            if np.any(filled_mask):
-                peaks_xyz = xyz_rec
 
-        # Extract multi-frame offsets, file names, and goniometer motor angles
+        # Extract multi-frame offsets, file names, and refined goniometer kinematics
         offsets = (
             np.asarray(f["file_offsets"][()], dtype=int)
             if "file_offsets" in f
@@ -1414,19 +2870,84 @@ def _extract_from_h5(
             if "goniometer/axes" in f
             else None
         )
+        has_axes_nominal = "goniometer/axes_nominal" in f
         gonio_angles_ref = (
             np.asarray(f["goniometer/angles"][()], dtype=float)
             if "goniometer/angles" in f
             else None
         )
-        gonio_angles_nom = None
+        gonio_angles_nom = (
+            np.asarray(f["goniometer/angles_nominal"][()], dtype=float)
+            if "goniometer/angles_nominal" in f
+            else None
+        )
         R_all = (
             np.asarray(f["goniometer/R"][()], dtype=float)
             if "goniometer/R" in f
             else None
         )
 
-        for aux_path in (src_h5, sib_solve_path):
+        def _parse_gonio_offsets_from_h5(
+            hf_obj: h5py.File, names_list: list[Any] | None
+        ) -> dict[str, float] | np.ndarray | None:
+            if "goniometer/offsets" not in hf_obj:
+                return None
+            off_obj = hf_obj["goniometer/offsets"]
+            if isinstance(off_obj, h5py.Group):
+                return {str(k_o): float(off_obj[k_o][()]) for k_o in off_obj}
+            return np.asarray(off_obj[()], dtype=float).ravel()
+
+        def _parse_per_run_from_h5(
+            hf_obj: h5py.File,
+        ) -> dict[str, Any] | None:
+            if "goniometer/per_run" not in hf_obj:
+                return None
+            pr_g = hf_obj["goniometer/per_run"]
+            if not isinstance(pr_g, h5py.Group):
+                return None
+            pr_out: dict[str, Any] = {}
+            if "motor" in pr_g:
+                pr_out["motor"] = _decode_str(pr_g["motor"][()], "")
+            if "delta_deg" in pr_g:
+                pr_out["delta_deg"] = np.asarray(
+                    pr_g["delta_deg"][()], dtype=float
+                ).ravel()
+            if "trans_m" in pr_g:
+                pr_out["trans_m"] = np.asarray(pr_g["trans_m"][()], dtype=float)
+            if "frame_to_run" in pr_g:
+                pr_out["frame_to_run"] = np.asarray(
+                    pr_g["frame_to_run"][()], dtype=int
+                ).ravel()
+            return pr_out if pr_out else None
+
+        def _parse_harmonics_from_h5(
+            hf_obj: h5py.File,
+        ) -> dict[str, Any] | None:
+            if "goniometer/harmonics" not in hf_obj:
+                return None
+            gh_g = hf_obj["goniometer/harmonics"]
+            if not isinstance(gh_g, h5py.Group):
+                return None
+            if all(k_h in gh_g for k_h in ("motor", "orders", "axes", "coeffs_deg")):
+                return {
+                    "motor": _decode_str(gh_g["motor"][()], ""),
+                    "orders": np.asarray(gh_g["orders"][()], dtype=int),
+                    "axes": np.asarray(gh_g["axes"][()], dtype=float),
+                    "coeffs_deg": np.asarray(gh_g["coeffs_deg"][()], dtype=float),
+                }
+            return None
+
+        gonio_offsets_spec = _parse_gonio_offsets_from_h5(f, gonio_names_raw)
+        sample_offset_raw = (
+            np.asarray(f["goniometer/translations"][()], dtype=float)
+            if "goniometer/translations" in f
+            else None
+        )
+        per_run_spec = _parse_per_run_from_h5(f)
+        harmonics_spec = _parse_harmonics_from_h5(f)
+
+        # Prefer solved/predictor files BEFORE nominal merged.h5 (`src_h5`) for refined kinematics!
+        for aux_path in (sib_solve_path, pred_h5_aux, src_h5):
             if not aux_path or not os.path.isfile(aux_path):
                 continue
             with (
@@ -1443,18 +2964,63 @@ def _extract_from_h5(
                     files_raw = list(af["files"][()])
                 if gonio_names_raw is None and "goniometer/names" in af:
                     gonio_names_raw = list(af["goniometer/names"][()])
-                if gonio_axes is None and "goniometer/axes" in af:
+                if "goniometer/axes_nominal" in af:
+                    has_axes_nominal = True
+                    if "goniometer/axes" in af and "goniometer/axes_nominal" not in f:
+                        gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
+                elif gonio_axes is None and "goniometer/axes" in af:
                     gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
-                if aux_path == src_h5 and "goniometer/angles" in af:
+                if gonio_angles_nom is None and "goniometer/angles_nominal" in af:
                     gonio_angles_nom = np.asarray(
-                        af["goniometer/angles"][()], dtype=float
+                        af["goniometer/angles_nominal"][()], dtype=float
                     )
+                if aux_path == src_h5 and "goniometer/angles" in af:
+                    if gonio_angles_nom is None:
+                        gonio_angles_nom = np.asarray(
+                            af["goniometer/angles"][()], dtype=float
+                        )
                 elif gonio_angles_ref is None and "goniometer/angles" in af:
                     gonio_angles_ref = np.asarray(
                         af["goniometer/angles"][()], dtype=float
                     )
                 if R_all is None and "goniometer/R" in af:
                     R_all = np.asarray(af["goniometer/R"][()], dtype=float)
+                if gonio_offsets_spec is None:
+                    gonio_offsets_spec = _parse_gonio_offsets_from_h5(
+                        af, gonio_names_raw
+                    )
+                if sample_offset_raw is None and "goniometer/translations" in af:
+                    sample_offset_raw = np.asarray(
+                        af["goniometer/translations"][()], dtype=float
+                    )
+                if per_run_spec is None:
+                    per_run_spec = _parse_per_run_from_h5(af)
+                if harmonics_spec is None:
+                    harmonics_spec = _parse_harmonics_from_h5(af)
+                if U is None and "sample/U" in af:
+                    U = np.asarray(af["sample/U"][()], dtype=float)
+                if B is None and "sample/B" in af:
+                    B = np.asarray(af["sample/B"][()], dtype=float)
+                if space_group == "P 1":
+                    if "sample/space_group" in af:
+                        space_group = _decode_str(af["sample/space_group"][()], "P 1")
+                    elif "space_group" in af:
+                        space_group = _decode_str(af["space_group"][()], "P 1")
+                if cell is None:
+                    if all(
+                        f"sample/{k}" in af
+                        for k in ("a", "b", "c", "alpha", "beta", "gamma")
+                    ):
+                        cell = [
+                            float(af["sample/a"][()]),
+                            float(af["sample/b"][()]),
+                            float(af["sample/c"][()]),
+                            float(af["sample/alpha"][()]),
+                            float(af["sample/beta"][()]),
+                            float(af["sample/gamma"][()]),
+                        ]
+                    elif B is not None:
+                        cell = list(_cell_from_B(B))
 
         if gonio_angles_nom is None:
             gonio_angles_nom = gonio_angles_ref
@@ -1466,6 +3032,37 @@ def _extract_from_h5(
         ):
             if n_frames_total == 0:
                 n_frames_total = len(gonio_angles_nom)
+            if offsets is None and "peaks/run_index" in f:
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ):
+                    r_probe = np.asarray(f["peaks/run_index"][()], dtype=int).ravel()
+                    if len(r_probe) > 0 and int(np.min(r_probe)) >= 0:
+                        n_r_probe = int(np.max(r_probe)) + 1
+                        n_tot_g = len(gonio_angles_nom)
+                        if 1 <= n_r_probe < n_tot_g:
+                            if n_tot_g % n_r_probe == 0:
+                                stride_g = n_tot_g // n_r_probe
+                                blk = gonio_angles_nom.reshape(n_r_probe, stride_g, -1)
+                                if float(np.max(np.ptp(blk, axis=1))) <= 1e-5:
+                                    offsets = np.arange(0, n_tot_g, stride_g, dtype=int)
+                            if offsets is None and "peaks/image_index" in f:
+                                img_probe = np.asarray(
+                                    f["peaks/image_index"][()], dtype=int
+                                ).ravel()
+                                if (
+                                    len(img_probe) == len(r_probe)
+                                    and int(np.max(img_probe)) < n_tot_g
+                                ):
+                                    inferred_offs: list[int] = []
+                                    last_off = 0
+                                    for r_k in range(n_r_probe):
+                                        m_rk = r_probe == r_k
+                                        if np.any(m_rk):
+                                            last_off = int(np.min(img_probe[m_rk]))
+                                        inferred_offs.append(last_off)
+                                    if np.all(np.diff(inferred_offs) >= 0):
+                                        offsets = np.asarray(inferred_offs, dtype=int)
             if offsets is None:
                 offsets = np.arange(len(gonio_angles_nom), dtype=int)
 
@@ -1598,6 +3195,120 @@ def _extract_from_h5(
                 int(frames_meta[active_frame]["f1"]),
             )
 
+        # Read full run_index upfront (small 1D int array) so single-frame payload builds
+        # (`not include_all_runs_peaks`) can HDF5-slice `[i0:i1]` instead of loading & projecting
+        # millions of peaks across all runs on every frame switch.
+        full_run_index = (
+            np.asarray(f["peaks/run_index"][()], dtype=int)
+            if "peaks/run_index" in f
+            else None
+        )
+        if full_run_index is None and "peaks/image_index" in f:
+            img_idx_raw = np.asarray(f["peaks/image_index"][()], dtype=int)
+            if "file_offsets" in f:
+                f_off_raw = np.asarray(f["file_offsets"][()], dtype=int)
+                if len(f_off_raw) > 1:
+                    full_run_index = np.maximum(
+                        0,
+                        np.searchsorted(f_off_raw, img_idx_raw, side="right") - 1,
+                    )
+            elif "goniometer/R" in f and len(img_idx_raw) > 0:
+                n_gonio_r = len(f["goniometer/R"])
+                if n_gonio_r > 1 and int(np.max(img_idx_raw)) < n_gonio_r:
+                    full_run_index = img_idx_raw
+
+        raw_peaks_total = 0
+        if full_run_index is not None:
+            raw_peaks_total = len(full_run_index)
+        else:
+            for pk_len_key in ("peaks/pixel_r", "peaks/xyz", "peaks/h"):
+                if pk_len_key in f:
+                    raw_peaks_total = len(f[pk_len_key])
+                    break
+
+        pk_slice: slice = slice(None)
+        if (
+            not include_all_runs_peaks
+            and len(frames_meta) > 1
+            and full_run_index is not None
+            and len(full_run_index) > 0
+            and bool(np.all(full_run_index[:-1] <= full_run_index[1:]))
+        ):
+            s0_pk = int(np.searchsorted(full_run_index, active_frame, side="left"))
+            s1_pk = int(np.searchsorted(full_run_index, active_frame, side="right"))
+            pk_slice = slice(s0_pk, s1_pk)
+            run_index = full_run_index[pk_slice]
+        else:
+            run_index = full_run_index
+
+        def _read_pk_col(ds_key: str, dtype: Any) -> np.ndarray | None:
+            if ds_key not in f:
+                return None
+            dset = f[ds_key]
+            if (
+                pk_slice != slice(None)
+                and raw_peaks_total > 0
+                and len(dset) == raw_peaks_total
+            ):
+                return np.asarray(dset[pk_slice], dtype=dtype)
+            return np.asarray(dset[()], dtype=dtype)
+
+        bank = _read_pk_col("bank", int)
+        if bank is None:
+            bank = _read_pk_col("peaks/bank", int)
+        pixel_r = _read_pk_col("peaks/pixel_r", float)
+        pixel_c = _read_pk_col("peaks/pixel_c", float)
+        peaks_xyz = _read_pk_col("peaks/xyz", float)
+        if (
+            peaks_xyz is None
+            and pixel_r is not None
+            and pixel_c is not None
+            and len(pixel_r) > 0
+            and len(pixel_c) == len(pixel_r)
+        ):
+            n_pk_raw = len(pixel_r)
+            xyz_rec = np.zeros((n_pk_raw, 3), dtype=float)
+            filled_mask = np.zeros(n_pk_raw, dtype=bool)
+            if bank is not None and len(bank) == n_pk_raw and detectors:
+                for ub_id in np.unique(bank):
+                    det_b = detectors.get(int(ub_id))
+                    if det_b is None:
+                        continue
+                    mb = bank == ub_id
+                    with contextlib.suppress(
+                        RuntimeError, ValueError, TypeError, IndexError
+                    ):
+                        xyz_rec[mb] = det_b.pixel_to_lab(pixel_r[mb], pixel_c[mb])
+                        filled_mask[mb] = True
+            if (
+                not np.all(filled_mask)
+                and "peaks/two_theta" in f
+                and "peaks/azimuthal" in f
+            ):
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, IndexError
+                ):
+                    tt_arr = _read_pk_col("peaks/two_theta", float)
+                    az_arr = _read_pk_col("peaks/azimuthal", float)
+                    if (
+                        tt_arr is not None
+                        and az_arr is not None
+                        and len(tt_arr) == n_pk_raw
+                        and len(az_arr) == n_pk_raw
+                    ):
+                        rem = ~filled_mask
+                        st = np.sin(tt_arr[rem])
+                        xyz_rec[rem] = np.column_stack(
+                            [
+                                st * np.cos(az_arr[rem]),
+                                st * np.sin(az_arr[rem]),
+                                np.cos(tt_arr[rem]),
+                            ]
+                        )
+                        filled_mask[rem] = True
+            if np.any(filled_mask):
+                peaks_xyz = xyz_rec
+
         if (
             peaks_xyz is None
             and pixel_r is not None
@@ -1681,68 +3392,21 @@ def _extract_from_h5(
 
         hkl = None
         if all(f"peaks/{k}" in f for k in ("h", "k", "l")):
-            hkl = np.column_stack(
-                [
-                    np.asarray(f["peaks/h"][()], dtype=int),
-                    np.asarray(f["peaks/k"][()], dtype=int),
-                    np.asarray(f["peaks/l"][()], dtype=int),
-                ]
-            )
-        lam = (
-            np.asarray(f["peaks/lambda"][()], dtype=float)
-            if "peaks/lambda" in f
-            else None
-        )
-        intensity = (
-            np.asarray(f["peaks/intensity"][()], dtype=float)
-            if "peaks/intensity" in f
-            else None
-        )
-        sigma = (
-            np.asarray(f["peaks/sigma"][()], dtype=float)
-            if "peaks/sigma" in f
-            else None
-        )
-        var_u = (
-            np.asarray(f["peaks/var_u"][()], dtype=float)
-            if "peaks/var_u" in f
-            else None
-        )
-        var_v = (
-            np.asarray(f["peaks/var_v"][()], dtype=float)
-            if "peaks/var_v" in f
-            else None
-        )
-        cov_uv = (
-            np.asarray(f["peaks/cov_uv"][()], dtype=float)
-            if "peaks/cov_uv" in f
-            else None
-        )
-        run_index = (
-            np.asarray(f["peaks/run_index"][()], dtype=int)
-            if "peaks/run_index" in f
-            else None
-        )
-        careless_residual = (
-            np.asarray(f["peaks/careless_residual"][()], dtype=float)
-            if "peaks/careless_residual" in f
-            else None
-        )
-        careless_scale = (
-            np.asarray(f["peaks/careless_scale"][()], dtype=float)
-            if "peaks/careless_scale" in f
-            else None
-        )
-        merged_i = (
-            np.asarray(f["peaks/merged_i"][()], dtype=float)
-            if "peaks/merged_i" in f
-            else None
-        )
-        merged_sigi = (
-            np.asarray(f["peaks/merged_sigi"][()], dtype=float)
-            if "peaks/merged_sigi" in f
-            else None
-        )
+            h_col = _read_pk_col("peaks/h", int)
+            k_col = _read_pk_col("peaks/k", int)
+            l_col = _read_pk_col("peaks/l", int)
+            if h_col is not None and k_col is not None and l_col is not None:
+                hkl = np.column_stack([h_col, k_col, l_col])
+        lam = _read_pk_col("peaks/lambda", float)
+        intensity = _read_pk_col("peaks/intensity", float)
+        sigma = _read_pk_col("peaks/sigma", float)
+        var_u = _read_pk_col("peaks/var_u", float)
+        var_v = _read_pk_col("peaks/var_v", float)
+        cov_uv = _read_pk_col("peaks/cov_uv", float)
+        careless_residual = _read_pk_col("peaks/careless_residual", float)
+        careless_scale = _read_pk_col("peaks/careless_scale", float)
+        merged_i = _read_pk_col("peaks/merged_i", float)
+        merged_sigi = _read_pk_col("peaks/merged_sigi", float)
 
         def _normalize_merge_metrics(doc_m: dict[str, Any]) -> dict[str, Any]:
             out = dict(doc_m)
@@ -1767,10 +3431,15 @@ def _extract_from_h5(
         has_careless_peak_data = bool(
             (careless_residual is not None and np.any(np.isfinite(careless_residual)))
             or (careless_scale is not None and np.any(np.isfinite(careless_scale)))
+            or (
+                pk_slice != slice(None)
+                and "careless/metrics_json" in f
+                and ("peaks/careless_residual" in f or "peaks/careless_scale" in f)
+            )
         )
 
         merge_metrics: dict[str, Any] | None = None
-        if has_careless_peak_data:
+        if has_careless_peak_data or "careless/metrics_json" in f:
             if "careless/metrics_json" in f:
                 with contextlib.suppress(
                     OSError, RuntimeError, ValueError, TypeError, KeyError
@@ -1783,7 +3452,7 @@ def _extract_from_h5(
                         or doc_m.get("cc_half_bins")
                     ):
                         merge_metrics = _normalize_merge_metrics(doc_m)
-            if merge_metrics is None and "peaks" in f:
+            if merge_metrics is None and has_careless_peak_data and "peaks" in f:
                 sib_m = Path(h5_path).parent / "careless_metrics.json"
                 if sib_m.is_file():
                     with (
@@ -1803,14 +3472,37 @@ def _extract_from_h5(
         if var_u is not None and var_v is not None:
             artifact_kind = (
                 "merged_careless"
-                if (merge_metrics is not None and has_careless_peak_data)
+                if (
+                    merge_metrics is not None
+                    and (has_careless_peak_data or "careless/asu_hkl" in f)
+                )
                 else "integrator"
             )
-            is_iso = bool(
-                np.allclose(var_u, var_v)
-                and (cov_uv is None or np.allclose(cov_uv, 0.0))
-            )
+            if len(var_u) > 0:
+                is_iso = bool(
+                    np.allclose(var_u, var_v)
+                    and (cov_uv is None or np.allclose(cov_uv, 0.0))
+                )
+            elif "peaks/var_u" in f and len(f["peaks/var_u"]) > 0:
+                n_chk = min(64, len(f["peaks/var_u"]))
+                vu_chk = np.asarray(f["peaks/var_u"][:n_chk], dtype=float)
+                vv_chk = np.asarray(f["peaks/var_v"][:n_chk], dtype=float)
+                cuv_chk = (
+                    np.asarray(f["peaks/cov_uv"][:n_chk], dtype=float)
+                    if "peaks/cov_uv" in f
+                    else None
+                )
+                is_iso = bool(
+                    np.allclose(vu_chk, vv_chk)
+                    and (cuv_chk is None or np.allclose(cuv_chk, 0.0))
+                )
+            else:
+                is_iso = True
             peak_shape_mode = "isotropic_circle" if is_iso else "anisotropic_ellipse"
+        elif merge_metrics is not None and (
+            has_careless_peak_data or "careless/asu_hkl" in f
+        ):
+            artifact_kind = "merged_careless"
         elif "peaks/pixel_r" in f:
             artifact_kind = "finder"
             peak_shape_mode = "isotropic_circle"
@@ -1821,10 +3513,616 @@ def _extract_from_h5(
             artifact_kind = "raw_nexus"
             peak_shape_mode = "none"
 
+        # Build refined goniometer rotation matrix & lab-frame sample origin lookup per run,
+        # matching predict_reflections_on_panel (gonio_axes, refined angles, zero_offsets,
+        # per-run delta/trans, Fourier harmonics, and per-peak vs per-frame R_all shapes).
+        raw_run_index_unfiltered = (
+            np.asarray(full_run_index, dtype=int).copy()
+            if full_run_index is not None
+            else None
+        )
+        raw_peaks_count = (
+            raw_peaks_total
+            if raw_peaks_total > 0
+            else (len(peaks_xyz) if peaks_xyz is not None else 0)
+        )
+        R_per_run_all: dict[int, np.ndarray] = {}
+        s_lab_per_run_all: dict[int, np.ndarray] = {}
+        n_runs_total = max(1, len(frames_meta))
+        n_axes_g = len(gonio_axes) if gonio_axes is not None else 0
+        decoded_gonio_names = (
+            [_decode_str(nm, "") for nm in gonio_names_raw] if gonio_names_raw else []
+        )
+        gonio_zero_offs = np.zeros(max(n_axes_g, 1), dtype=float)
+        has_zero_offsets = False
+        if gonio_offsets_spec is not None and n_axes_g > 0:
+            if isinstance(gonio_offsets_spec, dict):
+                for ax_i in range(n_axes_g):
+                    nm_full = (
+                        decoded_gonio_names[ax_i]
+                        if ax_i < len(decoded_gonio_names)
+                        else ""
+                    )
+                    if nm_full in gonio_offsets_spec:
+                        gonio_zero_offs[ax_i] = float(gonio_offsets_spec[nm_full])
+                    else:
+                        nm_short = nm_full.split(":")[-1].strip().lower()
+                        for k_off, v_off in gonio_offsets_spec.items():
+                            if (
+                                k_off.lower() == nm_short
+                                or k_off.split(":")[-1].strip().lower() == nm_short
+                            ):
+                                gonio_zero_offs[ax_i] = float(v_off)
+                                break
+            else:
+                arr_off = np.asarray(gonio_offsets_spec, dtype=float).ravel()
+                n_cp = min(n_axes_g, len(arr_off))
+                gonio_zero_offs[:n_cp] = arr_off[:n_cp]
+            has_zero_offsets = bool(np.any(np.abs(gonio_zero_offs[:n_axes_g]) > 1e-9))
+
+        def _extract_angles_for_run(
+            ang_arr: np.ndarray | None, f0_val: int, ur_val: int
+        ) -> np.ndarray | None:
+            if ang_arr is None or n_axes_g <= 0:
+                return None
+            if ang_arr.ndim == 1:
+                return (
+                    np.asarray(ang_arr[:n_axes_g], dtype=float).copy()
+                    if len(ang_arr) >= n_axes_g
+                    else None
+                )
+            if ang_arr.ndim != 2 or ang_arr.size == 0:
+                return None
+            frame_first_ang = ang_arr.shape[1] == n_axes_g and (
+                ang_arr.shape[0] != n_axes_g
+                or n_frames_total == n_axes_g
+                or (offsets is not None and len(offsets) == n_axes_g)
+            )
+            if not frame_first_ang and ang_arr.shape[0] == n_axes_g:
+                n_len = ang_arr.shape[1]
+                pick_col: int | None = None
+                if (
+                    raw_run_index_unfiltered is not None
+                    and n_len == len(raw_run_index_unfiltered)
+                    and n_len != n_frames_total
+                ):
+                    hits_r = np.flatnonzero(raw_run_index_unfiltered == ur_val)
+                    if len(hits_r) > 0:
+                        pick_col = int(hits_r[0])
+                elif (
+                    offsets is not None
+                    and n_len == len(offsets)
+                    and 0 <= ur_val < n_len
+                ):
+                    pick_col = ur_val
+                elif 0 <= f0_val < n_len:
+                    pick_col = f0_val
+                elif 0 <= ur_val < n_len:
+                    pick_col = ur_val
+                return (
+                    np.asarray(ang_arr[:, pick_col], dtype=float).copy()
+                    if pick_col is not None
+                    else None
+                )
+            if ang_arr.shape[1] == n_axes_g:
+                n_len = ang_arr.shape[0]
+                pick_row: int | None = None
+                if (
+                    raw_run_index_unfiltered is not None
+                    and n_len == len(raw_run_index_unfiltered)
+                    and n_len != n_frames_total
+                ):
+                    hits_r = np.flatnonzero(raw_run_index_unfiltered == ur_val)
+                    if len(hits_r) > 0:
+                        pick_row = int(hits_r[0])
+                elif (
+                    n_frames_total > 0
+                    and n_len == n_frames_total
+                    and 0 <= f0_val < n_len
+                ):
+                    pick_row = f0_val
+                elif (
+                    offsets is not None
+                    and n_len == len(offsets)
+                    and 0 <= ur_val < n_len
+                ):
+                    pick_row = ur_val
+                elif 0 <= f0_val < n_len:
+                    pick_row = f0_val
+                elif 0 <= ur_val < n_len:
+                    pick_row = ur_val
+                return (
+                    np.asarray(ang_arr[pick_row, :], dtype=float).copy()
+                    if pick_row is not None
+                    else None
+                )
+            return None
+
+        def _extract_R_from_R_all(f0_val: int, ur_val: int) -> np.ndarray | None:
+            if R_all is None:
+                return None
+            if R_all.ndim == 2:
+                return np.asarray(R_all, dtype=float)
+            if R_all.ndim != 3 or len(R_all) == 0:
+                return None
+            n_r_len = len(R_all)
+            if (
+                raw_run_index_unfiltered is not None
+                and n_r_len == len(raw_run_index_unfiltered)
+                and n_r_len != n_frames_total
+                and (offsets is None or n_r_len != len(offsets))
+            ):
+                hits_r = np.flatnonzero(raw_run_index_unfiltered == ur_val)
+                if len(hits_r) > 0:
+                    return np.asarray(R_all[int(hits_r[0])], dtype=float)
+                return None
+            if (
+                offsets is not None
+                and n_r_len == len(offsets)
+                and 0 <= ur_val < n_r_len
+            ):
+                return np.asarray(R_all[ur_val], dtype=float)
+            if (
+                n_frames_total > 0
+                and n_r_len == n_frames_total
+                and 0 <= f0_val < n_r_len
+            ):
+                return np.asarray(R_all[f0_val], dtype=float)
+            if (
+                raw_peaks_count > 0
+                and n_r_len == raw_peaks_count
+                and raw_run_index_unfiltered is not None
+                and len(raw_run_index_unfiltered) == n_r_len
+            ):
+                hits_r = np.flatnonzero(raw_run_index_unfiltered == ur_val)
+                if len(hits_r) > 0:
+                    return np.asarray(R_all[int(hits_r[0])], dtype=float)
+                return None
+            if 0 <= ur_val < n_r_len and (
+                offsets is None or n_r_len <= max(n_runs_total, 1)
+            ):
+                return np.asarray(R_all[ur_val], dtype=float)
+            if 0 <= f0_val < n_r_len and raw_peaks_count != n_r_len:
+                return np.asarray(R_all[f0_val], dtype=float)
+            return np.asarray(R_all[0], dtype=float)
+
+        per_run_delta = (
+            per_run_spec.get("delta_deg") if isinstance(per_run_spec, dict) else None
+        )
+        per_run_motor = (
+            str(per_run_spec.get("motor") or "")
+            if isinstance(per_run_spec, dict)
+            else ""
+        )
+        per_run_trans_m = (
+            per_run_spec.get("trans_m") if isinstance(per_run_spec, dict) else None
+        )
+        harm_motor_col: int | None = None
+        if isinstance(harmonics_spec, dict) and harmonics_spec.get("motor"):
+            hm_low = str(harmonics_spec["motor"]).lower()
+            for idx_nm, nm_s in enumerate(decoded_gonio_names):
+                if hm_low in nm_s.lower():
+                    harm_motor_col = idx_nm
+                    break
+
+        for ur_i in range(n_runs_total):
+            f0_r = (
+                int(offsets[ur_i])
+                if offsets is not None and 0 <= ur_i < len(offsets)
+                else ur_i
+            )
+            ang_ref_r = _extract_angles_for_run(gonio_angles_ref, f0_r, ur_i)
+            ang_nom_r = _extract_angles_for_run(gonio_angles_nom, f0_r, ur_i)
+            ang_eff_r = ang_ref_r if ang_ref_r is not None else ang_nom_r
+            ref_differs_from_nom = bool(
+                ang_ref_r is not None
+                and ang_nom_r is not None
+                and not np.allclose(ang_ref_r, ang_nom_r, atol=1e-6)
+            )
+            if (
+                ang_eff_r is not None
+                and not ref_differs_from_nom
+                and per_run_delta is not None
+                and per_run_motor
+                and 0 <= ur_i < len(per_run_delta)
+            ):
+                ang_eff_r = ang_eff_r.copy()
+                pm_low = per_run_motor.lower()
+                for ax_i, nm_s in enumerate(decoded_gonio_names):
+                    if ax_i < len(ang_eff_r) and pm_low in nm_s.lower():
+                        ang_eff_r[ax_i] += float(per_run_delta[ur_i])
+                        ref_differs_from_nom = True
+
+            R_cand_all = _extract_R_from_R_all(f0_r, ur_i)
+            R_kin_r: np.ndarray | None = None
+            s_kin_r: np.ndarray | None = None
+            if gonio_axes is not None and n_axes_g > 0 and ang_eff_r is not None:
+                with contextlib.suppress(
+                    ImportError, RuntimeError, ValueError, TypeError, IndexError
+                ):
+                    from subhkl.instrument.goniometer import (
+                        calc_goniometer_rotation_matrix,
+                    )
+
+                    true_ang_r = ang_eff_r + gonio_zero_offs[:n_axes_g]
+                    R_kin_r = calc_goniometer_rotation_matrix(gonio_axes, true_ang_r)
+                    offsets_full_r = np.zeros((n_axes_g, 3), dtype=float)
+                    if sample_offset_raw is not None:
+                        if (
+                            sample_offset_raw.ndim == 2
+                            and len(sample_offset_raw) == n_axes_g
+                        ):
+                            offsets_full_r[:, :] = sample_offset_raw[:, :3]
+                        elif sample_offset_raw.size >= 3:
+                            offsets_full_r[-1, :] = sample_offset_raw.ravel()[:3]
+                    if per_run_trans_m is not None and 0 <= ur_i < len(per_run_trans_m):
+                        offsets_full_r[-1, :] += np.asarray(
+                            per_run_trans_m[ur_i], dtype=float
+                        ).ravel()[:3]
+                    s_pt = np.zeros(3, dtype=float)
+                    deg2rad = np.pi / 180.0
+                    for ax_i in reversed(range(n_axes_g)):
+                        d_vec = np.asarray(gonio_axes[ax_i][:3], dtype=float)
+                        d_nrm = float(np.linalg.norm(d_vec))
+                        if d_nrm > 0.0:
+                            d_vec = d_vec / d_nrm
+                        d_mult = (
+                            float(gonio_axes[ax_i][3])
+                            if len(gonio_axes[ax_i]) > 3
+                            else 1.0
+                        )
+                        th_i = d_mult * float(true_ang_r[ax_i]) * deg2rad
+                        K_i = np.array(
+                            [
+                                [0.0, -d_vec[2], d_vec[1]],
+                                [d_vec[2], 0.0, -d_vec[0]],
+                                [-d_vec[1], d_vec[0], 0.0],
+                            ]
+                        )
+                        R_ax = (
+                            np.eye(3)
+                            + np.sin(th_i) * K_i
+                            + (1.0 - np.cos(th_i)) * (K_i @ K_i)
+                        )
+                        s_pt = R_ax @ (s_pt + offsets_full_r[ax_i])
+                    s_kin_r = s_pt
+                    if (
+                        harm_motor_col is not None
+                        and isinstance(harmonics_spec, dict)
+                        and harm_motor_col < len(ang_eff_r)
+                    ):
+                        from subhkl.optimization import harmonic_rocking_matrices
+
+                        h_mat = harmonic_rocking_matrices(
+                            np.array([float(ang_eff_r[harm_motor_col])], dtype=float),
+                            harmonics_spec["axes"],
+                            harmonics_spec["orders"],
+                            harmonics_spec["coeffs_deg"],
+                        )
+                        if h_mat.ndim == 3 and len(h_mat) > 0:
+                            R_kin_r = np.asarray(h_mat[0], dtype=float) @ R_kin_r
+
+            has_kinematic_ref = bool(
+                has_zero_offsets
+                or has_axes_nominal
+                or ref_differs_from_nom
+                or harm_motor_col is not None
+            )
+            if R_kin_r is not None and (has_kinematic_ref or R_cand_all is None):
+                R_per_run_all[ur_i] = R_kin_r
+            elif R_cand_all is not None:
+                R_per_run_all[ur_i] = R_cand_all
+            elif R_kin_r is not None:
+                R_per_run_all[ur_i] = R_kin_r
+
+            if s_kin_r is not None and (has_kinematic_ref or R_cand_all is None):
+                s_lab_per_run_all[ur_i] = s_kin_r
+            else:
+                s_base = np.zeros(3, dtype=float)
+                if sample_offset_raw is not None:
+                    if sample_offset_raw.ndim == 2 and len(sample_offset_raw) > 0:
+                        s_base = np.asarray(
+                            sample_offset_raw[-1][:3], dtype=float
+                        ).copy()
+                    elif sample_offset_raw.size >= 3:
+                        s_base = np.asarray(
+                            sample_offset_raw.ravel()[:3], dtype=float
+                        ).copy()
+                if per_run_trans_m is not None and 0 <= ur_i < len(per_run_trans_m):
+                    s_base = (
+                        s_base
+                        + np.asarray(per_run_trans_m[ur_i], dtype=float).ravel()[:3]
+                    )
+                R_use_s = R_per_run_all.get(ur_i, np.eye(3))
+                s_lab_per_run_all[ur_i] = R_use_s @ s_base
+
+        def _read_predictor_banks_group(
+            pf: h5py.File,
+        ) -> tuple[dict[str, np.ndarray] | None, dict[str, Any] | None]:
+            if "banks" not in pf:
+                return None, None
+            b_ids_pred = (
+                np.asarray(pf["bank_ids"][()], dtype=int) if "bank_ids" in pf else None
+            )
+            n_bank_entries = (
+                len(b_ids_pred) if b_ids_pred is not None else len(pf["banks"])
+            )
+            f0_p, f1_p = frame_slice if frame_slice is not None else (0, n_bank_entries)
+            bank_imgs_pred: dict[int, np.ndarray] = {}
+            if src_h5 and os.path.exists(src_h5):
+                with (
+                    contextlib.suppress(
+                        OSError, RuntimeError, ValueError, TypeError, KeyError
+                    ),
+                    h5py.File(src_h5, "r") as mf,
+                ):
+                    if "images" in mf and "bank_ids" in mf:
+                        b_ids_s = np.asarray(mf["bank_ids"][f0_p:f1_p], dtype=int)
+                        ims_s = np.asarray(mf["images"][f0_p:f1_p], dtype=np.float32)
+                        for b_id_s, im_s in zip(b_ids_s, ims_s):
+                            bank_imgs_pred[int(b_id_s)] = im_s
+
+            def _collect_slice(
+                s0: int, s1: int, r_idx_val: int, use_imgs: bool
+            ) -> dict[str, np.ndarray] | None:
+                xyz_p, hkl_p, lam_p, bank_p, pr_p, pc_p, inten_p = (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                banks_grp = pf["banks"]
+                for img_idx in range(s0, s1):
+                    key_s = str(img_idx)
+                    if key_s not in banks_grp:
+                        continue
+                    grp = banks_grp[key_s]
+                    if "i" not in grp or "j" not in grp:
+                        continue
+                    pr_i = np.asarray(grp["i"][()], dtype=float).ravel()
+                    pc_i = np.asarray(grp["j"][()], dtype=float).ravel()
+                    if len(pr_i) == 0:
+                        continue
+                    bid = (
+                        int(b_ids_pred[img_idx])
+                        if b_ids_pred is not None and img_idx < len(b_ids_pred)
+                        else int(img_idx)
+                    )
+                    det = detectors.get(bid)
+                    h_i = np.asarray(grp["h"][()], dtype=int).ravel()
+                    k_i = np.asarray(grp["k"][()], dtype=int).ravel()
+                    l_i = np.asarray(grp["l"][()], dtype=int).ravel()
+                    wl_i = np.asarray(grp["wavelength"][()], dtype=float).ravel()
+                    im_b = bank_imgs_pred.get(bid) if use_imgs else None
+                    n_det_r = (
+                        int(det.n)
+                        if det is not None and hasattr(det, "n")
+                        else (int(im_b.shape[0]) if im_b is not None else 0)
+                    )
+                    m_det_c = (
+                        int(det.m)
+                        if det is not None and hasattr(det, "m")
+                        else (int(im_b.shape[1]) if im_b is not None else 0)
+                    )
+                    keep_p = np.ones(len(pr_i), dtype=bool)
+                    eff_bw_frac = default_rel_border_for_instrument(instrument)
+                    if eff_bw_frac > 0.0 and n_det_r > 0 and m_det_c > 0:
+                        bw_p = int(eff_bw_frac * min(n_det_r, m_det_c))
+                        if bw_p > 0:
+                            keep_p &= (
+                                (pr_i >= bw_p)
+                                & (pr_i < (n_det_r - 1 - bw_p))
+                                & (pc_i >= bw_p)
+                                & (pc_i < (m_det_c - 1 - bw_p))
+                            )
+                    if pixel_class_by_bank is not None and bid in pixel_class_by_bank:
+                        cls_p = pixel_class_by_bank[bid]
+                        if cls_p is not None and cls_p.ndim == 2 and cls_p.size > 0:
+                            rm_p = np.clip(
+                                np.round(pr_i).astype(int), 0, cls_p.shape[0] - 1
+                            )
+                            cm_p = np.clip(
+                                np.round(pc_i).astype(int), 0, cls_p.shape[1] - 1
+                            )
+                            keep_p &= cls_p[rm_p, cm_p] == 0
+                    if not np.all(keep_p):
+                        if not np.any(keep_p):
+                            continue
+                        pr_i = pr_i[keep_p]
+                        pc_i = pc_i[keep_p]
+                        h_i = h_i[keep_p]
+                        k_i = k_i[keep_p]
+                        l_i = l_i[keep_p]
+                        wl_i = wl_i[keep_p]
+                    if im_b is not None:
+                        r_idx = np.clip(
+                            np.round(pr_i).astype(int), 2, max(2, im_b.shape[0] - 3)
+                        )
+                        c_idx = np.clip(
+                            np.round(pc_i).astype(int), 2, max(2, im_b.shape[1] - 3)
+                        )
+                        pk_val = np.maximum(
+                            np.maximum.reduce(
+                                [
+                                    im_b[r_idx + dr, c_idx + dc]
+                                    for dr in (-1, 0, 1)
+                                    for dc in (-1, 0, 1)
+                                ]
+                            ),
+                            1.0,
+                        )
+                    else:
+                        pk_val = np.full(len(pr_i), 150.0, dtype=float)
+                    if det is not None:
+                        xyz_i = det.pixel_to_lab(pr_i, pc_i)
+                    else:
+                        az = (int(bid) * 37.0 % 360.0 - 180.0) + (pc_i - 128.0) * 0.12
+                        rad = np.deg2rad(az)
+                        y_c = (pr_i - 128.0) * 0.002
+                        xyz_i = np.column_stack([np.sin(rad), y_c, np.cos(rad)])
+                    xyz_p.append(xyz_i)
+                    hkl_p.append(np.column_stack([h_i, k_i, l_i]))
+                    lam_p.append(wl_i)
+                    bank_p.append(np.full(len(pr_i), bid, dtype=int))
+                    pr_p.append(pr_i)
+                    pc_p.append(pc_i)
+                    inten_p.append(pk_val)
+                if not xyz_p:
+                    return None
+                pts_c = np.concatenate(xyz_p, axis=0)
+                return {
+                    "peaks_xyz": pts_c,
+                    "hkl": np.concatenate(hkl_p, axis=0),
+                    "wavelength": np.concatenate(lam_p, axis=0),
+                    "bank": np.concatenate(bank_p, axis=0),
+                    "pixel_r": np.concatenate(pr_p, axis=0),
+                    "pixel_c": np.concatenate(pc_p, axis=0),
+                    "intensity": None,
+                    "sigma": None,
+                    "run_index": np.full(len(pts_c), int(r_idx_val), dtype=int),
+                }
+
+            frame_pred = _collect_slice(f0_p, f1_p, active_frame, True)
+            all_pred: dict[str, Any] | None = None
+            if (
+                include_all_runs_peaks
+                and len(frames_meta) > 1
+                and offsets is not None
+                and len(offsets) > 1
+            ):
+                run_slices = []
+                for r_i in range(len(frames_meta)):
+                    s0_r = int(offsets[r_i]) if r_i < len(offsets) else 0
+                    s1_r = (
+                        int(offsets[r_i + 1])
+                        if (r_i + 1) < len(offsets)
+                        else n_bank_entries
+                    )
+                    c_r = _collect_slice(s0_r, s1_r, r_i, r_i == active_frame)
+                    if c_r is not None:
+                        run_slices.append(c_r)
+                if run_slices:
+                    pts_a = np.concatenate([c["peaks_xyz"] for c in run_slices], axis=0)
+                    hkl_a = np.concatenate([c["hkl"] for c in run_slices], axis=0)
+                    lam_a = np.concatenate(
+                        [c["wavelength"] for c in run_slices], axis=0
+                    )
+                    bnk_a = np.concatenate([c["bank"] for c in run_slices], axis=0)
+                    run_a = np.concatenate([c["run_index"] for c in run_slices], axis=0)
+                    if len(pts_a) > 12000:
+                        idx_sub = np.linspace(0, len(pts_a) - 1, 12000, dtype=int)
+                        pts_a = pts_a[idx_sub]
+                        hkl_a = hkl_a[idx_sub]
+                        lam_a = lam_a[idx_sub]
+                        bnk_a = bnk_a[idx_sub]
+                        run_a = run_a[idx_sub]
+                    all_pred = {
+                        "peaks_xyz": pts_a,
+                        "hkl": hkl_a,
+                        "wavelength": lam_a,
+                        "intensity": None,
+                        "sigma": None,
+                        "bank": bnk_a,
+                        "run_index": run_a,
+                        "R_per_run": R_per_run_all,
+                        "s_lab_per_run": s_lab_per_run_all,
+                    }
+            return frame_pred, all_pred
+
+        predicted_frame_data: dict[str, np.ndarray] | None = None
+        predicted_all_runs_data: dict[str, Any] | None = None
+        has_predictor_h5 = False
+
+        # When loading integrated.h5 / merged_careless, prefer the companion predictor.h5
+        # written by subhkl peak-predictor (sibling dir, /tmp/subhkl_work_<tag>/, or Galaxy cache).
+        if include_peaks and artifact_kind in ("integrator", "merged_careless"):
+            pred_h5_cand = _discover_predictor_h5(h5_path)
+            if pred_h5_cand and os.path.isfile(pred_h5_cand):
+                with (
+                    contextlib.suppress(
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        IndexError,
+                    ),
+                    h5py.File(pred_h5_cand, "r") as spf,
+                ):
+                    predicted_frame_data, predicted_all_runs_data = (
+                        _read_predictor_banks_group(spf)
+                    )
+                if predicted_frame_data is not None:
+                    has_predictor_h5 = True
+            # 2. Fallback if no predictor.h5 exists: preserve unfiltered candidate peaks stored in integrated.h5
+            if (
+                predicted_frame_data is None
+                and peaks_xyz is not None
+                and len(peaks_xyz) > 0
+                and hkl is not None
+                and len(hkl) == len(peaks_xyz)
+            ):
+                if (
+                    len(frames_meta) > 1
+                    and run_index is not None
+                    and len(run_index) == len(peaks_xyz)
+                ):
+                    if include_all_runs_peaks:
+                        idx_pred_all = np.arange(len(peaks_xyz))
+                        if len(idx_pred_all) > 4500:
+                            idx_pred_all = np.linspace(
+                                0, len(peaks_xyz) - 1, 4500, dtype=int
+                            )
+                        predicted_all_runs_data = {
+                            "peaks_xyz": peaks_xyz[idx_pred_all],
+                            "hkl": hkl[idx_pred_all],
+                            "wavelength": lam[idx_pred_all]
+                            if lam is not None and len(lam) == len(peaks_xyz)
+                            else None,
+                            "intensity": None,
+                            "sigma": None,
+                            "bank": bank[idx_pred_all]
+                            if bank is not None and len(bank) == len(peaks_xyz)
+                            else None,
+                            "run_index": run_index[idx_pred_all],
+                            "R_per_run": R_per_run_all,
+                            "s_lab_per_run": s_lab_per_run_all,
+                        }
+                    m_fr = run_index == active_frame
+                else:
+                    m_fr = np.ones(len(peaks_xyz), dtype=bool)
+                if np.any(m_fr):
+                    predicted_frame_data = {
+                        "peaks_xyz": peaks_xyz[m_fr],
+                        "hkl": hkl[m_fr],
+                        "wavelength": lam[m_fr]
+                        if lam is not None and len(lam) == len(peaks_xyz)
+                        else np.full(
+                            int(np.sum(m_fr)),
+                            0.5 * sum(wavelength_range),
+                            dtype=float,
+                        ),
+                        "bank": bank[m_fr]
+                        if bank is not None and len(bank) == len(peaks_xyz)
+                        else np.ones(int(np.sum(m_fr)), dtype=int),
+                        "pixel_r": pixel_r[m_fr]
+                        if pixel_r is not None and len(pixel_r) == len(peaks_xyz)
+                        else np.zeros(int(np.sum(m_fr)), dtype=float),
+                        "pixel_c": pixel_c[m_fr]
+                        if pixel_c is not None and len(pixel_c) == len(peaks_xyz)
+                        else np.zeros(int(np.sum(m_fr)), dtype=float),
+                        "intensity": None,
+                        "sigma": None,
+                    }
+
         # Capture all-runs sample-space peak arrays before filtering to active_frame
         all_runs_data: dict[str, Any] | None = None
         if (
-            peaks_xyz is not None
+            include_all_runs_peaks
+            and peaks_xyz is not None
             and len(peaks_xyz) > 0
             and hkl is not None
             and len(hkl) == len(peaks_xyz)
@@ -1837,56 +4135,56 @@ def _extract_from_h5(
                 and len(sigma) == len(peaks_xyz)
             ):
                 cand_snr = (sigma > 0) & (intensity / np.maximum(sigma, 1e-9) >= 2.5)
-                if int(np.sum(cand_snr)) >= 20:
+                if (
+                    artifact_kind in ("integrator", "merged_careless")
+                    and bool(np.any(cand_snr))
+                ) or int(np.sum(cand_snr)) >= 20:
                     mask_all_snr = cand_snr
+                elif np.any(sigma > 0):
+                    mask_all_snr = sigma > 0
             idx_all = np.flatnonzero(mask_all_snr)
-            if len(idx_all) > 3500:
-                if intensity is not None and len(intensity) == len(peaks_xyz):
-                    top_k = np.argsort(-intensity[idx_all])[:3500]
-                    idx_all = np.sort(idx_all[top_k])
-                else:
-                    idx_all = idx_all[:3500]
+            max_all_runs_peaks = 36000
+            if len(idx_all) > max_all_runs_peaks:
+                active_keep = np.array([], dtype=int)
+                if run_index is not None and len(run_index) == len(peaks_xyz):
+                    active_keep = np.flatnonzero(
+                        mask_all_snr & (run_index == active_frame)
+                    )
+                # Preserve at least the strongest observation per unique (h, k, l) across
+                # all runs so outer high-resolution shells are never starved by bright
+                # inner-shell reflections when filtering by d_min on the Wulff net.
+                score_all = (
+                    intensity[idx_all]
+                    if intensity is not None and len(intensity) == len(peaks_xyz)
+                    else np.zeros(len(idx_all), dtype=float)
+                )
+                order_desc = np.argsort(-score_all)
+                idx_desc = idx_all[order_desc]
+                hkl_desc = np.ascontiguousarray(hkl[idx_desc], dtype=np.int32)
+                hkl_void = hkl_desc.view(
+                    np.dtype((np.void, hkl_desc.dtype.itemsize * 3))
+                ).ravel()
+                _, uniq_pos = np.unique(hkl_void, return_index=True)
+                uniq_pos_sorted = np.sort(uniq_pos)[:max_all_runs_peaks]
+                chosen = idx_desc[uniq_pos_sorted]
+                if len(chosen) < max_all_runs_peaks:
+                    used_mask = np.zeros(len(idx_desc), dtype=bool)
+                    used_mask[uniq_pos_sorted] = True
+                    rem = idx_desc[~used_mask][: max_all_runs_peaks - len(chosen)]
+                    chosen = np.concatenate([chosen, rem])
+                idx_all = np.sort(chosen)
+                if len(active_keep) > 0:
+                    idx_all = np.unique(np.concatenate([idx_all, active_keep]))
             r_idx_all = (
                 run_index[idx_all]
                 if run_index is not None and len(run_index) == len(peaks_xyz)
                 else np.zeros(len(idx_all), dtype=int)
             )
-            R_per_run: dict[int, np.ndarray] = {}
+            R_per_run = dict(R_per_run_all)
             for ur in np.unique(r_idx_all):
                 ur_i = int(ur)
-                f0_r = (
-                    int(offsets[ur_i])
-                    if offsets is not None and 0 <= ur_i < len(offsets)
-                    else ur_i
-                )
-                if R_all is not None and R_all.ndim == 3 and len(R_all) > 0:
-                    if (
-                        offsets is not None
-                        and len(R_all) == len(offsets)
-                        and 0 <= ur_i < len(R_all)
-                    ):
-                        R_per_run[ur_i] = R_all[ur_i]
-                    elif 0 <= f0_r < len(R_all):
-                        R_per_run[ur_i] = R_all[f0_r]
-                    elif 0 <= ur_i < len(R_all):
-                        R_per_run[ur_i] = R_all[ur_i]
-                if (
-                    ur_i not in R_per_run
-                    and gonio_axes is not None
-                    and gonio_angles_nom is not None
-                    and gonio_angles_nom.ndim == 2
-                    and 0 <= f0_r < len(gonio_angles_nom)
-                ):
-                    with contextlib.suppress(
-                        ImportError, RuntimeError, ValueError, TypeError, IndexError
-                    ):
-                        from subhkl.instrument.goniometer import (
-                            calc_goniometer_rotation_matrix,
-                        )
-
-                        R_per_run[ur_i] = calc_goniometer_rotation_matrix(
-                            gonio_axes, gonio_angles_nom[f0_r]
-                        )
+                if ur_i not in R_per_run:
+                    R_per_run[ur_i] = np.eye(3)
             all_runs_data = {
                 "peaks_xyz": peaks_xyz[idx_all],
                 "hkl": hkl[idx_all],
@@ -1910,7 +4208,14 @@ def _extract_from_h5(
                 "careless_scale": careless_scale[idx_all]
                 if careless_scale is not None and len(careless_scale) == len(peaks_xyz)
                 else None,
+                "merged_i": merged_i[idx_all]
+                if merged_i is not None and len(merged_i) == len(peaks_xyz)
+                else None,
+                "merged_sigi": merged_sigi[idx_all]
+                if merged_sigi is not None and len(merged_sigi) == len(peaks_xyz)
+                else None,
                 "R_per_run": R_per_run,
+                "s_lab_per_run": s_lab_per_run_all,
             }
 
         # If multi-frame dataset has per-run peaks (e.g. integrated.h5), filter to active_frame
@@ -1964,7 +4269,9 @@ def _extract_from_h5(
             and len(sigma) == len(peaks_xyz)
         ):
             snr_mask = (sigma > 0) & (intensity / np.maximum(sigma, 1e-9) >= 2.5)
-            if int(np.sum(snr_mask)) >= 20 and int(np.sum(snr_mask)) < len(peaks_xyz):
+            if int(np.sum(snr_mask)) < 20 and np.any(sigma > 0):
+                snr_mask = sigma > 0
+            if int(np.sum(snr_mask)) > 0 and int(np.sum(snr_mask)) < len(peaks_xyz):
                 peaks_xyz = peaks_xyz[snr_mask]
                 if bank is not None and len(bank) == len(snr_mask):
                     bank = bank[snr_mask]
@@ -1998,7 +4305,11 @@ def _extract_from_h5(
                     run_index = run_index[snr_mask]
 
         # Recognize predictor.h5 format: banks/<img_idx>/(i, j, h, k, l, wavelength)
-        if (peaks_xyz is None or len(peaks_xyz) == 0) and "banks" in f:
+        if (
+            include_peaks
+            and (peaks_xyz is None or len(peaks_xyz) == 0)
+            and "banks" in f
+        ):
             with contextlib.suppress(
                 OSError,
                 RuntimeError,
@@ -2009,165 +4320,30 @@ def _extract_from_h5(
             ):
                 artifact_kind = "predictor"
                 peak_shape_mode = "predicted_circle"
-                b_ids_pred = (
-                    np.asarray(f["bank_ids"][()], dtype=int)
-                    if "bank_ids" in f
-                    else None
-                )
-                n_bank_entries = (
-                    len(b_ids_pred) if b_ids_pred is not None else len(f["banks"])
-                )
-                f0_p, f1_p = (
-                    frame_slice if frame_slice is not None else (0, n_bank_entries)
-                )
+                pred_f, pred_all = _read_predictor_banks_group(f)
+                if pred_f is not None:
+                    peaks_xyz = pred_f["peaks_xyz"]
+                    hkl = pred_f["hkl"]
+                    lam = pred_f["wavelength"]
+                    bank = pred_f["bank"]
+                    pixel_r = pred_f["pixel_r"]
+                    pixel_c = pred_f["pixel_c"]
+                    intensity = pred_f["intensity"]
+                    sigma = pred_f["sigma"]
+                    run_index = pred_f["run_index"]
+                if pred_all is not None:
+                    all_runs_data = pred_all
 
-                bank_imgs_pred: dict[int, np.ndarray] = {}
-                if src_h5 and os.path.exists(src_h5):
-                    with (
-                        contextlib.suppress(
-                            OSError, RuntimeError, ValueError, TypeError, KeyError
-                        ),
-                        h5py.File(src_h5, "r") as mf,
-                    ):
-                        if "images" in mf and "bank_ids" in mf:
-                            b_ids_s = np.asarray(mf["bank_ids"][f0_p:f1_p], dtype=int)
-                            ims_s = np.asarray(
-                                mf["images"][f0_p:f1_p], dtype=np.float32
-                            )
-                            for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                bank_imgs_pred[int(b_id_s)] = im_s
-
-                xyz_p, hkl_p, lam_p, bank_p, pr_p, pc_p, inten_p = (
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                )
-                banks_grp = f["banks"]
-                for img_idx in range(f0_p, f1_p):
-                    key_s = str(img_idx)
-                    if key_s not in banks_grp:
-                        continue
-                    grp = banks_grp[key_s]
-                    if "i" not in grp or "j" not in grp:
-                        continue
-                    pr_i = np.asarray(grp["i"][()], dtype=float).ravel()
-                    pc_i = np.asarray(grp["j"][()], dtype=float).ravel()
-                    if len(pr_i) == 0:
-                        continue
-                    bid = (
-                        int(b_ids_pred[img_idx])
-                        if b_ids_pred is not None and img_idx < len(b_ids_pred)
-                        else int(img_idx)
-                    )
-                    det = detectors.get(bid)
-                    h_i = np.asarray(grp["h"][()], dtype=int).ravel()
-                    k_i = np.asarray(grp["k"][()], dtype=int).ravel()
-                    l_i = np.asarray(grp["l"][()], dtype=int).ravel()
-                    wl_i = np.asarray(grp["wavelength"][()], dtype=float).ravel()
-
-                    im_b = bank_imgs_pred.get(bid)
-                    if im_b is not None:
-                        r_idx = np.clip(
-                            np.round(pr_i).astype(int), 2, im_b.shape[0] - 3
-                        )
-                        c_idx = np.clip(
-                            np.round(pc_i).astype(int), 2, im_b.shape[1] - 3
-                        )
-                        pk_val = np.maximum.reduce(
-                            [
-                                im_b[r_idx + dr, c_idx + dc]
-                                for dr in (-1, 0, 1)
-                                for dc in (-1, 0, 1)
-                            ]
-                        )
-                        bg_val = float(np.median(im_b))
-                        snr_val = (pk_val - bg_val) / np.sqrt(max(bg_val, 1.0))
-                        keep_p = snr_val >= 2.5
-                        if not np.any(keep_p):
-                            continue
-                        pr_i = pr_i[keep_p]
-                        pc_i = pc_i[keep_p]
-                        h_i, k_i, l_i = h_i[keep_p], k_i[keep_p], l_i[keep_p]
-                        wl_i = wl_i[keep_p]
-                        pk_val = pk_val[keep_p]
-                    else:
-                        pk_val = np.full(len(pr_i), 150.0, dtype=float)
-
-                    if det is not None:
-                        xyz_i = det.pixel_to_lab(pr_i, pc_i)
-                    else:
-                        az = (int(bid) * 37.0 % 360.0 - 180.0) + (pc_i - 128.0) * 0.12
-                        rad = np.deg2rad(az)
-                        y_c = (pr_i - 128.0) * 0.002
-                        xyz_i = np.column_stack([np.sin(rad), y_c, np.cos(rad)])
-                    xyz_p.append(xyz_i)
-                    hkl_p.append(np.column_stack([h_i, k_i, l_i]))
-                    lam_p.append(wl_i)
-                    bank_p.append(np.full(len(pr_i), bid, dtype=int))
-                    pr_p.append(pr_i)
-                    pc_p.append(pc_i)
-                    inten_p.append(pk_val)
-
-                if xyz_p:
-                    peaks_xyz = np.concatenate(xyz_p, axis=0)
-                    hkl = np.concatenate(hkl_p, axis=0)
-                    lam = np.concatenate(lam_p, axis=0)
-                    bank = np.concatenate(bank_p, axis=0)
-                    pixel_r = np.concatenate(pr_p, axis=0)
-                    pixel_c = np.concatenate(pc_p, axis=0)
-                    intensity = np.concatenate(inten_p, axis=0)
-                    sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
-
-        R_gonio = None
-        if R_all is not None:
-            if R_all.ndim == 3 and len(R_all) > 0:
-                if (
-                    offsets is not None
-                    and len(R_all) == len(offsets)
-                    and active_frame < len(R_all)
-                ):
-                    R_gonio = R_all[active_frame]
-                elif frame_slice is not None and frame_slice[0] < len(R_all):
-                    R_gonio = R_all[frame_slice[0]]
-                elif peaks_xyz is not None and len(R_all) == len(peaks_xyz):
+        R_gonio = R_per_run_all.get(active_frame)
+        if R_gonio is None and R_all is not None:
+            if R_all.ndim == 2:
+                R_gonio = R_all
+            elif R_all.ndim == 3 and len(R_all) > 0:
+                if peaks_xyz is not None and len(R_all) == len(peaks_xyz):
                     R_gonio = R_all
-                elif (
-                    run_index is not None
-                    and len(run_index) > 0
-                    and np.max(run_index, initial=0) < len(R_all)
-                ):
-                    R_gonio = R_all[run_index]
                 else:
                     R_gonio = R_all[0]
-            elif R_all.ndim == 2:
-                R_gonio = R_all
-        if (
-            R_gonio is None
-            and gonio_axes is not None
-            and gonio_angles_nom is not None
-            and gonio_angles_nom.ndim == 2
-            and len(gonio_angles_nom) > 0
-        ):
-            with contextlib.suppress(
-                ImportError, RuntimeError, ValueError, TypeError, IndexError
-            ):
-                from subhkl.instrument.goniometer import (
-                    calc_goniometer_rotation_matrix,
-                )
-
-                f0_ang = (
-                    frame_slice[0]
-                    if frame_slice is not None
-                    and 0 <= frame_slice[0] < len(gonio_angles_nom)
-                    else 0
-                )
-                R_gonio = calc_goniometer_rotation_matrix(
-                    gonio_axes, gonio_angles_nom[f0_ang]
-                )
+        s_lab_active = s_lab_per_run_all.get(active_frame, np.zeros(3, dtype=float))
 
         # Finder-less solve.h5 forward projection onto calibrated detector banks
         if (
@@ -2188,7 +4364,10 @@ def _extract_from_h5(
                 KeyError,
                 IndexError,
             ):
-                from subhkl.core.crystallography import generate_reflections
+                from subhkl.core.crystallography import (
+                    generate_ewald_reflections,
+                    generate_reflections,
+                )
 
                 U_mat = np.asarray(U, dtype=float)
                 if U_mat.ndim == 3:
@@ -2200,7 +4379,6 @@ def _extract_from_h5(
                     if R_gonio is not None and np.asarray(R_gonio).ndim == 2
                     else np.eye(3)
                 )
-                RUB = R_run @ U_mat @ B_mat
                 cell_use = (
                     cell if cell and len(cell) == 6 else list(_cell_from_B(B_mat))
                 )
@@ -2214,30 +4392,75 @@ def _extract_from_h5(
                         else default_d_min
                     )
                 )
-                hkl_all = np.stack(
-                    generate_reflections(
-                        *cell_use, space_group=space_group, d_min=d_min_use
-                    ),
-                    axis=1,
-                ).astype(int)
-                G = hkl_all.astype(float) @ RUB.T
-                qn = np.linalg.norm(G, axis=1)
                 ki_vec = np.asarray(ki, dtype=float)
                 ki_vec = ki_vec / max(float(np.linalg.norm(ki_vec)), 1e-12)
-                sth = -(G @ ki_vec) / np.maximum(qn, 1e-12)
-                lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
-                keep_wl = (
-                    (lam_pred >= wavelength_range[0])
-                    & (lam_pred <= wavelength_range[1])
-                    & (sth > 0)
+                UB_mat = U_mat @ B_mat
+                d_min_kin = max(
+                    float(d_min_use), 0.5 * float(wavelength_range[0]) - 1e-5
                 )
-                hkl_b = hkl_all[keep_wl]
-                lam_b = lam_pred[keep_wl]
-                G_b = G[keep_wl]
-                kf = ki_vec[None, :] + lam_b[:, None] * G_b
-                kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+                cell_vol = abs(float(np.linalg.det(UB_mat)))
+                cell_vol = (1.0 / cell_vol) if cell_vol > 1e-12 else 1000.0
+                est_sphere_pts = (
+                    (4.0 * np.pi / 3.0) * cell_vol / max(d_min_kin**3, 1e-6)
+                )
+                if est_sphere_pts > 2_000_000.0:
+                    r_list_ew = (
+                        [
+                            R_per_run_all.get(r_i, R_run)
+                            for r_i in range(len(frames_meta))
+                        ]
+                        if (include_all_runs_peaks and len(frames_meta) > 1)
+                        else [R_run]
+                    )
+                    hkl_cache_key = (
+                        tuple(round(float(v), 5) for v in cell_use),
+                        str(space_group).strip(),
+                        round(float(d_min_kin), 5),
+                        round(float(wavelength_range[0]), 5),
+                        round(float(wavelength_range[1]), 5),
+                        len(r_list_ew),
+                        tuple(round(float(v), 5) for v in UB_mat.ravel()),
+                        tuple(round(float(v), 5) for v in r_list_ew[0].ravel()),
+                    )
+                    hkl_all = _HKL_GEN_CACHE.get(hkl_cache_key)
+                    if hkl_all is None:
+                        hkl_all = np.stack(
+                            generate_ewald_reflections(
+                                *cell_use,
+                                space_group=space_group,
+                                d_min=d_min_kin,
+                                UB=UB_mat,
+                                R_runs=r_list_ew,
+                                ki=ki_vec,
+                                wavelength_range=wavelength_range,
+                            ),
+                            axis=1,
+                        ).astype(int)
+                        if len(_HKL_GEN_CACHE) >= 3:
+                            _HKL_GEN_CACHE.pop(next(iter(_HKL_GEN_CACHE)), None)
+                        _HKL_GEN_CACHE[hkl_cache_key] = hkl_all
+                else:
+                    hkl_cache_key = (
+                        tuple(round(float(v), 5) for v in cell_use),
+                        str(space_group).strip(),
+                        round(float(d_min_kin), 5),
+                    )
+                    hkl_all = _HKL_GEN_CACHE.get(hkl_cache_key)
+                    if hkl_all is None:
+                        hkl_all = np.stack(
+                            generate_reflections(
+                                *cell_use, space_group=space_group, d_min=d_min_kin
+                            ),
+                            axis=1,
+                        ).astype(int)
+                        if len(_HKL_GEN_CACHE) >= 3:
+                            _HKL_GEN_CACHE.pop(next(iter(_HKL_GEN_CACHE)), None)
+                        _HKL_GEN_CACHE[hkl_cache_key] = hkl_all
+                G_cryst = hkl_all.astype(float) @ UB_mat.T
+                qn_cryst = np.linalg.norm(G_cryst, axis=1)
 
-                bank_imgs: dict[int, np.ndarray] = {}
+                frame_img_bids: set[int] = set()
+                all_img_bids_set: set[int] = set()
                 if src_h5 and os.path.exists(src_h5):
                     with (
                         contextlib.suppress(
@@ -2245,31 +4468,35 @@ def _extract_from_h5(
                         ),
                         h5py.File(src_h5, "r") as mf,
                     ):
-                        if "images" in mf and "bank_ids" in mf:
-                            f0_s, f1_s = (
-                                frame_slice
-                                if frame_slice is not None
-                                else (0, len(mf["bank_ids"]))
-                            )
-                            b_ids_s = np.asarray(mf["bank_ids"][f0_s:f1_s], dtype=int)
-                            ims_s = np.asarray(
-                                mf["images"][f0_s:f1_s], dtype=np.float32
-                            )
-                            sample_det = (
-                                next(iter(detectors.values())) if detectors else None
-                            )
-                            det_n = int(getattr(sample_det, "n", 0))
-                            compat = True
-                            if (
-                                ims_s.ndim >= 3
-                                and det_n > 0
-                                and int(ims_s.shape[1]) != det_n
-                            ):
-                                compat = False
-                            if compat:
-                                for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                    if int(b_id_s) in detectors:
-                                        bank_imgs[int(b_id_s)] = im_s
+                        if "bank_ids" in mf:
+                            b_ids_full = np.asarray(mf["bank_ids"][()], dtype=int)
+                            all_img_bids_set = {
+                                int(b) for b in b_ids_full if int(b) in detectors
+                            }
+                            if "images" in mf:
+                                im_shape = mf["images"].shape
+                                sample_det = (
+                                    next(iter(detectors.values()))
+                                    if detectors
+                                    else None
+                                )
+                                det_n = int(getattr(sample_det, "n", 0))
+                                compat = not (
+                                    len(im_shape) >= 3
+                                    and det_n > 0
+                                    and int(im_shape[1]) != det_n
+                                )
+                                if compat:
+                                    f0_s, f1_s = (
+                                        frame_slice
+                                        if frame_slice is not None
+                                        else (0, len(b_ids_full))
+                                    )
+                                    frame_img_bids = {
+                                        int(b)
+                                        for b in b_ids_full[f0_s:f1_s]
+                                        if int(b) in detectors
+                                    }
 
                 cal_bids_set: set[int] = set()
                 if "detector_calibration" in f:
@@ -2281,141 +4508,187 @@ def _extract_from_h5(
                                 pass
 
                 active_bids = (
-                    set(bank_imgs.keys())
-                    if bank_imgs
-                    else (cal_bids_set if cal_bids_set else {int(k) for k in detectors})
+                    frame_img_bids
+                    if frame_img_bids
+                    else (
+                        all_img_bids_set
+                        if all_img_bids_set
+                        else (
+                            cal_bids_set
+                            if cal_bids_set
+                            else {int(k) for k in detectors}
+                        )
+                    )
+                )
+                all_runs_bids = (
+                    all_img_bids_set
+                    if all_img_bids_set
+                    else (cal_bids_set if cal_bids_set else active_bids)
                 )
 
-                raw_hits: list[dict[str, Any]] = []
-                total_geom_hits = 0
-                for bid, det in sorted(detectors.items()):
-                    if int(bid) not in active_bids:
-                        continue
-                    cen = np.asarray(det.center, dtype=float)
-                    uh = np.asarray(det.uhat, dtype=float)
-                    vh = np.asarray(det.vhat, dtype=float)
-                    w_d, h_d = float(det.width), float(det.height)
-                    nrm = np.cross(uh, vh)
-                    dn = kf @ nrm
-                    t_ray = np.dot(cen, nrm) / np.where(np.abs(dn) < 1e-9, -1.0, dn)
-                    hit = t_ray > 0
-                    if not np.any(hit):
-                        continue
-                    idx_h = np.flatnonzero(hit)
-                    p_hit = t_ray[idx_h, None] * kf[idx_h] - cen[None, :]
-                    um = p_hit @ uh
-                    vm = p_hit @ vh
-                    in_b = (
-                        (um >= w_d * 0.02)
-                        & (um <= w_d * 0.98)
-                        & (vm >= h_d * 0.02)
-                        & (vm <= h_d * 0.98)
+                eff_rel_border = default_rel_border_for_instrument(instrument)
+                ray_active = _raycast_hkl_on_detectors(
+                    hkl_all,
+                    U_mat,
+                    B_mat,
+                    R_run,
+                    detectors,
+                    wavelength_range,
+                    ki=ki_vec,
+                    sample_offset_lab=s_lab_active,
+                    active_bids=active_bids,
+                    pixel_class_by_bank=pixel_class_by_bank,
+                    margin_frac=eff_rel_border,
+                    G_cryst=G_cryst,
+                    qn_cryst=qn_cryst,
+                )
+                if len(ray_active["peaks_xyz"]) > 0:
+                    peaks_xyz = ray_active["peaks_xyz"]
+                    hkl = ray_active["hkl"]
+                    lam = ray_active["wavelength"]
+                    bank = ray_active["bank"]
+                    pixel_r = ray_active["pixel_r"]
+                    pixel_c = ray_active["pixel_c"]
+                    run_index = np.full(len(peaks_xyz), int(active_frame), dtype=int)
+                    intensity = None
+                    sigma = None
+
+                # Forward-project across ALL runs in solve.h5 so All-Runs Wulff Net shows
+                # the complete multi-run reflection set right after Solve (matching Integration)
+                if include_all_runs_peaks and len(frames_meta) > 1:
+                    h5_abs = os.path.abspath(str(h5_path))
+                    h5_mtime = (
+                        os.stat(h5_abs).st_mtime_ns if os.path.exists(h5_abs) else 0
                     )
-                    if not np.any(in_b):
-                        continue
-                    idx_h = idx_h[in_b]
-                    um, vm = um[in_b], vm[in_b]
-                    pr_hit = vm / max(h_d, 1e-6) * (det.n - 1)
-                    pc_hit = um / max(w_d, 1e-6) * (det.m - 1)
-                    cls_b = pixel_class_by_bank.get(int(bid))
-                    if cls_b is not None and cls_b.ndim == 2:
-                        rm = np.clip(
-                            np.round(pr_hit).astype(int), 0, cls_b.shape[0] - 1
-                        )
-                        cm = np.clip(
-                            np.round(pc_hit).astype(int), 0, cls_b.shape[1] - 1
-                        )
-                        valid_m = cls_b[rm, cm] == 0
-                        if not np.any(valid_m):
-                            continue
-                        idx_h = idx_h[valid_m]
-                        um, vm = um[valid_m], vm[valid_m]
-                        pr_hit, pc_hit = pr_hit[valid_m], pc_hit[valid_m]
-                    im_b = bank_imgs.get(int(bid))
-                    if im_b is not None:
-                        r_i = np.clip(
-                            np.round(pr_hit).astype(int), 3, im_b.shape[0] - 4
-                        )
-                        c_i = np.clip(
-                            np.round(pc_hit).astype(int), 3, im_b.shape[1] - 4
-                        )
-                        peak_val = np.maximum.reduce(
-                            [
-                                im_b[r_i + dr, c_i + dc]
-                                for dr in range(-3, 4)
-                                for dc in range(-3, 4)
-                            ]
-                        )
-                        bg_val = float(np.median(im_b))
-                        snr = (peak_val - bg_val) / np.sqrt(max(bg_val, 1.0))
+                    src_abs = os.path.abspath(str(src_h5)) if src_h5 else ""
+                    src_mtime = (
+                        os.stat(src_abs).st_mtime_ns
+                        if src_abs and os.path.exists(src_abs)
+                        else 0
+                    )
+                    mr_key = (
+                        h5_abs,
+                        h5_mtime,
+                        src_abs,
+                        src_mtime,
+                        hkl_cache_key,
+                        round(float(wavelength_range[0]), 5),
+                        round(float(wavelength_range[1]), 5),
+                        round(float(eff_rel_border), 5),
+                        tuple(sorted(all_runs_bids)),
+                        len(frames_meta),
+                    )
+                    cached_mr = _MULTI_RUN_SOLVE_CACHE.get(mr_key)
+                    if cached_mr is not None:
+                        pts_sa, hkl_sa, lam_sa, bnk_sa, run_sa = cached_mr
                     else:
-                        peak_val = np.full(len(idx_h), 150.0, dtype=float)
-                        snr = np.full(len(idx_h), 10.0, dtype=float)
+                        all_xyz_s, all_hkl_s, all_lam_s, all_bnk_s, all_run_s = (
+                            [],
+                            [],
+                            [],
+                            [],
+                            [],
+                        )
+                        for r_i in range(len(frames_meta)):
+                            R_ri = R_per_run_all.get(r_i, R_run)
+                            s_ri = s_lab_per_run_all.get(r_i, s_lab_active)
+                            ray_r = (
+                                ray_active
+                                if (
+                                    r_i == active_frame and active_bids == all_runs_bids
+                                )
+                                else _raycast_hkl_on_detectors(
+                                    hkl_all,
+                                    U_mat,
+                                    B_mat,
+                                    R_ri,
+                                    detectors,
+                                    wavelength_range,
+                                    ki=ki_vec,
+                                    sample_offset_lab=s_ri,
+                                    active_bids=all_runs_bids,
+                                    pixel_class_by_bank=pixel_class_by_bank,
+                                    margin_frac=eff_rel_border,
+                                    G_cryst=G_cryst,
+                                    qn_cryst=qn_cryst,
+                                )
+                            )
+                            n_rr = len(ray_r["peaks_xyz"])
+                            if n_rr > 0:
+                                all_xyz_s.append(ray_r["peaks_xyz"])
+                                all_hkl_s.append(ray_r["hkl"])
+                                all_lam_s.append(ray_r["wavelength"])
+                                all_bnk_s.append(ray_r["bank"])
+                                all_run_s.append(np.full(n_rr, int(r_i), dtype=int))
+                        if all_xyz_s:
+                            pts_sa = np.concatenate(all_xyz_s, axis=0)
+                            hkl_sa = np.concatenate(all_hkl_s, axis=0)
+                            lam_sa = np.concatenate(all_lam_s, axis=0)
+                            bnk_sa = np.concatenate(all_bnk_s, axis=0)
+                            run_sa = np.concatenate(all_run_s, axis=0)
+                            if len(_MULTI_RUN_SOLVE_CACHE) >= 2:
+                                _MULTI_RUN_SOLVE_CACHE.pop(
+                                    next(iter(_MULTI_RUN_SOLVE_CACHE)), None
+                                )
+                            _MULTI_RUN_SOLVE_CACHE[mr_key] = (
+                                pts_sa,
+                                hkl_sa,
+                                lam_sa,
+                                bnk_sa,
+                                run_sa,
+                            )
+                        else:
+                            pts_sa = np.zeros((0, 3), dtype=float)
+                            hkl_sa = np.zeros((0, 3), dtype=int)
+                            lam_sa = np.zeros(0, dtype=float)
+                            bnk_sa = np.zeros(0, dtype=int)
+                            run_sa = np.zeros(0, dtype=int)
 
-                    xyz_hit = (
-                        cen[None, :]
-                        + um[:, None] * uh[None, :]
-                        + vm[:, None] * vh[None, :]
-                    )
-                    total_geom_hits += len(idx_h)
-                    raw_hits.append(
-                        {
-                            "bid": int(bid),
-                            "idx_h": idx_h,
-                            "xyz_hit": xyz_hit,
-                            "pr_hit": pr_hit,
-                            "pc_hit": pc_hit,
-                            "peak_val": peak_val,
-                            "snr": snr,
-                            "has_img": im_b is not None,
+                    if len(pts_sa) > 0:
+                        if len(pts_sa) > 12000:
+                            # Keep every unique (h, k, l) first (preferring active_frame),
+                            # then top up evenly to 12000 so no crystal reflection is dropped
+                            prio_s = np.argsort(
+                                np.where(run_sa == active_frame, 0, 1),
+                                kind="mergesort",
+                            )
+                            pts_sa = pts_sa[prio_s]
+                            hkl_sa = hkl_sa[prio_s]
+                            lam_sa = lam_sa[prio_s]
+                            bnk_sa = bnk_sa[prio_s]
+                            run_sa = run_sa[prio_s]
+                            _, u_idx = np.unique(hkl_sa, axis=0, return_index=True)
+                            u_idx = np.sort(u_idx)
+                            if len(u_idx) >= 12000:
+                                sub_s = u_idx[
+                                    np.linspace(0, len(u_idx) - 1, 12000, dtype=int)
+                                ]
+                            else:
+                                rem_mask = np.ones(len(pts_sa), dtype=bool)
+                                rem_mask[u_idx] = False
+                                rem_idx = np.flatnonzero(rem_mask)
+                                n_fill = 12000 - len(u_idx)
+                                fill_idx = rem_idx[
+                                    np.linspace(0, len(rem_idx) - 1, n_fill, dtype=int)
+                                ]
+                                sub_s = np.sort(np.concatenate([u_idx, fill_idx]))
+                            pts_sa = pts_sa[sub_s]
+                            hkl_sa = hkl_sa[sub_s]
+                            lam_sa = lam_sa[sub_s]
+                            bnk_sa = bnk_sa[sub_s]
+                            run_sa = run_sa[sub_s]
+                        all_runs_data = {
+                            "peaks_xyz": pts_sa,
+                            "hkl": hkl_sa,
+                            "wavelength": lam_sa,
+                            "intensity": None,
+                            "sigma": None,
+                            "bank": bnk_sa,
+                            "run_index": run_sa,
+                            "R_per_run": R_per_run_all,
+                            "s_lab_per_run": s_lab_per_run_all,
                         }
-                    )
-
-                xyz_l, hkl_l, lam_l, bank_l, pr_l, pc_l, inten_l = (
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                )
-                use_strict_snr = total_geom_hits > 400
-                for rh in raw_hits:
-                    idx_h = rh["idx_h"]
-                    xyz_hit = rh["xyz_hit"]
-                    pr_hit = rh["pr_hit"]
-                    pc_hit = rh["pc_hit"]
-                    peak_val = rh["peak_val"]
-                    snr = rh["snr"]
-                    if rh["has_img"]:
-                        keep_mask = (snr >= 3.0) if use_strict_snr else (peak_val > 0.0)
-                        if not np.any(keep_mask) and not use_strict_snr:
-                            keep_mask = np.ones(len(idx_h), dtype=bool)
-                        if not np.any(keep_mask):
-                            continue
-                        idx_h = idx_h[keep_mask]
-                        xyz_hit = xyz_hit[keep_mask]
-                        pr_hit = pr_hit[keep_mask]
-                        pc_hit = pc_hit[keep_mask]
-                        peak_val = np.maximum(peak_val[keep_mask], 1.0)
-                    xyz_l.append(xyz_hit)
-                    hkl_l.append(hkl_b[idx_h])
-                    lam_l.append(lam_b[idx_h])
-                    bank_l.append(np.full(len(idx_h), rh["bid"], dtype=int))
-                    pr_l.append(pr_hit)
-                    pc_l.append(pc_hit)
-                    inten_l.append(peak_val)
-
-                if xyz_l:
-                    peaks_xyz = np.concatenate(xyz_l, axis=0)
-                    hkl = np.concatenate(hkl_l, axis=0)
-                    lam = np.concatenate(lam_l, axis=0)
-                    bank = np.concatenate(bank_l, axis=0)
-                    pixel_r = np.concatenate(pr_l, axis=0)
-                    pixel_c = np.concatenate(pc_l, axis=0)
-                    intensity = np.concatenate(inten_l, axis=0)
-                    sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
+                        predicted_all_runs_data = all_runs_data
 
         if peaks_xyz is None:
             peaks_xyz = np.zeros((0, 3), dtype=float)
@@ -2427,13 +4700,10 @@ def _extract_from_h5(
             pixel_r = np.zeros(n_peaks, dtype=float)
         if pixel_c is None:
             pixel_c = np.zeros(n_peaks, dtype=float)
-        if intensity is None:
-            intensity = np.ones(n_peaks, dtype=float) * 100.0
-        if sigma is None:
-            sigma = np.ones(n_peaks, dtype=float) * 3.0
         if run_index is None:
             run_index = np.zeros(n_peaks, dtype=int)
 
+        has_tof_data = _h5_has_tof_data(h5_path, src_h5)
         return {
             "instrument": instrument,
             "ki": ki,
@@ -2464,7 +4734,14 @@ def _extract_from_h5(
             "merged_sigi": merged_sigi,
             "merge_metrics": merge_metrics,
             "all_runs_data": all_runs_data,
+            "predicted_frame_data": predicted_frame_data,
+            "predicted_all_runs_data": predicted_all_runs_data,
+            "has_predictor_h5": has_predictor_h5,
+            "has_tof_data": has_tof_data,
+            "R_per_run_all": R_per_run_all,
             "R_gonio": R_gonio,
+            "s_lab_per_run_all": s_lab_per_run_all,
+            "sample_offset_lab": s_lab_active,
             "solve_diagnostics": solve_diagnostics,
             "pixel_class_by_bank": pixel_class_by_bank,
             "em_mask_summary": em_mask_summary,
@@ -2472,6 +4749,49 @@ def _extract_from_h5(
             "frames": frames_meta,
             "frame_index": active_frame,
         }
+
+
+def _h5_has_tof_data(*candidates: str | os.PathLike[str] | None) -> bool:
+    """Return True if any candidate HDF5 (or its linked ``source`` HDF5) carries TOF events or TOF-gated peaks."""
+    import h5py
+
+    seen: set[str] = set()
+    queue: list[str] = [str(p) for p in candidates if p and os.path.isfile(str(p))]
+    while queue:
+        cur = os.path.abspath(queue.pop(0))
+        if cur in seen or not os.path.isfile(cur):
+            continue
+        seen.add(cur)
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError),
+            h5py.File(cur, "r") as hf,
+        ):
+            if (
+                "tof_gate" in hf
+                or "peaks/tof" in hf
+                or bool(hf.attrs.get("has_tof_events"))
+                or ("events/tof" in hf and "events/image_offsets" in hf)
+            ):
+                return True
+            if "entry" in hf:
+                entry = hf["entry"]
+                if isinstance(entry, h5py.Group):
+                    for sub_k, sub_v in entry.items():
+                        if isinstance(sub_v, h5py.Group) and (
+                            "event_time_offset" in sub_v
+                            or (str(sub_k).endswith("_events") and "event_id" in sub_v)
+                        ):
+                            return True
+            src_attr = hf.attrs.get("source")
+            if src_attr:
+                src_str = (
+                    src_attr.decode("utf-8", errors="ignore")
+                    if isinstance(src_attr, (bytes, np.bytes_))
+                    else str(src_attr)
+                ).strip()
+                if src_str and os.path.isfile(src_str):
+                    queue.append(src_str)
+    return False
 
 
 def _build_lattice_ladder_steps(
@@ -2484,9 +4804,15 @@ def _build_lattice_ladder_steps(
     """Construct the interactive Lattice Ladder progression (Rung 1 -> Goal)."""
     n_total = max(len(peaks_list), 1)
     indexed_peaks = [p for p in peaks_list if p["indexed"]]
+    err_peaks = [
+        p
+        for p in indexed_peaks
+        if p.get("has_angular_error", True)
+        and isinstance(p.get("angular_error_deg"), (int, float))
+    ]
     overall_rms = (
-        float(np.sqrt(np.mean([p["angular_error_deg"] ** 2 for p in indexed_peaks])))
-        if indexed_peaks
+        float(np.sqrt(np.mean([p["angular_error_deg"] ** 2 for p in err_peaks])))
+        if err_peaks
         else 0.0
     )
 
@@ -2692,6 +5018,672 @@ def _build_lattice_ladder_steps(
     return steps
 
 
+def _ordinal_shell_badge(idx_one_based: int) -> str:
+    if 10 <= (idx_one_based % 100) <= 20:
+        suf = "TH"
+    else:
+        suf = {1: "ST", 2: "ND", 3: "RD"}.get(idx_one_based % 10, "TH")
+    return f"{idx_one_based}{suf}"
+
+
+def _compute_cc_star(cc_half: float | None) -> float | None:
+    if cc_half is None or not math.isfinite(cc_half) or cc_half < 0.0:
+        return None
+    if cc_half == 0.0:
+        return 0.0
+    denom = 1.0 + cc_half
+    if denom <= 1e-12:
+        return None
+    return math.sqrt(max(0.0, 2.0 * cc_half / denom))
+
+
+def _cc_half_tier(cc_half: float | None) -> str:
+    if cc_half is None or not math.isfinite(cc_half):
+        return "na"
+    if cc_half >= 0.80:
+        return "green"
+    if cc_half >= 0.30:
+        return "yellow"
+    return "red"
+
+
+def build_merge_resolution_table_data(
+    merge_metrics: dict[str, Any] | None,
+    *,
+    space_group: str | None = None,
+    cell: Sequence[float] | None = None,
+    wavelength_range: Sequence[float] | None = None,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Normalize Careless merge metrics into publication-ready per-shell and overall rows."""
+    m = dict(merge_metrics or {})
+    raw_bins = m.get("cc_half_bins")
+    if not isinstance(raw_bins, list) or not raw_bins:
+        raw_bins = m.get("resolution_bins")
+    bins_list = list(raw_bins) if isinstance(raw_bins, list) else []
+
+    def _fnum(val: Any) -> float | None:
+        if val is None or isinstance(val, bool):
+            return None
+        try:
+            fv = float(val)
+        except (TypeError, ValueError):
+            return None
+        return fv if math.isfinite(fv) else None
+
+    def _inum(val: Any) -> int | None:
+        fv = _fnum(val)
+        return round(fv) if fv is not None else None
+
+    rows: list[dict[str, Any]] = []
+    sum_n_obs = 0
+    all_have_n_obs = len(bins_list) > 0
+    sum_n_refl = 0
+    sum_n_theo = 0
+    any_have_n_theo = False
+
+    for idx, b in enumerate(bins_list):
+        if not isinstance(b, dict):
+            continue
+        shell_num = idx + 1
+        d_max = _fnum(b.get("d_max"))
+        d_min = _fnum(b.get("d_min"))
+        n_obs = _inum(b.get("n_obs"))
+        n_refl = _inum(b.get("n_refl"))
+        if n_refl is None:
+            n_refl = 0
+        n_theo = _inum(b.get("n_theo"))
+        if n_theo is not None and n_theo <= 0:
+            n_theo = None
+        mult = _fnum(b.get("multiplicity"))
+        if mult is None and n_obs is not None and n_refl > 0:
+            mult = n_obs / float(n_refl)
+        comp = _fnum(b.get("completeness_pct"))
+        if comp is None and n_theo is not None and n_theo > 0:
+            comp = 100.0 * float(n_refl) / float(n_theo)
+        isigi = _fnum(b.get("mean_isigi"))
+        cc_h = _fnum(b.get("cc_half"))
+        cc_s = _compute_cc_star(cc_h)
+
+        if n_obs is not None:
+            sum_n_obs += n_obs
+        else:
+            all_have_n_obs = False
+        sum_n_refl += n_refl
+        if n_theo is not None:
+            sum_n_theo += n_theo
+            any_have_n_theo = True
+
+        range_display = (
+            f"{d_max:.2f} \u2013 {d_min:.2f}"
+            if (d_max is not None and d_min is not None)
+            else f"Bin {shell_num}"
+        )
+        range_ascii = (
+            f"{d_max:.2f} - {d_min:.2f}"
+            if (d_max is not None and d_min is not None)
+            else f"Bin {shell_num}"
+        )
+        rows.append(
+            {
+                "shell": shell_num,
+                "rank_badge": _ordinal_shell_badge(shell_num),
+                "d_max": d_max,
+                "d_min": d_min,
+                "range_display": range_display,
+                "range_ascii": range_ascii,
+                "n_obs": n_obs,
+                "n_unique": n_refl,
+                "n_theo": n_theo,
+                "multiplicity": mult,
+                "completeness_pct": comp,
+                "mean_isigi": isigi,
+                "cc_half": cc_h,
+                "cc_star": cc_s,
+                "cc_tier": _cc_half_tier(cc_h),
+            }
+        )
+
+    ov_d_max = _fnum(m.get("d_max"))
+    if ov_d_max is None and rows and rows[0]["d_max"] is not None:
+        ov_d_max = rows[0]["d_max"]
+    ov_d_min = _fnum(m.get("d_min"))
+    if ov_d_min is None and rows and rows[-1]["d_min"] is not None:
+        ov_d_min = rows[-1]["d_min"]
+
+    ov_n_obs = _inum(m.get("n_observations"))
+    if ov_n_obs is None and all_have_n_obs and sum_n_obs > 0:
+        ov_n_obs = sum_n_obs
+    ov_n_unique = _inum(m.get("n_merged_asu"))
+    if not ov_n_unique:
+        ov_n_unique = sum_n_refl
+    ov_n_theo = _inum(m.get("n_theoretical_asu"))
+    if ov_n_theo is None and any_have_n_theo and sum_n_theo > 0:
+        ov_n_theo = sum_n_theo
+
+    ov_mult = _fnum(m.get("multiplicity"))
+    if ov_mult is None:
+        ov_mult = _fnum(m.get("mean_multiplicity"))
+    if ov_mult is None and ov_n_obs is not None and ov_n_unique > 0:
+        ov_mult = ov_n_obs / float(ov_n_unique)
+
+    ov_comp = _fnum(m.get("completeness_pct"))
+    if ov_comp is None and ov_n_theo is not None and ov_n_theo > 0:
+        ov_comp = 100.0 * float(ov_n_unique) / float(ov_n_theo)
+
+    ov_isigi = _fnum(m.get("mean_i_over_sigi"))
+    if ov_isigi is None:
+        ov_isigi = _fnum(m.get("mean_isigi"))
+
+    ov_cc = _fnum(m.get("cc_half_overall"))
+    if ov_cc is None:
+        ov_cc = _fnum(m.get("cc_half"))
+    ov_cc_star = _compute_cc_star(ov_cc)
+
+    ov_range_display = (
+        f"{ov_d_max:.2f} \u2013 {ov_d_min:.2f}"
+        if (ov_d_max is not None and ov_d_min is not None)
+        else "Overall"
+    )
+    ov_range_ascii = (
+        f"{ov_d_max:.2f} - {ov_d_min:.2f}"
+        if (ov_d_max is not None and ov_d_min is not None)
+        else "Overall"
+    )
+    overall = {
+        "shell": "Overall",
+        "rank_badge": "ALL",
+        "d_max": ov_d_max,
+        "d_min": ov_d_min,
+        "range_display": ov_range_display,
+        "range_ascii": ov_range_ascii,
+        "n_obs": ov_n_obs,
+        "n_unique": ov_n_unique,
+        "n_theo": ov_n_theo,
+        "multiplicity": ov_mult,
+        "completeness_pct": ov_comp,
+        "mean_isigi": ov_isigi,
+        "cc_half": ov_cc,
+        "cc_star": ov_cc_star,
+        "cc_tier": _cc_half_tier(ov_cc),
+    }
+
+    d_cc30: float | None = None
+    for r in rows:
+        if (
+            r["cc_half"] is not None
+            and r["cc_half"] >= 0.30
+            and r["d_min"] is not None
+            and (d_cc30 is None or r["d_min"] < d_cc30)
+        ):
+            d_cc30 = r["d_min"]
+
+    sg_val = str(space_group or m.get("space_group") or "").strip()
+    cell_in = cell if cell is not None else m.get("cell")
+    cell_vals: list[float] | None = None
+    if isinstance(cell_in, (list, tuple)) and len(cell_in) >= 6:
+        with contextlib.suppress(TypeError, ValueError):
+            cell_vals = [float(x) for x in cell_in[:6]]
+    wl_in = (
+        wavelength_range if wavelength_range is not None else m.get("wavelength_range")
+    )
+    wl_vals: list[float] | None = None
+    if isinstance(wl_in, (list, tuple)) and len(wl_in) >= 2:
+        with contextlib.suppress(TypeError, ValueError):
+            wl_vals = [float(wl_in[0]), float(wl_in[1])]
+
+    return {
+        "title": title or "Merging and Scaling Statistics by Resolution Shell",
+        "space_group": sg_val,
+        "cell": cell_vals,
+        "wavelength_range": wl_vals,
+        "d_cc30": d_cc30,
+        "rows": rows,
+        "overall": overall,
+    }
+
+
+def render_merge_table_csv(
+    merge_metrics: dict[str, Any] | None,
+    *,
+    space_group: str | None = None,
+    cell: Sequence[float] | None = None,
+    wavelength_range: Sequence[float] | None = None,
+) -> str:
+    """Render publication-ready merging statistics vs. resolution as RFC-4180 CSV."""
+    import csv as _csv
+    import io as _io
+
+    data = build_merge_resolution_table_data(
+        merge_metrics,
+        space_group=space_group,
+        cell=cell,
+        wavelength_range=wavelength_range,
+    )
+    buf = _io.StringIO()
+    writer = _csv.writer(buf, lineterminator="\n")
+    writer.writerow(
+        [
+            "shell",
+            "d_max_A",
+            "d_min_A",
+            "resolution_range_A",
+            "n_obs",
+            "n_unique",
+            "n_theo",
+            "multiplicity",
+            "completeness_pct",
+            "mean_isigi",
+            "cc_half",
+            "cc_star",
+        ]
+    )
+    for r in [*data["rows"], data["overall"]]:
+        writer.writerow(
+            [
+                r["shell"],
+                f"{r['d_max']:.2f}" if r["d_max"] is not None else "",
+                f"{r['d_min']:.2f}" if r["d_min"] is not None else "",
+                r["range_ascii"],
+                r["n_obs"] if r["n_obs"] is not None else "",
+                r["n_unique"] if r["n_unique"] is not None else "",
+                r["n_theo"] if r["n_theo"] is not None else "",
+                f"{r['multiplicity']:.2f}" if r["multiplicity"] is not None else "",
+                (
+                    f"{r['completeness_pct']:.1f}"
+                    if r["completeness_pct"] is not None
+                    else ""
+                ),
+                f"{r['mean_isigi']:.2f}" if r["mean_isigi"] is not None else "",
+                f"{r['cc_half']:.4f}" if r["cc_half"] is not None else "",
+                f"{r['cc_star']:.4f}" if r["cc_star"] is not None else "",
+            ]
+        )
+    return buf.getvalue()
+
+
+def render_merge_table_html(
+    merge_metrics: dict[str, Any] | None,
+    *,
+    space_group: str | None = None,
+    cell: Sequence[float] | None = None,
+    wavelength_range: Sequence[float] | None = None,
+    default_style: str = "blue_dark",
+    title: str | None = None,
+) -> str:
+    """Render a self-contained HTML artifact in monochrome blue-on-dark publication layout with HTML/TSV copy."""
+    import html as _html
+
+    _ = default_style
+    data = build_merge_resolution_table_data(
+        merge_metrics,
+        space_group=space_group,
+        cell=cell,
+        wavelength_range=wavelength_range,
+        title=title,
+    )
+    meta_parts: list[str] = []
+    if data["space_group"]:
+        meta_parts.append(f"Space group: {_html.escape(data['space_group'])}")
+    if data["cell"]:
+        c = data["cell"]
+        meta_parts.append(
+            f"Cell: {c[0]:.2f}, {c[1]:.2f}, {c[2]:.2f} \u00c5; "
+            f"{c[3]:.1f}\u00b0, {c[4]:.1f}\u00b0, {c[5]:.1f}\u00b0"
+        )
+    if data["wavelength_range"]:
+        wl = data["wavelength_range"]
+        meta_parts.append(f"\u03bb: {wl[0]:.2f}\u2013{wl[1]:.2f} \u00c5")
+    if data["d_cc30"] is not None:
+        meta_parts.append(f"d(CC\u00bd \u2265 0.30): {data['d_cc30']:.2f} \u00c5")
+    meta_line = " \u2022 ".join(meta_parts)
+
+    def _fmt(v: float | None, nd: int) -> str:
+        return f"{v:.{nd}f}" if v is not None else "\u2014"
+
+    def _fmt_int(v: int | None) -> str:
+        return f"{v:,}" if v is not None else "\u2014"
+
+    body_rows_html: list[str] = []
+    clean_rows_html: list[str] = []
+    tsv_lines: list[str] = [
+        "Shell\tResolution (\u00c5)\tN_obs\tN_unique\tN_theo\tMultiplicity\tCompleteness (%)\t<I/sigma(I)>\tCC1/2\tCC*"
+    ]
+
+    for r in data["rows"]:
+        body_rows_html.append(
+            "<tr>"
+            f'<td class="col-shell">{r["shell"]}</td>'
+            f'<td class="col-res">{_html.escape(r["range_display"])}</td>'
+            f'<td class="num">{_fmt_int(r["n_obs"])}</td>'
+            f'<td class="num">{_fmt_int(r["n_unique"])}</td>'
+            f'<td class="num">{_fmt_int(r["n_theo"])}</td>'
+            f'<td class="num">{_fmt(r["multiplicity"], 2)}</td>'
+            f'<td class="num">{_fmt(r["completeness_pct"], 1)}</td>'
+            f'<td class="num">{_fmt(r["mean_isigi"], 2)}</td>'
+            f'<td class="num cc-cell">{_fmt(r["cc_half"], 3)}</td>'
+            f'<td class="num">{_fmt(r["cc_star"], 3)}</td>'
+            "</tr>"
+        )
+        clean_rows_html.append(
+            "<tr>"
+            f'<td style="padding:4px 8px;text-align:center;">{r["shell"]}</td>'
+            f'<td style="padding:4px 8px;text-align:center;">{_html.escape(r["range_display"])}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{r["n_obs"] if r["n_obs"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{r["n_unique"]}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{r["n_theo"] if r["n_theo"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{_fmt(r["multiplicity"], 2) if r["multiplicity"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{_fmt(r["completeness_pct"], 1) if r["completeness_pct"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{_fmt(r["mean_isigi"], 2) if r["mean_isigi"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{_fmt(r["cc_half"], 3) if r["cc_half"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{_fmt(r["cc_star"], 3) if r["cc_star"] is not None else ""}</td>'
+            "</tr>"
+        )
+        tsv_lines.append(
+            "\t".join(
+                [
+                    str(r["shell"]),
+                    r["range_display"],
+                    str(r["n_obs"]) if r["n_obs"] is not None else "",
+                    str(r["n_unique"]),
+                    str(r["n_theo"]) if r["n_theo"] is not None else "",
+                    f"{r['multiplicity']:.2f}" if r["multiplicity"] is not None else "",
+                    (
+                        f"{r['completeness_pct']:.1f}"
+                        if r["completeness_pct"] is not None
+                        else ""
+                    ),
+                    f"{r['mean_isigi']:.2f}" if r["mean_isigi"] is not None else "",
+                    f"{r['cc_half']:.3f}" if r["cc_half"] is not None else "",
+                    f"{r['cc_star']:.3f}" if r["cc_star"] is not None else "",
+                ]
+            )
+        )
+
+    ov = data["overall"]
+    foot_html = (
+        '<tr class="overall-row">'
+        '<td class="col-shell">Overall</td>'
+        f'<td class="col-res">{_html.escape(ov["range_display"])}</td>'
+        f'<td class="num">{_fmt_int(ov["n_obs"])}</td>'
+        f'<td class="num">{_fmt_int(ov["n_unique"])}</td>'
+        f'<td class="num">{_fmt_int(ov["n_theo"])}</td>'
+        f'<td class="num">{_fmt(ov["multiplicity"], 2)}</td>'
+        f'<td class="num">{_fmt(ov["completeness_pct"], 1)}</td>'
+        f'<td class="num">{_fmt(ov["mean_isigi"], 2)}</td>'
+        f'<td class="num cc-cell">{_fmt(ov["cc_half"], 3)}</td>'
+        f'<td class="num">{_fmt(ov["cc_star"], 3)}</td>'
+        "</tr>"
+    )
+    clean_foot_html = (
+        '<tr style="border-top:1px solid #000;border-bottom:2px solid #000;font-weight:bold;">'
+        '<td style="padding:5px 8px;text-align:center;">Overall</td>'
+        f'<td style="padding:5px 8px;text-align:center;">{_html.escape(ov["range_display"])}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{ov["n_obs"] if ov["n_obs"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{ov["n_unique"]}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{ov["n_theo"] if ov["n_theo"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{_fmt(ov["multiplicity"], 2) if ov["multiplicity"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{_fmt(ov["completeness_pct"], 1) if ov["completeness_pct"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{_fmt(ov["mean_isigi"], 2) if ov["mean_isigi"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{_fmt(ov["cc_half"], 3) if ov["cc_half"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{_fmt(ov["cc_star"], 3) if ov["cc_star"] is not None else ""}</td>'
+        "</tr>"
+    )
+    tsv_lines.append(
+        "\t".join(
+            [
+                "Overall",
+                ov["range_display"],
+                str(ov["n_obs"]) if ov["n_obs"] is not None else "",
+                str(ov["n_unique"]),
+                str(ov["n_theo"]) if ov["n_theo"] is not None else "",
+                f"{ov['multiplicity']:.2f}" if ov["multiplicity"] is not None else "",
+                (
+                    f"{ov['completeness_pct']:.1f}"
+                    if ov["completeness_pct"] is not None
+                    else ""
+                ),
+                f"{ov['mean_isigi']:.2f}" if ov["mean_isigi"] is not None else "",
+                f"{ov['cc_half']:.3f}" if ov["cc_half"] is not None else "",
+                f"{ov['cc_star']:.3f}" if ov["cc_star"] is not None else "",
+            ]
+        )
+    )
+    clean_clip_html = (
+        '<div style="background:#ffffff;color:#000000;font-family:Calibri,Arial,sans-serif;font-size:11pt;">'
+        f'<p style="margin:0 0 6px 0;font-weight:bold;">{_html.escape(data["title"])}'
+        + (f" ({meta_line})" if meta_line else "")
+        + "</p>"
+        '<table style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:10.5pt;color:#000000;background:#ffffff;">'
+        '<thead><tr style="border-top:2px solid #000;border-bottom:1px solid #000;font-weight:bold;">'
+        '<th style="padding:5px 8px;text-align:center;">Shell</th>'
+        '<th style="padding:5px 8px;text-align:center;">Resolution (\u00c5)</th>'
+        '<th style="padding:5px 8px;text-align:right;">N<sub>obs</sub></th>'
+        '<th style="padding:5px 8px;text-align:right;">N<sub>unique</sub></th>'
+        '<th style="padding:5px 8px;text-align:right;">N<sub>theo</sub></th>'
+        '<th style="padding:5px 8px;text-align:right;">Multiplicity</th>'
+        '<th style="padding:5px 8px;text-align:right;">Completeness (%)</th>'
+        '<th style="padding:5px 8px;text-align:right;">\u27e8I/\u03c3(I)\u27e9</th>'
+        '<th style="padding:5px 8px;text-align:right;">CC<sub>1/2</sub></th>'
+        '<th style="padding:5px 8px;text-align:right;">CC*</th>'
+        "</tr></thead>"
+        f"<tbody>{''.join(clean_rows_html)}</tbody>"
+        f"<tfoot>{clean_foot_html}</tfoot>"
+        "</table></div>"
+    )
+    payload_js = json.dumps(
+        {
+            "clean_html": clean_clip_html,
+            "tsv": "\n".join(tsv_lines),
+        }
+    ).replace("</", "<\\/")
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>{_html.escape(data["title"])}</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    padding: 24px;
+    font-family: Georgia, 'Times New Roman', Times, serif;
+    background: #070911;
+    color: #bae6fd;
+  }}
+  .wrap {{
+    max-width: 960px;
+    margin: 0 auto;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #0a1020;
+    border: 1px solid rgba(56, 189, 248, 0.38);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.65), 0 0 24px rgba(56, 189, 248, 0.10);
+  }}
+  .toolbar {{
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 14px 18px;
+    border-bottom: 1px solid rgba(56, 189, 248, 0.20);
+  }}
+  h1 {{
+    margin: 0;
+    font-size: 1.08rem;
+    font-weight: 700;
+    color: #e0f2fe;
+  }}
+  .meta-line {{
+    font-size: 0.78rem;
+    color: rgba(147, 197, 253, 0.78);
+    margin-top: 4px;
+  }}
+  .actions {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }}
+  button {{
+    cursor: pointer;
+    border-radius: 5px;
+    border: 1px solid rgba(56, 189, 248, 0.55);
+    background: rgba(14, 116, 144, 0.22);
+    color: #e0f2fe;
+    font-family: Georgia, 'Times New Roman', Times, serif;
+    font-size: 0.80rem;
+    font-weight: 600;
+    padding: 5px 12px;
+  }}
+  button:hover {{
+    background: rgba(56, 189, 248, 0.22);
+    border-color: #7dd3fc;
+    color: #ffffff;
+  }}
+  .table-box {{ padding: 14px 18px 18px 18px; overflow-x: auto; }}
+  table.merge-tbl {{
+    width: 100%;
+    border-collapse: collapse;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.86rem;
+    color: #bae6fd;
+  }}
+  table.merge-tbl th {{
+    padding: 7px 9px;
+    text-align: right;
+    color: #7dd3fc;
+    border-top: 2px solid rgba(125, 211, 252, 0.72);
+    border-bottom: 1px solid rgba(125, 211, 252, 0.40);
+    font-weight: 700;
+    white-space: nowrap;
+  }}
+  table.merge-tbl th.col-shell,
+  table.merge-tbl th.col-res,
+  table.merge-tbl td.col-shell,
+  table.merge-tbl td.col-res {{
+    text-align: center;
+  }}
+  table.merge-tbl td {{
+    padding: 5px 9px;
+    text-align: right;
+    border-bottom: none;
+    white-space: nowrap;
+  }}
+  table.merge-tbl tbody tr:hover {{
+    background: rgba(56, 189, 248, 0.07);
+  }}
+  .cc-cell {{ font-weight: 600; color: #e0f2fe; }}
+  tr.overall-row td {{
+    border-top: 1px solid rgba(125, 211, 252, 0.40);
+    border-bottom: 2px solid rgba(125, 211, 252, 0.72);
+    font-weight: 700;
+    color: #e0f2fe;
+  }}
+  .legend-foot {{
+    margin-top: 10px;
+    font-size: 0.74rem;
+    color: rgba(147, 197, 253, 0.72);
+  }}
+  @media print {{
+    body {{ background: #ffffff !important; color: #000000 !important; padding: 0; }}
+    .wrap {{ border: none !important; box-shadow: none !important; background: #ffffff !important; }}
+    .actions {{ display: none !important; }}
+    h1, .meta-line, .legend-foot {{ color: #000000 !important; }}
+    table.merge-tbl th {{ color: #000 !important; border-top: 2px solid #000 !important; border-bottom: 1px solid #000 !important; }}
+    table.merge-tbl td, .cc-cell {{ color: #000 !important; border-bottom: none !important; }}
+    tr.overall-row td {{ color: #000 !important; border-top: 1px solid #000 !important; border-bottom: 2px solid #000 !important; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="toolbar">
+      <div>
+        <h1>{_html.escape(data["title"])}</h1>
+        {f'<div class="meta-line">{meta_line}</div>' if meta_line else ""}
+      </div>
+      <div class="actions">
+        <button id="btn-copy-pub" type="button" title="Copy formatted HTML table and tab-separated values to clipboard">Copy</button>
+      </div>
+    </div>
+    <div class="table-box">
+      <table class="merge-tbl" id="merge-resolution-table">
+        <thead>
+          <tr>
+            <th class="col-shell">Shell</th>
+            <th class="col-res">Resolution (\u00c5)</th>
+            <th>N<sub>obs</sub></th>
+            <th>N<sub>unique</sub></th>
+            <th>N<sub>theo</sub></th>
+            <th>Multiplicity</th>
+            <th>Completeness (%)</th>
+            <th>\u27e8I/\u03c3(I)\u27e9</th>
+            <th>CC<sub>1/2</sub></th>
+            <th>CC*</th>
+          </tr>
+        </thead>
+        <tbody>
+          {"".join(body_rows_html)}
+        </tbody>
+        <tfoot>
+          {foot_html}
+        </tfoot>
+      </table>
+      <div class="legend-foot">
+        <span>CC* = [2 CC<sub>1/2</sub> / (1 + CC<sub>1/2</sub>)]<sup>1/2</sup> (Karplus &amp; Diederichs, 2012).</span>
+      </div>
+    </div>
+  </div>
+<script>
+(function() {{
+  const EXPORT_DATA = {payload_js};
+  const btnCopy = document.getElementById("btn-copy-pub");
+  if (btnCopy) {{
+    btnCopy.addEventListener("click", async function() {{
+      let ok = false;
+      try {{
+        if (navigator.clipboard && window.ClipboardItem) {{
+          await navigator.clipboard.write([
+            new ClipboardItem({{
+              "text/html": new Blob([EXPORT_DATA.clean_html], {{ type: "text/html" }}),
+              "text/plain": new Blob([EXPORT_DATA.tsv], {{ type: "text/plain" }})
+            }})
+          ]);
+          ok = true;
+        }}
+      }} catch (_e) {{}}
+      if (!ok) {{
+        const holder = document.createElement("div");
+        holder.style.cssText = "position:fixed;left:-9999px;top:0;background:#fff;color:#000;";
+        holder.innerHTML = EXPORT_DATA.clean_html;
+        document.body.appendChild(holder);
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(holder);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        try {{ ok = document.execCommand("copy"); }} catch (_e2) {{}}
+        sel.removeAllRanges();
+        document.body.removeChild(holder);
+      }}
+      if (!ok && navigator.clipboard && navigator.clipboard.writeText) {{
+        try {{ await navigator.clipboard.writeText(EXPORT_DATA.tsv); ok = true; }} catch (_e3) {{}}
+      }}
+      btnCopy.textContent = ok ? "\u2713 Copied" : "Copy failed";
+      setTimeout(function() {{ btnCopy.textContent = "Copy"; }}, 1600);
+    }});
+  }}
+}})();
+</script>
+</body>
+</html>
+"""
+
+
 def _pending_stage_for_artifact_kind(artifact_kind: str | None) -> str:
     """Return the pending pipeline stage ID given the currently loaded HDF5 artifact kind."""
     kind = (artifact_kind or "solve").lower()
@@ -2746,12 +5738,14 @@ def _build_ndip_pipeline_stages(
             return "pending"
         return "ready"
 
-    merge_artifact_str = "merged.mtz + predictions.mtz + careless_metrics.json"
+    merge_artifact_str = (
+        "merged.mtz + predictions.mtz + careless_metrics.json + merge_table.csv"
+    )
     if isinstance(merge_metrics, dict) and merge_metrics.get("n_merged_asu"):
         cc_val = merge_metrics.get("cc_half_overall")
         n_asu = int(merge_metrics.get("n_merged_asu", 0))
         cc_txt = f"CC1/2={float(cc_val):.3f} • " if cc_val is not None else ""
-        merge_artifact_str = f"merged.mtz ({cc_txt}{n_asu:,} ASU)"
+        merge_artifact_str = f"merged.mtz + merge_table.csv ({cc_txt}{n_asu:,} ASU)"
 
     return [
         {
@@ -2830,284 +5824,287 @@ def _build_ndip_pipeline_stages(
     ]
 
 
-def build_rainbow_zone_payload(
-    peaks_xyz: np.ndarray | None = None,
-    ub_matrix: np.ndarray | None = None,
-    replay_h5: str | os.PathLike | None = None,
+_ASU_MAPPER_CACHE: dict[tuple[str, tuple[float, ...]], Any] = {}
+_ABSENCE_CHECKER_CACHE: dict[str, Any] = {}
+
+
+def _make_systematic_absence_checker(space_group: str | None) -> Any:
+    """Return ``is_absent(h, k, l) -> bool`` respecting full space-group systematic absences."""
+    sg_key = str(space_group or "P 1").strip()
+    cached_fn = _ABSENCE_CHECKER_CACHE.get(sg_key)
+    if cached_fn is not None:
+        return cached_fn
+    sg_ops = None
+    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
+        import gemmi
+
+        sg_obj = gemmi.find_spacegroup_by_name(sg_key)
+        if sg_obj is None and len(sg_key) >= 2 and " " not in sg_key:
+            sg_obj = gemmi.find_spacegroup_by_name(" ".join(list(sg_key)))
+        if sg_obj is not None:
+            sg_ops = sg_obj.operations()
+
+    sg_u = sg_key.upper()
+    centering = sg_u[0] if sg_u else "P"
+    _abs_cache: dict[tuple[int, int, int], bool] = {}
+
+    def _is_absent(h_v: int, k_v: int, l_v: int) -> bool:
+        if h_v == 0 and k_v == 0 and l_v == 0:
+            return True
+        ck = (int(h_v), int(k_v), int(l_v))
+        hit = _abs_cache.get(ck)
+        if hit is not None:
+            return hit
+        res = False
+        if sg_ops is not None:
+            with contextlib.suppress(RuntimeError, ValueError, TypeError):
+                res = bool(sg_ops.is_systematically_absent([h_v, k_v, l_v]))
+                if len(_abs_cache) < 250000:
+                    _abs_cache[ck] = res
+                return res
+        if centering == "I":
+            res = ((h_v + k_v + l_v) & 1) != 0
+        elif centering == "F":
+            res = (
+                ((h_v + k_v) & 1) != 0
+                or ((k_v + l_v) & 1) != 0
+                or ((h_v + l_v) & 1) != 0
+            )
+        elif centering == "C":
+            res = ((h_v + k_v) & 1) != 0
+        elif centering == "A":
+            res = ((k_v + l_v) & 1) != 0
+        elif centering == "B":
+            res = ((h_v + l_v) & 1) != 0
+        elif centering == "R":
+            res = ((-h_v + k_v + l_v) % 3) != 0
+        if len(_abs_cache) < 250000:
+            _abs_cache[ck] = res
+        return res
+
+    if len(_ABSENCE_CHECKER_CACHE) >= 32:
+        _ABSENCE_CHECKER_CACHE.pop(next(iter(_ABSENCE_CHECKER_CACHE)))
+    _ABSENCE_CHECKER_CACHE[sg_key] = _is_absent
+    return _is_absent
+
+
+def _compute_harmonic_order_and_multiplicity(
+    h_v: int,
+    k_v: int,
+    l_v: int,
+    lam_val: float,
+    d_val: float,
     *,
-    images_h5: str | os.PathLike | None = None,
-    projection: str | None = None,
-    U: np.ndarray | None = None,
-    B: np.ndarray | None = None,
-    R_gonio: np.ndarray | None = None,
-    ki: tuple[float, float, float] = (0.0, 0.0, 1.0),
-    wavelength_range: tuple[float, float] | None = None,
-    d_min: float | None = None,
-    instrument: str = "IMAGINE",
-    space_group: str = "P 1",
-    cell: list[float] | None = None,
+    wl_min: float,
+    wl_max: float,
+    d_min: float,
+    is_absent_fn: Any,
+    observed_distinct_orders: int = 1,
+) -> tuple[int, int]:
+    """Compute space-group-allowed harmonic order and in-band Laue harmonic multiplicity."""
+    if h_v == 0 and k_v == 0 and l_v == 0:
+        return (1, 1)
+    g = max(1, math.gcd(abs(h_v), math.gcd(abs(k_v), abs(l_v))))
+    h0, k0, l0 = h_v // g, k_v // g, l_v // g
+
+    if g <= 64:
+        allowed_ord = sum(
+            1 for m in range(1, g + 1) if not is_absent_fn(m * h0, m * k0, m * l0)
+        )
+        allowed_ord = max(1, allowed_ord)
+    else:
+        allowed_ord = g
+
+    if not (np.isfinite(lam_val) and lam_val > 0.0 and wl_max > wl_min > 0.0):
+        return (allowed_ord, max(1, int(observed_distinct_orders)))
+
+    lam_prod = float(g) * float(lam_val)
+    m_lo = max(1, math.ceil(lam_prod / max(float(wl_max), 1e-6) - 1e-5))
+    m_hi_wl = lam_prod / max(float(wl_min), 1e-6)
+    if np.isfinite(d_val) and d_val > 0.0 and np.isfinite(d_min) and d_min > 0.0:
+        d_eff = min(float(d_min), float(d_val))
+        m_hi_d = (float(g) * float(d_val)) / max(d_eff, 1e-6)
+        m_hi = math.floor(min(m_hi_wl, m_hi_d) + 1e-5)
+    else:
+        m_hi = math.floor(m_hi_wl + 1e-5)
+
+    if m_hi < m_lo:
+        n_in_band = 1
+    else:
+        m_cap = min(m_hi, m_lo + 64)
+        n_in_band = sum(
+            1
+            for m in range(m_lo, m_cap + 1)
+            if not is_absent_fn(m * h0, m * k0, m * l0)
+        )
+        if m_lo <= g <= m_hi and n_in_band < 1:
+            n_in_band = 1
+
+    return (allowed_ord, max(1, n_in_band, int(observed_distinct_orders)))
+
+
+def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
+    """Return ``(h, k, l) -> (asu_h, asu_k, asu_l, is_friedel, bijvoet_parity)``.
+
+    ``bijvoet_parity`` is ``+1`` or ``-1`` for acentric reflections (the two
+    anomalous Bijvoet hands ``I+`` / ``I-``) and ``0`` for centric reflections
+    (including all reflections in centrosymmetric space groups and centric zones
+    such as ``hk0`` in ``Fdd2``), where ``(h, k, l)`` and ``(-h, -k, -l)`` are
+    point-group equivalents with zero Bijvoet difference.
+    """
+    sg_key = str(space_group or "P 1").strip()
+    cell_key = (
+        tuple(round(float(x), 3) for x in cell[:6])
+        if cell is not None and len(cell) >= 6
+        else ()
+    )
+    mapper_key = (sg_key, cell_key)
+    cached_mapper = _ASU_MAPPER_CACHE.get(mapper_key)
+    if cached_mapper is not None:
+        return cached_mapper
+
+    sg_obj = None
+    asu_obj = None
+    sg_ops = None
+    proper_rots: list[np.ndarray] = []
+    is_centro = False
+    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
+        import gemmi
+
+        sg_obj = gemmi.find_spacegroup_by_name(sg_key) or (
+            gemmi.find_spacegroup_by_name("P 1")
+        )
+        if sg_obj is not None:
+            asu_obj = gemmi.ReciprocalAsu(sg_obj)
+            sg_ops = sg_obj.operations()
+            is_centro = bool(sg_ops.is_centrosymmetric())
+            for op in sg_ops.sym_ops:
+                r_m = np.asarray(op.rot, dtype=float) / float(op.DEN)
+                if float(np.linalg.det(r_m)) > 0.0:
+                    proper_rots.append(r_m)
+
+    _asu_cache: dict[tuple[int, int, int], tuple[int, int, int, bool, int]] = {}
+
+    def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int, bool, int]:
+        ck = (int(h_v), int(k_v), int(l_v))
+        cached = _asu_cache.get(ck)
+        if cached is not None:
+            return cached
+        if asu_obj is not None and sg_ops is not None and (h_v or k_v or l_v):
+            with contextlib.suppress(RuntimeError, ValueError, TypeError, IndexError):
+                ha, isym = asu_obj.to_asu([h_v, k_v, l_v], sg_ops)
+                ah_i, ak_i, al_i = int(ha[0]), int(ha[1]), int(ha[2])
+                is_centric = bool(
+                    is_centro or sg_ops.is_reflection_centric([h_v, k_v, l_v])
+                )
+                if not is_centric:
+                    is_fr = int(isym) % 2 == 0
+                    bij_parity = -1 if is_fr else 1
+                else:
+                    bij_parity = 0
+                    h_vec = np.array([ah_i, ak_i, al_i], dtype=float)
+                    is_fr = not any(
+                        round(float(h_vec @ r_m[:, 0])) == h_v
+                        and round(float(h_vec @ r_m[:, 1])) == k_v
+                        and round(float(h_vec @ r_m[:, 2])) == l_v
+                        for r_m in proper_rots
+                    )
+                res_asu = (ah_i, ak_i, al_i, bool(is_fr), int(bij_parity))
+                if len(_asu_cache) < 250000:
+                    _asu_cache[ck] = res_asu
+                return res_asu
+        ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
+        sg_u = sg_key.upper()
+        is_cubic = "3" in sg_u or (
+            cell is not None
+            and len(cell) >= 6
+            and abs(float(cell[0]) - float(cell[1])) < 0.05
+            and abs(float(cell[1]) - float(cell[2])) < 0.05
+        )
+        neg_parity = bool(
+            ((1 if h_v < 0 else 0) + (1 if k_v < 0 else 0) + (1 if l_v < 0 else 0)) % 2
+            == 1
+        )
+        if is_cubic:
+            s3 = sorted((ah, ak, al), reverse=True)
+            return (s3[0], s3[1], s3[2], neg_parity, 0)
+        return (ah, ak, al, neg_parity, 0)
+
+    if len(_ASU_MAPPER_CACHE) >= 32:
+        _ASU_MAPPER_CACHE.pop(next(iter(_ASU_MAPPER_CACHE)))
+    _ASU_MAPPER_CACHE[mapper_key] = _to_asu_hkl
+    return _to_asu_hkl
+
+
+def _serialize_space_group_ops(space_group: str) -> dict[str, Any]:
+    """Serialize compact integer Gemmi space-group operations for exact client-side re-prediction."""
+    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
+        import gemmi
+
+        sg_obj = gemmi.find_spacegroup_by_name(str(space_group)) or (
+            gemmi.find_spacegroup_by_name("P 1")
+        )
+        if sg_obj is not None:
+            asu_obj = gemmi.ReciprocalAsu(sg_obj)
+            sg_ops = sg_obj.operations()
+            return {
+                "space_group": str(sg_obj.xhm() or space_group),
+                "den": int(gemmi.Op.DEN),
+                "is_centrosymmetric": bool(sg_ops.is_centrosymmetric()),
+                "centering_mult": max(1, len(sg_ops.cen_ops)),
+                "asu_condition": str(asu_obj.condition_str()),
+                "cen_ops": [[int(t) for t in c] for c in sg_ops.cen_ops],
+                "sym_ops": [
+                    {
+                        "rot": [[int(x) for x in r] for r in op.rot],
+                        "tr": [int(t) for t in op.tran],
+                    }
+                    for op in sg_ops.sym_ops
+                ],
+            }
+    sg_u = str(space_group or "P 1").strip().upper()
+    c_mult = (
+        4
+        if sg_u.startswith("F")
+        else (
+            3
+            if sg_u.startswith("R")
+            else (2 if sg_u[:1] in ("I", "A", "B", "C") else 1)
+        )
+    )
+    return {
+        "space_group": str(space_group or "P 1"),
+        "den": 24,
+        "is_centrosymmetric": False,
+        "centering_mult": c_mult,
+        "asu_condition": "l>0 or (l=0 and (h>0 or (h=0 and k>=0)))",
+        "cen_ops": [[0, 0, 0]],
+        "sym_ops": [{"rot": [[24, 0, 0], [0, 24, 0], [0, 0, 24]], "tr": [0, 0, 0]}],
+    }
+
+
+def _compute_zones_payload_for_geometry(
+    pts: np.ndarray,
+    *,
+    ub_matrix: np.ndarray | None,
+    R_gonio: np.ndarray | None,
+    R_single: np.ndarray,
+    ki_hat: np.ndarray,
+    detectors: dict[int, Any],
+    sample_offset_lab: Any = None,
     max_zone_index: int = 3,
     zone_tolerance_deg: float = 0.75,
     min_zone_peaks: int = 2,
     max_zones: int = 36,
     n_arc: int = 720,
-    max_peaks: int = 2500,
-    render_binning: int = 4,
-    frame_index: int | None = None,
-    include_panels: bool = True,
-    include_panel_images: bool = True,
-    include_peaks: bool = True,
-) -> dict[str, Any]:
-    """Build the JSON-serializable data contract for the Rainbow Zones widget.
-
-    Includes detector bank outlines in both Cylindrical ``(az, y)`` and Spherical
-    ``(az, elevation)`` coordinates, log-scaled detector intensity heatmaps,
-    peak reflections, and Lattice Ladder steps.
-    """
-    detectors: dict[int, Any] = {}
-    fallback_cell = list(cell) if cell and len(cell) == 6 else None
-    fallback_sg = space_group
-    cell = None
-    bank_arr = None
-    pixel_r_arr = None
-    pixel_c_arr = None
-    intensity_arr = None
-    sigma_arr = None
-    var_u_arr = None
-    var_v_arr = None
-    cov_uv_arr = None
-    artifact_kind = "solve"
-    peak_shape_mode = "solved_circle"
-    hkl_arr = None
-    lam_arr = None
-    careless_residual_arr = None
-    careless_scale_arr = None
-    merged_i_arr = None
-    merged_sigi_arr = None
-    merge_metrics: dict[str, Any] | None = None
-    all_runs_data: dict[str, Any] | None = None
-    solve_diagnostics = None
-    pixel_class_by_bank: dict[int, np.ndarray] | None = None
-    em_mask_summary: dict[str, Any] = {"available": False}
-    frame_slice = None
-    frames_meta: list[dict[str, Any]] = []
-    active_frame = int(frame_index) if frame_index is not None else 0
-
-    if replay_h5 is not None:
-        extracted = _extract_from_h5(
-            replay_h5,
-            images_h5=images_h5,
-            frame_index=frame_index,
-            include_peaks=include_peaks,
-            default_instrument=instrument or "IMAGINE",
-            d_min=d_min,
-        )
-        instrument = extracted["instrument"] or instrument
-        ki = extracted["ki"]
-        if wavelength_range is None:
-            wavelength_range = extracted["wavelength_range"]
-        if U is None:
-            U = extracted["U"]
-        if B is None:
-            B = extracted["B"]
-        ex_sg = extracted.get("space_group")
-        if ex_sg and ex_sg not in ("P 1", "Unknown"):
-            space_group = ex_sg
-        elif fallback_sg and fallback_sg not in ("P 1", "Unknown"):
-            space_group = fallback_sg
-        else:
-            space_group = ex_sg or space_group
-        cell = extracted["cell"] or fallback_cell
-        detectors = extracted["detectors"]
-        if peaks_xyz is None:
-            peaks_xyz = extracted["peaks_xyz"]
-        bank_arr = extracted["bank"]
-        pixel_r_arr = extracted["pixel_r"]
-        pixel_c_arr = extracted["pixel_c"]
-        intensity_arr = extracted["intensity"]
-        sigma_arr = extracted["sigma"]
-        var_u_arr = extracted.get("var_u")
-        var_v_arr = extracted.get("var_v")
-        cov_uv_arr = extracted.get("cov_uv")
-        artifact_kind = extracted.get("artifact_kind") or artifact_kind
-        peak_shape_mode = extracted.get("peak_shape_mode") or peak_shape_mode
-        hkl_arr = extracted["hkl"]
-        lam_arr = extracted["wavelength"]
-        careless_residual_arr = extracted.get("careless_residual")
-        careless_scale_arr = extracted.get("careless_scale")
-        merged_i_arr = extracted.get("merged_i")
-        merged_sigi_arr = extracted.get("merged_sigi")
-        merge_metrics = extracted.get("merge_metrics")
-        all_runs_data = extracted.get("all_runs_data")
-        solve_diagnostics = extracted.get("solve_diagnostics")
-        pixel_class_by_bank = extracted.get("pixel_class_by_bank")
-        em_mask_summary = extracted.get("em_mask_summary") or {"available": False}
-        frame_slice = extracted.get("frame_slice")
-        frames_meta = extracted.get("frames") or []
-        active_frame = int(extracted.get("frame_index", active_frame))
-        if R_gonio is None:
-            R_gonio = extracted["R_gonio"]
-        if extracted.get("images_h5"):
-            images_h5 = extracted["images_h5"]
-        elif images_h5 is None:
-            images_h5 = _discover_images_h5(replay_h5)
-    elif not detectors:
-        detectors = _load_detectors_from_h5(None, instrument)
-        cell = fallback_cell
-        if peaks_xyz is None and ub_matrix is None and U is None:
-            artifact_kind = "empty"
-    if wavelength_range is None:
-        wavelength_range = _get_instrument_default_wavelength(instrument)
-
-    if peaks_xyz is None:
-        peaks_xyz = np.zeros((0, 3), dtype=float)
-    pts = np.asarray(peaks_xyz, dtype=float)
-    if pts.ndim != 2 or pts.shape[1] != 3:
-        raise ValueError("peaks_xyz must have shape (N, 3)")
-
-    if ub_matrix is None and U is not None and B is not None:
-        ub_matrix = np.asarray(U, dtype=float) @ np.asarray(B, dtype=float)
-    elif ub_matrix is not None:
-        ub_matrix = np.asarray(ub_matrix, dtype=float)
-        if B is None:
-            cell = list(_cell_from_B(ub_matrix))
-
-    if cell is None and B is not None:
-        cell = list(_cell_from_B(B))
-
-    n_raw = len(pts)
-    if n_raw > max_peaks:
-        order = (
-            np.argsort(-np.asarray(intensity_arr))[:max_peaks]
-            if intensity_arr is not None and len(intensity_arr) == n_raw
-            else np.linspace(0, n_raw - 1, max_peaks, dtype=int)
-        )
-        order = np.sort(order)
-        pts = pts[order]
-        if bank_arr is not None and len(bank_arr) == n_raw:
-            bank_arr = bank_arr[order]
-        if pixel_r_arr is not None and len(pixel_r_arr) == n_raw:
-            pixel_r_arr = pixel_r_arr[order]
-        if pixel_c_arr is not None and len(pixel_c_arr) == n_raw:
-            pixel_c_arr = pixel_c_arr[order]
-        if intensity_arr is not None and len(intensity_arr) == n_raw:
-            intensity_arr = intensity_arr[order]
-        if sigma_arr is not None and len(sigma_arr) == n_raw:
-            sigma_arr = sigma_arr[order]
-        if var_u_arr is not None and len(var_u_arr) == n_raw:
-            var_u_arr = var_u_arr[order]
-        if var_v_arr is not None and len(var_v_arr) == n_raw:
-            var_v_arr = var_v_arr[order]
-        if cov_uv_arr is not None and len(cov_uv_arr) == n_raw:
-            cov_uv_arr = cov_uv_arr[order]
-        if hkl_arr is not None and len(hkl_arr) == n_raw:
-            hkl_arr = hkl_arr[order]
-        if lam_arr is not None and len(lam_arr) == n_raw:
-            lam_arr = lam_arr[order]
-        if careless_residual_arr is not None and len(careless_residual_arr) == n_raw:
-            careless_residual_arr = careless_residual_arr[order]
-        if careless_scale_arr is not None and len(careless_scale_arr) == n_raw:
-            careless_scale_arr = careless_scale_arr[order]
-        if merged_i_arr is not None and len(merged_i_arr) == n_raw:
-            merged_i_arr = merged_i_arr[order]
-        if merged_sigi_arr is not None and len(merged_sigi_arr) == n_raw:
-            merged_sigi_arr = merged_sigi_arr[order]
-        if (
-            isinstance(R_gonio, np.ndarray)
-            and R_gonio.ndim == 3
-            and len(R_gonio) == n_raw
-        ):
-            R_gonio = R_gonio[order]
-
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Identify and serialize detector/stereographic Laue zone arcs."""
+    s_off = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None and np.asarray(sample_offset_lab).size >= 3
+        else None
+    )
     n_peaks = len(pts)
-    ki_hat = np.asarray(ki, dtype=float)
-    ki_hat = ki_hat / np.linalg.norm(ki_hat)
-
-    norms = np.linalg.norm(pts, axis=1, keepdims=True)
-    kf_hat = pts / np.maximum(norms, 1e-12)
-    q_vec = kf_hat - ki_hat[None, :]
-    q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True)
-    g_hat = np.where(q_norm > 1e-6, q_vec / np.maximum(q_norm, 1e-12), kf_hat)
-
-    R_single = np.eye(3)
-    if R_gonio is not None:
-        R_arr = np.asarray(R_gonio, dtype=float)
-        if R_arr.ndim == 2:
-            R_single = R_arr
-            g_crystal = g_hat @ R_single
-        elif R_arr.ndim == 3 and len(R_arr) == n_peaks:
-            g_crystal = np.einsum("ni,nij->nj", g_hat, R_arr)
-            R_single = R_arr[0]
-        else:
-            g_crystal = g_hat
-    else:
-        g_crystal = g_hat
-
-    sx, sy, hemi = (
-        stereographic_projection(g_crystal)
-        if n_peaks > 0
-        else (np.zeros(0), np.zeros(0), np.zeros(0, dtype=np.int8))
-    )
-    sx_lab, sy_lab, hemi_lab = (
-        stereographic_projection(g_hat)
-        if n_peaks > 0
-        else (np.zeros(0), np.zeros(0), np.zeros(0, dtype=np.int8))
-    )
-    det_x, det_y = (
-        _unrolled(pts)
-        if n_peaks > 0
-        else (np.zeros(0, dtype=float), np.zeros(0, dtype=float))
-    )
-    _, det_el = (
-        _spherical_angles(pts)
-        if n_peaks > 0
-        else (np.zeros(0, dtype=float), np.zeros(0, dtype=float))
-    )
-
-    wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
-    if n_peaks > 0 and ub_matrix is not None:
-        inv_ub = np.linalg.inv(ub_matrix)
-        hkl_dir = g_crystal @ inv_ub.T
-        sin_theta = np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999)
-        if hkl_arr is None:
-            lam_grid = np.linspace(wl_min, wl_max, 64)
-            q_mag_grid = (2.0 * sin_theta[:, None]) / lam_grid[None, :]
-            hkl_cand = hkl_dir[:, None, :] * q_mag_grid[:, :, None]
-            hkl_round = np.rint(hkl_cand)
-            nonzero = np.any(hkl_round != 0, axis=-1)
-            diff = np.linalg.norm(hkl_cand - hkl_round, axis=-1)
-            diff = np.where(nonzero, diff, 1e9)
-            best_l = np.argmin(diff, axis=1)
-            hkl_arr = hkl_round[np.arange(n_peaks), best_l].astype(int)
-
-        G_pred_cryst = hkl_arr @ ub_matrix.T
-        G_norm = np.linalg.norm(G_pred_cryst, axis=1)
-        valid_hkl = G_norm > 1e-8
-        G_pred_hat = np.divide(G_pred_cryst, np.maximum(G_norm[:, None], 1e-12))
-        cos_err = np.clip(np.sum(g_crystal * G_pred_hat, axis=1), -1.0, 1.0)
-        ang_err_deg = np.where(valid_hkl, np.rad2deg(np.arccos(cos_err)), 90.0)
-        d_spacing = np.where(valid_hkl, 1.0 / np.maximum(G_norm, 1e-8), 0.0)
-        if lam_arr is None:
-            lam_arr = np.where(
-                valid_hkl,
-                2.0 * sin_theta / np.maximum(G_norm, 1e-8),
-                0.5 * (wl_min + wl_max),
-            )
-    else:
-        if hkl_arr is None:
-            hkl_arr = np.zeros((n_peaks, 3), dtype=int)
-        sin_theta = (
-            np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999) if n_peaks > 0 else np.zeros(0)
-        )
-        if lam_arr is None:
-            lam_arr = np.full(n_peaks, 0.5 * (wl_min + wl_max), dtype=float)
-        d_spacing = (
-            lam_arr / np.maximum(2.0 * sin_theta, 1e-4)
-            if n_peaks > 0
-            else np.zeros(0, dtype=float)
-        )
-        ang_err_deg = np.zeros(n_peaks, dtype=float)
-
     raw_zones = (
         identify_zones(
             pts,
@@ -3128,7 +6125,6 @@ def build_rainbow_zone_payload(
         uvw_vals = [abs(int(x)) for x in z.get("uvw", [1, 0, 0])]
         z["order"] = max(uvw_vals) if any(uvw_vals) else 1
 
-    # Keep all fundamental Order 1 zones (|u|,|v|,|w| <= 1) plus populated Order 2 and Order 3 zones
     selected_zones: list[dict[str, Any]] = []
     z_ord1 = [
         z
@@ -3167,23 +6163,2118 @@ def build_rainbow_zone_payload(
     for new_zid, z in enumerate(raw_zones):
         z["zone_id"] = new_zid
 
-    peak_zones: list[list[int]] = [[] for _ in range(n_peaks)]
-    for z in raw_zones:
-        zid = z["zone_id"]
-        for pid in z["member_peak_ids"]:
-            if 0 <= pid < n_peaks:
-                peak_zones[pid].append(zid)
+    zones_payload: list[dict[str, Any]] = []
+    for zi, z in enumerate(raw_zones):
+        t_cryst = np.asarray(z["axis_crystal_xyz"], dtype=float)
+        t_lab = R_single @ t_cryst
+        conic_cryst = get_zone_conic_points(t_cryst, ki=ki_hat, n_arc=n_arc)
+        conic_lab = get_zone_conic_points(t_lab, ki=ki_hat, n_arc=n_arc)
 
-    # Precompute 2-sigma detector-projected peak contours (ellipses or isotropic circles)
-    # when covariance parameters (var_u, var_v, cov_uv) are present from integrator/finder
+        det_segments: list[list[list[float]]] = []
+        det_segments_sph: list[list[list[float]]] = []
+        kf = conic_lab["kf_hat"]
+        if detectors:
+            for bk, det in sorted(detectors.items()):
+                with contextlib.suppress(
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    IndexError,
+                ):
+                    mask, row, col = det.reflections_mask(
+                        kf[:, 0], kf[:, 1], kf[:, 2], sample_offset=s_off
+                    )
+                    if not np.any(mask):
+                        continue
+                    idx_hits = np.where(mask)[0]
+                    splits = np.where(np.diff(idx_hits) > 2)[0] + 1
+                    for chunk in np.split(idx_hits, splits):
+                        if len(chunk) < 2:
+                            continue
+                        xyz_seg = det.pixel_to_lab(row[chunk], col[chunk])
+                        px, py = _unrolled(xyz_seg)
+                        _, pel = _spherical_angles(xyz_seg)
+                        if np.ptp(px) <= 90.0:
+                            step_s = max(1, len(px) // 32)
+                            sample_idx = list(range(0, len(px), step_s))
+                            if sample_idx[-1] != len(px) - 1:
+                                sample_idx.append(len(px) - 1)
+                            det_segments.append(
+                                [
+                                    [
+                                        round(float(px[j]), 3),
+                                        round(float(py[j]), 5),
+                                    ]
+                                    for j in sample_idx
+                                ]
+                            )
+                            det_segments_sph.append(
+                                [
+                                    [
+                                        round(float(px[j]), 3),
+                                        round(float(pel[j]), 3),
+                                    ]
+                                    for j in sample_idx
+                                ]
+                            )
+
+        dx = np.asarray(conic_lab["det_x"], dtype=float)
+        dy = np.asarray(conic_lab["det_y"], dtype=float)
+        del_deg = np.asarray(conic_lab["det_el"], dtype=float)
+        if n_peaks > 0:
+            med_r_xz = float(np.median(np.hypot(pts[:, 0], pts[:, 2])))
+            if med_r_xz > 0.05:
+                dy = dy * med_r_xz
+
+        continuous_segments: list[list[list[float]]] = []
+        continuous_segments_sph: list[list[list[float]]] = []
+        cur_seg: list[list[float]] = []
+        cur_seg_sph: list[list[float]] = []
+        for k in range(0, len(dx), 2):
+            if cur_seg and abs(dx[k] - cur_seg[-1][0]) > 45.0:
+                if len(cur_seg) >= 2:
+                    continuous_segments.append(cur_seg)
+                    continuous_segments_sph.append(cur_seg_sph)
+                cur_seg = []
+                cur_seg_sph = []
+            cur_seg.append([round(float(dx[k]), 2), round(float(dy[k]), 4)])
+            cur_seg_sph.append([round(float(dx[k]), 2), round(float(del_deg[k]), 3)])
+        if len(cur_seg) >= 2:
+            continuous_segments.append(cur_seg)
+            continuous_segments_sph.append(cur_seg_sph)
+
+        if not detectors and not det_segments:
+            det_segments = continuous_segments
+            det_segments_sph = continuous_segments_sph
+
+        sx_z = np.asarray(conic_cryst["sx"], dtype=float)
+        sy_z = np.asarray(conic_cryst["sy"], dtype=float)
+        hm_z = np.asarray(conic_cryst["hemisphere"], dtype=int)
+        stereo_segments: list[list[list[float]]] = []
+        cur_s: list[list[float]] = []
+        for k in range(0, len(sx_z), 2):
+            if cur_s and (
+                hm_z[k] != cur_s[-1][2]
+                or np.hypot(sx_z[k] - cur_s[-1][0], sy_z[k] - cur_s[-1][1]) > 0.35
+            ):
+                if len(cur_s) >= 2:
+                    stereo_segments.append(cur_s)
+                cur_s = []
+            cur_s.append(
+                [
+                    round(float(sx_z[k]), 4),
+                    round(float(sy_z[k]), 4),
+                    int(hm_z[k]),
+                ]
+            )
+        if len(cur_s) >= 2:
+            stereo_segments.append(cur_s)
+
+        pole_sx, pole_sy, pole_hemi = stereographic_projection(t_cryst)
+
+        zones_payload.append(
+            {
+                "zone_id": int(z["zone_id"]),
+                "uvw": z["uvw"],
+                "order": int(z.get("order", max(abs(int(x)) for x in z["uvw"]))),
+                "label": z["label"],
+                "axis_xyz": z["axis_xyz"],
+                "axis_crystal_xyz": z["axis_crystal_xyz"],
+                "pole_stereo": [
+                    round(float(pole_sx), 4),
+                    round(float(pole_sy), 4),
+                    int(pole_hemi),
+                ],
+                "d_direct": z["d_direct"],
+                "score": z["score"],
+                "n_peaks": z["n_peaks"],
+                "angular_rms_deg": z["angular_rms_deg"],
+                "member_peak_ids": z["member_peak_ids"],
+                "rainbow_color": RAINBOW_SPECTRAL_HEX[zi % len(RAINBOW_SPECTRAL_HEX)],
+                "pro_color": PRO_PALETTE_HEX[zi % len(PRO_PALETTE_HEX)],
+                "stereo_segments": stereo_segments,
+                "detector_segments": det_segments,
+                "detector_segments_sph": det_segments_sph,
+                "continuous_segments": continuous_segments,
+                "continuous_segments_sph": continuous_segments_sph,
+            }
+        )
+    return raw_zones, zones_payload
+
+
+_SPOT_IMG_SLAB_CACHE: dict[tuple[str, int, int, int], dict[int, np.ndarray]] = {}
+
+
+def _load_cached_frame_bank_images(
+    images_h5: str | os.PathLike[str] | None,
+    frame_slice: tuple[int, int] | None,
+) -> dict[int, np.ndarray]:
+    """Load and LRU-cache 2D raw detector bank images for the active frame."""
+    if not images_h5 or not os.path.isfile(images_h5):
+        return {}
+    try:
+        h5_abs = os.path.abspath(str(images_h5))
+        mtime_ns = int(os.stat(h5_abs).st_mtime_ns)
+        f0_req = int(frame_slice[0]) if frame_slice is not None else -1
+        f1_req = int(frame_slice[1]) if frame_slice is not None else -1
+        cache_key = (h5_abs, mtime_ns, f0_req, f1_req)
+        cached = _SPOT_IMG_SLAB_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        import h5py
+
+        bank_images: dict[int, np.ndarray] = {}
+        with h5py.File(h5_abs, "r") as hf:
+            ims = (
+                hf["images/ims"]
+                if "images" in hf
+                and isinstance(hf["images"], h5py.Group)
+                and "ims" in hf["images"]
+                else hf.get("images")
+            )
+            if ims is None or len(ims) == 0:
+                return {}
+            n_tot = len(ims)
+            if "bank_ids" in hf:
+                b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
+            elif "banks" in hf:
+                b_ids = np.asarray(hf["banks"][()], dtype=int).ravel()
+            else:
+                b_ids = np.arange(1, n_tot + 1, dtype=int)
+            if len(b_ids) > 0 and len(b_ids) < n_tot:
+                b_ids = np.resize(b_ids, n_tot)
+            elif len(b_ids) == 0:
+                b_ids = np.arange(1, n_tot + 1, dtype=int)
+            if frame_slice is not None:
+                f0 = max(0, min(int(frame_slice[0]), n_tot))
+                f1 = max(f0, min(int(frame_slice[1]), n_tot))
+            elif "file_offsets" in hf:
+                offsets = np.asarray(hf["file_offsets"][()], dtype=int)
+                if len(offsets) > 1:
+                    counts = np.diff(np.append(offsets, n_tot))
+                    best_r = int(np.argmax(counts))
+                    f0 = int(offsets[best_r])
+                    f1 = int(offsets[best_r] + counts[best_r])
+                else:
+                    f0, f1 = 0, n_tot
+            else:
+                f0, f1 = 0, n_tot
+            if f1 > f0:
+                slab = np.asarray(ims[f0:f1], dtype=np.float32)
+                for rel_i, idx in enumerate(range(f0, f1)):
+                    bk = int(b_ids[idx])
+                    im = (
+                        slab[rel_i]
+                        if slab.ndim == 3
+                        else np.asarray(ims[idx], dtype=np.float32)
+                    )
+                    if im.ndim != 2:
+                        continue
+                    if bk in bank_images:
+                        bank_images[bk] = np.maximum(bank_images[bk], im)
+                    else:
+                        bank_images[bk] = im
+        if bank_images:
+            if len(_SPOT_IMG_SLAB_CACHE) >= 4:
+                _SPOT_IMG_SLAB_CACHE.pop(next(iter(_SPOT_IMG_SLAB_CACHE)))
+            _SPOT_IMG_SLAB_CACHE[cache_key] = bank_images
+        return bank_images
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
+        return {}
+
+
+def _estimate_image_spot_angular_errors_deg(
+    *,
+    images_h5: str | os.PathLike[str] | None,
+    frame_slice: tuple[int, int] | None,
+    hkl_arr: np.ndarray | None,
+    bank_arr: np.ndarray | None,
+    pixel_r_arr: np.ndarray | None,
+    pixel_c_arr: np.ndarray | None,
+    ub_matrix: np.ndarray | None,
+    R_run: np.ndarray | None,
+    detectors: dict[int, Any],
+    ki_hat: np.ndarray,
+    sample_offset_lab: Any = None,
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
+) -> tuple[np.ndarray | None, bool]:
+    """
+    Estimate local background-thresholded spot centroid angular errors ``Δθ`` [deg]
+    for predicted/solved reflections directly against the active detector count maps.
+
+    Returns ``(ang_err_deg_or_nan, has_image_slab)``. Reflections without a local
+    signal peak above background receive ``NaN`` so unobserved reflections do not
+    dilute the RMS indexing diagnostic toward zero.
+    """
+    if (
+        hkl_arr is None
+        or bank_arr is None
+        or pixel_r_arr is None
+        or pixel_c_arr is None
+        or ub_matrix is None
+        or not detectors
+        or len(hkl_arr) == 0
+    ):
+        return None, False
+
+    bank_images = _load_cached_frame_bank_images(images_h5, frame_slice)
+    if not bank_images:
+        return None, False
+
+    n_peaks = len(hkl_arr)
+    out_err = np.full(n_peaks, np.nan, dtype=float)
+    R_mat = (
+        np.asarray(R_run, dtype=float)
+        if R_run is not None and np.asarray(R_run).ndim == 2
+        else np.eye(3, dtype=float)
+    )
+    s_off = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None and np.asarray(sample_offset_lab).size >= 3
+        else np.zeros(3, dtype=float)
+    )
+    G_pred = np.asarray(hkl_arr, dtype=float) @ np.asarray(ub_matrix, dtype=float).T
+    G_norm = np.linalg.norm(G_pred, axis=1)
+    G_hat = np.divide(G_pred, np.maximum(G_norm[:, None], 1e-12))
+
+    b_arr = np.asarray(bank_arr, dtype=int)
+    r_arr = np.asarray(pixel_r_arr, dtype=float)
+    c_arr = np.asarray(pixel_c_arr, dtype=float)
+
+    for bk in np.unique(b_arr):
+        im = bank_images.get(int(bk))
+        det = detectors.get(int(bk))
+        if im is None or det is None or im.ndim != 2:
+            continue
+        H, W = im.shape
+        if H < 8 or W < 8:
+            continue
+        idxs = np.flatnonzero((b_arr == bk) & (G_norm > 1e-8))
+        if len(idxs) == 0:
+            continue
+
+        det_n = max(1, int(getattr(det, "n", H)))
+        det_m = max(1, int(getattr(det, "m", W)))
+        scale_r = (H - 1) / max(det_n - 1, 1) if det_n > 1 else 1.0
+        scale_c = (W - 1) / max(det_m - 1, 1) if det_m > 1 else 1.0
+
+        r_im = r_arr[idxs] * scale_r
+        c_im = c_arr[idxs] * scale_c
+        in_bounds = (
+            (r_im >= 1.5) & (r_im <= H - 2.5) & (c_im >= 1.5) & (c_im <= W - 2.5)
+        )
+        if not np.any(in_bounds):
+            continue
+        idxs_in = idxs[in_bounds]
+        r0 = np.rint(r_im[in_bounds]).astype(int)
+        c0 = np.rint(c_im[in_bounds]).astype(int)
+
+        rad = max(3, min(10, round(0.028 * min(H, W))))
+        offs = np.arange(-rad, rad + 1, dtype=int)
+        dr, dc = np.meshgrid(offs, offs, indexing="ij")
+        circ_mask = ((dr * dr + dc * dc) <= (rad * rad)).astype(np.float32)
+
+        rr = np.clip(r0[:, None, None] + dr[None, :, :], 0, H - 1)
+        cc = np.clip(c0[:, None, None] + dc[None, :, :], 0, W - 1)
+        patches = im[rr, cc]
+
+        pcls = pixel_class_by_bank.get(int(bk)) if pixel_class_by_bank else None
+        valid_px = circ_mask[None, :, :]
+        if pcls is not None and pcls.shape == im.shape:
+            valid_px = valid_px * (pcls[rr, cc] == 0).astype(np.float32)
+
+        bg = np.median(patches, axis=(1, 2), keepdims=True)
+        mad = 1.4826 * np.median(np.abs(patches - bg), axis=(1, 2), keepdims=True)
+        thr = bg + np.maximum(4.0 * mad, np.maximum(2.5, 0.15 * np.maximum(bg, 1.0)))
+        excess = np.maximum(0.0, patches - thr) * valid_px
+        w = excess * excess
+        w_sum = np.sum(w, axis=(1, 2))
+        has_spot = w_sum > 0.0
+        if not np.any(has_spot):
+            continue
+
+        sel_local = np.flatnonzero(has_spot)
+        sel_global = idxs_in[sel_local]
+        w_sel = w[sel_local]
+        ws_sel = w_sum[sel_local]
+        r_cent_im = np.sum(w_sel * rr[sel_local], axis=(1, 2)) / ws_sel
+        c_cent_im = np.sum(w_sel * cc[sel_local], axis=(1, 2)) / ws_sel
+
+        # Voronoi ownership on dense long-axis Laue patterns: only assign an
+        # observed spot centroid to the closest predicted reflection on the bank
+        # so unobserved adjacent (h, k, l+-1) rungs do not hijack neighbors.
+        if len(r_im) > 1:
+            from scipy.spatial import cKDTree
+
+            d_self = np.hypot(
+                r_cent_im - r_im[in_bounds][sel_local],
+                c_cent_im - c_im[in_bounds][sel_local],
+            )
+            d_near, _ = cKDTree(np.column_stack([r_im, c_im])).query(
+                np.column_stack([r_cent_im, c_cent_im]), k=1
+            )
+            own_mask = d_self <= d_near + 1e-4
+            if not np.any(own_mask):
+                continue
+            sel_global = sel_global[own_mask]
+            r_cent_im = r_cent_im[own_mask]
+            c_cent_im = c_cent_im[own_mask]
+
+        r_cent_det = r_cent_im / max(scale_r, 1e-9)
+        c_cent_det = c_cent_im / max(scale_c, 1e-9)
+
+        with contextlib.suppress(
+            OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+        ):
+            xyz_obs = np.asarray(det.pixel_to_lab(r_cent_det, c_cent_det), dtype=float)
+            if xyz_obs.ndim == 1:
+                xyz_obs = xyz_obs.reshape(1, 3)
+            rays_obs = xyz_obs - s_off[None, :]
+            rn = np.linalg.norm(rays_obs, axis=1, keepdims=True)
+            kf_obs = rays_obs / np.maximum(rn, 1e-12)
+            q_obs = kf_obs - ki_hat[None, :]
+            qn_obs = np.linalg.norm(q_obs, axis=1, keepdims=True)
+            g_lab = np.where(qn_obs > 1e-6, q_obs / np.maximum(qn_obs, 1e-12), kf_obs)
+            g_cryst = g_lab @ R_mat
+            dots = np.clip(np.sum(g_cryst * G_hat[sel_global], axis=1), -1.0, 1.0)
+            out_err[sel_global] = np.rad2deg(np.arccos(dots))
+
+    return out_err, True
+
+
+_SPOT_TOF_SLAB_CACHE: dict[
+    tuple[str, int, int, int],
+    dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]],
+] = {}
+_SPOT_TOF_GATE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_SPOT_TOF_OBS_Q_CACHE: dict[
+    tuple[Any, ...],
+    dict[int, tuple[set[int], dict[int, tuple[float, float, float]]]],
+] = {}
+_LIVE_RAYCAST_SHELL_CACHE: dict[
+    tuple[Any, ...], tuple[float, dict[str, np.ndarray], np.ndarray]
+] = {}
+_REMOTE_TOF_SLAB_LOADER: Any = None
+
+
+def _pack_hkl_int64(hkl_arr: np.ndarray) -> np.ndarray:
+    """Pack integer Miller indices ``(N, 3)`` in ``[-2048, 2047]`` into unique ``int64`` keys."""
+    h = np.asarray(hkl_arr[:, 0], dtype=np.int64) + 2048
+    k = np.asarray(hkl_arr[:, 1], dtype=np.int64) + 2048
+    l = np.asarray(hkl_arr[:, 2], dtype=np.int64) + 2048
+    return (h << 26) | (k << 13) | l
+
+
+def _detector_and_mask_signature(
+    detectors: dict[int, Any],
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
+) -> bytes:
+    """Compute a fast 16-byte digest covering all active detector banks and pixel masks."""
+    import hashlib
+
+    h = hashlib.blake2b(digest_size=16)
+    for bid in sorted(detectors):
+        det = detectors[bid]
+        h.update(int(bid).to_bytes(4, "little", signed=True))
+        for attr in ("n", "m", "width", "height", "radius"):
+            val = getattr(det, attr, None)
+            if val is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    h.update(np.float64(float(val)).tobytes())
+        for vec_attr in ("center", "uhat", "vhat", "rhat"):
+            vec = getattr(det, vec_attr, None)
+            if vec is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    h.update(np.asarray(vec, dtype=np.float64).ravel().tobytes())
+    if pixel_class_by_bank:
+        for bid in sorted(pixel_class_by_bank):
+            arr = pixel_class_by_bank[bid]
+            if arr is not None:
+                h.update(int(bid).to_bytes(4, "little", signed=True))
+                h.update(repr(arr.shape).encode("ascii"))
+                h.update(int(np.sum(arr)).to_bytes(8, "little", signed=False))
+    return h.digest()
+
+
+def register_remote_tof_slab_loader(loader_fn: Any) -> None:
+    """Register an optional callback ``loader_fn(images_h5, f0, f1)`` for slimmed remote HDF5s."""
+    global _REMOTE_TOF_SLAB_LOADER
+    _REMOTE_TOF_SLAB_LOADER = loader_fn
+
+
+def _resolve_tof_l1(
+    *candidates: str | os.PathLike[str] | None,
+    instrument: str = "IMAGINE",
+    explicit_l1: float | None = None,
+) -> float | None:
+    """Resolve current moderator-to-sample flight distance ``L1`` [m] consistently with ``tof_gate``."""
+    if explicit_l1 is not None:
+        try:
+            v = float(explicit_l1)
+            if np.isfinite(v) and v > 0.0:
+                return v
+        except (TypeError, ValueError):
+            pass
+
+    import h5py
+
+    seen: set[str] = set()
+    queue: list[str] = [str(p) for p in candidates if p and os.path.isfile(str(p))]
+    while queue:
+        cur = os.path.abspath(queue.pop(0))
+        if cur in seen or not os.path.isfile(cur):
+            continue
+        seen.add(cur)
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError, TypeError),
+            h5py.File(cur, "r") as hf,
+        ):
+            for ds_key in ("detector_calibration/L1", "instrument/L1"):
+                if ds_key in hf:
+                    v = float(np.asarray(hf[ds_key][()]).ravel()[0])
+                    if np.isfinite(v) and v > 0.0:
+                        return v
+            if (
+                "detector_calibration" in hf
+                and "L1" in hf["detector_calibration"].attrs
+            ):
+                v = float(hf["detector_calibration"].attrs["L1"])
+                if np.isfinite(v) and v > 0.0:
+                    return v
+            if "tof_gate" in hf and "L1" in hf["tof_gate"].attrs:
+                v = float(hf["tof_gate"].attrs["L1"])
+                if np.isfinite(v) and v > 0.0:
+                    return v
+            if "L1" in hf.attrs:
+                v = float(hf.attrs["L1"])
+                if np.isfinite(v) and v > 0.0:
+                    return v
+            src_attr = hf.attrs.get("source")
+            if src_attr:
+                src_str = (
+                    src_attr.decode("utf-8", errors="ignore")
+                    if isinstance(src_attr, (bytes, np.bytes_))
+                    else str(src_attr)
+                ).strip()
+                if src_str and os.path.isfile(src_str):
+                    queue.append(src_str)
+
+    with contextlib.suppress(ImportError, KeyError, TypeError, ValueError):
+        from subhkl.config import reduction_settings
+
+        v_cfg = reduction_settings.get(str(instrument), {}).get("L1")
+        if v_cfg is not None and float(v_cfg) > 0.0:
+            return float(v_cfg)
+    return None
+
+
+def _h5_has_tof_events(*candidates: str | os.PathLike[str] | None) -> bool:
+    """Return True if any candidate HDF5 carries ``events/tof`` or a slimmed ``has_tof_events`` stamp."""
+    import h5py
+
+    seen: set[str] = set()
+    queue: list[str] = [str(p) for p in candidates if p and os.path.isfile(str(p))]
+    while queue:
+        cur = os.path.abspath(queue.pop(0))
+        if cur in seen or not os.path.isfile(cur):
+            continue
+        seen.add(cur)
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError),
+            h5py.File(cur, "r") as hf,
+        ):
+            if bool(hf.attrs.get("has_tof_events")) or (
+                "events/tof" in hf and "events/image_offsets" in hf
+            ):
+                return True
+            src_attr = hf.attrs.get("source")
+            if src_attr:
+                src_str = (
+                    src_attr.decode("utf-8", errors="ignore")
+                    if isinstance(src_attr, (bytes, np.bytes_))
+                    else str(src_attr)
+                ).strip()
+                if src_str and os.path.isfile(src_str):
+                    queue.append(src_str)
+    return False
+
+
+def _resolve_images_h5_with_events(
+    images_h5: str | os.PathLike[str] | None,
+    replay_h5: str | os.PathLike[str] | None = None,
+) -> str | None:
+    """Resolve the HDF5 file carrying detector images + ToF events (following ``source`` attr if needed)."""
+    import h5py
+
+    for cand in (images_h5, replay_h5):
+        if not cand or not os.path.isfile(str(cand)):
+            continue
+        abs_p = os.path.abspath(str(cand))
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError),
+            h5py.File(abs_p, "r") as hf,
+        ):
+            if ("events/tof" in hf and "events/image_offsets" in hf) or bool(
+                hf.attrs.get("has_tof_events")
+            ):
+                return abs_p
+            src_attr = hf.attrs.get("source")
+            if src_attr:
+                src_str = (
+                    src_attr.decode("utf-8", errors="ignore")
+                    if isinstance(src_attr, (bytes, np.bytes_))
+                    else str(src_attr)
+                ).strip()
+                if src_str and os.path.isfile(src_str):
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, KeyError
+                        ),
+                        h5py.File(src_str, "r") as hf_src,
+                    ):
+                        if (
+                            "events/tof" in hf_src and "events/image_offsets" in hf_src
+                        ) or bool(hf_src.attrs.get("has_tof_events")):
+                            return os.path.abspath(src_str)
+    return str(images_h5) if images_h5 and os.path.isfile(str(images_h5)) else None
+
+
+def _load_cached_frame_tof_events(
+    images_h5: str | os.PathLike[str] | None,
+    frame_slice: tuple[int, int] | None,
+) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]]:
+    """Load and LRU-cache per-bank L3-friendly ``(tof_f32, pixel_off_i32, cumsum_tof_f64, (H, W))``."""
+    if not images_h5 or not os.path.isfile(str(images_h5)):
+        return {}
+    try:
+        import h5py
+
+        from subhkl.io.events import EventStore, has_events
+
+        abs_p = os.path.abspath(str(images_h5))
+        mtime_ns = int(os.stat(abs_p).st_mtime_ns)
+        with h5py.File(abs_p, "r") as hf:
+            ims = hf.get("images") or hf.get("entry/data/data")
+            if ims is None or len(ims) == 0:
+                return {}
+            n_tot = len(ims)
+            if "bank_ids" in hf:
+                b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
+            elif "banks" in hf:
+                b_ids = np.asarray(hf["banks"][()], dtype=int).ravel()
+            else:
+                b_ids = np.arange(1, n_tot + 1, dtype=int)
+            if len(b_ids) > 0 and len(b_ids) < n_tot:
+                b_ids = np.resize(b_ids, n_tot)
+            elif len(b_ids) == 0:
+                b_ids = np.arange(1, n_tot + 1, dtype=int)
+            if frame_slice is not None:
+                f0 = max(0, min(int(frame_slice[0]), n_tot))
+                f1 = max(f0, min(int(frame_slice[1]), n_tot))
+            elif "file_offsets" in hf:
+                offsets = np.asarray(hf["file_offsets"][()], dtype=int)
+                if len(offsets) > 1:
+                    counts = np.diff(np.append(offsets, n_tot))
+                    best_r = int(np.argmax(counts))
+                    f0 = int(offsets[best_r])
+                    f1 = int(offsets[best_r] + counts[best_r])
+                else:
+                    f0, f1 = 0, n_tot
+            else:
+                f0, f1 = 0, n_tot
+            if f1 <= f0:
+                return {}
+
+            cache_key = (abs_p, mtime_ns, f0, f1)
+            cached = _SPOT_TOF_SLAB_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+
+            imgs_slab = np.asarray(ims[f0:f1])
+            b_slice = b_ids[f0:f1]
+            has_slim_remote = bool(hf.attrs.get("has_tof_events")) and not (
+                "events/tof" in hf and "events/image_offsets" in hf
+            )
+
+        tof_slab: np.ndarray | None = None
+        off_slab: np.ndarray | None = None
+        if has_events(abs_p):
+            with EventStore(abs_p) as store:
+                tof_slab, off_slab, _ = store.read_slab(
+                    np.arange(f0, f1, dtype=np.int64), imgs_slab
+                )
+        elif has_slim_remote and callable(_REMOTE_TOF_SLAB_LOADER):
+            remote_res = _REMOTE_TOF_SLAB_LOADER(abs_p, f0, f1, imgs_slab)
+            if remote_res is not None:
+                tof_slab, off_slab = remote_res
+
+        if tof_slab is None or off_slab is None or len(tof_slab) == 0:
+            return {}
+
+        bank_tof_map: dict[
+            int, tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]
+        ] = {}
+        for rel_i, bk_raw in enumerate(b_slice):
+            bk = int(bk_raw)
+            im_i = imgs_slab[rel_i]
+            if im_i.ndim != 2:
+                continue
+            s0 = int(off_slab[rel_i, 0])
+            s1 = int(off_slab[rel_i, -1])
+            if bk in bank_tof_map and len(bank_tof_map[bk][0]) >= (s1 - s0):
+                continue
+            tb = np.ascontiguousarray(tof_slab[s0:s1], dtype=np.float32)
+            ob = np.ascontiguousarray(off_slab[rel_i] - s0, dtype=np.int32)
+            pb = np.empty(len(tb) + 1, dtype=np.float64)
+            pb[0] = 0.0
+            if len(tb) > 0:
+                np.cumsum(tb, dtype=np.float64, out=pb[1:])
+            bank_tof_map[bk] = (tb, ob, pb, (int(im_i.shape[0]), int(im_i.shape[1])))
+
+        if bank_tof_map:
+            if len(_SPOT_TOF_SLAB_CACHE) >= 4:
+                _SPOT_TOF_SLAB_CACHE.pop(next(iter(_SPOT_TOF_SLAB_CACHE)))
+            _SPOT_TOF_SLAB_CACHE[cache_key] = bank_tof_map
+        return bank_tof_map
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
+        return {}
+
+
+def _bsearch_tof_bank_left(
+    tof_b: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    target: np.ndarray,
+) -> np.ndarray:
+    """Vectorized lower-bound binary search within per-pixel event slices ``[lo, hi)``."""
+    if lo.size == 0 or len(tof_b) == 0:
+        return lo.copy()
+    max_len = int(np.max(hi - lo))
+    if max_len <= 0:
+        return lo.copy()
+    n_steps = int(max_len - 1).bit_length()
+    l_idx = lo.copy()
+    r_idx = hi.copy()
+    n_tot_m1 = len(tof_b) - 1
+    for _ in range(n_steps):
+        mid = (l_idx + r_idx) >> 1
+        safe = np.minimum(mid, n_tot_m1)
+        cond = (mid < r_idx) & (tof_b[safe] < target)
+        l_idx = np.where(cond, mid + 1, l_idx)
+        r_idx = np.where(cond, r_idx, mid)
+    return l_idx
+
+
+def _bsearch_tof_bank_right(
+    tof_b: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    target: np.ndarray,
+) -> np.ndarray:
+    """Vectorized upper-bound binary search within per-pixel event slices ``[lo, hi)``."""
+    if lo.size == 0 or len(tof_b) == 0:
+        return lo.copy()
+    max_len = int(np.max(hi - lo))
+    if max_len <= 0:
+        return lo.copy()
+    n_steps = int(max_len - 1).bit_length()
+    l_idx = lo.copy()
+    r_idx = hi.copy()
+    n_tot_m1 = len(tof_b) - 1
+    for _ in range(n_steps):
+        mid = (l_idx + r_idx) >> 1
+        safe = np.minimum(mid, n_tot_m1)
+        cond = (mid < r_idx) & (tof_b[safe] <= target)
+        l_idx = np.where(cond, mid + 1, l_idx)
+        r_idx = np.where(cond, r_idx, mid)
+    return l_idx
+
+
+def _measure_or_cache_tof_gate(
+    *,
+    cache_sig: tuple[Any, ...] | None,
+    bank_tof_map: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]],
+    b_arr: np.ndarray,
+    r_im_by_peak: np.ndarray,
+    c_im_by_peak: np.ndarray,
+    t_pred_arr: np.ndarray,
+    d_spacing_arr: np.ndarray,
+    l1_eff: float,
+) -> dict[str, Any]:
+    """Measure (and LRU-cache) stacked relative ToF gates consistent with ``tof_gate.gate_from_stack``."""
+    if cache_sig is not None and cache_sig in _SPOT_TOF_GATE_CACHE:
+        return _SPOT_TOF_GATE_CACHE[cache_sig]
+
+    from subhkl.search.tof_gate import TofGate, gate_from_stack
+
+    valid_idx = np.flatnonzero(
+        np.isfinite(t_pred_arr)
+        & (t_pred_arr > 1.0)
+        & np.isfinite(r_im_by_peak)
+        & np.isfinite(c_im_by_peak)
+    )
+    if len(valid_idx) > 3000:
+        order = np.argsort(-d_spacing_arr[valid_idx])[:3000]
+        sample_idx = valid_idx[order]
+    else:
+        sample_idx = valid_idx
+
+    search_half = 0.045
+    n_bins = 90
+    edges = np.linspace(-search_half, search_half, n_bins + 1)
+    inv_bin = float(n_bins) / (2.0 * search_half)
+    hist = np.zeros(n_bins, dtype=np.float64)
+
+    if len(sample_idx) > 0:
+        dr_5, dc_5 = np.meshgrid(
+            np.arange(-2, 3, dtype=np.int64),
+            np.arange(-2, 3, dtype=np.int64),
+            indexing="ij",
+        )
+        dr_flat = dr_5.ravel()[None, :]
+        dc_flat = dc_5.ravel()[None, :]
+        samp_banks = b_arr[sample_idx]
+        for bk_val, bd in bank_tof_map.items():
+            tb, ob, _, (H, W) = bd
+            if len(tb) == 0:
+                continue
+            s_mask = samp_banks == int(bk_val)
+            if not np.any(s_mask):
+                continue
+            s_idxs = sample_idx[s_mask]
+            r0_v = np.rint(r_im_by_peak[s_idxs].astype(np.float64)).astype(np.int64)
+            c0_v = np.rint(c_im_by_peak[s_idxs].astype(np.float64)).astype(np.int64)
+            in_b = (r0_v >= 2) & (r0_v < H - 2) & (c0_v >= 2) & (c0_v < W - 2)
+            if not np.any(in_b):
+                continue
+            r0_v = r0_v[in_b]
+            c0_v = c0_v[in_b]
+            tp_v = t_pred_arr[s_idxs[in_b]].astype(np.float64)
+            pix_all = (
+                (r0_v[:, None] + dr_flat) * W + (c0_v[:, None] + dc_flat)
+            ).ravel()
+            e0_all = ob[pix_all]
+            e1_all = ob[pix_all + 1]
+            ne = e1_all > e0_all
+            if not np.any(ne):
+                continue
+            e0_ne = e0_all[ne]
+            e1_ne = e1_all[ne]
+            tp_ne = np.repeat(tp_v, 25)[ne]
+            t_lo_ne = tp_ne * (1.0 - search_half)
+            t_hi_ne = tp_ne * (1.0 + search_half)
+            i0_ne = _bsearch_tof_bank_left(tb, e0_ne, e1_ne, t_lo_ne)
+            i1_ne = _bsearch_tof_bank_right(tb, i0_ne, e1_ne, t_hi_ne)
+            cnts = (i1_ne - i0_ne).astype(np.int64)
+            hit = cnts > 0
+            if np.any(hit):
+                starts = i0_ne[hit].astype(np.int64)
+                lens = cnts[hit]
+                cum = np.cumsum(lens)
+                ev_idx = (
+                    np.arange(int(cum[-1]), dtype=np.int64)
+                    - np.repeat(cum - lens, lens)
+                    + np.repeat(starts, lens)
+                )
+                rel_all = (
+                    tb[ev_idx].astype(np.float64) / np.repeat(tp_ne[hit], lens)
+                ) - 1.0
+                b_idx_all = np.clip(
+                    ((rel_all + search_half) * inv_bin).astype(np.int32),
+                    0,
+                    n_bins - 1,
+                )
+                hist += np.bincount(b_idx_all, minlength=n_bins)[:n_bins]
+
+    gate_outer = (
+        gate_from_stack(edges, hist, coverage=0.95, min_z=4.5)
+        if len(sample_idx) >= 25
+        else None
+    )
+    gate_core = (
+        gate_from_stack(edges, hist, coverage=0.70, min_z=4.5)
+        if gate_outer is not None
+        else None
+    )
+    if gate_outer is None:
+        gate_outer = TofGate(-0.015, 0.015, source="fallback", coverage=None)
+    if gate_core is None:
+        gate_core = gate_outer
+
+    center_rel = 0.0
+    if str(gate_core.source) == "stack" and len(sample_idx) >= 25:
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        bg_bin = float(np.median(hist))
+        in_core = (centers >= float(gate_core.lo)) & (centers <= float(gate_core.hi))
+        if np.any(in_core):
+            w_core = np.maximum(0.0, hist[in_core] - bg_bin)
+            w_tot = float(np.sum(w_core))
+            if w_tot > 0.0:
+                center_rel = float(np.sum(w_core * centers[in_core]) / w_tot)
+
+    # Ensure core search gate spans at least ±1.2% around center_rel so reflections with
+    # 0.2°-0.4° angular offset (whose Bragg wavelength shifts by cot(theta)*d_theta) stay inside.
+    eff_core_lo = min(float(gate_outer.lo), center_rel - 0.012)
+    eff_core_hi = max(float(gate_outer.hi), center_rel + 0.012)
+
+    meta = {
+        "lo": round(float(gate_outer.lo), 5),
+        "hi": round(float(gate_outer.hi), 5),
+        "core_lo": round(eff_core_lo, 5),
+        "core_hi": round(eff_core_hi, 5),
+        "center_rel": round(center_rel, 5),
+        "source": str(gate_outer.source),
+        "l1": round(float(l1_eff), 6),
+    }
+    if cache_sig is not None:
+        if len(_SPOT_TOF_GATE_CACHE) >= 16:
+            _SPOT_TOF_GATE_CACHE.pop(next(iter(_SPOT_TOF_GATE_CACHE)))
+        _SPOT_TOF_GATE_CACHE[cache_sig] = meta
+    return meta
+
+
+def _estimate_tof_gated_spot_angular_errors_deg(
+    *,
+    images_h5: str | os.PathLike[str] | None,
+    replay_h5: str | os.PathLike[str] | None = None,
+    frame_slice: tuple[int, int] | None,
+    hkl_arr: np.ndarray | None,
+    bank_arr: np.ndarray | None,
+    pixel_r_arr: np.ndarray | None,
+    pixel_c_arr: np.ndarray | None,
+    lam_arr: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None,
+    R_run: np.ndarray | None,
+    detectors: dict[int, Any],
+    ki_hat: np.ndarray,
+    sample_offset_lab: Any = None,
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
+    instrument: str = "IMAGINE",
+    tof_l1: float | None = None,
+    wavelength_range: tuple[float, float] | None = None,
+    eval_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, bool, dict[str, Any] | None]:
+    """
+    Estimate directional reciprocal-sphere angular errors ``Δθ`` [deg] for ToF
+    reflections by gating events around predicted ``t_pred(λ_pred, L1 + L2)``,
+    placing background-subtracted 3D ``(r, c, t)`` spot centroids into crystal
+    ``q``-space using current ``L1 + L2`` geometry, enforcing 3D ``cKDTree``
+    Voronoi ownership across all predicted reflections on each bank, and
+    evaluating ``arccos(q̂_obs · Ĝ_pred)``.
+    """
+    if (
+        hkl_arr is None
+        or bank_arr is None
+        or pixel_r_arr is None
+        or pixel_c_arr is None
+        or ub_matrix is None
+        or not detectors
+        or len(hkl_arr) == 0
+    ):
+        return None, False, None
+
+    ev_h5 = _resolve_images_h5_with_events(images_h5, replay_h5)
+    if not ev_h5:
+        return None, False, None
+
+    l1_base = _resolve_tof_l1(
+        replay_h5,
+        ev_h5,
+        images_h5,
+        instrument=instrument,
+        explicit_l1=tof_l1,
+    )
+    if l1_base is None or l1_base <= 0.0:
+        return None, False, None
+
+    bank_tof_map = _load_cached_frame_tof_events(ev_h5, frame_slice)
+    if not bank_tof_map:
+        return None, False, None
+
+    from scipy.spatial import cKDTree
+
+    from subhkl.io.events import ANGSTROM_M_PER_US
+    from subhkl.search.tof_gate import predicted_tof
+
+    n_peaks = len(hkl_arr)
+    out_err = np.full(n_peaks, np.nan, dtype=float)
+    ub_mat = np.asarray(ub_matrix, dtype=float)
+    R_mat = (
+        np.asarray(R_run, dtype=float)
+        if R_run is not None and np.asarray(R_run).ndim == 2
+        else np.eye(3, dtype=float)
+    )
+    s_off = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None and np.asarray(sample_offset_lab).size >= 3
+        else np.zeros(3, dtype=float)
+    )
+    ki_u = np.asarray(ki_hat, dtype=float).ravel()[:3]
+    ki_n = float(np.linalg.norm(ki_u))
+    ki_u = ki_u / max(ki_n, 1e-12)
+    l1_eff = max(0.05, float(l1_base) + float(np.dot(s_off, ki_u)))
+
+    G_pred = np.asarray(hkl_arr, dtype=float) @ ub_mat.T
+    G_norm = np.linalg.norm(G_pred, axis=1)
+    d_all = 1.0 / np.maximum(G_norm, 1e-12)
+
+    b_arr = np.asarray(bank_arr, dtype=int)
+    r_arr = np.asarray(pixel_r_arr, dtype=float)
+    c_arr = np.asarray(pixel_c_arr, dtype=float)
+
+    if lam_arr is not None and len(lam_arr) == n_peaks:
+        lam_pred = np.asarray(lam_arr, dtype=np.float64)
+    else:
+        G_lab = G_pred @ R_mat.T
+        G_sq = np.maximum(G_norm * G_norm, 1e-12)
+        lam_pred = np.maximum(1e-4, -2.0 * (G_lab @ ki_u) / G_sq)
+
+    l2_pred = np.zeros(n_peaks, dtype=np.float64)
+    r_im_all = np.full(n_peaks, np.nan, dtype=np.float64)
+    c_im_all = np.full(n_peaks, np.nan, dtype=np.float64)
+    scale_by_bank: dict[int, tuple[float, float]] = {}
+
+    for bk in np.unique(b_arr):
+        bk_i = int(bk)
+        bd = bank_tof_map.get(bk_i)
+        det = detectors.get(bk_i)
+        if bd is None or det is None:
+            continue
+        _, _, _, (H, W) = bd
+        det_n = max(1, int(getattr(det, "n", H)))
+        det_m = max(1, int(getattr(det, "m", W)))
+        scale_r = (H - 1) / max(det_n - 1, 1) if det_n > 1 else 1.0
+        scale_c = (W - 1) / max(det_m - 1, 1) if det_m > 1 else 1.0
+        scale_by_bank[bk_i] = (scale_r, scale_c)
+
+        m_bk = b_arr == bk_i
+        r_im_all[m_bk] = r_arr[m_bk] * scale_r
+        c_im_all[m_bk] = c_arr[m_bk] * scale_c
+        with contextlib.suppress(
+            OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+        ):
+            xyz_p = np.asarray(det.pixel_to_lab(r_arr[m_bk], c_arr[m_bk]), dtype=float)
+            if xyz_p.ndim == 1:
+                xyz_p = xyz_p.reshape(1, 3)
+            l2_pred[m_bk] = np.linalg.norm(xyz_p - s_off[None, :], axis=1)
+
+    t_pred_all = np.where(
+        l2_pred > 1e-6,
+        predicted_tof(lam_pred, l1_eff, l2_pred),
+        np.nan,
+    )
+
+    try:
+        mtime_ev = int(os.stat(ev_h5).st_mtime_ns)
+    except OSError:
+        mtime_ev = 0
+    geom_mask_sig = _detector_and_mask_signature(detectors, pixel_class_by_bank)
+    n_fin_t = int(np.count_nonzero(np.isfinite(t_pred_all)))
+    n_valid_gate_bucket = min(300, n_fin_t)
+    gate_sig = (
+        ev_h5,
+        mtime_ev,
+        tuple(frame_slice) if frame_slice is not None else (-1, -1),
+        np.asarray(ub_mat, dtype=np.float64).tobytes(),
+        np.asarray(R_mat, dtype=np.float64).tobytes(),
+        np.asarray(s_off, dtype=np.float64).tobytes(),
+        np.asarray(ki_u, dtype=np.float64).tobytes(),
+        geom_mask_sig,
+        round(float(l1_eff), 6),
+        n_valid_gate_bucket,
+    )
+    gate_meta = _measure_or_cache_tof_gate(
+        cache_sig=gate_sig,
+        bank_tof_map=bank_tof_map,
+        b_arr=b_arr,
+        r_im_by_peak=r_im_all,
+        c_im_by_peak=c_im_all,
+        t_pred_arr=t_pred_all,
+        d_spacing_arr=d_all,
+        l1_eff=l1_eff,
+    )
+
+    g_lo = float(gate_meta["core_lo"])
+    g_hi = float(gate_meta["core_hi"])
+    g_center_rel = float(gate_meta.get("center_rel", 0.0))
+    sb_lo = float(gate_meta["lo"])
+    sb_hi = float(gate_meta["hi"])
+    gw_core = max(g_hi - g_lo, 1e-4)
+    gw_outer = max(sb_hi - sb_lo, 1e-4)
+
+    if wavelength_range is not None and len(wavelength_range) >= 2:
+        wl_lo = max(0.05, float(wavelength_range[0]))
+        wl_hi = max(wl_lo + 0.05, float(wavelength_range[1]))
+    else:
+        fin_lam = lam_pred[np.isfinite(lam_pred) & (lam_pred > 0)]
+        wl_lo = float(np.min(fin_lam)) if len(fin_lam) else 1.0
+        wl_hi = float(np.max(fin_lam)) if len(fin_lam) else 4.0
+    band_log_span = max(float(np.log(max(wl_hi / max(wl_lo, 0.05), 1.05))), 0.12)
+    gate_band_frac = min(0.5, gw_core / band_log_span)
+
+    obs_q_sig = (
+        gate_sig[:-1],
+        round(g_lo, 6),
+        round(g_hi, 6),
+        round(g_center_rel, 6),
+        round(sb_lo, 6),
+        round(sb_hi, 6),
+        round(wl_lo, 5),
+        round(wl_hi, 5),
+    )
+    obs_q_by_bank = _SPOT_TOF_OBS_Q_CACHE.get(obs_q_sig)
+    if obs_q_by_bank is None:
+        obs_q_by_bank = {}
+        if len(_SPOT_TOF_OBS_Q_CACHE) >= 16:
+            _SPOT_TOF_OBS_Q_CACHE.pop(next(iter(_SPOT_TOF_OBS_Q_CACHE)))
+        _SPOT_TOF_OBS_Q_CACHE[obs_q_sig] = obs_q_by_bank
+
+    hkl_int = np.asarray(hkl_arr, dtype=np.int32)
+    hkl_packed_all = _pack_hkl_int64(hkl_int)
+
+    ev_mask_bool = (
+        np.asarray(eval_mask, dtype=bool)
+        if eval_mask is not None and len(eval_mask) == n_peaks
+        else None
+    )
+
+    for bk in np.unique(b_arr):
+        bk_i = int(bk)
+        bd = bank_tof_map.get(bk_i)
+        det = detectors.get(bk_i)
+        scales = scale_by_bank.get(bk_i)
+        if bd is None or det is None or scales is None:
+            continue
+        tb, ob, pb, (H, W) = bd
+        if len(tb) == 0 or H < 8 or W < 8:
+            continue
+        scale_r, scale_c = scales
+
+        idxs_all = np.flatnonzero(
+            (b_arr == bk_i) & (G_norm > 1e-8) & np.isfinite(t_pred_all)
+        )
+        if len(idxs_all) == 0:
+            continue
+
+        if ev_mask_bool is not None:
+            idxs_eval = idxs_all[ev_mask_bool[idxs_all]]
+        else:
+            idxs_eval = idxs_all
+        if len(idxs_eval) == 0:
+            continue
+
+        bk_cache = obs_q_by_bank.get(bk_i)
+        if bk_cache is None:
+            bk_cache = (set(), {})
+            obs_q_by_bank[bk_i] = bk_cache
+        probed_set, hits_map = bk_cache
+
+        keys_eval = hkl_packed_all[idxs_eval]
+        if probed_set:
+            unprobed_mask = np.fromiter(
+                (int(k) not in probed_set for k in keys_eval),
+                dtype=bool,
+                count=len(keys_eval),
+            )
+            idxs_probe = idxs_eval[unprobed_mask]
+        else:
+            idxs_probe = idxs_eval
+
+        if len(idxs_probe) > 0:
+            probed_set.update(int(k) for k in hkl_packed_all[idxs_probe])
+            r_im = r_im_all[idxs_probe]
+            c_im = c_im_all[idxs_probe]
+            in_bounds = (
+                (r_im >= 1.5) & (r_im <= H - 2.5) & (c_im >= 1.5) & (c_im <= W - 2.5)
+            )
+            if np.any(in_bounds):
+                idxs_in = idxs_probe[in_bounds]
+                r0 = np.rint(r_im[in_bounds]).astype(np.int32)
+                c0 = np.rint(c_im[in_bounds]).astype(np.int32)
+
+                # Search full circular spatial patch so off-center spots (e.g. at coarse
+                # d_min before higher-order neighbors enter the predicted Voronoi shell)
+                # are captured anywhere inside rad, while 3x3 local clustering rejects
+                # scattered single-pixel Poisson background hits.
+                rad = max(3, min(10, round(0.028 * min(H, W))))
+                offs = np.arange(-rad, rad + 1, dtype=np.int32)
+                dr_g, dc_g = np.meshgrid(offs, offs, indexing="ij")
+                circ_bool = (dr_g * dr_g + dc_g * dc_g) <= (rad * rad)
+                circ_mask = circ_bool.astype(np.float32)
+
+                rr = np.clip(r0[:, None, None] + dr_g[None, :, :], 0, H - 1)
+                cc = np.clip(c0[:, None, None] + dc_g[None, :, :], 0, W - 1)
+                pf = rr * W + cc
+                elo = ob[pf]
+                ehi = ob[pf + 1]
+
+                tp_all = t_pred_all[idxs_in][:, None, None]
+                t_lo_all = (tp_all * (1.0 + g_lo)).astype(np.float32)
+                t_hi_all = (tp_all * (1.0 + g_hi)).astype(np.float32)
+                ia_all = _bsearch_tof_bank_left(
+                    tb, elo, ehi, np.broadcast_to(t_lo_all, elo.shape)
+                )
+                ib_all = _bsearch_tof_bank_left(
+                    tb, ia_all, ehi, np.broadcast_to(t_hi_all, elo.shape)
+                )
+
+                pcls = pixel_class_by_bank.get(bk_i) if pixel_class_by_bank else None
+                valid_px_all = circ_mask[None, :, :]
+                if pcls is not None and pcls.shape == (H, W):
+                    valid_px_all = valid_px_all * (pcls[rr, cc] == 0).astype(np.float32)
+
+                cg_all = (ib_all - ia_all).astype(np.float32) * valid_px_all
+                s_row = cg_all[:, :-2, :] + cg_all[:, 1:-1, :] + cg_all[:, 2:, :]
+                box3_all = s_row[:, :, :-2] + s_row[:, :, 1:-1] + s_row[:, :, 2:]
+                max_box3 = np.max(box3_all, axis=(1, 2))
+                max_px = np.max(cg_all, axis=(1, 2))
+                n_vpx_all = np.maximum(np.sum(valid_px_all, axis=(1, 2)), 1.0)
+                bg_est = (
+                    np.sum((ehi - elo) * valid_px_all, axis=(1, 2)) / n_vpx_all
+                ) * gate_band_frac
+                cand = (
+                    (max_px >= 2.0)
+                    & (max_box3 >= 5.0)
+                    & (
+                        max_box3
+                        >= 9.0 * bg_est + 4.0 * np.sqrt(np.maximum(9.0 * bg_est, 0.45))
+                    )
+                )
+                if np.any(cand):
+                    idxs_c = idxs_in[cand]
+                    rr = rr[cand]
+                    cc = cc[cand]
+                    elo = elo[cand]
+                    ehi = ehi[cand]
+                    tp_k = tp_all[cand]
+                    t_lo = t_lo_all[cand]
+                    t_hi = t_hi_all[cand]
+                    ia = ia_all[cand]
+                    ib = ib_all[cand]
+                    cnt_gate = cg_all[cand]
+                    valid_px = (
+                        valid_px_all[cand]
+                        if valid_px_all.shape[0] > 1
+                        else valid_px_all
+                    )
+                    box3_c = box3_all[cand]
+                    max_box3_c = max_box3[cand]
+
+                    sb_f_lo0 = max(0.05, 1.0 + sb_lo - 2.5 * gw_outer)
+                    sb_f_lo1 = max(0.05, 1.0 + sb_lo - 0.5 * gw_outer)
+                    sb_f_hi0 = 1.0 + sb_hi + 0.5 * gw_outer
+                    sb_f_hi1 = 1.0 + sb_hi + 2.5 * gw_outer
+                    sb_span = max((sb_f_lo1 - sb_f_lo0) + (sb_f_hi1 - sb_f_hi0), 1e-4)
+
+                    isl0 = _bsearch_tof_bank_left(
+                        tb,
+                        elo,
+                        ehi,
+                        np.broadcast_to(
+                            (tp_k * sb_f_lo0).astype(np.float32), elo.shape
+                        ),
+                    )
+                    isl1 = _bsearch_tof_bank_left(
+                        tb,
+                        isl0,
+                        ehi,
+                        np.broadcast_to(
+                            (tp_k * sb_f_lo1).astype(np.float32), elo.shape
+                        ),
+                    )
+                    isr0 = _bsearch_tof_bank_left(
+                        tb,
+                        ib,
+                        ehi,
+                        np.broadcast_to(
+                            (tp_k * sb_f_hi0).astype(np.float32), elo.shape
+                        ),
+                    )
+                    isr1 = _bsearch_tof_bank_left(
+                        tb,
+                        isr0,
+                        ehi,
+                        np.broadcast_to(
+                            (tp_k * sb_f_hi1).astype(np.float32), elo.shape
+                        ),
+                    )
+
+                    sum_tof = pb[ib] - pb[ia]
+                    cnt_sb = ((isl1 - isl0) + (isr1 - isr0)).astype(np.float32)
+
+                    n_vpx = np.maximum(
+                        np.sum(valid_px, axis=(1, 2), keepdims=True), 1.0
+                    )
+                    bg_sb = (
+                        np.sum(cnt_sb * valid_px, axis=(1, 2), keepdims=True) / n_vpx
+                    ) * (gw_core / sb_span)
+                    bg_sp = np.median(cnt_gate[:, circ_bool], axis=1)[:, None, None]
+                    bg = np.maximum(bg_sb, bg_sp)
+
+                    # Anchor centroid in a 3-pixel radius around the brightest 3x3 local
+                    # cluster so isolated noise hits elsewhere in the disk cannot pull it.
+                    flat_arg = np.argmax(box3_c.reshape(len(idxs_c), -1), axis=1)
+                    side3 = box3_c.shape[1]
+                    pk_r = (flat_arg // side3) + 1
+                    pk_c = (flat_arg % side3) + 1
+                    grid_i = np.arange(cnt_gate.shape[1], dtype=np.int32)[None, :, None]
+                    grid_j = np.arange(cnt_gate.shape[2], dtype=np.int32)[None, None, :]
+                    local_win = (
+                        (grid_i - pk_r[:, None, None]) ** 2
+                        + (grid_j - pk_c[:, None, None]) ** 2
+                    ) <= 9
+
+                    sig3 = max_box3_c - 9.0 * bg[:, 0, 0]
+                    z3 = sig3 / np.sqrt(np.maximum(9.0 * bg[:, 0, 0], 0.49))
+
+                    thr = bg + np.maximum(0.5, 1.5 * np.sqrt(np.maximum(bg, 0.09)))
+                    excess = (
+                        np.maximum(0.0, cnt_gate - thr)
+                        * valid_px
+                        * local_win.astype(np.float32)
+                    )
+                    w = excess * excess
+                    w_sum = np.sum(w, axis=(1, 2))
+
+                    has_spot = (w_sum > 0.0) & (sig3 >= 4.0) & (z3 >= 4.5)
+                    if np.any(has_spot):
+                        sel_local = np.flatnonzero(has_spot)
+                        sel_new = idxs_c[sel_local]
+                        w_sel = w[sel_local]
+                        ws_sel = w_sum[sel_local]
+                        r_cent_im = np.sum(w_sel * rr[sel_local], axis=(1, 2)) / ws_sel
+                        c_cent_im = np.sum(w_sel * cc[sel_local], axis=(1, 2)) / ws_sel
+
+                        t_mid = 0.5 * (t_lo[sel_local] + t_hi[sel_local])
+                        t_px = np.clip(
+                            (sum_tof[sel_local] - bg[sel_local] * t_mid)
+                            / np.maximum(cnt_gate[sel_local] - bg[sel_local], 1e-3),
+                            t_lo[sel_local],
+                            t_hi[sel_local],
+                        )
+                        t_cent = np.sum(w_sel * t_px, axis=(1, 2)) / ws_sel
+                        t_cent_debias = t_cent / max(1.0 + g_center_rel, 0.25)
+
+                        r_cent_det = r_cent_im / max(scale_r, 1e-9)
+                        c_cent_det = c_cent_im / max(scale_c, 1e-9)
+
+                        with contextlib.suppress(
+                            OSError,
+                            RuntimeError,
+                            ValueError,
+                            TypeError,
+                            KeyError,
+                            IndexError,
+                        ):
+                            xyz_obs = np.asarray(
+                                det.pixel_to_lab(r_cent_det, c_cent_det),
+                                dtype=float,
+                            )
+                            if xyz_obs.ndim == 1:
+                                xyz_obs = xyz_obs.reshape(1, 3)
+                            rays_obs = xyz_obs - s_off[None, :]
+                            l2_obs = np.linalg.norm(rays_obs, axis=1)
+                            kf_obs = rays_obs / np.maximum(l2_obs[:, None], 1e-12)
+                            q_unit = kf_obs - ki_u[None, :]
+                            lam_obs = (t_cent_debias * ANGSTROM_M_PER_US) / np.maximum(
+                                l1_eff + l2_obs, 1e-6
+                            )
+                            q_new = (
+                                q_unit / np.maximum(lam_obs[:, None], 1e-6)
+                            ) @ R_mat
+                            for gi, qv in zip(sel_new, q_new, strict=False):
+                                hits_map[int(hkl_packed_all[gi])] = (
+                                    float(qv[0]),
+                                    float(qv[1]),
+                                    float(qv[2]),
+                                )
+
+        if not hits_map:
+            continue
+
+        sel_global_list: list[int] = []
+        q_obs_list: list[tuple[float, float, float]] = []
+        for gi, pk_k in zip(idxs_eval, keys_eval, strict=False):
+            qv = hits_map.get(int(pk_k))
+            if qv is not None:
+                sel_global_list.append(int(gi))
+                q_obs_list.append(qv)
+        if not sel_global_list:
+            continue
+
+        sel_global = np.asarray(sel_global_list, dtype=np.intp)
+        q_obs_cryst = np.asarray(q_obs_list, dtype=np.float64)
+
+        # 3D reciprocal-space Voronoi ownership across ALL predicted reflections on bank
+        if len(idxs_all) > 1:
+            d_self = np.linalg.norm(q_obs_cryst - G_pred[sel_global], axis=1)
+            d_near, _ = cKDTree(G_pred[idxs_all]).query(q_obs_cryst, k=1)
+            own_mask = d_self <= d_near + 1e-5
+            if not np.any(own_mask):
+                continue
+            sel_global = sel_global[own_mask]
+            q_obs_cryst = q_obs_cryst[own_mask]
+
+        Gp_sel = G_pred[sel_global]
+        Gn_sel = G_norm[sel_global]
+        qn_sel = np.linalg.norm(q_obs_cryst, axis=1)
+        valid_dir = (qn_sel > 1e-12) & (Gn_sel > 1e-12)
+        if np.any(valid_dir):
+            sel_v = sel_global[valid_dir]
+            q_hat_sel = q_obs_cryst[valid_dir] / qn_sel[valid_dir, None]
+            G_hat_sel = Gp_sel[valid_dir] / Gn_sel[valid_dir, None]
+            cos_ang = np.clip(np.sum(q_hat_sel * G_hat_sel, axis=1), -1.0, 1.0)
+            out_err[sel_v] = np.rad2deg(np.arccos(cos_ang))
+
+    return out_err, True, gate_meta
+
+
+def _estimate_spot_angular_errors_deg(
+    *,
+    images_h5: str | os.PathLike[str] | None,
+    replay_h5: str | os.PathLike[str] | None = None,
+    frame_slice: tuple[int, int] | None,
+    hkl_arr: np.ndarray | None,
+    bank_arr: np.ndarray | None,
+    pixel_r_arr: np.ndarray | None,
+    pixel_c_arr: np.ndarray | None,
+    lam_arr: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None,
+    R_run: np.ndarray | None,
+    detectors: dict[int, Any],
+    ki_hat: np.ndarray,
+    sample_offset_lab: Any = None,
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
+    instrument: str = "IMAGINE",
+    tof_l1: float | None = None,
+    wavelength_range: tuple[float, float] | None = None,
+    eval_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, bool, str, dict[str, Any] | None]:
+    """Unified dispatcher: prefers 3D ToF-gated reciprocal-space ``Δθ`` when events + L1 exist."""
+    tof_err, tof_ok, gate_meta = _estimate_tof_gated_spot_angular_errors_deg(
+        images_h5=images_h5,
+        replay_h5=replay_h5,
+        frame_slice=frame_slice,
+        hkl_arr=hkl_arr,
+        bank_arr=bank_arr,
+        pixel_r_arr=pixel_r_arr,
+        pixel_c_arr=pixel_c_arr,
+        lam_arr=lam_arr,
+        ub_matrix=ub_matrix,
+        R_run=R_run,
+        detectors=detectors,
+        ki_hat=ki_hat,
+        sample_offset_lab=sample_offset_lab,
+        pixel_class_by_bank=pixel_class_by_bank,
+        instrument=instrument,
+        tof_l1=tof_l1,
+        wavelength_range=wavelength_range,
+        eval_mask=eval_mask,
+    )
+    if tof_ok and tof_err is not None:
+        return tof_err, True, "tof_3d", gate_meta
+
+    img_err, img_ok = _estimate_image_spot_angular_errors_deg(
+        images_h5=images_h5,
+        frame_slice=frame_slice,
+        hkl_arr=hkl_arr,
+        bank_arr=bank_arr,
+        pixel_r_arr=pixel_r_arr,
+        pixel_c_arr=pixel_c_arr,
+        ub_matrix=ub_matrix,
+        R_run=R_run,
+        detectors=detectors,
+        ki_hat=ki_hat,
+        sample_offset_lab=sample_offset_lab,
+        pixel_class_by_bank=pixel_class_by_bank,
+    )
+    return img_err, img_ok, "image_2d", None
+
+
+_LIVE_MASK_SLAB_CACHE: dict[tuple[str, int, int, int], dict[int, np.ndarray]] = {}
+
+
+def compute_live_tof_delta_theta_payload(
+    *,
+    images_h5: str | os.PathLike[str] | None,
+    replay_h5: str | os.PathLike[str] | None = None,
+    frame_index: int = 0,
+    d_min: float = 1.5,
+    wavelength_range: tuple[float, float] = (2.0, 4.0),
+    ub_matrix: Any = None,
+    R_run: Any = None,
+    sample_offset_lab: Any = None,
+    ki: Any = (0.0, 0.0, 1.0),
+    instrument: str = "IMAGINE",
+    space_group: str = "P 1",
+    cell: list[float] | None = None,
+    detector_configs: dict[str, Any] | None = None,
+    tof_l1: float | None = None,
+    zone_axes_crystal: list[list[float]] | None = None,
+    zone_tolerance_deg: float = 0.75,
+) -> dict[str, Any]:
+    """
+    Compute live 3D ToF-gated reciprocal-space ``Δθ`` for the active frame at the
+    requested ``d_min``, ``wavelength_range``, ``UB``, ``R_run``, ``sample_offset_lab``,
+    calibrated ``detector_configs``, and ``L1``.
+
+    Builds the full Ewald reflection shell down to ``d_min`` on active banks so
+    3D ``cKDTree`` Voronoi ownership honors high-resolution reflection crowding,
+    and returns ``{"ok": True, "angular_error_mode": ..., "tof_gate": ..., "errors": {...}}``
+    keyed by ``"bank|h,k,l"``.
+    """
+    import h5py
+
+    from subhkl.core.crystallography import (
+        generate_ewald_reflections,
+        generate_reflections,
+    )
+    from subhkl.instrument.detector import Detector
+
+    ev_h5 = _resolve_images_h5_with_events(images_h5, replay_h5)
+    img_src = ev_h5 or (
+        os.path.abspath(str(images_h5))
+        if images_h5 and os.path.isfile(str(images_h5))
+        else None
+    )
+    if not img_src:
+        return {"ok": False, "error": "No images HDF5 available."}
+
+    ub_mat: np.ndarray | None = None
+    if ub_matrix is not None:
+        arr_ub = np.asarray(ub_matrix, dtype=float)
+        if arr_ub.shape == (3, 3) and np.all(np.isfinite(arr_ub)):
+            ub_mat = arr_ub
+
+    ext_meta: dict[str, Any] | None = None
+    if (
+        (ub_mat is None or R_run is None or not detector_configs)
+        and replay_h5
+        and os.path.isfile(str(replay_h5))
+    ):
+        with contextlib.suppress(
+            OSError, RuntimeError, ValueError, TypeError, KeyError
+        ):
+            ext_meta = _extract_from_h5(
+                replay_h5,
+                images_h5=img_src,
+                frame_index=int(frame_index),
+                include_peaks=False,
+                include_all_runs_peaks=False,
+                default_instrument=instrument,
+                d_min=d_min,
+            )
+
+    if (
+        ub_mat is None
+        and ext_meta is not None
+        and ext_meta.get("U") is not None
+        and ext_meta.get("B") is not None
+    ):
+        ub_mat = np.asarray(ext_meta["U"], dtype=float) @ np.asarray(
+            ext_meta["B"], dtype=float
+        )
+    if ub_mat is None or abs(float(np.linalg.det(ub_mat))) <= 1e-12:
+        return {"ok": False, "error": "Valid 3x3 UB matrix required."}
+
+    U_mat = _u_from_ub(ub_mat)
+    B_mat = U_mat.T @ ub_mat
+    cell_use = (
+        [float(x) for x in cell]
+        if cell and len(cell) == 6
+        else (
+            ext_meta["cell"]
+            if ext_meta and ext_meta.get("cell")
+            else list(_cell_from_B(B_mat))
+        )
+    )
+    sg_use = str(
+        space_group or (ext_meta.get("space_group") if ext_meta else None) or "P 1"
+    )
+    inst_use = str(
+        instrument or (ext_meta.get("instrument") if ext_meta else None) or "IMAGINE"
+    )
+
+    R_mat = (
+        np.asarray(R_run, dtype=float)
+        if R_run is not None and np.asarray(R_run).shape == (3, 3)
+        else (
+            np.asarray(ext_meta["R_gonio"], dtype=float)
+            if ext_meta and ext_meta.get("R_gonio") is not None
+            else np.eye(3, dtype=float)
+        )
+    )
+    s_off = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None and np.asarray(sample_offset_lab).size >= 3
+        else (
+            np.asarray(ext_meta["sample_offset_lab"], dtype=float).ravel()[:3]
+            if ext_meta and ext_meta.get("sample_offset_lab") is not None
+            else np.zeros(3, dtype=float)
+        )
+    )
+    ki_u = np.asarray(ki if ki is not None else (0.0, 0.0, 1.0), dtype=float).ravel()[
+        :3
+    ]
+    ki_u = ki_u / max(float(np.linalg.norm(ki_u)), 1e-12)
+
+    wl_min = max(0.05, float(wavelength_range[0]))
+    wl_max = max(wl_min + 0.02, float(wavelength_range[1]))
+    d_min_kin = max(0.25, float(d_min), 0.5 * wl_min - 1e-5)
+
+    # Resolve frame_slice and bank_ids for frame_index
+    f0, f1 = 0, 0
+    active_bids: set[int] = set()
+    with h5py.File(img_src, "r") as hf:
+        ims = hf.get("images")
+        n_tot = len(ims) if ims is not None else 0
+        if n_tot <= 0:
+            return {"ok": False, "error": "Empty images dataset."}
+        if "file_offsets" in hf:
+            offs = np.asarray(hf["file_offsets"][()], dtype=int).ravel()
+            if len(offs) > 0:
+                fi = max(0, min(int(frame_index), len(offs) - 1))
+                f0 = int(offs[fi])
+                f1 = int(offs[fi + 1]) if fi + 1 < len(offs) else n_tot
+            else:
+                f0, f1 = 0, n_tot
+        else:
+            f0, f1 = 0, n_tot
+        if "bank_ids" in hf:
+            b_ids = np.asarray(hf["bank_ids"][f0:f1], dtype=int).ravel()
+            active_bids = {int(b) for b in b_ids}
+
+    # Build current Detector objects honoring live client detector_configs overrides
+    detectors: dict[int, Any] = {}
+    if ext_meta and ext_meta.get("detectors"):
+        detectors.update(ext_meta["detectors"])
+    elif replay_h5 and os.path.isfile(str(replay_h5)):
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError),
+            h5py.File(str(replay_h5), "r") as rf,
+        ):
+            detectors.update(_load_detectors_from_h5(rf, inst_use, (img_src,)))
+    else:
+        detectors.update(_load_detectors_from_h5(None, inst_use, (img_src,)))
+
+    if isinstance(detector_configs, dict) and detector_configs:
+        for b_str, cfg_in in detector_configs.items():
+            if not isinstance(cfg_in, dict):
+                continue
+            with contextlib.suppress(ValueError, TypeError, KeyError):
+                bid = int(b_str)
+                base_det = detectors.get(bid)
+                merged_cfg: dict[str, Any] = {}
+                if base_det is not None and hasattr(base_det, "config"):
+                    merged_cfg.update(dict(base_det.config))
+                for k_c in (
+                    "panel",
+                    "m",
+                    "n",
+                    "width",
+                    "height",
+                    "radius",
+                    "center",
+                    "uhat",
+                    "vhat",
+                ):
+                    if k_c in cfg_in and cfg_in[k_c] is not None:
+                        merged_cfg[k_c] = cfg_in[k_c]
+                if "panel" not in merged_cfg and cfg_in.get("panel_type"):
+                    merged_cfg["panel"] = cfg_in["panel_type"]
+                merged_cfg.setdefault("panel", "flat")
+                detectors[bid] = Detector(merged_cfg)
+
+    if not detectors:
+        return {"ok": False, "error": "No detector geometry available."}
+    if not active_bids:
+        active_bids = {int(k) for k in detectors}
+    else:
+        active_bids = {b for b in active_bids if b in detectors} or {
+            int(k) for k in detectors
+        }
+
+    # Load cached per-bank pixel_class masks if present
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None
+    mask_src = (
+        str(replay_h5) if replay_h5 and os.path.isfile(str(replay_h5)) else img_src
+    )
+    if mask_src and os.path.isfile(mask_src):
+        try:
+            m_stat = int(os.stat(mask_src).st_mtime_ns)
+            mk_key = (os.path.abspath(mask_src), m_stat, f0, f1)
+            pixel_class_by_bank = _LIVE_MASK_SLAB_CACHE.get(mk_key)
+            if pixel_class_by_bank is None:
+                pcls_tmp: dict[int, np.ndarray] = {}
+                for cand_m in (replay_h5, img_src):
+                    if not cand_m or not os.path.isfile(str(cand_m)):
+                        continue
+                    with (
+                        contextlib.suppress(OSError, KeyError, ValueError),
+                        h5py.File(str(cand_m), "r") as mf_m,
+                    ):
+                        if "pixel_mask/class_per_bank" in mf_m:
+                            grp_m = mf_m["pixel_mask/class_per_bank"]
+                            for bk_nm in grp_m:
+                                with contextlib.suppress(ValueError):
+                                    pcls_tmp[int(bk_nm)] = np.asarray(
+                                        grp_m[bk_nm][()], dtype=np.uint8
+                                    )
+                            if pcls_tmp:
+                                break
+                pixel_class_by_bank = pcls_tmp
+                if len(_LIVE_MASK_SLAB_CACHE) >= 4:
+                    _LIVE_MASK_SLAB_CACHE.pop(next(iter(_LIVE_MASK_SLAB_CACHE)))
+                _LIVE_MASK_SLAB_CACHE[mk_key] = pixel_class_by_bank
+        except OSError:
+            pixel_class_by_bank = None
+
+    # Generate (or slice cached) complete Ewald reflection shell down to d_min
+    try:
+        mtime_img = int(os.stat(img_src).st_mtime_ns)
+    except OSError:
+        mtime_img = 0
+    shell_sig = (
+        os.path.abspath(img_src),
+        mtime_img,
+        f0,
+        f1,
+        inst_use,
+        sg_use.strip(),
+        tuple(round(float(v), 5) for v in cell_use),
+        round(float(wl_min), 5),
+        round(float(wl_max), 5),
+        np.asarray(ub_mat, dtype=np.float64).tobytes(),
+        np.asarray(R_mat, dtype=np.float64).tobytes(),
+        np.asarray(s_off, dtype=np.float64).tobytes(),
+        np.asarray(ki_u, dtype=np.float64).tobytes(),
+        tuple(sorted(active_bids)),
+        _detector_and_mask_signature(detectors, pixel_class_by_bank),
+    )
+    cached_shell = _LIVE_RAYCAST_SHELL_CACHE.get(shell_sig)
+    if cached_shell is not None and d_min_kin >= cached_shell[0] - 1e-7:
+        _, ray_full, d_full = cached_shell
+    else:
+        vol = 1.0 / max(abs(float(np.linalg.det(ub_mat))), 1e-12)
+        # Pre-build down to 1.0 A when affordable so interactive d_min dragging is O(15 ms)
+        floor_cand = max(1.0, 0.5 * wl_min - 1e-5)
+        est_at_floor = (4.0 * np.pi / 3.0) * vol / max(floor_cand**3, 1e-6)
+        d_build = (
+            min(d_min_kin, floor_cand) if est_at_floor <= 8_000_000.0 else d_min_kin
+        )
+        est_pts = (4.0 * np.pi / 3.0) * vol / max(d_build**3, 1e-6)
+        if est_pts > 250_000.0:
+            hkl_cache_key = (
+                tuple(round(float(v), 5) for v in cell_use),
+                sg_use.strip(),
+                round(float(d_build), 5),
+                round(float(wl_min), 5),
+                round(float(wl_max), 5),
+                1,
+                tuple(round(float(v), 5) for v in ub_mat.ravel()),
+                tuple(round(float(v), 5) for v in R_mat.ravel()),
+            )
+            hkl_all = _HKL_GEN_CACHE.get(hkl_cache_key)
+            if hkl_all is None:
+                hkl_all = np.stack(
+                    generate_ewald_reflections(
+                        *cell_use,
+                        space_group=sg_use,
+                        d_min=d_build,
+                        UB=ub_mat,
+                        R_runs=[R_mat],
+                        ki=ki_u,
+                        wavelength_range=(wl_min, wl_max),
+                    ),
+                    axis=1,
+                ).astype(np.int32)
+                if len(_HKL_GEN_CACHE) >= 3:
+                    _HKL_GEN_CACHE.pop(next(iter(_HKL_GEN_CACHE)), None)
+                _HKL_GEN_CACHE[hkl_cache_key] = hkl_all
+        else:
+            hkl_cache_key = (
+                tuple(round(float(v), 5) for v in cell_use),
+                sg_use.strip(),
+                round(float(d_build), 5),
+            )
+            hkl_all = _HKL_GEN_CACHE.get(hkl_cache_key)
+            if hkl_all is None:
+                hkl_all = np.stack(
+                    generate_reflections(
+                        *cell_use,
+                        space_group=sg_use,
+                        d_min=d_build,
+                    ),
+                    axis=1,
+                ).astype(np.int32)
+                if len(_HKL_GEN_CACHE) >= 3:
+                    _HKL_GEN_CACHE.pop(next(iter(_HKL_GEN_CACHE)), None)
+                _HKL_GEN_CACHE[hkl_cache_key] = hkl_all
+
+        G_cryst = hkl_all.astype(float) @ ub_mat.T
+        qn_cryst = np.linalg.norm(G_cryst, axis=1)
+        rel_border = default_rel_border_for_instrument(inst_use)
+        ray_full = _raycast_hkl_on_detectors(
+            hkl_all,
+            U_mat,
+            B_mat,
+            R_mat,
+            detectors,
+            (wl_min, wl_max),
+            ki=ki_u,
+            sample_offset_lab=s_off,
+            active_bids=active_bids,
+            pixel_class_by_bank=pixel_class_by_bank,
+            margin_frac=rel_border,
+            G_cryst=G_cryst,
+            qn_cryst=qn_cryst,
+        )
+        if len(ray_full["hkl"]) > 0:
+            G_rf = ray_full["hkl"].astype(float) @ ub_mat.T
+            d_full = 1.0 / np.maximum(np.linalg.norm(G_rf, axis=1), 1e-12)
+        else:
+            d_full = np.zeros(0, dtype=float)
+        if (
+            len(_LIVE_RAYCAST_SHELL_CACHE) >= 3
+            and shell_sig not in _LIVE_RAYCAST_SHELL_CACHE
+        ):
+            _LIVE_RAYCAST_SHELL_CACHE.pop(next(iter(_LIVE_RAYCAST_SHELL_CACHE)))
+        _LIVE_RAYCAST_SHELL_CACHE[shell_sig] = (d_build, ray_full, d_full)
+
+    if len(d_full) == 0:
+        ray = ray_full
+    else:
+        keep_d = d_full >= (d_min_kin - 1e-9)
+        ray = {
+            k_r: v_r[keep_d]
+            for k_r, v_r in ray_full.items()
+            if isinstance(v_r, np.ndarray) and len(v_r) == len(d_full)
+        }
+    hkl_hit = ray["hkl"]
+    n_hit = len(hkl_hit)
+    if n_hit == 0:
+        return {
+            "ok": True,
+            "angular_error_mode": "tof_3d",
+            "tof_gate": None,
+            "n_shell": 0,
+            "errors": {},
+        }
+
+    eval_mask: np.ndarray | None = None
+    if n_hit > 35_000 and zone_axes_crystal:
+        G_hit = hkl_hit.astype(float) @ ub_mat.T
+        Gn_hit = np.maximum(np.linalg.norm(G_hit, axis=1), 1e-12)
+        Gh_hit = G_hit / Gn_hit[:, None]
+        sin_tol = float(np.sin(np.deg2rad(max(float(zone_tolerance_deg) * 1.5, 0.5))))
+        z_keep = np.zeros(n_hit, dtype=bool)
+        for ax_raw in zone_axes_crystal:
+            ax_v = np.asarray(ax_raw, dtype=float).ravel()[:3]
+            ax_n = float(np.linalg.norm(ax_v))
+            if ax_n > 1e-9:
+                z_keep |= np.abs(Gh_hit @ (ax_v / ax_n)) <= sin_tol
+        # Also include top-35,000 highest-d reflections matching MAX_DYNAMIC_FRAME_PEAKS
+        top_k = np.argpartition(Gn_hit, min(35_000, n_hit - 1))[:35_000]
+        z_keep[top_k] = True
+        eval_mask = z_keep
+
+    err_arr, ok_est, err_mode, gate_meta = _estimate_spot_angular_errors_deg(
+        images_h5=img_src,
+        replay_h5=replay_h5,
+        frame_slice=(f0, f1),
+        hkl_arr=hkl_hit,
+        bank_arr=ray["bank"],
+        pixel_r_arr=ray["pixel_r"],
+        pixel_c_arr=ray["pixel_c"],
+        lam_arr=ray["wavelength"],
+        ub_matrix=ub_mat,
+        R_run=R_mat,
+        detectors=detectors,
+        ki_hat=ki_u,
+        sample_offset_lab=s_off,
+        pixel_class_by_bank=pixel_class_by_bank,
+        instrument=inst_use,
+        tof_l1=tof_l1,
+        wavelength_range=(wl_min, wl_max),
+        eval_mask=eval_mask,
+    )
+    if not ok_est or err_arr is None:
+        return {"ok": False, "error": "Failed to evaluate spot angular errors."}
+
+    fin_idx = np.flatnonzero(np.isfinite(err_arr))
+    b_hit = ray["bank"]
+    errors_map: dict[str, float] = {}
+    for idx in fin_idx:
+        hv, kv, lv = int(hkl_hit[idx, 0]), int(hkl_hit[idx, 1]), int(hkl_hit[idx, 2])
+        errors_map[f"{int(b_hit[idx])}|{hv},{kv},{lv}"] = round(float(err_arr[idx]), 4)
+
+    return {
+        "ok": True,
+        "angular_error_mode": err_mode,
+        "tof_gate": gate_meta,
+        "n_shell": int(n_hit),
+        "n_matched": len(errors_map),
+        "errors": errors_map,
+    }
+
+
+def _stratified_spherical_subsample(
+    pts: np.ndarray,
+    max_peaks: int,
+    priority_arr: np.ndarray | None = None,
+    sample_offset_lab: Any = None,
+) -> np.ndarray:
+    """Select up to `max_peaks` indices stratified uniformly over solid angle."""
+    n_raw = len(pts)
+    if n_raw <= max_peaks:
+        return np.arange(n_raw, dtype=int)
+    s0 = np.zeros(3, dtype=float)
+    if sample_offset_lab is not None:
+        s_try = np.asarray(sample_offset_lab, dtype=float).reshape(-1)
+        if s_try.size == 3 and np.all(np.isfinite(s_try)):
+            s0 = s_try
+    rel = np.asarray(pts, dtype=float) - s0[None, :]
+    r = np.maximum(np.linalg.norm(rel, axis=1), 1e-12)
+    az01 = (np.arctan2(rel[:, 0], rel[:, 2]) + np.pi) * (1.0 / (2.0 * np.pi))
+    el01 = 0.5 * (rel[:, 1] / r + 1.0)
+    cx = np.clip((az01 * 128.0).astype(np.int32), 0, 127)
+    cy = np.clip((el01 * 64.0).astype(np.int32), 0, 63)
+    cells = (cy << 7) | cx
+
+    if priority_arr is not None and len(priority_arr) == n_raw:
+        pri = np.where(np.isfinite(priority_arr), priority_arr, -1e30)
+        by_pri = np.argsort(-pri, kind="stable")
+    else:
+        by_pri = np.arange(n_raw, dtype=int)
+
+    cells_pri = cells[by_pri]
+    cell_sort = np.argsort(cells_pri, kind="stable")
+    sorted_cells = cells_pri[cell_sort]
+    first_idx = np.r_[0, np.flatnonzero(np.diff(sorted_cells)) + 1]
+    counts = np.diff(np.r_[first_idx, n_raw])
+    ranks_sorted = np.arange(n_raw, dtype=np.int32) - np.repeat(first_idx, counts)
+    ranks = np.empty(n_raw, dtype=np.int32)
+    ranks[cell_sort] = ranks_sorted
+    keep_in_pri = np.argsort(ranks, kind="stable")[:max_peaks]
+    return np.sort(by_pri[keep_in_pri])
+
+
+def _select_serialized_peak_indices(
+    pts: np.ndarray,
+    *,
+    max_peaks: int,
+    intensity_arr: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None = None,
+    hkl_arr: np.ndarray | None = None,
+    sample_offset_lab: Any = None,
+) -> np.ndarray | None:
+    """Return stratified subsample indices when ``len(pts) > max_peaks``, else ``None``."""
+    pts_f = np.asarray(pts, dtype=float)
+    n_raw = len(pts_f)
+    if n_raw <= int(max_peaks):
+        return None
+    pri_arr: np.ndarray | None = None
+    if intensity_arr is not None and len(intensity_arr) == n_raw:
+        pri_arr = np.asarray(intensity_arr, dtype=float)
+    elif ub_matrix is not None and hkl_arr is not None and len(hkl_arr) == n_raw:
+        g_cryst = (
+            np.asarray(hkl_arr, dtype=float) @ np.asarray(ub_matrix, dtype=float).T
+        )
+        pri_arr = 1.0 / np.maximum(np.linalg.norm(g_cryst, axis=1), 1e-12)
+    return _stratified_spherical_subsample(
+        pts_f,
+        int(max_peaks),
+        priority_arr=pri_arr,
+        sample_offset_lab=sample_offset_lab,
+    )
+
+
+def _serialize_peak_entries(
+    pts: np.ndarray,
+    *,
+    bank_arr: np.ndarray | None,
+    pixel_r_arr: np.ndarray | None,
+    pixel_c_arr: np.ndarray | None,
+    intensity_arr: np.ndarray | None,
+    sigma_arr: np.ndarray | None,
+    var_u_arr: np.ndarray | None,
+    var_v_arr: np.ndarray | None,
+    cov_uv_arr: np.ndarray | None,
+    hkl_arr: np.ndarray | None,
+    lam_arr: np.ndarray | None,
+    careless_residual_arr: np.ndarray | None = None,
+    careless_scale_arr: np.ndarray | None = None,
+    merged_i_arr: np.ndarray | None = None,
+    merged_sigi_arr: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None,
+    R_gonio: np.ndarray | None,
+    ki_hat: np.ndarray,
+    wavelength_range: tuple[float, float],
+    space_group: str,
+    cell: list[float] | None,
+    detectors: dict[int, Any],
+    raw_zones: list[dict[str, Any]],
+    active_frame: int = 0,
+    zone_tolerance_deg: float = 0.75,
+    max_peaks: int = 2500,
+    peak_source: str = "predicted",
+    d_min: float = 0.0,
+    sample_offset_lab: Any = None,
+    spot_ang_err_arr: np.ndarray | None = None,
+    spot_img_available: bool = False,
+    subsample_order: np.ndarray | None = None,
+) -> list[dict[str, Any]]:
+    """Serialize a set of detector peak observations for the active frame."""
+    pts = np.asarray(pts, dtype=float)
+    n_raw = len(pts)
+    if n_raw > max_peaks:
+        order = (
+            subsample_order
+            if subsample_order is not None
+            else _select_serialized_peak_indices(
+                pts,
+                max_peaks=int(max_peaks),
+                intensity_arr=intensity_arr,
+                ub_matrix=ub_matrix,
+                hkl_arr=hkl_arr,
+                sample_offset_lab=sample_offset_lab,
+            )
+        )
+        assert order is not None
+        pts = pts[order]
+        if bank_arr is not None and len(bank_arr) == n_raw:
+            bank_arr = bank_arr[order]
+        if pixel_r_arr is not None and len(pixel_r_arr) == n_raw:
+            pixel_r_arr = pixel_r_arr[order]
+        if pixel_c_arr is not None and len(pixel_c_arr) == n_raw:
+            pixel_c_arr = pixel_c_arr[order]
+        if intensity_arr is not None and len(intensity_arr) == n_raw:
+            intensity_arr = intensity_arr[order]
+        if sigma_arr is not None and len(sigma_arr) == n_raw:
+            sigma_arr = sigma_arr[order]
+        if var_u_arr is not None and len(var_u_arr) == n_raw:
+            var_u_arr = var_u_arr[order]
+        if var_v_arr is not None and len(var_v_arr) == n_raw:
+            var_v_arr = var_v_arr[order]
+        if cov_uv_arr is not None and len(cov_uv_arr) == n_raw:
+            cov_uv_arr = cov_uv_arr[order]
+        if hkl_arr is not None and len(hkl_arr) == n_raw:
+            hkl_arr = hkl_arr[order]
+        if lam_arr is not None and len(lam_arr) == n_raw:
+            lam_arr = lam_arr[order]
+        if careless_residual_arr is not None and len(careless_residual_arr) == n_raw:
+            careless_residual_arr = careless_residual_arr[order]
+        if careless_scale_arr is not None and len(careless_scale_arr) == n_raw:
+            careless_scale_arr = careless_scale_arr[order]
+        if merged_i_arr is not None and len(merged_i_arr) == n_raw:
+            merged_i_arr = merged_i_arr[order]
+        if merged_sigi_arr is not None and len(merged_sigi_arr) == n_raw:
+            merged_sigi_arr = merged_sigi_arr[order]
+        if spot_ang_err_arr is not None and len(spot_ang_err_arr) == n_raw:
+            spot_ang_err_arr = spot_ang_err_arr[order]
+        if (
+            isinstance(R_gonio, np.ndarray)
+            and R_gonio.ndim == 3
+            and len(R_gonio) == n_raw
+        ):
+            R_gonio = R_gonio[order]
+
+    n_peaks = len(pts)
+    if n_peaks == 0:
+        return []
+
+    if sample_offset_lab is not None:
+        s_off_arr = np.asarray(sample_offset_lab, dtype=float)
+        if s_off_arr.ndim == 1 and s_off_arr.size >= 3:
+            rays_lab = pts - s_off_arr.ravel()[:3][None, :]
+        elif s_off_arr.ndim == 2 and len(s_off_arr) == n_peaks:
+            rays_lab = pts - s_off_arr[:, :3]
+        else:
+            rays_lab = pts
+    else:
+        rays_lab = pts
+    norms = np.linalg.norm(rays_lab, axis=1, keepdims=True)
+    kf_hat = rays_lab / np.maximum(norms, 1e-12)
+    q_vec = kf_hat - ki_hat[None, :]
+    q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True)
+    g_hat = np.where(q_norm > 1e-6, q_vec / np.maximum(q_norm, 1e-12), kf_hat)
+
+    if R_gonio is not None:
+        R_arr = np.asarray(R_gonio, dtype=float)
+        if R_arr.ndim == 2:
+            g_crystal = g_hat @ R_arr
+        elif R_arr.ndim == 3 and len(R_arr) == n_peaks:
+            g_crystal = np.einsum("ni,nij->nj", g_hat, R_arr)
+        else:
+            g_crystal = g_hat
+    else:
+        g_crystal = g_hat
+
+    sx, sy, hemi = stereographic_projection(g_crystal)
+    sx_lab, sy_lab, hemi_lab = stereographic_projection(g_hat)
+    det_x, det_y = _unrolled(pts)
+    _, det_el = _spherical_angles(pts)
+
+    wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
+    if ub_matrix is not None:
+        inv_ub = np.linalg.inv(ub_matrix)
+        hkl_dir = g_crystal @ inv_ub.T
+        sin_theta = np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999)
+        if hkl_arr is None:
+            lam_grid = np.linspace(wl_min, wl_max, 64)
+            q_mag_grid = (2.0 * sin_theta[:, None]) / lam_grid[None, :]
+            hkl_cand = hkl_dir[:, None, :] * q_mag_grid[:, :, None]
+            hkl_round = np.rint(hkl_cand)
+            nonzero = np.any(hkl_round != 0, axis=-1)
+            diff = np.linalg.norm(hkl_cand - hkl_round, axis=-1)
+            diff = np.where(nonzero, diff, 1e9)
+            best_l = np.argmin(diff, axis=1)
+            hkl_arr = hkl_round[np.arange(n_peaks), best_l].astype(int)
+
+        G_pred_cryst = hkl_arr @ ub_matrix.T
+        G_norm = np.linalg.norm(G_pred_cryst, axis=1)
+        valid_hkl = G_norm > 1e-8
+        G_pred_hat = np.divide(G_pred_cryst, np.maximum(G_norm[:, None], 1e-12))
+        cos_err = np.clip(np.sum(g_crystal * G_pred_hat, axis=1), -1.0, 1.0)
+        ang_err_deg = np.where(valid_hkl, np.rad2deg(np.arccos(cos_err)), 90.0)
+        d_spacing = np.where(valid_hkl, 1.0 / np.maximum(G_norm, 1e-8), 0.0)
+        if lam_arr is None:
+            lam_arr = np.where(
+                valid_hkl,
+                2.0 * sin_theta / np.maximum(G_norm, 1e-8),
+                0.5 * (wl_min + wl_max),
+            )
+    else:
+        if hkl_arr is None:
+            hkl_arr = np.zeros((n_peaks, 3), dtype=int)
+        sin_theta = np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999)
+        if lam_arr is None:
+            lam_arr = np.full(n_peaks, 0.5 * (wl_min + wl_max), dtype=float)
+        d_spacing = lam_arr / np.maximum(2.0 * sin_theta, 1e-4)
+        ang_err_deg = np.zeros(n_peaks, dtype=float)
+
+    peak_zones: list[list[int]] = [[] for _ in range(n_peaks)]
+    sin_tol = float(np.sin(np.deg2rad(max(zone_tolerance_deg, 0.25))))
+    for z in raw_zones:
+        zid = int(z["zone_id"])
+        ax_c = np.asarray(z["axis_crystal_xyz"], dtype=float)
+        ax_n = float(np.linalg.norm(ax_c))
+        if ax_n > 1e-9:
+            ax_u = ax_c / ax_n
+            in_z = np.abs(g_crystal @ ax_u) <= sin_tol
+            for pid in np.flatnonzero(in_z):
+                peak_zones[int(pid)].append(zid)
+
     ellipse_cyl_by_idx: dict[int, list[list[float]]] = {}
     ellipse_sph_by_idx: dict[int, list[list[float]]] = {}
     sigma_major_by_idx: dict[int, float] = {}
     sigma_minor_by_idx: dict[int, float] = {}
     ellipse_ang_by_idx: dict[int, float] = {}
     if (
-        n_peaks > 0
-        and var_u_arr is not None
+        var_u_arr is not None
         and var_v_arr is not None
         and len(var_u_arr) == n_peaks
         and len(var_v_arr) == n_peaks
@@ -3236,161 +8327,208 @@ def build_rainbow_zone_payload(
                 az_mat = az_ell.reshape(len(idxs), n_ell_pts)
                 y_mat = y_ell.reshape(len(idxs), n_ell_pts)
                 el_mat = el_ell.reshape(len(idxs), n_ell_pts)
-                for k_local, p_idx in enumerate(idxs):
-                    p_i = int(p_idx)
-                    az_row = az_mat[k_local]
-                    if float(np.ptp(az_row)) > 90.0:
-                        continue
-                    ellipse_cyl_by_idx[p_i] = [
-                        [round(float(az_row[m]), 3), round(float(y_mat[k_local, m]), 4)]
-                        for m in range(n_ell_pts)
-                    ]
-                    ellipse_sph_by_idx[p_i] = [
-                        [
-                            round(float(az_row[m]), 3),
-                            round(float(el_mat[k_local, m]), 3),
-                        ]
-                        for m in range(n_ell_pts)
-                    ]
-                    sigma_major_by_idx[p_i] = round(float(s1_all[p_i]), 2)
-                    sigma_minor_by_idx[p_i] = round(float(s2_all[p_i]), 2)
-                    ellipse_ang_by_idx[p_i] = round(float(np.rad2deg(phi_all[p_i])), 1)
+                valid_ell_mask = np.ptp(az_mat, axis=1) <= 90.0
+                if np.any(valid_ell_mask):
+                    valid_k = np.flatnonzero(valid_ell_mask)
+                    valid_p_arr = idxs[valid_k]
+                    valid_p = valid_p_arr.tolist()
+                    az_r = np.round(az_mat[valid_k], 3)
+                    cyl_lists = np.stack(
+                        [az_r, np.round(y_mat[valid_k], 4)], axis=-1
+                    ).tolist()
+                    sph_lists = np.stack(
+                        [az_r, np.round(el_mat[valid_k], 3)], axis=-1
+                    ).tolist()
+                    s1_r = np.round(s1_all[valid_p_arr], 2).tolist()
+                    s2_r = np.round(s2_all[valid_p_arr], 2).tolist()
+                    ang_r = np.round(np.rad2deg(phi_all[valid_p_arr]), 1).tolist()
+                    for loc_m, p_i in enumerate(valid_p):
+                        ellipse_cyl_by_idx[p_i] = cyl_lists[loc_m]
+                        ellipse_sph_by_idx[p_i] = sph_lists[loc_m]
+                        sigma_major_by_idx[p_i] = s1_r[loc_m]
+                        sigma_minor_by_idx[p_i] = s2_r[loc_m]
+                        ellipse_ang_by_idx[p_i] = ang_r[loc_m]
 
-    # Compute canonical ASU symmetry orbits and Laue harmonic ray multiplicity
-    sg_obj = None
-    asu_obj = None
-    sg_ops = None
-    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
-        import gemmi
-
-        sg_obj = gemmi.find_spacegroup_by_name(str(space_group)) or (
-            gemmi.find_spacegroup_by_name("P 1")
+    _to_asu_hkl = _make_asu_mapper(space_group, cell)
+    _is_absent = _make_systematic_absence_checker(space_group)
+    d_min_eff = (
+        float(d_min)
+        if d_min and float(d_min) > 0.0
+        else (
+            float(np.min(d_spacing[d_spacing > 0]))
+            if len(d_spacing) > 0 and np.any(d_spacing > 0)
+            else 0.5 * wl_min
         )
-        if sg_obj is not None:
-            asu_obj = gemmi.ReciprocalAsu(sg_obj)
-            sg_ops = sg_obj.operations()
+    )
 
-    def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int]:
-        if asu_obj is not None and sg_ops is not None and (h_v or k_v or l_v):
-            with contextlib.suppress(RuntimeError, ValueError, TypeError, IndexError):
-                ha, _ = asu_obj.to_asu([h_v, k_v, l_v], sg_ops)
-                return (int(ha[0]), int(ha[1]), int(ha[2]))
-        ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
-        sg_u = str(space_group or "").upper()
-        is_cubic = "3" in sg_u or (
-            cell is not None
-            and len(cell) >= 6
-            and abs(float(cell[0]) - float(cell[1])) < 0.05
-            and abs(float(cell[1]) - float(cell[2])) < 0.05
-        )
-        if is_cubic:
-            s3 = sorted((ah, ak, al), reverse=True)
-            return (s3[0], s3[1], s3[2])
-        return (ah, ak, al)
-
-    base_ray_counts: dict[tuple[int, int, int], int] = {}
+    base_ray_orders: dict[tuple[int, int, int], set[int]] = {}
+    hkl_py = hkl_arr.tolist()
     for i in range(n_peaks):
-        h_i, k_i, l_i = (
-            int(hkl_arr[i, 0]),
-            int(hkl_arr[i, 1]),
-            int(hkl_arr[i, 2]),
-        )
+        h_i, k_i, l_i = hkl_py[i]
         if h_i or k_i or l_i:
-            g_c = max(1, int(np.gcd.reduce(np.abs([h_i, k_i, l_i]))))
-            b_ray = (h_i // g_c, k_i // g_c, l_i // g_c)
-            base_ray_counts[b_ray] = base_ray_counts.get(b_ray, 0) + 1
+            lam_chk = float(lam_arr[i]) if i < len(lam_arr) else 0.5 * (wl_min + wl_max)
+            if wl_min - 1e-4 <= lam_chk <= wl_max + 1e-4:
+                g_c = max(1, math.gcd(abs(h_i), math.gcd(abs(k_i), abs(l_i))))
+                b_ray = (h_i // g_c, k_i // g_c, l_i // g_c)
+                base_ray_orders.setdefault(b_ray, set()).add(g_c)
 
+    det_x_py = np.round(det_x, 3).tolist()
+    det_y_py = np.round(det_y, 4).tolist()
+    det_el_py = np.round(det_el, 3).tolist()
+    q_hat_py = np.round(g_crystal, 5).tolist()
+    q_hat_lab_py = np.round(g_hat, 5).tolist()
+    sx_py = np.round(sx, 5).tolist()
+    sy_py = np.round(sy, 5).tolist()
+    hemi_py = hemi.astype(int).tolist()
+    sx_lab_py = np.round(sx_lab, 5).tolist()
+    sy_lab_py = np.round(sy_lab, 5).tolist()
+    hemi_lab_py = hemi_lab.astype(int).tolist()
+    row_py = (
+        np.round(pixel_r_arr, 2).tolist()
+        if pixel_r_arr is not None and len(pixel_r_arr) == n_peaks
+        else None
+    )
+    col_py = (
+        np.round(pixel_c_arr, 2).tolist()
+        if pixel_c_arr is not None and len(pixel_c_arr) == n_peaks
+        else None
+    )
+    bank_py = (
+        bank_arr.astype(int).tolist()
+        if bank_arr is not None and len(bank_arr) == n_peaks
+        else None
+    )
+    active_frame_i = int(active_frame)
+
+    has_ray_err = bool(len(ang_err_deg) > 0 and float(np.max(ang_err_deg)) > 1e-4)
     peaks_list: list[dict[str, Any]] = []
     for i in range(n_peaks):
-        h_i, k_i, l_i = (
-            int(hkl_arr[i, 0]),
-            int(hkl_arr[i, 1]),
-            int(hkl_arr[i, 2]),
-        )
+        h_i, k_i, l_i = hkl_py[i]
         g_gcd = (
-            int(np.gcd.reduce(np.abs([h_i, k_i, l_i]))) if (h_i or k_i or l_i) else 1
+            math.gcd(abs(h_i), math.gcd(abs(k_i), abs(l_i)))
+            if (h_i or k_i or l_i)
+            else 1
         )
         b_ray = (
             (h_i // max(1, g_gcd), k_i // max(1, g_gcd), l_i // max(1, g_gcd))
             if (h_i or k_i or l_i)
             else (0, 0, 0)
         )
-        harm_mult = max(
-            int(base_ray_counts.get(b_ray, 1)),
-            2 if g_gcd > 1 else 1,
-        )
-        asu_h, asu_k, asu_l = _to_asu_hkl(h_i, k_i, l_i)
+        asu_h, asu_k, asu_l, asu_is_friedel, asu_bij_parity = _to_asu_hkl(h_i, k_i, l_i)
         orbit_id = f"{asu_h},{asu_k},{asu_l}"
         orbit_color_idx = (
             abs(asu_h * 73856093 ^ asu_k * 19349663 ^ asu_l * 83492791) % 12
         )
         d_val = float(d_spacing[i]) if i < len(d_spacing) else 2.0
         lam_val = float(lam_arr[i]) if i < len(lam_arr) else 0.5 * (wl_min + wl_max)
-        err_val = float(ang_err_deg[i]) if i < len(ang_err_deg) else 0.0
+        obs_ord_cnt = len(base_ray_orders.get(b_ray, ())) if (h_i or k_i or l_i) else 1
+        harm_ord, harm_mult = _compute_harmonic_order_and_multiplicity(
+            h_i,
+            k_i,
+            l_i,
+            lam_val,
+            d_val,
+            wl_min=wl_min,
+            wl_max=wl_max,
+            d_min=d_min_eff,
+            is_absent_fn=_is_absent,
+            observed_distinct_orders=max(1, obs_ord_cnt),
+        )
+        ray_err_val = float(ang_err_deg[i]) if i < len(ang_err_deg) else 0.0
+        if peak_source == "integrated":
+            err_val = ray_err_val
+            has_err = bool(ub_matrix is not None and (h_i or k_i or l_i))
+        elif (
+            spot_ang_err_arr is not None
+            and i < len(spot_ang_err_arr)
+            and np.isfinite(spot_ang_err_arr[i])
+        ):
+            err_val = float(spot_ang_err_arr[i])
+            has_err = True
+        elif not spot_img_available and has_ray_err and ub_matrix is not None:
+            err_val = ray_err_val
+            has_err = True
+        else:
+            err_val = 0.0
+            has_err = False
         is_indexed = bool(
             (
                 (h_i != 0 or k_i != 0 or l_i != 0)
-                and err_val <= max(2.0, zone_tolerance_deg * 2.5)
+                and ray_err_val <= max(2.0, zone_tolerance_deg * 2.5)
             )
             or len(peak_zones[i]) > 0
         )
-        parallax_depth = float(
-            np.clip(1.0 / (1.0 + 0.35 * max(d_val, 0.2)), 0.05, 0.98)
-        )
+        parallax_depth = min(0.98, max(0.05, 1.0 / (1.0 + 0.35 * max(d_val, 0.2))))
 
         pk_entry: dict[str, Any] = {
             "id": i,
-            "run_index": int(active_frame),
+            "peak_source": peak_source,
+            "run_index": active_frame_i,
             "bank": (
-                int(bank_arr[i]) if bank_arr is not None and i < len(bank_arr) else 1
+                bank_py[i]
+                if bank_py is not None
+                else (
+                    int(bank_arr[i])
+                    if bank_arr is not None and i < len(bank_arr)
+                    else 1
+                )
             ),
             "row": (
-                round(float(pixel_r_arr[i]), 2)
-                if pixel_r_arr is not None and i < len(pixel_r_arr)
-                else 0.0
+                row_py[i]
+                if row_py is not None
+                else (
+                    round(float(pixel_r_arr[i]), 2)
+                    if pixel_r_arr is not None and i < len(pixel_r_arr)
+                    else 0.0
+                )
             ),
             "col": (
-                round(float(pixel_c_arr[i]), 2)
-                if pixel_c_arr is not None and i < len(pixel_c_arr)
-                else 0.0
+                col_py[i]
+                if col_py is not None
+                else (
+                    round(float(pixel_c_arr[i]), 2)
+                    if pixel_c_arr is not None and i < len(pixel_c_arr)
+                    else 0.0
+                )
             ),
-            "det_x": round(float(det_x[i]), 3),
-            "det_y": round(float(det_y[i]), 4),
-            "det_el": round(float(det_el[i]), 3),
-            "q_hat": [round(float(x), 5) for x in g_crystal[i]],
-            "q_hat_lab": [round(float(x), 5) for x in g_hat[i]],
-            "stereographic": [
-                round(float(sx[i]), 5),
-                round(float(sy[i]), 5),
-            ],
-            "hemisphere": int(hemi[i]),
-            "stereo_lab": [
-                round(float(sx_lab[i]), 5),
-                round(float(sy_lab[i]), 5),
-                int(hemi_lab[i]),
-            ],
+            "det_x": det_x_py[i],
+            "det_y": det_y_py[i],
+            "det_el": det_el_py[i],
+            "q_hat": q_hat_py[i],
+            "q_hat_lab": q_hat_lab_py[i],
+            "stereographic": [sx_py[i], sy_py[i]],
+            "hemisphere": hemi_py[i],
+            "stereo_lab": [sx_lab_py[i], sy_lab_py[i], hemi_lab_py[i]],
             "intensity": (
                 round(float(intensity_arr[i]), 2)
-                if intensity_arr is not None and i < len(intensity_arr)
-                else 100.0
+                if intensity_arr is not None
+                and i < len(intensity_arr)
+                and np.isfinite(intensity_arr[i])
+                else None
             ),
             "sigma": (
                 round(float(sigma_arr[i]), 2)
-                if sigma_arr is not None and i < len(sigma_arr)
-                else 3.0
+                if sigma_arr is not None
+                and i < len(sigma_arr)
+                and np.isfinite(sigma_arr[i])
+                and sigma_arr[i] > 0
+                else None
             ),
             "wavelength": round(float(np.clip(lam_val, wl_min * 0.5, wl_max * 1.5)), 4),
             "d_spacing": round(d_val, 4),
-            "harmonic_order": max(1, g_gcd),
-            "harmonic_multiplicity": harm_mult,
+            "harmonic_order": int(harm_ord),
+            "harmonic_multiplicity": int(harm_mult),
             "parallax_depth": round(parallax_depth, 4),
             "hkl": [h_i, k_i, l_i],
             "asu_hkl": [asu_h, asu_k, asu_l],
             "asu_orbit_id": orbit_id,
+            "asu_friedel": bool(asu_is_friedel),
+            "asu_bijvoet_parity": int(asu_bij_parity),
             "orbit_color_idx": int(orbit_color_idx),
             "zone_ids": peak_zones[i],
             "indexed": is_indexed,
             "angular_error_deg": round(err_val, 4),
+            "has_angular_error": bool(has_err),
         }
         if (
             careless_residual_arr is not None
@@ -3427,121 +8565,846 @@ def build_rainbow_zone_payload(
             pk_entry["shape_kind"] = (
                 "ellipse" if abs(s_maj - s_min) > 0.05 else "isotropic_circle"
             )
+        else:
+            pk_entry["shape_kind"] = "circle"
         peaks_list.append(pk_entry)
+    return peaks_list
 
-    # Build all-runs sample-space peak list (for Wulff Net 'All Runs (Sample)' mode)
-    sample_peaks: list[dict[str, Any]] = []
+
+def _serialize_sample_peaks(
+    all_runs_data: dict[str, Any] | None,
+    *,
+    fallback_peaks: list[dict[str, Any]],
+    n_frames: int,
+    ki_hat: np.ndarray,
+    R_single: np.ndarray,
+    wavelength_range: tuple[float, float],
+    space_group: str,
+    cell: list[float] | None,
+    ub_matrix: np.ndarray | None = None,
+    merged_i_arr: np.ndarray | None = None,
+    merged_sigi_arr: np.ndarray | None = None,
+    peak_source: str = "predicted",
+    d_min: float = 0.0,
+    sample_offset_lab: Any = None,
+) -> list[dict[str, Any]]:
+    """Serialize multi-run sample-space reflections for the Wulff Net."""
     if (
-        all_runs_data is not None
-        and len(all_runs_data.get("peaks_xyz", [])) > 0
-        and len(frames_meta) > 1
+        all_runs_data is None
+        or len(all_runs_data.get("peaks_xyz", [])) == 0
+        or n_frames <= 1
     ):
-        pts_all = np.asarray(all_runs_data["peaks_xyz"], dtype=float)
-        hkl_all = np.asarray(all_runs_data["hkl"], dtype=int)
-        r_idx_all = np.asarray(all_runs_data["run_index"], dtype=int)
-        lam_all = all_runs_data.get("wavelength")
-        int_all = all_runs_data.get("intensity")
-        sig_all = all_runs_data.get("sigma")
-        bnk_all = all_runs_data.get("bank")
-        res_all = all_runs_data.get("careless_residual")
-        scl_all = all_runs_data.get("careless_scale")
-        R_per_run = all_runs_data.get("R_per_run") or {}
+        return fallback_peaks
 
-        norms_all = np.linalg.norm(pts_all, axis=1, keepdims=True)
-        kf_all = pts_all / np.maximum(norms_all, 1e-12)
-        q_all = kf_all - ki_hat[None, :]
-        qn_all = np.linalg.norm(q_all, axis=1, keepdims=True)
-        g_lab_all = np.where(qn_all > 1e-6, q_all / np.maximum(qn_all, 1e-12), kf_all)
-        g_samp_all = np.copy(g_lab_all)
+    pts_all = np.asarray(all_runs_data["peaks_xyz"], dtype=float)
+    hkl_all = np.asarray(all_runs_data["hkl"], dtype=int)
+    r_idx_all = np.asarray(all_runs_data["run_index"], dtype=int)
+    lam_all = all_runs_data.get("wavelength")
+    int_all = all_runs_data.get("intensity")
+    sig_all = all_runs_data.get("sigma")
+    bnk_all = all_runs_data.get("bank")
+    res_all = all_runs_data.get("careless_residual")
+    scl_all = all_runs_data.get("careless_scale")
+    m_i_all = all_runs_data.get("merged_i")
+    m_sigi_all = all_runs_data.get("merged_sigi")
+    if (
+        m_i_all is None
+        and merged_i_arr is not None
+        and len(merged_i_arr) == len(pts_all)
+    ):
+        m_i_all = merged_i_arr
+    if (
+        m_sigi_all is None
+        and merged_sigi_arr is not None
+        and len(merged_sigi_arr) == len(pts_all)
+    ):
+        m_sigi_all = merged_sigi_arr
+    R_per_run = all_runs_data.get("R_per_run") or {}
+    s_per_run = all_runs_data.get("s_lab_per_run") or {}
+    s_default = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None and np.asarray(sample_offset_lab).size >= 3
+        else np.zeros(3, dtype=float)
+    )
+
+    rays_all = np.copy(pts_all)
+    if s_per_run or float(np.linalg.norm(s_default)) > 1e-12:
         for ur in np.unique(r_idx_all):
-            R_u = R_per_run.get(int(ur), R_single)
+            s_u = s_per_run.get(int(ur), s_default)
             m_u = r_idx_all == ur
-            g_samp_all[m_u] = g_lab_all[m_u] @ R_u
+            rays_all[m_u] = (
+                pts_all[m_u] - np.asarray(s_u, dtype=float).ravel()[:3][None, :]
+            )
+    norms_all = np.linalg.norm(rays_all, axis=1, keepdims=True)
+    kf_all = rays_all / np.maximum(norms_all, 1e-12)
+    q_all = kf_all - ki_hat[None, :]
+    qn_all = np.linalg.norm(q_all, axis=1, keepdims=True)
+    g_lab_all = np.where(qn_all > 1e-6, q_all / np.maximum(qn_all, 1e-12), kf_all)
+    g_samp_all = np.copy(g_lab_all)
+    for ur in np.unique(r_idx_all):
+        R_u = R_per_run.get(int(ur), R_single)
+        m_u = r_idx_all == ur
+        g_samp_all[m_u] = g_lab_all[m_u] @ R_u
 
-        sx_all, sy_all, hm_all = stereographic_projection(g_samp_all)
-        ray_counts_all: dict[tuple[int, int, int, int], int] = {}
-        for j in range(len(pts_all)):
-            hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
-            if hj or kj or lj:
+    _to_asu_hkl = _make_asu_mapper(space_group, cell)
+    _is_absent = _make_systematic_absence_checker(space_group)
+    wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
+
+    st_all = np.clip(0.5 * qn_all[:, 0], 1e-4, 0.9999)
+    if ub_matrix is not None:
+        G_cryst_all = hkl_all @ np.asarray(ub_matrix, dtype=float).T
+        G_norm_all = np.linalg.norm(G_cryst_all, axis=1)
+        valid_hkl_all = G_norm_all > 1e-8
+        if lam_all is not None and len(lam_all) == len(pts_all):
+            lam_vec = np.asarray(lam_all, dtype=float)
+        else:
+            lam_vec = np.where(
+                valid_hkl_all,
+                2.0 * st_all / np.maximum(G_norm_all, 1e-8),
+                0.5 * (wl_min + wl_max),
+            )
+        d_vec = np.where(
+            valid_hkl_all,
+            1.0 / np.maximum(G_norm_all, 1e-8),
+            lam_vec / np.maximum(2.0 * st_all, 1e-4),
+        )
+    else:
+        lam_vec = (
+            np.asarray(lam_all, dtype=float)
+            if lam_all is not None and len(lam_all) == len(pts_all)
+            else np.full(len(pts_all), 0.5 * (wl_min + wl_max), dtype=float)
+        )
+        d_vec = lam_vec / np.maximum(2.0 * st_all, 1e-4)
+    d_min_eff = (
+        float(d_min)
+        if d_min and float(d_min) > 0.0
+        else (
+            float(np.min(d_vec[d_vec > 0]))
+            if len(d_vec) > 0 and np.any(d_vec > 0)
+            else 0.5 * wl_min
+        )
+    )
+
+    sx_all, sy_all, hm_all = stereographic_projection(g_samp_all)
+    ray_orders_all: dict[tuple[int, int, int, int], set[int]] = {}
+    for j in range(len(pts_all)):
+        hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
+        if hj or kj or lj:
+            lv_chk = float(lam_vec[j])
+            if wl_min - 1e-4 <= lv_chk <= wl_max + 1e-4:
                 gc = max(1, int(np.gcd.reduce(np.abs([hj, kj, lj]))))
                 rk = (int(r_idx_all[j]), hj // gc, kj // gc, lj // gc)
-                ray_counts_all[rk] = ray_counts_all.get(rk, 0) + 1
+                ray_orders_all.setdefault(rk, set()).add(gc)
 
-        for j in range(len(pts_all)):
-            hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
-            gc = int(np.gcd.reduce(np.abs([hj, kj, lj]))) if (hj or kj or lj) else 1
-            rk = (
-                (
-                    int(r_idx_all[j]),
-                    hj // max(1, gc),
-                    kj // max(1, gc),
-                    lj // max(1, gc),
-                )
-                if (hj or kj or lj)
-                else (int(r_idx_all[j]), 0, 0, 0)
+    sample_peaks: list[dict[str, Any]] = []
+    for j in range(len(pts_all)):
+        hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
+        gc = int(np.gcd.reduce(np.abs([hj, kj, lj]))) if (hj or kj or lj) else 1
+        rk = (
+            (
+                int(r_idx_all[j]),
+                hj // max(1, gc),
+                kj // max(1, gc),
+                lj // max(1, gc),
             )
-            h_mult = max(int(ray_counts_all.get(rk, 1)), 2 if gc > 1 else 1)
-            ah, ak, al = _to_asu_hkl(hj, kj, lj)
-            orb_id = f"{ah},{ak},{al}"
-            orb_c = abs(ah * 73856093 ^ ak * 19349663 ^ al * 83492791) % 12
-            lv = (
-                float(lam_all[j])
-                if lam_all is not None and j < len(lam_all)
-                else 0.5 * (wl_min + wl_max)
-            )
-            st_j = float(np.clip(0.5 * qn_all[j, 0], 1e-4, 0.9999))
-            dv = lv / max(2.0 * st_j, 1e-4)
-            sp_item: dict[str, Any] = {
-                "id": j,
-                "run_index": int(r_idx_all[j]),
-                "bank": int(bnk_all[j])
-                if bnk_all is not None and j < len(bnk_all)
-                else 1,
-                "q_hat": [round(float(x), 5) for x in g_samp_all[j]],
-                "q_hat_lab": [round(float(x), 5) for x in g_lab_all[j]],
-                "stereographic": [
-                    round(float(sx_all[j]), 5),
-                    round(float(sy_all[j]), 5),
-                ],
-                "hemisphere": int(hm_all[j]),
-                "intensity": round(float(int_all[j]), 2)
-                if int_all is not None and j < len(int_all)
-                else 100.0,
-                "sigma": round(float(sig_all[j]), 2)
-                if sig_all is not None and j < len(sig_all)
-                else 3.0,
-                "wavelength": round(float(np.clip(lv, wl_min * 0.5, wl_max * 1.5)), 4),
-                "d_spacing": round(dv, 4),
-                "harmonic_order": max(1, gc),
-                "harmonic_multiplicity": h_mult,
-                "hkl": [hj, kj, lj],
-                "asu_hkl": [ah, ak, al],
-                "asu_orbit_id": orb_id,
-                "orbit_color_idx": int(orb_c),
-                "zone_ids": [],
-                "indexed": bool(hj or kj or lj),
-            }
-            if res_all is not None and j < len(res_all) and np.isfinite(res_all[j]):
-                sp_item["careless_residual"] = round(float(res_all[j]), 3)
-            if scl_all is not None and j < len(scl_all) and np.isfinite(scl_all[j]):
-                sp_item["careless_scale"] = round(float(scl_all[j]), 4)
-            if (
-                merged_i_arr is not None
-                and j < len(merged_i_arr)
-                and np.isfinite(merged_i_arr[j])
-            ):
-                sp_item["merged_i"] = round(float(merged_i_arr[j]), 2)
-            if (
-                merged_sigi_arr is not None
-                and j < len(merged_sigi_arr)
-                and np.isfinite(merged_sigi_arr[j])
-            ):
-                sp_item["merged_sigi"] = round(float(merged_sigi_arr[j]), 2)
-            sample_peaks.append(sp_item)
+            if (hj or kj or lj)
+            else (int(r_idx_all[j]), 0, 0, 0)
+        )
+        ah, ak, al, asu_fr_j, asu_bij_j = _to_asu_hkl(hj, kj, lj)
+        orb_id = f"{ah},{ak},{al}"
+        orb_c = abs(ah * 73856093 ^ ak * 19349663 ^ al * 83492791) % 12
+        lv = float(lam_vec[j])
+        dv = float(d_vec[j])
+        obs_ord_j = len(ray_orders_all.get(rk, ())) if (hj or kj or lj) else 1
+        h_ord, h_mult = _compute_harmonic_order_and_multiplicity(
+            hj,
+            kj,
+            lj,
+            lv,
+            dv,
+            wl_min=wl_min,
+            wl_max=wl_max,
+            d_min=d_min_eff,
+            is_absent_fn=_is_absent,
+            observed_distinct_orders=max(1, obs_ord_j),
+        )
+        sp_item: dict[str, Any] = {
+            "id": j,
+            "peak_source": peak_source,
+            "run_index": int(r_idx_all[j]),
+            "bank": int(bnk_all[j]) if bnk_all is not None and j < len(bnk_all) else 1,
+            "q_hat": [round(float(x), 5) for x in g_samp_all[j]],
+            "q_hat_lab": [round(float(x), 5) for x in g_lab_all[j]],
+            "stereographic": [
+                round(float(sx_all[j]), 5),
+                round(float(sy_all[j]), 5),
+            ],
+            "hemisphere": int(hm_all[j]),
+            "intensity": (
+                round(float(int_all[j]), 2)
+                if int_all is not None and j < len(int_all) and np.isfinite(int_all[j])
+                else None
+            ),
+            "sigma": (
+                round(float(sig_all[j]), 2)
+                if sig_all is not None
+                and j < len(sig_all)
+                and np.isfinite(sig_all[j])
+                and sig_all[j] > 0
+                else None
+            ),
+            "wavelength": round(float(np.clip(lv, wl_min * 0.5, wl_max * 1.5)), 4),
+            "d_spacing": round(dv, 4),
+            "harmonic_order": int(h_ord),
+            "harmonic_multiplicity": int(h_mult),
+            "hkl": [hj, kj, lj],
+            "asu_hkl": [ah, ak, al],
+            "asu_orbit_id": orb_id,
+            "asu_friedel": bool(asu_fr_j),
+            "asu_bijvoet_parity": int(asu_bij_j),
+            "orbit_color_idx": int(orb_c),
+            "zone_ids": [],
+            "indexed": bool(hj or kj or lj),
+            "shape_kind": "circle",
+        }
+        if res_all is not None and j < len(res_all) and np.isfinite(res_all[j]):
+            sp_item["careless_residual"] = round(float(res_all[j]), 3)
+        if scl_all is not None and j < len(scl_all) and np.isfinite(scl_all[j]):
+            sp_item["careless_scale"] = round(float(scl_all[j]), 4)
+        if m_i_all is not None and j < len(m_i_all) and np.isfinite(m_i_all[j]):
+            sp_item["merged_i"] = round(float(m_i_all[j]), 2)
+        if (
+            m_sigi_all is not None
+            and j < len(m_sigi_all)
+            and np.isfinite(m_sigi_all[j])
+        ):
+            sp_item["merged_sigi"] = round(float(m_sigi_all[j]), 2)
+        sample_peaks.append(sp_item)
+    return sample_peaks
+
+
+def build_rainbow_zone_payload(
+    peaks_xyz: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None = None,
+    replay_h5: str | os.PathLike | None = None,
+    *,
+    images_h5: str | os.PathLike | None = None,
+    projection: str | None = None,
+    U: np.ndarray | None = None,
+    B: np.ndarray | None = None,
+    R_gonio: np.ndarray | None = None,
+    ki: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    wavelength_range: tuple[float, float] | None = None,
+    d_min: float | None = None,
+    instrument: str = "IMAGINE",
+    space_group: str = "P 1",
+    cell: list[float] | None = None,
+    max_zone_index: int = 3,
+    zone_tolerance_deg: float = 0.75,
+    min_zone_peaks: int = 2,
+    max_zones: int = 36,
+    n_arc: int = 720,
+    max_peaks: int = 2500,
+    render_binning: int = 4,
+    frame_index: int | None = None,
+    include_panels: bool = True,
+    include_panel_images: bool = True,
+    include_peaks: bool = True,
+    include_all_runs_peaks: bool = True,
+) -> dict[str, Any]:
+    """Build the JSON-serializable data contract for the Rainbow Zones widget.
+
+    Includes detector bank outlines in both Cylindrical ``(az, y)`` and Spherical
+    ``(az, elevation)`` coordinates, log-scaled detector intensity heatmaps,
+    peak reflections, and Lattice Ladder steps.
+    """
+    detectors: dict[int, Any] = {}
+    fallback_cell = list(cell) if cell and len(cell) == 6 else None
+    fallback_sg = space_group
+    cell = None
+    bank_arr = None
+    pixel_r_arr = None
+    pixel_c_arr = None
+    intensity_arr = None
+    sigma_arr = None
+    var_u_arr = None
+    var_v_arr = None
+    cov_uv_arr = None
+    artifact_kind = "solve"
+    peak_shape_mode = "solved_circle"
+    hkl_arr = None
+    lam_arr = None
+    careless_residual_arr = None
+    careless_scale_arr = None
+    merged_i_arr = None
+    merged_sigi_arr = None
+    merge_metrics: dict[str, Any] | None = None
+    all_runs_data: dict[str, Any] | None = None
+    predicted_frame_data: dict[str, np.ndarray] | None = None
+    predicted_all_runs_data: dict[str, Any] | None = None
+    has_predictor_h5 = False
+    has_tof_data = False
+    R_per_run_all: dict[int, np.ndarray] = {}
+    solve_diagnostics = None
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None
+    em_mask_summary: dict[str, Any] = {"available": False}
+    frame_slice = None
+    frames_meta: list[dict[str, Any]] = []
+    active_frame = int(frame_index) if frame_index is not None else 0
+
+    if replay_h5 is not None:
+        extracted = _extract_from_h5(
+            replay_h5,
+            images_h5=images_h5,
+            frame_index=frame_index,
+            include_peaks=include_peaks,
+            include_all_runs_peaks=include_all_runs_peaks,
+            default_instrument=instrument or "IMAGINE",
+            d_min=d_min,
+        )
+        instrument = extracted["instrument"] or instrument
+        ki = extracted["ki"]
+        if wavelength_range is None:
+            wavelength_range = extracted["wavelength_range"]
+        if U is None:
+            U = extracted["U"]
+        if B is None:
+            B = extracted["B"]
+        ex_sg = extracted.get("space_group")
+        if ex_sg and ex_sg not in ("P 1", "Unknown"):
+            space_group = ex_sg
+        elif fallback_sg and fallback_sg not in ("P 1", "Unknown"):
+            space_group = fallback_sg
+        else:
+            space_group = ex_sg or space_group
+        cell = extracted["cell"] or fallback_cell
+        detectors = extracted["detectors"]
+        if peaks_xyz is None:
+            peaks_xyz = extracted["peaks_xyz"]
+        bank_arr = extracted["bank"]
+        pixel_r_arr = extracted["pixel_r"]
+        pixel_c_arr = extracted["pixel_c"]
+        intensity_arr = extracted["intensity"]
+        sigma_arr = extracted["sigma"]
+        var_u_arr = extracted.get("var_u")
+        var_v_arr = extracted.get("var_v")
+        cov_uv_arr = extracted.get("cov_uv")
+        artifact_kind = extracted.get("artifact_kind") or artifact_kind
+        peak_shape_mode = extracted.get("peak_shape_mode") or peak_shape_mode
+        hkl_arr = extracted["hkl"]
+        lam_arr = extracted["wavelength"]
+        careless_residual_arr = extracted.get("careless_residual")
+        careless_scale_arr = extracted.get("careless_scale")
+        merged_i_arr = extracted.get("merged_i")
+        merged_sigi_arr = extracted.get("merged_sigi")
+        merge_metrics = extracted.get("merge_metrics")
+        all_runs_data = extracted.get("all_runs_data")
+        predicted_frame_data = extracted.get("predicted_frame_data")
+        predicted_all_runs_data = extracted.get("predicted_all_runs_data")
+        has_predictor_h5 = bool(extracted.get("has_predictor_h5"))
+        has_tof_data = bool(extracted.get("has_tof_data"))
+        R_per_run_all = dict(extracted.get("R_per_run_all") or {})
+        s_lab_per_run_all = dict(extracted.get("s_lab_per_run_all") or {})
+        s_lab_single = np.asarray(
+            extracted.get("sample_offset_lab", np.zeros(3, dtype=float)),
+            dtype=float,
+        ).ravel()[:3]
+        solve_diagnostics = extracted.get("solve_diagnostics")
+        pixel_class_by_bank = extracted.get("pixel_class_by_bank")
+        em_mask_summary = extracted.get("em_mask_summary") or {"available": False}
+        frame_slice = extracted.get("frame_slice")
+        frames_meta = extracted.get("frames") or []
+        active_frame = int(extracted.get("frame_index", active_frame))
+        if R_gonio is None:
+            R_gonio = extracted["R_gonio"]
+        if extracted.get("images_h5"):
+            images_h5 = extracted["images_h5"]
+        elif images_h5 is None:
+            images_h5 = _discover_images_h5(replay_h5)
+    elif not detectors:
+        detectors = _load_detectors_from_h5(None, instrument)
+        cell = fallback_cell
+        if peaks_xyz is None and ub_matrix is None and U is None:
+            artifact_kind = "empty"
+        s_lab_per_run_all = {}
+        s_lab_single = np.zeros(3, dtype=float)
     else:
-        sample_peaks = peaks_list
+        s_lab_per_run_all = {}
+        s_lab_single = np.zeros(3, dtype=float)
+    has_tof_data = bool(has_tof_data or _h5_has_tof_data(replay_h5, images_h5))
+    if wavelength_range is None:
+        wavelength_range = _get_instrument_default_wavelength(instrument)
+
+    if peaks_xyz is None:
+        peaks_xyz = np.zeros((0, 3), dtype=float)
+    pts = np.asarray(peaks_xyz, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("peaks_xyz must have shape (N, 3)")
+
+    if ub_matrix is None and U is not None and B is not None:
+        ub_matrix = np.asarray(U, dtype=float) @ np.asarray(B, dtype=float)
+    elif ub_matrix is not None:
+        ub_matrix = np.asarray(ub_matrix, dtype=float)
+        if U is None:
+            U = _u_from_ub(ub_matrix)
+        if B is None:
+            cell = list(_cell_from_B(ub_matrix))
+
+    if cell is None and B is not None:
+        cell = list(_cell_from_B(B))
+
+    ki_hat = np.asarray(ki, dtype=float)
+    ki_hat = ki_hat / np.linalg.norm(ki_hat)
+    wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
+
+    R_single = np.eye(3)
+    if R_gonio is not None:
+        R_arr = np.asarray(R_gonio, dtype=float)
+        if R_arr.ndim == 2:
+            R_single = R_arr
+        elif R_arr.ndim == 3 and len(R_arr) > 0:
+            R_single = R_arr[0]
+
+    raw_zones, zones_payload = _compute_zones_payload_for_geometry(
+        pts,
+        ub_matrix=ub_matrix,
+        R_gonio=R_gonio,
+        R_single=R_single,
+        ki_hat=ki_hat,
+        detectors=detectors,
+        sample_offset_lab=s_lab_single,
+        max_zone_index=max_zone_index,
+        zone_tolerance_deg=zone_tolerance_deg,
+        min_zone_peaks=min_zone_peaks,
+        max_zones=max_zones,
+        n_arc=n_arc,
+    )
+
+    is_integrated_artifact = artifact_kind in ("integrator", "merged_careless")
+    primary_source = "integrated" if is_integrated_artifact else "predicted"
+    primary_max_peaks = (
+        max(int(max_peaks), 12000) if int(max_peaks) == 2500 else int(max_peaks)
+    )
+
+    default_d_min = round(0.5 * float(wl_min), 2)
+    d_min_use = (
+        float(d_min)
+        if d_min is not None and float(d_min) > 0
+        else float((solve_diagnostics or {}).get("d_min", default_d_min))
+    )
+
+    spot_ang_err_primary: np.ndarray | None = None
+    spot_img_avail_primary = False
+    angular_error_mode = "image_2d"
+    tof_gate_meta: dict[str, Any] | None = None
+    has_tof_events = _h5_has_tof_events(images_h5, replay_h5)
+    tof_l1_resolved = (
+        _resolve_tof_l1(replay_h5, images_h5, instrument=instrument)
+        if (has_tof_data or has_tof_events)
+        else None
+    )
+    primary_sub_order = (
+        _select_serialized_peak_indices(
+            pts,
+            max_peaks=primary_max_peaks,
+            intensity_arr=intensity_arr,
+            ub_matrix=ub_matrix,
+            hkl_arr=hkl_arr,
+            sample_offset_lab=s_lab_single,
+        )
+        if len(pts) > 0
+        else None
+    )
+    primary_eval_mask: np.ndarray | None = None
+    if primary_sub_order is not None:
+        primary_eval_mask = np.zeros(len(pts), dtype=bool)
+        primary_eval_mask[primary_sub_order] = True
+
+    if primary_source == "predicted" and len(pts) > 0:
+        (
+            spot_ang_err_primary,
+            spot_img_avail_primary,
+            angular_error_mode,
+            tof_gate_meta,
+        ) = _estimate_spot_angular_errors_deg(
+            images_h5=images_h5,
+            replay_h5=replay_h5,
+            frame_slice=frame_slice,
+            hkl_arr=hkl_arr,
+            bank_arr=bank_arr,
+            pixel_r_arr=pixel_r_arr,
+            pixel_c_arr=pixel_c_arr,
+            lam_arr=lam_arr,
+            ub_matrix=ub_matrix,
+            R_run=R_single,
+            detectors=detectors,
+            ki_hat=ki_hat,
+            sample_offset_lab=s_lab_single,
+            pixel_class_by_bank=pixel_class_by_bank,
+            instrument=instrument,
+            tof_l1=tof_l1_resolved,
+            wavelength_range=(wl_min, wl_max),
+            eval_mask=primary_eval_mask,
+        )
+
+    peaks_list = _serialize_peak_entries(
+        pts,
+        bank_arr=bank_arr,
+        pixel_r_arr=pixel_r_arr,
+        pixel_c_arr=pixel_c_arr,
+        intensity_arr=intensity_arr,
+        sigma_arr=sigma_arr,
+        var_u_arr=var_u_arr,
+        var_v_arr=var_v_arr,
+        cov_uv_arr=cov_uv_arr,
+        hkl_arr=hkl_arr,
+        lam_arr=lam_arr,
+        careless_residual_arr=careless_residual_arr,
+        careless_scale_arr=careless_scale_arr,
+        merged_i_arr=merged_i_arr,
+        merged_sigi_arr=merged_sigi_arr,
+        ub_matrix=ub_matrix,
+        R_gonio=R_gonio,
+        ki_hat=ki_hat,
+        wavelength_range=(wl_min, wl_max),
+        space_group=space_group,
+        cell=cell,
+        detectors=detectors,
+        raw_zones=raw_zones,
+        active_frame=active_frame,
+        zone_tolerance_deg=zone_tolerance_deg,
+        max_peaks=primary_max_peaks,
+        peak_source=primary_source,
+        d_min=d_min_use,
+        sample_offset_lab=s_lab_single,
+        spot_ang_err_arr=spot_ang_err_primary,
+        spot_img_available=spot_img_avail_primary,
+        subsample_order=primary_sub_order,
+    )
+
+    measured_err_by_zone: dict[int, list[float]] = {}
+    for pk_item in peaks_list:
+        if pk_item.get("has_angular_error"):
+            ev = float(pk_item.get("angular_error_deg") or 0.0)
+            for zid_m in pk_item.get("zone_ids") or ():
+                measured_err_by_zone.setdefault(int(zid_m), []).append(ev)
+    if measured_err_by_zone:
+        for zp in zones_payload:
+            z_errs = measured_err_by_zone.get(int(zp["zone_id"]))
+            if z_errs:
+                zp["angular_rms_deg"] = round(
+                    float(np.sqrt(np.mean(np.square(z_errs)))), 4
+                )
+
+    sample_peaks = (
+        _serialize_sample_peaks(
+            all_runs_data,
+            fallback_peaks=peaks_list,
+            n_frames=len(frames_meta),
+            ki_hat=ki_hat,
+            R_single=R_single,
+            wavelength_range=(wl_min, wl_max),
+            space_group=space_group,
+            cell=cell,
+            ub_matrix=ub_matrix,
+            merged_i_arr=merged_i_arr,
+            merged_sigi_arr=merged_sigi_arr,
+            peak_source=primary_source,
+            d_min=d_min_use,
+            sample_offset_lab=s_lab_single,
+        )
+        if include_all_runs_peaks
+        else []
+    )
+
+    if is_integrated_artifact:
+        integrated_peaks = peaks_list
+        integrated_sample_peaks = sample_peaks
+
+        # If no companion predictor.h5 from `subhkl peak-predictor` was found and
+        # integrated.h5 was pre-filtered with no extra unintegrated candidates,
+        # forward-project theoretical Laue reflections from (U, B, space_group).
+        if (
+            not has_predictor_h5
+            and (
+                predicted_frame_data is None
+                or len(predicted_frame_data.get("peaks_xyz", []))
+                <= len(integrated_peaks)
+            )
+            and ub_matrix is not None
+            and cell is not None
+            and len(cell) >= 6
+            and detectors
+        ):
+            with contextlib.suppress(
+                ImportError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
+                from subhkl.core.crystallography import (
+                    generate_ewald_reflections,
+                    generate_reflections,
+                )
+
+                U_fb = (
+                    np.asarray(U, dtype=float)
+                    if U is not None
+                    else _u_from_ub(ub_matrix)
+                )
+                B_fb = (
+                    np.asarray(B, dtype=float)
+                    if B is not None
+                    else U_fb.T @ np.asarray(ub_matrix, dtype=float)
+                )
+                UB_fb = U_fb @ B_fb
+                d_fb_kin = max(0.25, float(d_min_use), 0.5 * float(wl_min) - 1e-5)
+                det_ub_fb = abs(float(np.linalg.det(UB_fb)))
+                vol_fb = (1.0 / det_ub_fb) if det_ub_fb > 1e-12 else 1000.0
+                if (4.0 * np.pi / 3.0) * vol_fb / max(d_fb_kin**3, 1e-6) > 2_000_000.0:
+                    h_gen, k_gen, l_gen = generate_ewald_reflections(
+                        float(cell[0]),
+                        float(cell[1]),
+                        float(cell[2]),
+                        float(cell[3]),
+                        float(cell[4]),
+                        float(cell[5]),
+                        str(space_group),
+                        d_fb_kin,
+                        UB=UB_fb,
+                        R_runs=[R_single],
+                        ki=ki_hat,
+                        wavelength_range=(wl_min, wl_max),
+                    )
+                else:
+                    h_gen, k_gen, l_gen = generate_reflections(
+                        float(cell[0]),
+                        float(cell[1]),
+                        float(cell[2]),
+                        float(cell[3]),
+                        float(cell[4]),
+                        float(cell[5]),
+                        str(space_group),
+                        d_fb_kin,
+                    )
+                hkl_theo = np.column_stack([h_gen, k_gen, l_gen]).astype(np.int32)
+                fb_active_bids: set[int] = set()
+                if images_h5 and os.path.exists(images_h5):
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ),
+                        h5py.File(images_h5, "r") as mf_fb,
+                    ):
+                        if "images" in mf_fb and "bank_ids" in mf_fb:
+                            fb_active_bids = {
+                                int(b) for b in np.asarray(mf_fb["bank_ids"], dtype=int)
+                            }
+                eff_fb_border = default_rel_border_for_instrument(instrument)
+                ray_fr = _raycast_hkl_on_detectors(
+                    hkl_theo,
+                    U_fb,
+                    B_fb,
+                    R_single,
+                    detectors,
+                    (wl_min, wl_max),
+                    ki=ki_hat,
+                    sample_offset_lab=s_lab_single,
+                    active_bids=fb_active_bids or None,
+                    pixel_class_by_bank=pixel_class_by_bank,
+                    margin_frac=eff_fb_border,
+                )
+                if len(ray_fr["peaks_xyz"]) > len(
+                    (predicted_frame_data or {}).get("peaks_xyz", [])
+                ):
+                    predicted_frame_data = {
+                        "peaks_xyz": ray_fr["peaks_xyz"],
+                        "hkl": ray_fr["hkl"],
+                        "wavelength": ray_fr["wavelength"],
+                        "bank": ray_fr["bank"],
+                        "pixel_r": ray_fr["pixel_r"],
+                        "pixel_c": ray_fr["pixel_c"],
+                        "intensity": None,
+                        "sigma": None,
+                    }
+                    if include_all_runs_peaks and len(frames_meta) > 1:
+                        all_xyz_p, all_hkl_p, all_lam_p, all_bnk_p, all_run_p = (
+                            [],
+                            [],
+                            [],
+                            [],
+                            [],
+                        )
+                        for r_i in range(len(frames_meta)):
+                            R_ri = R_per_run_all.get(r_i, R_single)
+                            s_ri = s_lab_per_run_all.get(r_i, s_lab_single)
+                            ray_r = (
+                                ray_fr
+                                if r_i == active_frame
+                                else _raycast_hkl_on_detectors(
+                                    hkl_theo,
+                                    U_fb,
+                                    B_fb,
+                                    R_ri,
+                                    detectors,
+                                    (wl_min, wl_max),
+                                    ki=ki_hat,
+                                    sample_offset_lab=s_ri,
+                                    active_bids=fb_active_bids or None,
+                                    pixel_class_by_bank=pixel_class_by_bank,
+                                    margin_frac=eff_fb_border,
+                                )
+                            )
+                            n_rr = len(ray_r["peaks_xyz"])
+                            if n_rr > 0:
+                                all_xyz_p.append(ray_r["peaks_xyz"])
+                                all_hkl_p.append(ray_r["hkl"])
+                                all_lam_p.append(ray_r["wavelength"])
+                                all_bnk_p.append(ray_r["bank"])
+                                all_run_p.append(np.full(n_rr, int(r_i), dtype=int))
+                        if all_xyz_p:
+                            pts_pa = np.concatenate(all_xyz_p, axis=0)
+                            hkl_pa = np.concatenate(all_hkl_p, axis=0)
+                            lam_pa = np.concatenate(all_lam_p, axis=0)
+                            bnk_pa = np.concatenate(all_bnk_p, axis=0)
+                            run_pa = np.concatenate(all_run_p, axis=0)
+                            if len(pts_pa) > 36000:
+                                sub_i = np.linspace(
+                                    0, len(pts_pa) - 1, 36000, dtype=int
+                                )
+                                pts_pa = pts_pa[sub_i]
+                                hkl_pa = hkl_pa[sub_i]
+                                lam_pa = lam_pa[sub_i]
+                                bnk_pa = bnk_pa[sub_i]
+                                run_pa = run_pa[sub_i]
+                            predicted_all_runs_data = {
+                                "peaks_xyz": pts_pa,
+                                "hkl": hkl_pa,
+                                "wavelength": lam_pa,
+                                "intensity": None,
+                                "sigma": None,
+                                "bank": bnk_pa,
+                                "run_index": run_pa,
+                                "R_per_run": R_per_run_all,
+                                "s_lab_per_run": s_lab_per_run_all,
+                            }
+
+        if (
+            predicted_frame_data is not None
+            and len(predicted_frame_data.get("peaks_xyz", [])) > 0
+        ):
+            pred_pts_arr = np.asarray(predicted_frame_data["peaks_xyz"], dtype=float)
+            pred_max_peaks = max(int(max_peaks), 12000)
+            pred_sub_order = _select_serialized_peak_indices(
+                pred_pts_arr,
+                max_peaks=pred_max_peaks,
+                intensity_arr=predicted_frame_data.get("intensity"),
+                ub_matrix=ub_matrix,
+                hkl_arr=predicted_frame_data.get("hkl"),
+                sample_offset_lab=s_lab_single,
+            )
+            pred_eval_mask: np.ndarray | None = None
+            if pred_sub_order is not None:
+                pred_eval_mask = np.zeros(len(pred_pts_arr), dtype=bool)
+                pred_eval_mask[pred_sub_order] = True
+            (
+                spot_err_pred,
+                spot_avail_pred,
+                pred_err_mode,
+                pred_gate_meta,
+            ) = _estimate_spot_angular_errors_deg(
+                images_h5=images_h5,
+                replay_h5=replay_h5,
+                frame_slice=frame_slice,
+                hkl_arr=predicted_frame_data.get("hkl"),
+                bank_arr=predicted_frame_data.get("bank"),
+                pixel_r_arr=predicted_frame_data.get("pixel_r"),
+                pixel_c_arr=predicted_frame_data.get("pixel_c"),
+                lam_arr=predicted_frame_data.get("wavelength"),
+                ub_matrix=ub_matrix,
+                R_run=R_single,
+                detectors=detectors,
+                ki_hat=ki_hat,
+                sample_offset_lab=s_lab_single,
+                pixel_class_by_bank=pixel_class_by_bank,
+                instrument=instrument,
+                tof_l1=tof_l1_resolved,
+                wavelength_range=(wl_min, wl_max),
+                eval_mask=pred_eval_mask,
+            )
+            if pred_err_mode == "tof_3d":
+                angular_error_mode = "tof_3d"
+                if tof_gate_meta is None:
+                    tof_gate_meta = pred_gate_meta
+            predicted_peaks = _serialize_peak_entries(
+                pred_pts_arr,
+                bank_arr=predicted_frame_data.get("bank"),
+                pixel_r_arr=predicted_frame_data.get("pixel_r"),
+                pixel_c_arr=predicted_frame_data.get("pixel_c"),
+                intensity_arr=predicted_frame_data.get("intensity"),
+                sigma_arr=predicted_frame_data.get("sigma"),
+                var_u_arr=None,
+                var_v_arr=None,
+                cov_uv_arr=None,
+                hkl_arr=predicted_frame_data.get("hkl"),
+                lam_arr=predicted_frame_data.get("wavelength"),
+                ub_matrix=ub_matrix,
+                R_gonio=R_single,
+                ki_hat=ki_hat,
+                wavelength_range=(wl_min, wl_max),
+                space_group=space_group,
+                cell=cell,
+                detectors=detectors,
+                raw_zones=raw_zones,
+                active_frame=active_frame,
+                zone_tolerance_deg=zone_tolerance_deg,
+                max_peaks=pred_max_peaks,
+                peak_source="predicted",
+                d_min=d_min_use,
+                sample_offset_lab=s_lab_single,
+                spot_ang_err_arr=spot_err_pred,
+                spot_img_available=spot_avail_pred,
+                subsample_order=pred_sub_order,
+            )
+            predicted_sample_peaks = (
+                _serialize_sample_peaks(
+                    predicted_all_runs_data,
+                    fallback_peaks=predicted_peaks,
+                    n_frames=len(frames_meta),
+                    ki_hat=ki_hat,
+                    R_single=R_single,
+                    wavelength_range=(wl_min, wl_max),
+                    space_group=space_group,
+                    cell=cell,
+                    ub_matrix=ub_matrix,
+                    peak_source="predicted",
+                    d_min=d_min_use,
+                    sample_offset_lab=s_lab_single,
+                )
+                if include_all_runs_peaks
+                else []
+            )
+        else:
+            predicted_peaks = []
+            predicted_sample_peaks = []
+        default_peak_source = "integrated" if len(integrated_peaks) > 0 else "predicted"
+    else:
+        predicted_peaks = peaks_list
+        predicted_sample_peaks = sample_peaks
+        integrated_peaks = []
+        integrated_sample_peaks = []
+        default_peak_source = "predicted"
 
     if isinstance(merge_metrics, dict):
+        if space_group and "space_group" not in merge_metrics:
+            merge_metrics["space_group"] = str(space_group)
+        if cell and len(cell) >= 6 and "cell" not in merge_metrics:
+            merge_metrics["cell"] = [round(float(x), 4) for x in cell[:6]]
+        if "wavelength_range" not in merge_metrics:
+            merge_metrics["wavelength_range"] = [round(wl_min, 3), round(wl_max, 3)]
         if "harmonic_overlap_fraction" not in merge_metrics and len(sample_peaks) > 0:
             n_harm = sum(
                 1 for p in sample_peaks if int(p.get("harmonic_multiplicity", 1)) > 1
@@ -3554,7 +9417,8 @@ def build_rainbow_zone_payload(
             not isinstance(bins_in, list)
             or len(bins_in) == 0
             or any(
-                "mean_isigi" not in b or "completeness_pct" not in b for b in bins_in
+                "mean_isigi" not in b or "completeness_pct" not in b or "n_obs" not in b
+                for b in bins_in
             )
         )
         if needs_bin_enrich and len(sample_peaks) > 0:
@@ -3586,16 +9450,27 @@ def build_rainbow_zone_payload(
                         ],
                         dtype=float,
                     )
+                    asu_nobs = np.array(
+                        [len(asu_obs_map[k]) for k in asu_keys],
+                        dtype=int,
+                    )
                     asu_isigi = np.array(
                         [
                             float(asu_obs_map[k][0]["merged_i"])
                             / max(
-                                float(asu_obs_map[k][0].get("merged_sigi", 1.0)), 1e-6
+                                float(asu_obs_map[k][0].get("merged_sigi") or 1.0),
+                                1e-6,
                             )
-                            if "merged_i" in asu_obs_map[k][0]
-                            and float(asu_obs_map[k][0].get("merged_sigi", 0.0)) > 0
-                            else float(asu_obs_map[k][0].get("intensity", 100.0))
-                            / max(float(asu_obs_map[k][0].get("sigma", 3.0)), 1e-6)
+                            if asu_obs_map[k][0].get("merged_i") is not None
+                            and float(asu_obs_map[k][0].get("merged_sigi") or 0.0) > 0
+                            else (
+                                float(asu_obs_map[k][0]["intensity"])
+                                / max(float(asu_obs_map[k][0]["sigma"]), 1e-6)
+                                if asu_obs_map[k][0].get("intensity") is not None
+                                and asu_obs_map[k][0].get("sigma") is not None
+                                and float(asu_obs_map[k][0]["sigma"]) > 0
+                                else 0.0
+                            )
                             for k in asu_keys
                         ],
                         dtype=float,
@@ -3686,6 +9561,20 @@ def build_rainbow_zone_payload(
                             if isinstance(bins_in, list) and b_idx < len(bins_in)
                             else {}
                         )
+                        n_obs_b = (
+                            int(orig_b["n_obs"])
+                            if orig_b.get("n_obs") is not None
+                            else int(np.sum(asu_nobs[bm_o]))
+                        )
+                        mult_b = (
+                            float(orig_b["multiplicity"])
+                            if orig_b.get("multiplicity") is not None
+                            else (
+                                round(float(n_obs_b) / max(1, n_m_b), 2)
+                                if n_m_b > 0
+                                else 0.0
+                            )
+                        )
                         cc_b = orig_b.get("cc_half")
                         d_lo = round(float(1.0 / np.sqrt(max(lo_e, 1e-6))), 2)
                         d_hi = round(float(1.0 / np.sqrt(max(hi_e, 1e-6))), 2)
@@ -3694,149 +9583,19 @@ def build_rainbow_zone_payload(
                                 "bin": b_idx,
                                 "d_max": orig_b.get("d_max", d_lo),
                                 "d_min": orig_b.get("d_min", d_hi),
-                                "n_refl": n_m_b,
-                                "n_theo": n_t_b,
-                                "completeness_pct": comp_b,
-                                "mean_isigi": isig_b,
+                                "n_obs": n_obs_b,
+                                "n_refl": orig_b.get("n_refl", n_m_b),
+                                "n_theo": orig_b.get("n_theo", n_t_b),
+                                "multiplicity": mult_b,
+                                "completeness_pct": orig_b.get(
+                                    "completeness_pct", comp_b
+                                ),
+                                "mean_isigi": orig_b.get("mean_isigi", isig_b),
                                 "cc_half": cc_b,
                             }
                         )
                     merge_metrics["cc_half_bins"] = enriched_bins
                     merge_metrics["resolution_bins"] = enriched_bins
-
-    zones_payload: list[dict[str, Any]] = []
-    for zi, z in enumerate(raw_zones):
-        t_cryst = np.asarray(z["axis_crystal_xyz"], dtype=float)
-        t_lab = R_single @ t_cryst
-        conic_cryst = get_zone_conic_points(t_cryst, ki=ki_hat, n_arc=n_arc)
-        conic_lab = get_zone_conic_points(t_lab, ki=ki_hat, n_arc=n_arc)
-
-        det_segments: list[list[list[float]]] = []
-        det_segments_sph: list[list[list[float]]] = []
-        kf = conic_lab["kf_hat"]
-        if detectors:
-            for bk, det in sorted(detectors.items()):
-                with contextlib.suppress(
-                    OSError,
-                    RuntimeError,
-                    ValueError,
-                    TypeError,
-                    KeyError,
-                    IndexError,
-                ):
-                    mask, row, col = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
-                    if not np.any(mask):
-                        continue
-                    idx_hits = np.where(mask)[0]
-                    splits = np.where(np.diff(idx_hits) > 2)[0] + 1
-                    for chunk in np.split(idx_hits, splits):
-                        if len(chunk) < 2:
-                            continue
-                        xyz_seg = det.pixel_to_lab(row[chunk], col[chunk])
-                        px, py = _unrolled(xyz_seg)
-                        _, pel = _spherical_angles(xyz_seg)
-                        if np.ptp(px) <= 90.0:
-                            step_s = max(1, len(px) // 32)
-                            det_segments.append(
-                                [
-                                    [
-                                        round(float(px[j]), 2),
-                                        round(float(py[j]), 4),
-                                    ]
-                                    for j in range(0, len(px), step_s)
-                                ]
-                            )
-                            det_segments_sph.append(
-                                [
-                                    [
-                                        round(float(px[j]), 2),
-                                        round(float(pel[j]), 3),
-                                    ]
-                                    for j in range(0, len(px), step_s)
-                                ]
-                            )
-
-        dx = np.asarray(conic_lab["det_x"], dtype=float)
-        dy = np.asarray(conic_lab["det_y"], dtype=float)
-        del_deg = np.asarray(conic_lab["det_el"], dtype=float)
-        if n_peaks > 0:
-            med_r_xz = float(np.median(np.hypot(pts[:, 0], pts[:, 2])))
-            if med_r_xz > 0.05:
-                dy = dy * med_r_xz
-
-        continuous_segments: list[list[list[float]]] = []
-        continuous_segments_sph: list[list[list[float]]] = []
-        cur_seg: list[list[float]] = []
-        cur_seg_sph: list[list[float]] = []
-        for k in range(0, len(dx), 2):
-            if cur_seg and abs(dx[k] - cur_seg[-1][0]) > 45.0:
-                if len(cur_seg) >= 2:
-                    continuous_segments.append(cur_seg)
-                    continuous_segments_sph.append(cur_seg_sph)
-                cur_seg = []
-                cur_seg_sph = []
-            cur_seg.append([round(float(dx[k]), 2), round(float(dy[k]), 4)])
-            cur_seg_sph.append([round(float(dx[k]), 2), round(float(del_deg[k]), 3)])
-        if len(cur_seg) >= 2:
-            continuous_segments.append(cur_seg)
-            continuous_segments_sph.append(cur_seg_sph)
-
-        if not detectors and not det_segments:
-            det_segments = continuous_segments
-            det_segments_sph = continuous_segments_sph
-
-        sx_z = np.asarray(conic_cryst["sx"], dtype=float)
-        sy_z = np.asarray(conic_cryst["sy"], dtype=float)
-        hm_z = np.asarray(conic_cryst["hemisphere"], dtype=int)
-        stereo_segments: list[list[list[float]]] = []
-        cur_s: list[list[float]] = []
-        for k in range(0, len(sx_z), 2):
-            if cur_s and (
-                hm_z[k] != cur_s[-1][2]
-                or np.hypot(sx_z[k] - cur_s[-1][0], sy_z[k] - cur_s[-1][1]) > 0.35
-            ):
-                if len(cur_s) >= 2:
-                    stereo_segments.append(cur_s)
-                cur_s = []
-            cur_s.append(
-                [
-                    round(float(sx_z[k]), 4),
-                    round(float(sy_z[k]), 4),
-                    int(hm_z[k]),
-                ]
-            )
-        if len(cur_s) >= 2:
-            stereo_segments.append(cur_s)
-
-        pole_sx, pole_sy, pole_hemi = stereographic_projection(t_cryst)
-
-        zones_payload.append(
-            {
-                "zone_id": int(z["zone_id"]),
-                "uvw": z["uvw"],
-                "order": int(z.get("order", max(abs(int(x)) for x in z["uvw"]))),
-                "label": z["label"],
-                "axis_xyz": z["axis_xyz"],
-                "axis_crystal_xyz": z["axis_crystal_xyz"],
-                "pole_stereo": [
-                    round(float(pole_sx), 4),
-                    round(float(pole_sy), 4),
-                    int(pole_hemi),
-                ],
-                "d_direct": z["d_direct"],
-                "score": z["score"],
-                "n_peaks": z["n_peaks"],
-                "angular_rms_deg": z["angular_rms_deg"],
-                "member_peak_ids": z["member_peak_ids"],
-                "rainbow_color": RAINBOW_SPECTRAL_HEX[zi % len(RAINBOW_SPECTRAL_HEX)],
-                "pro_color": PRO_PALETTE_HEX[zi % len(PRO_PALETTE_HEX)],
-                "stereo_segments": stereo_segments,
-                "detector_segments": det_segments,
-                "detector_segments_sph": det_segments_sph,
-                "continuous_segments": continuous_segments,
-                "continuous_segments_sph": continuous_segments_sph,
-            }
-        )
 
     if include_panels:
         panels_payload, intensity_source = _encode_panel_textures(
@@ -3881,73 +9640,285 @@ def build_rainbow_zone_payload(
         else default_projection_for_instrument(instrument)
     )
 
-    default_d_min = round(0.5 * float(wl_min), 2)
-    d_min_use = (
-        float(d_min)
-        if d_min is not None and float(d_min) > 0
-        else float((solve_diagnostics or {}).get("d_min", default_d_min))
-    )
     gonio_summary = (
         frames_meta[active_frame].get("motor_summary", "—")
         if 0 <= active_frame < len(frames_meta)
         else "—"
     )
 
+    detector_configs: dict[str, dict[str, Any]] = {}
+    for bk_k, det_v in sorted(detectors.items()):
+        cfg_d = getattr(det_v, "config", None)
+        if isinstance(cfg_d, dict):
+            raw_pt = str(
+                cfg_d.get("panel") or cfg_d.get("panel_type") or "flat"
+            ).lower()
+            is_curved_d = raw_pt in ("curved", "cylindrical")
+            det_entry: dict[str, Any] = {
+                "panel": "curved" if is_curved_d else "flat",
+                "panel_type": str(
+                    cfg_d.get("panel_type")
+                    or ("cylindrical" if is_curved_d else "flat")
+                ),
+                "m": int(cfg_d.get("m", getattr(det_v, "m", 256))),
+                "n": int(cfg_d.get("n", getattr(det_v, "n", 256))),
+            }
+            for vec_k in (
+                "center",
+                "uhat",
+                "vhat",
+                "rhat",
+                "axis_offset",
+                "axis_direction",
+            ):
+                if vec_k in cfg_d and cfg_d[vec_k] is not None:
+                    det_entry[vec_k] = [round(float(x), 8) for x in cfg_d[vec_k]]
+            for scl_k in (
+                "width",
+                "height",
+                "radius",
+                "angular_width",
+                "theta_min",
+                "theta_max",
+                "y_min",
+                "y_max",
+            ):
+                if scl_k in cfg_d and cfg_d[scl_k] is not None:
+                    det_entry[scl_k] = round(float(cfg_d[scl_k]), 8)
+            detector_configs[str(bk_k)] = det_entry
+
+    gonio_R_per_run_payload = {
+        str(int(rk)): [[round(float(v), 8) for v in row] for row in rm]
+        for rk, rm in sorted(R_per_run_all.items())
+    }
+    if str(int(active_frame)) not in gonio_R_per_run_payload:
+        gonio_R_per_run_payload[str(int(active_frame))] = [
+            [round(float(v), 8) for v in row] for row in R_single
+        ]
+    sample_offset_per_run_payload = {
+        str(int(rk)): [
+            round(float(v), 8) for v in np.asarray(sv, dtype=float).ravel()[:3]
+        ]
+        for rk, sv in sorted(s_lab_per_run_all.items())
+    }
+    if str(int(active_frame)) not in sample_offset_per_run_payload:
+        sample_offset_per_run_payload[str(int(active_frame))] = [
+            round(float(v), 8) for v in s_lab_single
+        ]
+
     from subhkl.config import beamlines as _cfg_beamlines
 
     beamline_detectors: dict[str, dict[str, Any]] = {}
     for _inst_k in ("CG4D", "MANDI", "TOPAZ", "IMAGINE"):
         if _inst_k in _cfg_beamlines:
-            beamline_detectors[_inst_k] = {
-                str(bk): {
-                    "center": [round(float(x), 5) for x in cfg["center"]],
-                    "uhat": [round(float(x), 5) for x in cfg["uhat"]],
-                    "vhat": [round(float(x), 5) for x in cfg["vhat"]],
-                    "width": round(float(cfg["width"]), 5),
-                    "height": round(float(cfg["height"]), 5),
+            inst_entries: dict[str, Any] = {}
+            for bk, cfg in _cfg_beamlines[_inst_k].items():
+                if not isinstance(cfg, dict):
+                    continue
+                raw_bpt = str(
+                    cfg.get("panel") or cfg.get("panel_type") or "flat"
+                ).lower()
+                is_crv_b = raw_bpt in ("curved", "cylindrical")
+                b_entry: dict[str, Any] = {
+                    "panel": "curved" if is_crv_b else "flat",
+                    "panel_type": "cylindrical" if is_crv_b else "flat",
                     "m": int(cfg.get("m", 256)),
                     "n": int(cfg.get("n", 256)),
                 }
-                for bk, cfg in _cfg_beamlines[_inst_k].items()
-                if isinstance(cfg, dict)
-                and "center" in cfg
-                and "uhat" in cfg
-                and "vhat" in cfg
-            }
+                for vk_b in ("center", "uhat", "vhat", "rhat"):
+                    if vk_b in cfg and cfg[vk_b] is not None:
+                        b_entry[vk_b] = [round(float(x), 6) for x in cfg[vk_b]]
+                for sk_b in ("width", "height", "radius"):
+                    if sk_b in cfg and cfg[sk_b] is not None:
+                        b_entry[sk_b] = round(float(cfg[sk_b]), 6)
+                if "center" in b_entry or "radius" in b_entry:
+                    inst_entries[str(bk)] = b_entry
+            beamline_detectors[_inst_k] = inst_entries
 
-    return {
+    careless_mtz_asu_lookup: dict[str, list[float]] | None = None
+    if (
+        include_all_runs_peaks
+        and replay_h5 is not None
+        and artifact_kind == "merged_careless"
+        and os.path.exists(replay_h5)
+    ):
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, TypeError, KeyError),
+            h5py.File(replay_h5, "r") as cf_lu,
+        ):
+            if (
+                "careless/asu_hkl" in cf_lu
+                and "careless/merged_i" in cf_lu
+                and "careless/merged_sigi" in cf_lu
+            ):
+                c_asu = np.asarray(cf_lu["careless/asu_hkl"][()], dtype=int)
+                c_mi = np.asarray(cf_lu["careless/merged_i"][()], dtype=float)
+                c_ms = np.asarray(cf_lu["careless/merged_sigi"][()], dtype=float)
+                if (
+                    c_asu.ndim == 2
+                    and c_asu.shape[1] == 3
+                    and len(c_asu) == len(c_mi) == len(c_ms)
+                    and 0 < len(c_asu) <= 120000
+                ):
+                    careless_mtz_asu_lookup = {
+                        f"{int(c_asu[j, 0])},{int(c_asu[j, 1])},{int(c_asu[j, 2])}": [
+                            round(float(c_mi[j]), 2),
+                            round(float(c_ms[j]), 2),
+                        ]
+                        for j in range(len(c_asu))
+                        if np.isfinite(c_mi[j]) and np.isfinite(c_ms[j])
+                    }
+
+    out_payload: dict[str, Any] = {
         "subhkl_version": get_subhkl_version(),
         "instrument": str(instrument),
         "default_projection": resolved_proj,
         "space_group": str(space_group),
+        "space_group_ops": _serialize_space_group_ops(str(space_group)),
         "intensity_source": intensity_source,
+        "render_binning": int(render_binning),
+        "all_runs_min_isigi": 2.5,
         "artifact_kind": artifact_kind,
         "peak_shape_mode": peak_shape_mode,
+        "default_peak_source": default_peak_source,
         "pending_stage": pending_stage,
+        "ki": [round(float(x), 8) for x in ki_hat],
         "wavelength_range": [round(wl_min, 3), round(wl_max, 3)],
         "d_min": round(d_min_use, 3),
         "frame_index": int(active_frame),
         "goniometer_summary": gonio_summary,
-        "goniometer_R": [[round(float(v), 6) for v in row] for row in R_single],
+        "goniometer_R": [[round(float(v), 8) for v in row] for row in R_single],
+        "goniometer_R_per_run": gonio_R_per_run_payload,
+        "sample_offset_lab": [round(float(v), 8) for v in s_lab_single],
+        "sample_offset_lab_per_run": sample_offset_per_run_payload,
         "frames": frames_meta,
         "images_h5": str(images_h5) if images_h5 else None,
+        "has_tof_data": bool(has_tof_data),
+        "has_tof_events": bool(has_tof_events),
+        "angular_error_mode": angular_error_mode,
+        "tof_l1": round(float(tof_l1_resolved), 6) if tof_l1_resolved else None,
+        "tof_gate": tof_gate_meta,
         "cell": [round(float(x), 4) for x in cell] if cell else None,
+        "u_matrix": (
+            [[round(float(v), 8) for v in row] for row in np.asarray(U, dtype=float)]
+            if U is not None
+            else None
+        ),
+        "b_matrix": (
+            [[round(float(v), 8) for v in row] for row in np.asarray(B, dtype=float)]
+            if B is not None
+            else None
+        ),
         "ub_matrix": (
-            [[round(float(v), 6) for v in row] for row in ub_matrix]
+            [[round(float(v), 8) for v in row] for row in ub_matrix]
             if ub_matrix is not None
             else None
         ),
+        "detector_configs": detector_configs,
         "beamline_detectors": beamline_detectors,
         "solve_diagnostics": solve_diagnostics,
         "em_mask_summary": em_mask_summary,
+        "rel_border_width": round(default_rel_border_for_instrument(instrument), 4),
+        "pixel_mask_bits": (
+            _encode_pixel_valid_masks_for_js(pixel_class_by_bank, em_mask_summary)
+            if include_panels and include_all_runs_peaks
+            else None
+        ),
         "merge_metrics": merge_metrics,
         "peaks": peaks_list,
         "sample_peaks": sample_peaks,
+        "predicted_peaks": predicted_peaks,
+        "predicted_sample_peaks": predicted_sample_peaks,
+        "integrated_peaks": integrated_peaks,
+        "integrated_sample_peaks": integrated_sample_peaks,
         "zones": zones_payload,
         "panels": panels_payload,
         "ladder_steps": ladder_steps,
         "pipeline_stages": pipeline_stages,
     }
+    if careless_mtz_asu_lookup:
+        out_payload["mtz_asu_lookup"] = careless_mtz_asu_lookup
+        for _pk_bucket in (
+            peaks_list,
+            sample_peaks,
+            predicted_peaks,
+            predicted_sample_peaks,
+            integrated_peaks,
+            integrated_sample_peaks,
+        ):
+            for _pk in _pk_bucket:
+                if not isinstance(_pk, dict) or _pk.get("mtz_isigi") is not None:
+                    continue
+                _orb = _pk.get("asu_orbit_id")
+                _pair = careless_mtz_asu_lookup.get(_orb) if _orb else None
+                if _pair is not None and len(_pair) >= 2:
+                    _mi, _ms = float(_pair[0]), float(_pair[1])
+                    _pk["mtz_i"] = _mi
+                    _pk["mtz_sigi"] = _ms
+                    if _ms > 0.0 and np.isfinite(_mi / _ms):
+                        _pk["mtz_isigi"] = round(float(_mi / _ms), 2)
+        out_payload["mtz_overlay_name"] = "merged.mtz"
+    return out_payload
+
+
+def merge_frame_only_payload(
+    prev_payload: dict[str, Any] | None,
+    frame_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve dataset-wide all-runs arrays on server state after a single-frame rebuild."""
+    if not isinstance(prev_payload, dict):
+        return frame_payload
+    prev_mm = prev_payload.get("merge_metrics")
+    if isinstance(prev_mm, dict) and prev_mm:
+        frame_payload["merge_metrics"] = prev_mm
+    for keep_key in (
+        "sample_peaks",
+        "predicted_sample_peaks",
+        "integrated_sample_peaks",
+        "pixel_mask_bits",
+        "mtz_overlay_name",
+        "mtz_overlay_reflections",
+        "mtz_overlay_matched",
+        "mtz_overlay_space_group",
+        "mtz_overlay_cell",
+        "mtz_overlay_warning",
+        "mtz_asu_lookup",
+        "mtz_exact_lookup",
+    ):
+        prev_val = prev_payload.get(keep_key)
+        if prev_val is not None and not frame_payload.get(keep_key):
+            frame_payload[keep_key] = prev_val
+    return frame_payload
+
+
+def build_frame_only_response(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact HTTP response for frame switches omitting unchanged multi-run arrays."""
+    out = dict(payload)
+    out["frame_only"] = True
+    for drop_key in (
+        "sample_peaks",
+        "predicted_sample_peaks",
+        "integrated_sample_peaks",
+        "pixel_mask_bits",
+        "merge_metrics",
+        "beamline_detectors",
+        "detector_configs",
+        "space_group_ops",
+        "mtz_asu_lookup",
+        "mtz_exact_lookup",
+    ):
+        out.pop(drop_key, None)
+    # Avoid JSON-serializing the primary peak list twice (`peaks` aliases `integrated_peaks` or `predicted_peaks`)
+    has_integ_arr = (
+        isinstance(out.get("integrated_peaks"), list)
+        and len(out["integrated_peaks"]) > 0
+    )
+    has_pred_arr = (
+        isinstance(out.get("predicted_peaks"), list) and len(out["predicted_peaks"]) > 0
+    )
+    if has_integ_arr or has_pred_arr:
+        out["peaks"] = None
+    return out
 
 
 def render_rainbow_html(
@@ -3972,8 +9943,44 @@ def render_rainbow_html(
     init_wl = payload.get("wavelength_range") or [2.8, 4.5]
     init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
     init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
+    init_wl_dom_min = min(0.20, max(0.05, math.floor(init_wl_min * 20.0) / 20.0))
+    init_wl_dom_max = max(
+        6.0, math.ceil(max(init_wl_max * 1.35, init_wl_max + 0.5) * 2.0) / 2.0
+    )
+    init_wl_span = max(0.05, init_wl_dom_max - init_wl_dom_min)
+    init_wl_pct_lo = max(
+        0.0, min(100.0, ((init_wl_min - init_wl_dom_min) / init_wl_span) * 100.0)
+    )
+    init_wl_pct_hi = max(
+        init_wl_pct_lo,
+        min(100.0, ((init_wl_max - init_wl_dom_min) / init_wl_span) * 100.0),
+    )
+    init_wl_pct_w = max(0.0, init_wl_pct_hi - init_wl_pct_lo)
     init_dmin = float(payload.get("d_min") or round(0.5 * init_wl_min, 2))
+    init_border = float(
+        payload.get("rel_border_width")
+        if payload.get("rel_border_width") is not None
+        else default_rel_border_for_instrument(inst)
+    )
+    raw_init_binning = payload.get("solve_binning")
+    init_binning = (
+        str(int(raw_init_binning))
+        if raw_init_binning in (16, 8, 4, 2, "16", "8", "4", "2")
+        else ""
+    )
+    sel_bin_auto = " selected" if init_binning == "" else ""
+    sel_bin_16 = " selected" if init_binning == "16" else ""
+    sel_bin_8 = " selected" if init_binning == "8" else ""
+    sel_bin_4 = " selected" if init_binning == "4" else ""
+    sel_bin_2 = " selected" if init_binning == "2" else ""
     sg_symmetry_groups_json = _build_space_group_symmetry_lookup_json()
+    from subhkl.viz.arcade_exit_quips import (
+        ARCADE_PIXEL_FONT_DATA_URI,
+        build_arcade_exit_quips_json,
+    )
+
+    arcade_exit_quips_json = build_arcade_exit_quips_json()
+    arcade_pixel_font_uri = ARCADE_PIXEL_FONT_DATA_URI
     ep_env = os.environ.get("EP_PATH", "").strip().rstrip("/")
     base_tag_html = (
         f'<base href="{ep_env}/" />\n' if ep_env and ep_env.startswith("/") else ""
@@ -4048,7 +10055,8 @@ def render_rainbow_html(
     gap: calc(6px * var(--top-bar-scale, 1));
     white-space: nowrap;
     min-width: 0;
-    flex-shrink: 1;
+    flex: 0 1 auto;
+    overflow: hidden;
   }}
 
   .rainbow-logo {{
@@ -4121,8 +10129,8 @@ def render_rainbow_html(
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
-    flex-shrink: 0;
+    min-width: 36px;
+    flex: 0 1 auto;
   }}
 
   .hud-metrics {{
@@ -4131,7 +10139,7 @@ def render_rainbow_html(
     gap: calc(5px * var(--top-bar-scale, 1));
     white-space: nowrap;
     min-width: 0;
-    flex-shrink: 1;
+    flex-shrink: 0;
   }}
 
   .hud-pill {{
@@ -4333,14 +10341,51 @@ def render_rainbow_html(
     flex-wrap: wrap;
   }}
 
+  .stereo-inset.expanded .stereo-inset-header {{
+    flex-wrap: nowrap;
+  }}
+
+  #stereo-title {{
+    order: 1;
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+
+  .stereo-win-controls {{
+    order: 2;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex: 0 0 auto;
+    margin-left: auto;
+  }}
+
+  .stereo-inset.expanded .stereo-win-controls {{
+    order: 3;
+    margin-left: 0;
+  }}
+
   .stereo-toolbar {{
+    order: 3;
     display: flex;
     align-items: center;
     gap: 3px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    flex: 1 1 100%;
+    width: 100%;
+    min-width: 0;
   }}
 
-  .stereo-toolbar button, .stereo-toolbar select {{
+  .stereo-inset.expanded .stereo-toolbar {{
+    order: 2;
+    flex: 0 0 auto;
+    width: auto;
+  }}
+
+  .stereo-toolbar button, .stereo-toolbar select, .stereo-win-controls button {{
     font-size: 0.58rem;
     padding: 1px 5px;
     border-radius: 4px;
@@ -4349,6 +10394,41 @@ def render_rainbow_html(
     border: 1px solid var(--border-color);
     font-family: var(--font-display);
     cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }}
+
+  .stereo-win-controls button {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 19px;
+    height: 18px;
+    padding: 0;
+    line-height: 1;
+  }}
+
+  #btn-wulff-scope {{
+    flex: 0 0 54px;
+    width: 54px;
+    min-width: 54px;
+    padding-left: 0;
+    padding-right: 0;
+    text-align: center;
+  }}
+
+  #sel-wulff-color {{
+    flex: 1 1 0;
+    min-width: 0;
+    max-width: 108px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+
+  .stereo-inset.expanded #sel-wulff-color {{
+    flex: 0 0 96px;
+    width: 96px;
+    max-width: 96px;
   }}
 
   .stereo-merge-bar {{
@@ -4947,7 +11027,8 @@ def render_rainbow_html(
     display: flex;
   }}
 
-  .params-drawer input {{
+  .params-drawer input,
+  .params-drawer select {{
     background: var(--bg-card);
     color: var(--text-main);
     border: 1px solid var(--border-color);
@@ -4956,6 +11037,11 @@ def render_rainbow_html(
     font-family: var(--font-display);
     font-size: 0.64rem;
     width: 54px;
+  }}
+
+  .params-drawer select {{
+    width: auto;
+    cursor: pointer;
   }}
 
   .file-dl-pill {{
@@ -5074,6 +11160,331 @@ def render_rainbow_html(
     overflow: hidden;
     text-overflow: ellipsis;
   }}
+
+  .seg-toggle {{
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    overflow: hidden;
+    background: var(--bg-card);
+  }}
+
+  .seg-toggle button {{
+    border: none;
+    border-right: 1px solid var(--border-color);
+    border-radius: 0;
+    padding: 3px 7px;
+    font-size: 0.66rem;
+    margin: 0;
+    box-shadow: none;
+  }}
+
+  .seg-toggle button:last-child {{
+    border-right: none;
+  }}
+
+  .seg-toggle button:disabled {{
+    opacity: 0.34;
+    cursor: not-allowed;
+    pointer-events: none;
+  }}
+
+  .seg-toggle button[data-peak-src="predicted"].active-btn {{
+    background: rgba(0, 229, 255, 0.18);
+    color: var(--accent-cyan);
+    text-shadow: 0 0 6px rgba(0, 229, 255, 0.35);
+  }}
+
+  .seg-toggle button[data-peak-src="integrated"].active-btn {{
+    background: rgba(251, 191, 36, 0.20);
+    color: #fbbf24;
+    text-shadow: 0 0 6px rgba(251, 191, 36, 0.38);
+  }}
+
+  .editable-slider-val {{
+    cursor: pointer;
+    border-bottom: 1px dashed rgba(0, 229, 255, 0.45);
+    border-radius: 2px;
+    padding: 0 1px;
+    transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+  }}
+
+  .editable-slider-val:hover,
+  .editable-slider-val:focus-visible {{
+    color: var(--accent-cyan);
+    background: rgba(0, 229, 255, 0.12);
+    border-bottom-color: var(--accent-cyan);
+    outline: none;
+  }}
+
+  .inline-slider-input {{
+    width: 4.4ch;
+    padding: 0 2px;
+    margin: 0;
+    font-family: var(--font-mono, monospace);
+    font-size: inherit;
+    line-height: 1.15;
+    color: var(--accent-cyan);
+    background: rgba(7, 11, 24, 0.96);
+    border: 1px solid var(--accent-cyan);
+    border-radius: 3px;
+    text-align: right;
+    outline: none;
+    box-shadow: 0 0 6px rgba(0, 229, 255, 0.32);
+  }}
+
+  /* Photoshop-checkerboard + live active-colorscale gradient slider with crossover knob */
+  #slider-color-emphasis {{
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 13px;
+    border-radius: 6px;
+    border: 1px solid rgba(148, 163, 184, 0.48);
+    background-color: #cbd5e1;
+    background-image:
+      var(--cs-gradient, linear-gradient(90deg, rgba(20, 184, 166, 0.90) 0%, rgba(162, 220, 178, 0.85) 36%, rgba(254, 232, 170, 0.90) 50%, rgba(251, 140, 36, 0.98) 78%, rgba(232, 56, 24, 1) 100%)),
+      repeating-conic-gradient(#64748b 0% 25%, #cbd5e1 0% 50%);
+    background-size: 100% 100%, 8px 8px;
+    background-position: 0 0, 0 0;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.38);
+    cursor: ew-resize;
+    outline: none;
+    margin: 2px 0 4px 0;
+  }}
+
+  #slider-color-emphasis::-webkit-slider-thumb {{
+    -webkit-appearance: none;
+    appearance: none;
+    width: 10px;
+    height: 18px;
+    border-radius: 4px;
+    background: rgba(15, 23, 42, 0.72);
+    border: 2px solid #f8fafc;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.85), 0 1px 4px rgba(0, 0, 0, 0.65);
+    cursor: ew-resize;
+  }}
+
+  #slider-color-emphasis::-moz-range-thumb {{
+    width: 8px;
+    height: 16px;
+    border-radius: 4px;
+    background: rgba(15, 23, 42, 0.72);
+    border: 2px solid #f8fafc;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.85), 0 1px 4px rgba(0, 0, 0, 0.65);
+    cursor: ew-resize;
+  }}
+
+  /* Dual-bracket [ and ] wavelength interval slider */
+  .wl-interval-slider {{
+    position: relative;
+    height: 18px;
+    margin: 1px 5px 3px 5px;
+    display: flex;
+    align-items: center;
+    user-select: none;
+    touch-action: none;
+    cursor: pointer;
+  }}
+
+  .wl-interval-slider .sr-only-range {{
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+    margin: 0;
+  }}
+
+  .wl-track-rail {{
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 6px;
+    border-radius: 3px;
+    background: rgba(15, 23, 42, 0.88);
+    border: 1px solid rgba(148, 163, 184, 0.36);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.52);
+    pointer-events: none;
+  }}
+
+  .wl-track-fill {{
+    position: absolute;
+    height: 6px;
+    border-radius: 2px;
+    background: linear-gradient(
+      90deg,
+      hsla(265, 92%, 62%, 0.88) 0%,
+      hsla(195, 95%, 56%, 0.88) 34%,
+      hsla(120, 82%, 52%, 0.88) 68%,
+      hsla(12, 92%, 58%, 0.90) 100%
+    );
+    box-shadow: 0 0 6px rgba(56, 189, 248, 0.25);
+    pointer-events: none;
+  }}
+
+  .wl-bracket-knob {{
+    position: absolute;
+    top: 50%;
+    width: 11px;
+    height: 17px;
+    padding: 0;
+    margin: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-display);
+    font-size: 0.74rem;
+    font-weight: 800;
+    line-height: 1;
+    color: #f8fafc;
+    background: rgba(15, 23, 42, 0.94);
+    border: 1.5px solid var(--accent-cyan);
+    border-radius: 3px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.78);
+    cursor: ew-resize;
+    z-index: 2;
+    transition: border-color 0.1s ease, color 0.1s ease, background 0.1s ease;
+  }}
+
+  .wl-bracket-knob.wl-knob-min {{
+    transform: translate(-85%, -50%);
+  }}
+
+  .wl-bracket-knob.wl-knob-max {{
+    transform: translate(-15%, -50%);
+  }}
+
+  .wl-bracket-knob:hover,
+  .wl-bracket-knob:focus-visible,
+  .wl-bracket-knob.dragging {{
+    border-color: var(--accent-gold);
+    color: #fef08a;
+    background: rgba(30, 41, 59, 0.98);
+    outline: none;
+    z-index: 3;
+  }}
+</style>
+<style id="arcade-exit-style">
+  @font-face {{
+    font-family: "SubhklArcade";
+    src: url("{arcade_pixel_font_uri}") format("truetype");
+    font-weight: 400 700;
+    font-style: normal;
+    font-display: block;
+  }}
+  #btn-exit-app {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }}
+  #modal-arcade-exit {{
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 2147483000;
+    background: rgba(3, 5, 11, 0.80);
+    backdrop-filter: blur(4px);
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    font-family: "SubhklArcade", "Courier New", monospace;
+    -webkit-font-smoothing: none;
+    -moz-osx-font-smoothing: grayscale;
+    font-smooth: never;
+    user-select: none;
+  }}
+  #modal-arcade-exit.arcade-exit-card-open {{
+    display: flex;
+  }}
+  .arcade-exit-cabinet {{
+    width: min(620px, 92vw);
+    background: #090b13;
+    color: #fcd34d;
+    padding: 34px 32px 28px 32px;
+    border: 1px solid rgba(245, 158, 11, 0.45);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.88);
+    text-align: center;
+  }}
+  #arcade-exit-quip-text {{
+    font-size: 16px;
+    line-height: 28px;
+    letter-spacing: 1px;
+    color: #fcd34d;
+    text-shadow: 2px 2px 0 #3b1d06;
+    margin: 0 auto 28px auto;
+    max-width: 34ch;
+    min-height: 84px;
+    user-select: text;
+  }}
+  .arcade-exit-actions {{
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }}
+  .arcade-exit-btn {{
+    font-family: "SubhklArcade", "Courier New", monospace;
+    font-size: 12px;
+    line-height: 16px;
+    letter-spacing: 1px;
+    padding: 10px 16px;
+    border: 1px solid rgba(245, 158, 11, 0.44);
+    border-radius: 0;
+    background: transparent;
+    color: #fcd34d;
+    cursor: pointer;
+    text-transform: uppercase;
+    -webkit-font-smoothing: none;
+    transition: border-color 0.14s ease, color 0.14s ease, background 0.14s ease;
+  }}
+  .arcade-exit-btn:hover:not(:disabled) {{
+    border-color: #fbbf24;
+    background: rgba(245, 158, 11, 0.14);
+    color: #fef3c7;
+  }}
+  #btn-arcade-exit-close-tab {{
+    border-color: #ef4444;
+    background: rgba(220, 38, 38, 0.22);
+    color: #fca5a5;
+  }}
+  #btn-arcade-exit-close-tab:hover:not(:disabled) {{
+    border-color: #f87171;
+    background: rgba(220, 38, 38, 0.36);
+    color: #fff1f2;
+  }}
+  #btn-arcade-exit-close-tab:disabled {{
+    border-color: rgba(148, 163, 184, 0.22);
+    background: rgba(51, 65, 85, 0.24);
+    color: rgba(148, 163, 184, 0.46);
+    cursor: default;
+  }}
+  #modal-arcade-exit.pro-exit-mode {{
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }}
+  #modal-arcade-exit.pro-exit-mode .arcade-exit-cabinet {{
+    border-radius: 8px;
+  }}
+  #modal-arcade-exit.pro-exit-mode #arcade-exit-quip-text {{
+    font-size: 1.02rem;
+    line-height: 1.6;
+    letter-spacing: 0;
+    color: #f8fafc;
+    text-shadow: none;
+    max-width: 46ch;
+    min-height: 3.2em;
+  }}
+  #modal-arcade-exit.pro-exit-mode .arcade-exit-btn {{
+    font-family: inherit;
+    font-size: 0.78rem;
+    border-radius: 5px;
+    letter-spacing: 0.04em;
+    text-transform: none;
+    -webkit-font-smoothing: antialiased;
+  }}
 </style>
 </head>
 <body>
@@ -5081,34 +11492,34 @@ def render_rainbow_html(
   <!-- TOP BAR -->
   <header class="top-bar">
     <div class="brand-block">
-      <div class="rainbow-logo" id="app-title">{SUBHKL_LOGO_SVG}<span class="sr-only"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></span><span class="logo-version" id="app-version">{subhkl_ver_badge}</span></div>
-      <span class="subtitle-tag">{inst} · {sg}</span>
+      <div class="rainbow-logo" id="app-title" title="sUBhkl {subhkl_ver_badge} — Quasi-Laue &amp; TOF single-crystal neutron diffraction indexing, integration, and scaling">{SUBHKL_LOGO_SVG}<span class="sr-only"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></span><span class="logo-version" title="sUBhkl version {subhkl_ver_badge}" id="app-version">{subhkl_ver_badge}</span></div>
+      <span class="subtitle-tag" id="subtitle-tag" title="{inst} · {sg} — Active instrument, space group, and workflow stage">{inst} · {sg}</span>
     </div>
 
     <div class="hud-metrics">
-      <div class="hud-pill">
+      <div class="hud-pill" id="hud-peaks-pill" title="PEAKS (captured / visible): Indexed reflections captured by active Laue zones [uvw] (numerator) out of total visible reflections on this frame within λ and d_min cutoffs (denominator)">
         <span class="hud-label">PEAKS</span>
         <span class="hud-value" id="val-indexed">0 / 0</span>
       </div>
-      <div class="hud-pill">
+      <div class="hud-pill" id="hud-rms-pill" title="Δθ: RMS angular discrepancy between observed detector spot centroids and theoretical UB·hkl Bragg directions across active-zone spots (indexing &amp; calibration quality diagnostic)">
         <span class="hud-label">Δθ</span>
-        <span class="hud-value" id="val-rms">0.000°</span>
+        <span class="hud-value" id="val-rms">—</span>
       </div>
-      <div class="hud-pill">
+      <div class="hud-pill" id="hud-zones-pill" title="ZONES: Number of active Laue zone conics [uvw] shown on the detector and Wulff map (up to max zone order |u|,|v|,|w|)">
         <span class="hud-label">ZONES</span>
         <span class="hud-value" id="val-zones">0</span>
       </div>
-      <div class="hud-pill" id="hud-gonio-pill" title="Goniometer motor angles for the active frame">
+      <div class="hud-pill" id="hud-gonio-pill" title="GONIO: Goniometer motor angles for the active frame">
         <span class="hud-label">GONIO</span>
         <span class="hud-value" id="val-gonio">—</span>
       </div>
-      <div class="hud-pill" id="hud-frame-ctrl" style="gap:3px;padding:1px 5px;" title="Select goniometer frame / run orientation">
+      <div class="hud-pill" id="hud-frame-ctrl" style="gap:3px;padding:1px 5px;" title="FRAME: Select active goniometer frame / run orientation">
         <span class="hud-label">FRAME</span>
-        <button id="btn-frame-prev" style="padding:1px 5px;font-size:0.62rem;" title="Previous frame">&lt;</button>
-        <select id="sel-frame" style="background:transparent;color:var(--accent-pink);border:none;font-family:var(--font-display);font-size:0.68rem;font-weight:700;outline:none;cursor:pointer;max-width:190px;">
+        <button id="btn-frame-prev" style="padding:1px 5px;font-size:0.62rem;" title="Previous goniometer frame / run">&lt;</button>
+        <select id="sel-frame" title="Active goniometer frame / run (1 / 1)" style="background:transparent;color:var(--accent-pink);border:none;font-family:var(--font-display);font-size:0.68rem;font-weight:700;outline:none;cursor:pointer;max-width:190px;">
           <option value="0">1 / 1</option>
         </select>
-        <button id="btn-frame-next" style="padding:1px 5px;font-size:0.62rem;" title="Next frame">&gt;</button>
+        <button id="btn-frame-next" style="padding:1px 5px;font-size:0.62rem;" title="Next goniometer frame / run">&gt;</button>
       </div>
       <div class="hud-pill" style="display:none;">
         <span class="hud-label">PROJ</span>
@@ -5117,23 +11528,31 @@ def render_rainbow_html(
     </div>
 
     <div class="controls-cluster">
-      <select id="sel-galaxy-h5" title="Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus files, or select from Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:5px;padding:3px 6px;font-size:0.68rem;font-family:var(--font-display);max-width:175px;">
+      <select id="sel-galaxy-h5" title="Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus/.mtz files, or select from Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:5px;padding:3px 6px;font-size:0.68rem;font-family:var(--font-display);max-width:175px;">
         <option value="">Data Source...</option>
         <option value="__action_neutron_data__">Neutron data (SNS/HFIR)...</option>
         <option value="__action_local_file__">From local computer...</option>
       </select>
-      <input type="file" id="inp-local-h5" accept=".h5,.hdf5,.nxs" multiple style="display:none;" />
-      <button id="btn-local-h5" style="display:none;" title="Open local .h5 / .nxs.h5 files">
+      <input type="file" id="inp-local-h5" accept=".h5,.hdf5,.nxs,.mtz" multiple style="display:none;" />
+      <button id="btn-local-h5" style="display:none;" title="Open local .h5 / .nxs.h5 / .mtz files">
         Local .h5
       </button>
       <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
         Cyl
       </button>
+      <div id="peak-source-group" class="seg-toggle" title="Toggle displayed &amp; Wulff-projected reflections: Predicted (circles) or Integrated (2σ ellipses)">
+        <button id="btn-peaks-pred" type="button" data-peak-src="predicted" class="active-btn" title="All predicted reflections within λ_min..λ_max and d ≥ d_min (circles)">○ Pred</button>
+        <button id="btn-peaks-integ" type="button" data-peak-src="integrated" disabled title="Successfully integrated reflections (2σ ellipses)">⬭ Integ</button>
+      </div>
       <button id="btn-zone-arcs" class="active-btn" title="Show/Hide single-arc Laue zone curves on the detector">
         Arcs
       </button>
       <button id="btn-pixel-mask" title="Show/Hide translucent two-color EM pixel mask overlay (Cyan = Dark/Shadowed, Lime = Static Bright)">
         Mask
+      </button>
+      <button id="btn-hires-tex" title="Toggle native 1× Hi-Res detector textures vs fast 4× downsampled preview" style="display:inline-flex;align-items:center;gap:4px;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 18h8"/><path d="M3 22h18"/><path d="M14 22a7 7 0 1 0 0-14h-1"/><path d="M9 14h2"/><path d="M9 12a2 2 0 0 1-2-2V6h6v4a2 2 0 0 1-2 2Z"/><path d="M12 6V3a1 1 0 0 0-1-1H9a1 1 0 0 0-1 1v3"/></svg>
+        <span id="lbl-hires-tex">Hi-Res</span>
       </button>
       <button id="btn-heatmap-cmap" title="Cycle Detector Intensity Heatmap Colormap (Magma / Cyan Glow / Film)">
         Magma
@@ -5146,6 +11565,9 @@ def render_rainbow_html(
       </button>
       <button id="btn-new-tab" style="border-color:var(--accent-gold);color:var(--accent-gold);" title="Open this view in its own full-screen browser tab">
         Tab
+      </button>
+      <button id="btn-exit-app" type="button" aria-label="Exit" title="Clean up temporary &amp; shared intermediates and close SubHKL session">
+        ⏻
       </button>
     </div>
   </header>
@@ -5164,7 +11586,7 @@ def render_rainbow_html(
     <section class="canvas-card">
       <div class="card-header">
         <span id="detector-header-title">DETECTOR ASSEMBLY — LOG(INTENSITY) + PARALLAX BRAGG RINGS</span>
-        <span class="hint">Move mouse to peek behind predicted rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
+        <span class="hint">Hold Ctrl / Shift / Alt to peek behind rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
       </div>
       <div class="canvas-wrap" id="canvas-wrap">
         <div class="detector-pane" id="detector-pane">
@@ -5181,8 +11603,8 @@ def render_rainbow_html(
               <span>Mid Layer: Single-Arc Zone Conics [uvw]</span>
             </div>
             <div class="legend-item">
-              <span style="display:inline-block;width:10px;height:10px;border:2px solid #fbbf24;border-radius:50%;"></span>
-              <span>Front Layer: Predicted Bragg Rings (parallax peeks behind spots)</span>
+              <span id="legend-peak-shape-icon" style="display:inline-block;width:10px;height:10px;border:2px solid #00e5ff;border-radius:50%;"></span>
+              <span id="legend-peak-shape-label">Front Layer: Predicted Bragg Rings (hold Ctrl/Shift for parallax)</span>
             </div>
           </div>
         </div>
@@ -5192,16 +11614,20 @@ def render_rainbow_html(
           <div class="stereo-inset-header">
             <span id="stereo-title" style="color:var(--accent-cyan);font-weight:700;">WULFF NET</span>
             <div class="stereo-toolbar">
-              <button id="btn-wulff-scope" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
-              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, Unscaled I/σ, or Careless Merge Residual">
+              <button id="btn-wulff-scope" type="button" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
+              <button id="btn-wulff-friedel" type="button" class="active-btn" title="Show antipodal Friedel mates (-h,-k,-l) on the Wulff sphere (fills the θ vs 2θ hemisphere; violet symmetry links vs gold proper rotations)">±Friedel</button>
+              <select id="sel-wulff-color" title="Color reflections on Wulff Net &amp; Detector by Wavelength, ASU Symmetry Orbit, Divergent Quantile I/σ, .mtz I/σ, or Careless Merge Residual">
                 <option value="wavelength">Color: λ/Zone</option>
                 <option value="orbit">Color: ASU Orbit</option>
-                <option value="isigi">Color: I/σ (Unscaled)</option>
+                <option value="isigi">Color: I/σ</option>
+                <option value="mtz_isigi">Color: .mtz I/σ</option>
                 <option value="residual">Color: ΔI/σ Residual</option>
                 <option value="scale">Color: Scale</option>
               </select>
-              <button id="btn-wulff-expand" title="Toggle between side-by-side Split View and docked Corner Inset">Split</button>
-              <button id="btn-wulff-close" title="Hide Wulff Net">X</button>
+            </div>
+            <div class="stereo-win-controls">
+              <button id="btn-wulff-expand" type="button" data-caret="up" aria-label="Magnify Wulff Net to side-by-side Split View" title="Magnify Wulff Net to side-by-side Split View"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3.5 10.5 8 6 12.5 10.5"/></svg></button>
+              <button id="btn-wulff-close" type="button" aria-label="Hide Wulff Net" title="Hide Wulff Net">X</button>
             </div>
           </div>
           <canvas id="canvas-stereo" style="flex:1;width:100%;min-height:0;cursor:grab;"></canvas>
@@ -5214,8 +11640,7 @@ def render_rainbow_html(
     <aside class="side-panel">
       <div>
         <div class="section-title">
-          <span>Detector &amp; Parallax Controls</span>
-          <span id="wl-readout">λ: {init_wl_min:.1f}–{init_wl_max:.1f} Å</span>
+          <span>Detector &amp; Color Controls</span>
         </div>
         <div class="slider-group">
           <div class="slider-row">
@@ -5225,35 +11650,53 @@ def render_rainbow_html(
           <input type="range" id="slider-det-alpha" min="0.0" max="1.0" step="0.05" value="0.85" />
 
           <div class="slider-row">
-            <span>Depth Parallax ("Peek Behind")</span>
-            <span id="lbl-parallax">1.00×</span>
+            <span>Colorscale Crossover</span>
+            <span id="lbl-color-emphasis" style="white-space:nowrap;">-3.0 · 3.0 · 20.0</span>
           </div>
-          <input type="range" id="slider-parallax" min="0.0" max="2.5" step="0.05" value="1.00" />
+          <input type="range" id="slider-color-emphasis" min="0.05" max="0.95" step="0.01" value="0.38" title="Drag knob to tune colorscale contrast / midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
+
+          <div class="slider-row">
+            <span>Wavelength λ [Å]</span>
+            <span id="wl-readout" title="Click λ_min or λ_max to enter an exact wavelength [Å]">[<span id="wl-val-min" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact λ_min [Å]">{init_wl_min:.2f}</span>, <span id="wl-val-max" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact λ_max [Å]">{init_wl_max:.2f}</span>] Å</span>
+          </div>
+          <div class="wl-interval-slider" id="wl-interval-slider" title="Active wavelength interval [λ_min, λ_max] in Å — drag [ and ] brackets (double-click to reset)">
+            <input type="range" id="slider-wl-min" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_min:.2f}" aria-label="Minimum wavelength λ_min [Å]" />
+            <input type="range" id="slider-wl-max" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_max:.2f}" aria-label="Maximum wavelength λ_max [Å]" />
+            <div class="wl-track-rail"></div>
+            <div class="wl-track-fill" id="wl-track-fill" style="left:{init_wl_pct_lo:.2f}%;width:{init_wl_pct_w:.2f}%;"></div>
+            <button type="button" class="wl-bracket-knob wl-knob-min" id="wl-knob-min" style="left:{init_wl_pct_lo:.2f}%;" title="Minimum wavelength λ_min [Å] (drag or Left/Right arrows)">[</button>
+            <button type="button" class="wl-bracket-knob wl-knob-max" id="wl-knob-max" style="left:{init_wl_pct_hi:.2f}%;" title="Maximum wavelength λ_max [Å] (drag or Left/Right arrows)">]</button>
+          </div>
 
           <div class="slider-row">
             <span>Resolution Cutoff d_min [Å]</span>
-            <span id="lbl-dmin-val">{init_dmin:.2f} Å</span>
+            <span id="lbl-dmin-val" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact resolution cutoff d_min [Å]">{init_dmin:.2f} Å</span>
           </div>
-          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å] (synchronized with Params bar)" />
+          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å] (0.05 Å slider steps; click value for 0.01 Å input)" />
 
           <div class="slider-row" style="margin-top:2px;">
             <span>Spot Color</span>
-            <select id="sel-spot-color" title="Color reflections on Detector & Wulff Net by Wavelength, ASU Orbit, Unscaled I/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
+            <select id="sel-spot-color" title="Color reflections on Detector & Wulff Net by Wavelength, ASU Orbit, Divergent Quantile I/σ, .mtz I/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
               <option value="wavelength">Color: λ/Zone</option>
               <option value="orbit">Color: ASU Orbit</option>
-              <option value="isigi">Color: I/σ (Unscaled)</option>
+              <option value="isigi">Color: I/σ</option>
+              <option value="mtz_isigi">Color: .mtz I/σ</option>
               <option value="residual">Color: ΔI/σ Residual</option>
               <option value="scale">Color: Scale</option>
             </select>
           </div>
-          <div id="mask-legend-row" class="slider-row" style="display:none;margin-top:3px;padding-top:3px;border-top:1px solid rgba(38,49,79,0.75);font-size:0.61rem;gap:6px;">
-            <span style="display:inline-flex;align-items:center;gap:4px;" title="Dead detector banks and cryostat/panel shadows ignored during solve &amp; prediction">
+          <div id="mask-legend-row" class="slider-row" style="display:none;margin-top:3px;padding-top:3px;border-top:1px solid rgba(38,49,79,0.75);font-size:0.61rem;gap:6px;flex-wrap:wrap;">
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Dead detector banks and cryostat/panel shadows ignored during solve, prediction &amp; integration">
               <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(56,189,248,0.62);border:1px solid #38bdf8;"></span>
               <span id="lbl-mask-dark">Dark 0.0%</span>
             </span>
-            <span style="display:inline-flex;align-items:center;gap:4px;" title="Static bright enclosure flares &amp; hot strips ignored during solve &amp; prediction">
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Static bright enclosure flares &amp; hot strips ignored during solve, prediction &amp; integration">
               <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(180,255,20,0.88);border:1px solid #b4ff14;"></span>
               <span id="lbl-mask-bright">Bright 0.00%</span>
+            </span>
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Detector panel perimeter border exclusion width (adjust 'border' in Unit cell / Params)">
+              <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(251,146,60,0.52);border:1px solid #fb923c;"></span>
+              <span id="lbl-mask-edge">Edge {init_border * 100.0:.1f}%</span>
             </span>
           </div>
         </div>
@@ -5263,11 +11706,18 @@ def render_rainbow_html(
         <div class="section-title">
           <span>Laue Zones [uvw]</span>
           <div style="display:flex;gap:2px;">
-            <button id="btn-order-1" class="active-btn" style="padding:1px 4px;font-size:0.58rem;" title="Fundamental zones |u|,|v|,|w| ≤ 1">≤1</button>
-            <button id="btn-order-2" style="padding:1px 4px;font-size:0.58rem;" title="Include 2nd-order zones |u|,|v|,|w| ≤ 2">≤2</button>
-            <button id="btn-order-3" style="padding:1px 4px;font-size:0.58rem;" title="Include higher-order zones |u|,|v|,|w| ≤ 3">≤3</button>
-            <button id="btn-zones-all" style="padding:1px 4px;font-size:0.58rem;" title="Enable all zones in current order">ALL</button>
-            <button id="btn-zones-none" style="padding:1px 4px;font-size:0.58rem;" title="Hide all zone arcs">NONE</button>
+            <button id="btn-order-1" class="active-btn" style="padding:1px 4px;font-size:0.58rem;" title="Enable all fundamental Laue zones |u|,|v|,|w| ≤ 1">≤1</button>
+            <button id="btn-order-2" style="padding:1px 4px;font-size:0.58rem;" title="Enable all Laue zones up to 2nd order |u|,|v|,|w| ≤ 2">≤2</button>
+            <button id="btn-order-3" style="padding:1px 4px;font-size:0.58rem;" title="Enable all Laue zones up to 3rd order |u|,|v|,|w| ≤ 3">≤3</button>
+            <button id="btn-zones-none" style="padding:1px 4px;font-size:0.58rem;" title="Deselect all Laue zone arcs (click ≤1, ≤2, or ≤3 to restore)">NONE</button>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;margin-bottom:3px;font-size:0.58rem;">
+          <span style="color:var(--text-dim);font-family:var(--font-display);letter-spacing:0.2px;" title="Nodal points (zone intersections + {{a⋆, b⋆, c⋆}} reciprocal axes) and Higher-Order Laue Zones (G·[uvw] = ±1, ±2)">Hubs / HOLZ</span>
+          <div style="display:flex;gap:2px;align-items:center;">
+            <button id="btn-nodal-points" type="button" class="active-btn" style="padding:1px 5px;font-size:0.58rem;" title="Show/Hide Laue zone nodal intersections and {{a⋆, b⋆, c⋆}} reciprocal axis circles">⊙ Nodals</button>
+            <button id="btn-holz-1" type="button" style="padding:1px 5px;font-size:0.58rem;" title="Toggle 1st-order Higher-Order Laue Zones (G·[uvw] = ±1)">±1</button>
+            <button id="btn-holz-2" type="button" style="padding:1px 5px;font-size:0.58rem;" title="Toggle 2nd-order Higher-Order Laue Zones (G·[uvw] = ±2)">±2</button>
           </div>
         </div>
         <div class="zone-list" id="zone-list"></div>
@@ -5304,7 +11754,13 @@ def render_rainbow_html(
             <span class="sw-time" id="stdio-stopwatch-time">00:00<span class="sw-ms">.000</span></span>
           </div>
         </div>
-        <canvas id="canvas-hist" title="Click to cycle resolution sparkline: CC½ vs d → Completeness vs d → ⟨I/σ⟩ vs d" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
+        <div id="hist-bar-header" style="display:none;align-items:center;justify-content:space-between;gap:4px;margin-top:4px;padding:0 2px;font-family:var(--font-display);font-size:0.59rem;">
+          <span style="color:var(--text-dim);letter-spacing:0.04em;">SHELLS vs d</span>
+          <div style="display:flex;align-items:center;gap:3px;">
+            <button id="btn-hist-open-table" type="button" aria-label="Merging statistics table" style="display:inline-flex;align-items:center;justify-content:center;padding:2px 5px;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open merging statistics by resolution shell"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/></svg></button>
+          </div>
+        </div>
+        <canvas id="canvas-hist" aria-label="Resolution sparkline (hover bin for shell edges and statistic; click to cycle metric)" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
       </div>
     </aside>
   </main>
@@ -5318,19 +11774,18 @@ def render_rainbow_html(
       <div class="ladder-actions" id="ladder-actions">
         <span id="lbl-execute" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));color:var(--text-dim);font-family:var(--font-display);">EXECUTE:</span>
         <div id="pipeline-stages" style="display:flex;align-items:center;gap:calc(4px * var(--bottom-bar-scale, 1));"></div>
-        <button id="btn-params-toggle" title="Configure unit cell, space group, and wavelength parameters for Solve/Integrate">
-          Params
+        <button id="btn-params-toggle" title="Configure unit cell, space group, panel border exclusion, and solve binning">
+          Unit cell / Params
         </button>
-        <button id="btn-files-toggle" title="Download NDIP / workflow artifacts for the current step (switch steps with < Walk > arrows)">
+        <button id="btn-files-toggle" title="Download NDIP / workflow artifacts for the current step (switch steps with &lt; &gt; arrows)">
           Files
         </button>
-        <span id="galaxy-status-badge" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));font-family:var(--font-display);padding:2px calc(6px * var(--bottom-bar-scale, 1));border-radius:4px;border:1px solid #334155;color:var(--text-dim);white-space:nowrap;">
+        <span id="galaxy-status-badge" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));font-family:var(--font-display);padding:2px calc(6px * var(--bottom-bar-scale, 1));border-radius:4px;border:1px solid #334155;color:var(--text-dim);white-space:nowrap;" title="Execution backend status (LOCAL or NDIP Galaxy/Pulsar)">
           LOCAL
         </span>
         <button id="btn-galaxy-dispatch" style="display:none;">Run</button>
-        <button id="btn-ladder-prev">&lt;</button>
-        <button id="btn-ladder-play" class="active-btn">Walk</button>
-        <button id="btn-ladder-next">&gt;</button>
+        <button id="btn-ladder-prev" title="Previous Lattice Ladder / pipeline step">&lt;</button>
+        <button id="btn-ladder-next" title="Next Lattice Ladder / pipeline step">&gt;</button>
       </div>
     </div>
     <div id="params-drawer" class="params-drawer">
@@ -5341,10 +11796,8 @@ def render_rainbow_html(
       <span>α <input id="inp-alpha" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>β <input id="inp-beta" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>γ <input id="inp-gamma" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
-      <span title="Minimum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_min <input id="inp-lmin" type="number" step="0.05" value="{init_wl_min:.2f}" style="width:48px;" /></span>
-      <span title="Maximum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_max <input id="inp-lmax" type="number" step="0.05" value="{init_wl_max:.2f}" style="width:48px;" /></span>
-      <span title="High-resolution cutoff d_min [Å] (synchronized with sidebar slider)">d_min <input id="inp-dmin" type="number" step="0.05" value="{init_dmin:.2f}" style="width:48px;" /></span>
-      <span title="Panel border rejection width (fraction of image size)">border <input id="inp-border" type="number" min="0" max="0.25" step="0.005" value="0.03" style="width:52px;" /></span>
+      <span title="Panel border rejection width (fraction of image size; visualized in Mask view)">border <input id="inp-border" type="number" min="0" max="0.25" step="0.005" value="{init_border:.3g}" style="width:52px;" /></span>
+      <span title="Solve step spatial pixel binning (auto = cell- &amp; resolution-aware default)">binning <select id="inp-binning"><option value=""{sel_bin_auto}>auto</option><option value="16"{sel_bin_16}>16</option><option value="8"{sel_bin_8}>8</option><option value="4"{sel_bin_4}>4</option><option value="2"{sel_bin_2}>2</option></select></span>
     </div>
     <div id="files-drawer" class="params-drawer"></div>
     <div class="ladder-rungs" id="ladder-rungs"></div>
@@ -5562,17 +12015,2004 @@ def render_rainbow_html(
     </div>
   </div>
 
+  <div id="hist-bin-tooltip" role="tooltip" style="display:none;position:fixed;z-index:9600;pointer-events:none;background:rgba(7,9,19,0.96);border:1px solid var(--accent-cyan);border-radius:5px;padding:4px 8px;box-shadow:0 8px 22px rgba(0,0,0,0.82);font-family:var(--font-display);font-size:0.64rem;line-height:1.35;color:var(--text-main);white-space:nowrap;"></div>
+  <div id="ui-hover-tooltip" role="tooltip" style="display:none;position:fixed;z-index:9650;pointer-events:none;max-width:340px;background:rgba(7,9,19,0.96);border:1px solid var(--accent-cyan);border-radius:5px;padding:5px 9px;box-shadow:0 8px 22px rgba(0,0,0,0.82);font-family:var(--font-ui, sans-serif);font-size:0.68rem;line-height:1.4;color:var(--text-main);white-space:normal;word-break:break-word;"></div>
+
+  <!-- Modal Dialog: Merging and Scaling Statistics by Resolution Shell -->
+  <div id="modal-merge-table" role="dialog" aria-modal="true" aria-labelledby="merge-tbl-modal-title" style="display:none;position:fixed;inset:0;z-index:9400;background:rgba(4,6,14,0.84);backdrop-filter:blur(4px);align-items:center;justify-content:center;padding:14px;">
+    <div id="merge-tbl-card" style="width:min(940px,96vw);max-height:90vh;display:flex;flex-direction:column;border-radius:8px;overflow:hidden;background:#0a1020;border:1px solid rgba(56,189,248,0.38);box-shadow:0 20px 55px rgba(0,0,0,0.85),0 0 24px rgba(56,189,248,0.10);color:#bae6fd;font-family:Georgia,'Times New Roman',Times,serif;user-select:text;">
+      <div id="merge-tbl-header" style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-bottom:1px solid rgba(56,189,248,0.20);flex-shrink:0;">
+        <div>
+          <div id="merge-tbl-modal-title" style="font-size:1.00rem;font-weight:700;color:#e0f2fe;">Merging and Scaling Statistics by Resolution Shell</div>
+          <div id="merge-tbl-meta" style="font-size:0.74rem;color:rgba(147,197,253,0.78);margin-top:3px;"></div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;">
+          <button id="btn-merge-tbl-copy" type="button" style="padding:4px 12px;font-family:Georgia,'Times New Roman',Times,serif;font-size:0.74rem;font-weight:600;border-radius:5px;border:1px solid rgba(56,189,248,0.55);background:rgba(14,116,144,0.22);color:#e0f2fe;" title="Copy formatted HTML table and tab-separated values to clipboard">Copy</button>
+          <button id="btn-merge-tbl-close" type="button" style="padding:4px 8px;font-size:0.74rem;border-radius:5px;border:1px solid rgba(56,189,248,0.32);background:transparent;color:#bae6fd;" title="Close resolution table (Esc)">✕</button>
+        </div>
+      </div>
+      <div id="merge-tbl-scroll" style="padding:12px 18px 16px 18px;overflow:auto;flex:1 1 auto;">
+        <div id="merge-tbl-body-wrap"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal Dialog: Minimalist 80s Pixel-Font Exit Popup -->
+  <div id="modal-arcade-exit" role="dialog" aria-modal="true" aria-labelledby="arcade-exit-quip-text">
+    <div class="arcade-exit-cabinet">
+      <div id="arcade-exit-quip-text"></div>
+      <div class="arcade-exit-actions" id="arcade-exit-actions">
+        <button id="btn-arcade-exit-cancel" type="button" class="arcade-exit-btn">
+          Go back
+        </button>
+        <button id="btn-arcade-exit-close-tab" type="button" class="arcade-exit-btn" disabled>
+          Close tab
+        </button>
+      </div>
+    </div>
+  </div>
+
 <script>
 window.RAINBOW_ZONES_DATA = {payload_json};
+window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
 (function() {{
   const DATA = window.RAINBOW_ZONES_DATA || {{ peaks: [], sample_peaks: [], zones: [], panels: [], ladder_steps: [], pipeline_stages: [] }};
-  const PEAKS = DATA.peaks || [];
-  const SAMPLE_PEAKS = DATA.sample_peaks || [];
+  function escTxt(s) {{
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }}
+  function extractPeakBucketsFromPayload(payload) {{
+    const pObj = payload || {{}};
+    const isFrameOnly = Boolean(pObj.frame_only);
+    const art = String(pObj.artifact_kind || "").toLowerCase();
+    const isIntegPayload = art === "integrator" || art === "merged_careless";
+    const basePeaks = Array.isArray(pObj.peaks) ? pObj.peaks : [];
+    const baseSample = Array.isArray(pObj.sample_peaks) ? pObj.sample_peaks : basePeaks;
+    const predPeaks = Array.isArray(pObj.predicted_peaks)
+      ? [...pObj.predicted_peaks]
+      : (isIntegPayload ? [] : [...basePeaks]);
+    const hasNonEmptyPredSample = Array.isArray(pObj.predicted_sample_peaks) &&
+      (!isFrameOnly || pObj.predicted_sample_peaks.length > 0);
+    const predSample = hasNonEmptyPredSample
+      ? [...pObj.predicted_sample_peaks]
+      : (isFrameOnly && typeof PREDICTED_SAMPLE_PEAKS !== "undefined" && Array.isArray(PREDICTED_SAMPLE_PEAKS) && PREDICTED_SAMPLE_PEAKS.length > 0
+        ? PREDICTED_SAMPLE_PEAKS
+        : (isIntegPayload ? predPeaks : [...baseSample]));
+    const integPeaks = Array.isArray(pObj.integrated_peaks)
+      ? [...pObj.integrated_peaks]
+      : (isIntegPayload ? [...basePeaks] : []);
+    const hasNonEmptyIntegSample = Array.isArray(pObj.integrated_sample_peaks) &&
+      (!isFrameOnly || pObj.integrated_sample_peaks.length > 0);
+    const integSample = hasNonEmptyIntegSample
+      ? [...pObj.integrated_sample_peaks]
+      : (isFrameOnly && typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" && Array.isArray(INTEGRATED_SAMPLE_PEAKS) && INTEGRATED_SAMPLE_PEAKS.length > 0
+        ? INTEGRATED_SAMPLE_PEAKS
+        : (isIntegPayload ? [...baseSample] : integPeaks));
+    // Once Integration has produced real intensities (integPeaks.length > 0), link measured
+    // I/σ and Careless scale/residual onto matching predicted (h,k,l) reflections so toggling
+    // ○ Pred <-> ⬭ Integ preserves intensity-related color modes with source-specific palettes
+    // (while keeping I/σ strictly absent right after indexing before integration runs).
+    if (integPeaks.length > 0 && predPeaks.length > 0) {{
+      const copyMeasFields = (dst, src) => {{
+        if (!dst || !src) return;
+        if (dst.intensity == null && typeof src.intensity === "number") dst.intensity = src.intensity;
+        if (dst.sigma == null && typeof src.sigma === "number") dst.sigma = src.sigma;
+        if (dst.merged_i == null && typeof src.merged_i === "number") dst.merged_i = src.merged_i;
+        if (dst.merged_sigi == null && typeof src.merged_sigi === "number") dst.merged_sigi = src.merged_sigi;
+        if (dst.careless_scale == null && typeof src.careless_scale === "number") dst.careless_scale = src.careless_scale;
+        if (dst.careless_residual == null && typeof src.careless_residual === "number") dst.careless_residual = src.careless_residual;
+      }};
+      const frameByBankHkl = new Map();
+      const frameByHkl = new Map();
+      for (let i = 0; i < integPeaks.length; i++) {{
+        const ip = integPeaks[i];
+        if (!ip || !Array.isArray(ip.hkl)) continue;
+        const hk = ip.hkl.join(",");
+        frameByBankHkl.set(`${{ip.bank}}|${{hk}}`, ip);
+        if (!frameByHkl.has(hk)) frameByHkl.set(hk, ip);
+      }}
+      for (let i = 0; i < predPeaks.length; i++) {{
+        const pp = predPeaks[i];
+        if (!pp || !Array.isArray(pp.hkl)) continue;
+        const hk = pp.hkl.join(",");
+        const match = frameByBankHkl.get(`${{pp.bank}}|${{hk}}`) || frameByHkl.get(hk);
+        if (match) copyMeasFields(pp, match);
+      }}
+      if (!isFrameOnly && integSample.length > 0 && predSample.length > 0 && predSample !== predPeaks) {{
+        const sampByRunHkl = new Map();
+        const sampByHkl = new Map();
+        for (let i = 0; i < integSample.length; i++) {{
+          const ismp = integSample[i];
+          if (!ismp || !Array.isArray(ismp.hkl)) continue;
+          const hk = ismp.hkl.join(",");
+          sampByRunHkl.set(`${{ismp.run_index ?? 0}}|${{hk}}`, ismp);
+          if (!sampByHkl.has(hk)) sampByHkl.set(hk, ismp);
+        }}
+        for (let i = 0; i < predSample.length; i++) {{
+          const psmp = predSample[i];
+          if (!psmp || !Array.isArray(psmp.hkl)) continue;
+          const hk = psmp.hkl.join(",");
+          const match = sampByRunHkl.get(`${{psmp.run_index ?? 0}}|${{hk}}`) || sampByHkl.get(hk);
+          if (match) copyMeasFields(psmp, match);
+        }}
+      }}
+    }}
+    return {{ predPeaks, predSample, integPeaks, integSample }};
+  }}
+  const initBuckets = extractPeakBucketsFromPayload(DATA);
+  let PREDICTED_PEAKS = initBuckets.predPeaks;
+  let PREDICTED_SAMPLE_PEAKS = initBuckets.predSample;
+  let INTEGRATED_PEAKS = initBuckets.integPeaks;
+  let INTEGRATED_SAMPLE_PEAKS = initBuckets.integSample;
+  const PEAKS = [...(DATA.peaks || [])];
+  const SAMPLE_PEAKS = [...(DATA.sample_peaks || PEAKS)];
   const ZONES = DATA.zones || [];
   const PANELS = DATA.panels || [];
   const LADDER = DATA.ladder_steps || [];
   const PIPELINE = DATA.pipeline_stages || [];
+
+  // Dynamic d_min / wavelength forward-projection & detector LOD state (declared at boot to avoid TDZ)
+  const ABS_DMIN_FLOOR = 0.50;
+  const MAX_DYNAMIC_LATTICE_POINTS = 2000000;
+  const MAX_EWALD_SHELL_EVALS = 45000000;
+  const MAX_DYNAMIC_FRAME_PEAKS = 36000;
+  const MAX_VIEWPORT_PATCH_PEAKS = 20000;
+  const MAX_DYNAMIC_SAMPLE_PEAKS = 72000;
+  let _dynPredEpoch = 0;
+  let _dynHklPool = null;
+  let _dynEwaldTruncated = false;
+  let _dynEwaldRawTotal = 0;
+  let _dynViewportPatchCache = {{ sig: "", peaks: [], rawTotal: 0, bvh: null, bvhZonesSig: "" }};
+  let _dynSgHelperCache = {{ key: "", helper: null }};
+  let _dynMultiRunTimer = null;
+  let _dynPendingMultiRunFn = null;
+  const _payloadBaseParams = {{
+    dMin: Number(DATA.d_min || 1.0),
+    lamMin: Number((DATA.wavelength_range && DATA.wavelength_range[0]) || 2.0),
+    lamMax: Number((DATA.wavelength_range && DATA.wavelength_range[1]) || 4.5),
+  }};
+  const _baselineMeasCache = {{
+    byBankHkl: new Map(),
+    byRunHkl: new Map(),
+    byHkl: new Map(),
+    byOrbit: new Map(),
+    mtzAsuLookup: null,
+    mtzExactLookup: null,
+    minIntegD: Infinity,
+  }};
+  const _detBvhCache = {{
+    sig: "",
+    firstRef: null,
+    bvh: null,
+  }};
+  const _detLodCache = {{
+    sig: "",
+    firstRef: null,
+    visiblePeaks: [],
+    lodDcut: 0.0,
+    isLodThinned: false,
+    totalCount: 0,
+    inViewCount: 0,
+    activeDmin: 0.0,
+  }};
+  const _wulffBvhCache = {{
+    sig: "",
+    firstRef: null,
+    bvh: null,
+  }};
+  const _wulffLodCache = {{
+    sig: "",
+    firstRef: null,
+    value: null,
+  }};
+
+  const _MEAS_KEYS = [
+    "intensity", "sigma", "merged_i", "merged_sigi",
+    "careless_residual", "careless_scale",
+    "mtz_i", "mtz_sigi", "mtz_isigi", "mtz_col_val",
+  ];
+  const _FRAME_ERR_KEYS = ["angular_error_deg", "has_angular_error"];
+  const _SHAPE_KEYS = [
+    "ellipse", "ellipse_sph", "sigma_major_px", "sigma_minor_px",
+    "ellipse_angle_deg", "shape_kind",
+  ];
+
+  function _extractMeasSnapshot(p, includeShape, includeFrameErr = false) {{
+    if (!p) return null;
+    let hasAny = false;
+    const snap = {{}};
+    for (let i = 0; i < _MEAS_KEYS.length; i++) {{
+      const k = _MEAS_KEYS[i];
+      if (typeof p[k] === "number" && Number.isFinite(p[k])) {{
+        snap[k] = p[k];
+        hasAny = true;
+      }}
+    }}
+    if (includeFrameErr && p.has_angular_error === true && typeof p.angular_error_deg === "number" && Number.isFinite(p.angular_error_deg)) {{
+      snap.angular_error_deg = p.angular_error_deg;
+      snap.has_angular_error = true;
+      hasAny = true;
+    }}
+    if (includeShape) {{
+      for (let i = 0; i < _SHAPE_KEYS.length; i++) {{
+        const k = _SHAPE_KEYS[i];
+        if (p[k] !== undefined && p[k] !== null && p[k] !== "circle") {{
+          snap[k] = p[k];
+          hasAny = true;
+        }}
+      }}
+    }}
+    return hasAny ? snap : null;
+  }}
+
+  function _mergeMeasSnapshot(target, src) {{
+    if (!src) return target;
+    if (!target) return {{ ...src }};
+    const keys = Object.keys(src);
+    for (let i = 0; i < keys.length; i++) {{
+      const k = keys[i];
+      if (target[k] === undefined || target[k] === null) target[k] = src[k];
+    }}
+    return target;
+  }}
+
+  function captureBaselineMeasurements(buckets, payloadObj, preserveExistingMtz = false) {{
+    const isFrameOnly = Boolean(payloadObj && payloadObj.frame_only);
+    const prevAsu = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzAsuLookup : null;
+    const prevEx = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzExactLookup : null;
+    _baselineMeasCache.byBankHkl.clear();
+    if (!isFrameOnly) {{
+      _baselineMeasCache.byRunHkl.clear();
+      _baselineMeasCache.byHkl.clear();
+      _baselineMeasCache.byOrbit.clear();
+      _baselineMeasCache.minIntegD = Infinity;
+    }}
+    _baselineMeasCache.mtzAsuLookup = (payloadObj && payloadObj.mtz_asu_lookup) || prevAsu || null;
+    _baselineMeasCache.mtzExactLookup = (payloadObj && payloadObj.mtz_exact_lookup) || prevEx || null;
+
+    const wlArr = payloadObj && Array.isArray(payloadObj.wavelength_range) ? payloadObj.wavelength_range : DATA.wavelength_range;
+    if (Array.isArray(wlArr) && wlArr.length >= 2) {{
+      _payloadBaseParams.lamMin = Number(wlArr[0]) || _payloadBaseParams.lamMin;
+      _payloadBaseParams.lamMax = Number(wlArr[1]) || _payloadBaseParams.lamMax;
+    }}
+    if (payloadObj && typeof payloadObj.d_min === "number" && payloadObj.d_min > 0) {{
+      _payloadBaseParams.dMin = Number(payloadObj.d_min);
+    }}
+    const ubSrc = (payloadObj && Array.isArray(payloadObj.ub_matrix)) ? payloadObj.ub_matrix : DATA.ub_matrix;
+    _payloadBaseParams.ubSig = Array.isArray(ubSrc)
+      ? ubSrc.flat().map(v => Number(v || 0).toFixed(6)).join(",")
+      : "";
+
+    if (!buckets) return;
+    const ingestList = (arr, isFrameLevel, isIntegBucket) => {{
+      if (!Array.isArray(arr)) return;
+      for (let i = 0; i < arr.length; i++) {{
+        const p = arr[i];
+        if (!p || !Array.isArray(p.hkl) || p.hkl.length < 3) continue;
+        if (isIntegBucket && typeof p.d_spacing === "number" && p.d_spacing > 0 && p.d_spacing < _baselineMeasCache.minIntegD) {{
+          _baselineMeasCache.minIntegD = p.d_spacing;
+        }}
+        const snap = _extractMeasSnapshot(p, isFrameLevel, isFrameLevel);
+        if (!snap) continue;
+        const hk = `${{p.hkl[0]}},${{p.hkl[1]}},${{p.hkl[2]}}`;
+        if (isFrameLevel && typeof p.bank === "number") {{
+          const bkKey = `${{p.bank}}|${{hk}}`;
+          _baselineMeasCache.byBankHkl.set(bkKey, _mergeMeasSnapshot(_baselineMeasCache.byBankHkl.get(bkKey), snap));
+        }}
+        const rIdx = typeof p.run_index === "number" ? p.run_index : (DATA.frame_index || 0);
+        const rKey = `${{rIdx}}|${{hk}}`;
+        const runSnap = _extractMeasSnapshot(p, false, isFrameLevel);
+        if (runSnap) {{
+          _baselineMeasCache.byRunHkl.set(rKey, _mergeMeasSnapshot(_baselineMeasCache.byRunHkl.get(rKey), runSnap));
+        }}
+        const noShape = _extractMeasSnapshot(p, false, false);
+        if (noShape) {{
+          _baselineMeasCache.byHkl.set(hk, _mergeMeasSnapshot(_baselineMeasCache.byHkl.get(hk), noShape));
+          if (p.asu_orbit_id && (typeof noShape.mtz_i === "number" || typeof noShape.merged_i === "number")) {{
+            const orbSnap = {{}};
+            if (typeof noShape.mtz_i === "number") orbSnap.mtz_i = noShape.mtz_i;
+            if (typeof noShape.mtz_sigi === "number") orbSnap.mtz_sigi = noShape.mtz_sigi;
+            if (typeof noShape.mtz_isigi === "number") orbSnap.mtz_isigi = noShape.mtz_isigi;
+            if (typeof noShape.mtz_col_val === "number") orbSnap.mtz_col_val = noShape.mtz_col_val;
+            if (typeof noShape.merged_i === "number") orbSnap.merged_i = noShape.merged_i;
+            if (typeof noShape.merged_sigi === "number") orbSnap.merged_sigi = noShape.merged_sigi;
+            _baselineMeasCache.byOrbit.set(p.asu_orbit_id, _mergeMeasSnapshot(_baselineMeasCache.byOrbit.get(p.asu_orbit_id), orbSnap));
+          }}
+        }}
+      }}
+    }};
+    ingestList(buckets.integPeaks, true, true);
+    ingestList(buckets.predPeaks, true, false);
+    if (!isFrameOnly) {{
+      ingestList(buckets.integSample, false, true);
+      ingestList(buckets.predSample, false, false);
+    }}
+  }}
+  captureBaselineMeasurements(initBuckets, DATA, false);
+
+  function computeUnitCellVolumeAng3(cell, ubMat) {{
+    if (Array.isArray(cell) && cell.length >= 6) {{
+      const a = Number(cell[0]), b = Number(cell[1]), c = Number(cell[2]);
+      const ca = Math.cos((Number(cell[3]) || 90) * Math.PI / 180.0);
+      const cb = Math.cos((Number(cell[4]) || 90) * Math.PI / 180.0);
+      const cg = Math.cos((Number(cell[5]) || 90) * Math.PI / 180.0);
+      const rad = 1.0 - ca * ca - cb * cb - cg * cg + 2.0 * ca * cb * cg;
+      if (a > 0 && b > 0 && c > 0 && rad > 1e-8) {{
+        return a * b * c * Math.sqrt(rad);
+      }}
+    }}
+    if (Array.isArray(ubMat) && ubMat.length === 3) {{
+      const det = Math.abs(
+        ubMat[0][0] * (ubMat[1][1] * ubMat[2][2] - ubMat[1][2] * ubMat[2][1]) -
+        ubMat[0][1] * (ubMat[1][0] * ubMat[2][2] - ubMat[1][2] * ubMat[2][0]) +
+        ubMat[0][2] * (ubMat[1][0] * ubMat[2][1] - ubMat[1][1] * ubMat[2][0])
+      );
+      if (det > 1e-12) return 1.0 / det;
+    }}
+    return 1000.0;
+  }}
+
+  function getLatticeCenteringMult() {{
+    if (DATA.space_group_ops && typeof DATA.space_group_ops.centering_mult === "number" && DATA.space_group_ops.centering_mult >= 1) {{
+      return DATA.space_group_ops.centering_mult;
+    }}
+    const sgU = String(DATA.space_group || "P 1").trim().toUpperCase();
+    if (sgU.startsWith("F")) return 4;
+    if (sgU.startsWith("R")) return 3;
+    if (sgU.startsWith("I") || sgU.startsWith("A") || sgU.startsWith("B") || sgU.startsWith("C")) return 2;
+    return 1;
+  }}
+
+  function getFullSpherePoolDminFloor() {{
+    const ub = getActiveUbMatrix();
+    const vol = computeUnitCellVolumeAng3(DATA.cell, ub);
+    const mLat = getLatticeCenteringMult();
+    const rawFloor = Math.cbrt((4.0 * Math.PI * Math.max(vol, 1.0)) / (3.0 * mLat * MAX_DYNAMIC_LATTICE_POINTS));
+    const rounded = Math.ceil(rawFloor * 100.0 - 1e-9) / 100.0;
+    return Math.max(ABS_DMIN_FLOOR, Math.min(4.50, rounded));
+  }}
+
+  function getDynamicDminFloor() {{
+    return ABS_DMIN_FLOOR;
+  }}
+
+  function getActiveUbMatrix() {{
+    if (Array.isArray(DATA.ub_matrix) && DATA.ub_matrix.length === 3) return DATA.ub_matrix;
+    if (Array.isArray(DATA.u_matrix) && DATA.u_matrix.length === 3 && Array.isArray(DATA.b_matrix) && DATA.b_matrix.length === 3) {{
+      return mat3Mul(DATA.u_matrix, DATA.b_matrix);
+    }}
+    return null;
+  }}
+
+  function _compileAsuConditionPredicate(condStr) {{
+    const c = String(condStr || "").trim();
+    if (c === "h>=0 and k>=0 and l>=0") return (h, k, l) => h >= 0 && k >= 0 && l >= 0;
+    if (c === "k>=0 and (l>0 or (l=0 and h>=0))") return (h, k, l) => k >= 0 && (l > 0 || (l === 0 && h >= 0));
+    if (c === "l>=0 and ((h>=0 and k>0) or (h=0 and k=0))") return (h, k, l) => l >= 0 && ((h >= 0 && k > 0) || (h === 0 && k === 0));
+    if (c === "h>=k and k>=0 and l>=0") return (h, k, l) => h >= k && k >= 0 && l >= 0;
+    if (c === "(h>=0 and k>0) or (h=0 and k=0 and l>=0)") return (h, k, l) => (h >= 0 && k > 0) || (h === 0 && k === 0 && l >= 0);
+    if (c === "h>=k and k>=0 and (k>0 or l>=0)") return (h, k, l) => h >= k && k >= 0 && (k > 0 || l >= 0);
+    if (c === "h>=k and k>=0 and (h>k or l>=0)") return (h, k, l) => h >= k && k >= 0 && (h > k || l >= 0);
+    if (c === "h>=0 and ((l>=h and k>h) or (l=h and k=h))") return (h, k, l) => h >= 0 && ((l >= h && k > h) || (l === h && k === h));
+    if (c === "k>=l and l>=h and h>=0") return (h, k, l) => k >= l && l >= h && h >= 0;
+    return (h, k, l) => l > 0 || (l === 0 && (h > 0 || (h === 0 && k >= 0)));
+  }}
+
+  function buildClientSpaceGroupHelper() {{
+    const sgOps = DATA.space_group_ops || null;
+    const sgName = String(DATA.space_group || "P 1").trim();
+    const cacheKey = `${{sgName}}|${{sgOps ? (sgOps.space_group || "") + ":" + (sgOps.asu_condition || "") + ":" + ((sgOps.sym_ops && sgOps.sym_ops.length) || 0) : "fallback"}}`;
+    if (_dynSgHelperCache.key === cacheKey && _dynSgHelperCache.helper) {{
+      return _dynSgHelperCache.helper;
+    }}
+    const sgU = sgName.toUpperCase();
+    if (sgOps && Array.isArray(sgOps.sym_ops) && sgOps.sym_ops.length > 0) {{
+      const den = Number(sgOps.den) || 24;
+      const isCentro = Boolean(sgOps.is_centrosymmetric);
+      const inAsu = _compileAsuConditionPredicate(sgOps.asu_condition);
+      const cenOps = Array.isArray(sgOps.cen_ops) ? sgOps.cen_ops : [[0, 0, 0]];
+      const symOps = sgOps.sym_ops;
+      const fullOps = [];
+      const properRots = [];
+      for (let s = 0; s < symOps.length; s++) {{
+        const R = symOps[s].rot;
+        const tr = symOps[s].tr || [0, 0, 0];
+        const detR = (
+          R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1]) -
+          R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0]) +
+          R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0])
+        );
+        if (detR > 0) properRots.push(R);
+        for (let c = 0; c < cenOps.length; c++) {{
+          const ct = cenOps[c];
+          fullOps.push({{
+            R,
+            tx: (tr[0] + ct[0]) % den,
+            ty: (tr[1] + ct[1]) % den,
+            tz: (tr[2] + ct[2]) % den,
+          }});
+        }}
+      }}
+      const nonZeroCen = cenOps.filter(ct => (ct[0] % den) !== 0 || (ct[1] % den) !== 0 || (ct[2] % den) !== 0);
+      const isCenteringAbsent = (h, k, l) => {{
+        for (let c = 0; c < nonZeroCen.length; c++) {{
+          const ct = nonZeroCen[c];
+          if (((h * ct[0] + k * ct[1] + l * ct[2]) % den) !== 0) return true;
+        }}
+        return false;
+      }};
+      const isAbsent = (h, k, l) => {{
+        if (h === 0 && k === 0 && l === 0) return true;
+        if (isCenteringAbsent(h, k, l)) return true;
+        for (let i = 0; i < fullOps.length; i++) {{
+          const op = fullOps[i];
+          const R = op.R;
+          const hp = Math.trunc((h * R[0][0] + k * R[1][0] + l * R[2][0]) / den);
+          if (hp !== h) continue;
+          const kp = Math.trunc((h * R[0][1] + k * R[1][1] + l * R[2][1]) / den);
+          if (kp !== k) continue;
+          const lp = Math.trunc((h * R[0][2] + k * R[1][2] + l * R[2][2]) / den);
+          if (lp !== l) continue;
+          if (((h * op.tx + k * op.ty + l * op.tz) % den) !== 0) return true;
+        }}
+        return false;
+      }};
+      const toAsu = (h, k, l) => {{
+        let bestH = -32768, bestK = -32768, bestL = -32768, bestSgn = 1, found = false;
+        let centricNegHit = false;
+        for (let i = 0; i < symOps.length; i++) {{
+          const R = symOps[i].rot;
+          const hp = Math.trunc((h * R[0][0] + k * R[1][0] + l * R[2][0]) / den);
+          const kp = Math.trunc((h * R[0][1] + k * R[1][1] + l * R[2][1]) / den);
+          const lp = Math.trunc((h * R[0][2] + k * R[1][2] + l * R[2][2]) / den);
+          if (hp === -h && kp === -k && lp === -l) centricNegHit = true;
+          if (inAsu(hp, kp, lp)) {{
+            if (!found || hp > bestH || (hp === bestH && (kp > bestK || (kp === bestK && lp > bestL))) || (hp === bestH && kp === bestK && lp === bestL && bestSgn < 0)) {{
+              bestH = hp; bestK = kp; bestL = lp; bestSgn = 1; found = true;
+            }}
+          }}
+          if (!isCentro) {{
+            const nh = -hp, nk = -kp, nl = -lp;
+            if (inAsu(nh, nk, nl)) {{
+              if (!found || nh > bestH || (nh === bestH && (nk > bestK || (nk === bestK && nl > bestL)))) {{
+                bestH = nh; bestK = nk; bestL = nl; bestSgn = -1; found = true;
+              }}
+            }}
+          }}
+        }}
+        if (!found) {{ bestH = Math.abs(h); bestK = Math.abs(k); bestL = Math.abs(l); bestSgn = 1; }}
+        const isCentric = isCentro || centricNegHit;
+        let isFr = false;
+        let bijParity = 0;
+        if (!isCentric) {{
+          isFr = bestSgn < 0;
+          bijParity = isFr ? -1 : 1;
+        }} else {{
+          let properHit = false;
+          for (let p = 0; p < properRots.length; p++) {{
+            const R = properRots[p];
+            const rh = Math.trunc((bestH * R[0][0] + bestK * R[1][0] + bestL * R[2][0]) / den);
+            if (rh !== h) continue;
+            const rk = Math.trunc((bestH * R[0][1] + bestK * R[1][1] + bestL * R[2][1]) / den);
+            if (rk !== k) continue;
+            const rl = Math.trunc((bestH * R[0][2] + bestK * R[1][2] + bestL * R[2][2]) / den);
+            if (rl === l) {{ properHit = true; break; }}
+          }}
+          isFr = !properHit;
+          bijParity = 0;
+        }}
+        const colorIdx = Math.abs(bestH * 73856093 ^ bestK * 19349663 ^ bestL * 83492791) % 12;
+        return [bestH, bestK, bestL, isFr ? 1 : 0, bijParity, colorIdx];
+      }};
+      const helper = {{ isCenteringAbsent, isAbsent, toAsu }};
+      _dynSgHelperCache = {{ key: cacheKey, helper }};
+      return helper;
+    }}
+
+    const isCenteringAbsent = (h, k, l) => {{
+      if (sgU.startsWith("I")) return (((h + k + l) & 1) !== 0);
+      if (sgU.startsWith("F")) return ((((h + k) & 1) !== 0) || (((k + l) & 1) !== 0) || (((h + l) & 1) !== 0));
+      if (sgU.startsWith("C")) return (((h + k) & 1) !== 0);
+      if (sgU.startsWith("A")) return (((k + l) & 1) !== 0);
+      if (sgU.startsWith("B")) return (((h + l) & 1) !== 0);
+      if (sgU.startsWith("R")) return (((((-h + k + l) % 3) + 3) % 3) !== 0);
+      return false;
+    }};
+    const isAbsent = (h, k, l) => (h === 0 && k === 0 && l === 0) || isCenteringAbsent(h, k, l);
+    const toAsu = (h, k, l) => {{
+      const ah = Math.abs(h), ak = Math.abs(k), al = Math.abs(l);
+      const isFr = (((h < 0 ? 1 : 0) + (k < 0 ? 1 : 0) + (l < 0 ? 1 : 0)) & 1) === 1 ? 1 : 0;
+      const colorIdx = Math.abs(ah * 73856093 ^ ak * 19349663 ^ al * 83492791) % 12;
+      return [ah, ak, al, isFr, 0, colorIdx];
+    }};
+    const helper = {{ isCenteringAbsent, isAbsent, toAsu }};
+    _dynSgHelperCache = {{ key: cacheKey, helper }};
+    return helper;
+  }}
+
+  function ensureDynamicHklPool(requestedDMin) {{
+    const ub = getActiveUbMatrix();
+    if (!ub) return null;
+    const poolFloor = getFullSpherePoolDminFloor();
+    if (Number(requestedDMin) < poolFloor - 1e-5) {{
+      return null;
+    }}
+    const targetD = Math.max(poolFloor, Number(requestedDMin) || poolFloor);
+    const ubKey = ub.map(r => r.map(v => Number(v).toFixed(6)).join(",")).join(";") + "|" + String(DATA.space_group || "");
+    if (_dynHklPool && _dynHklPool.ubKey === ubKey && targetD >= _dynHklPool.minD - 1e-5) {{
+      return _dynHklPool;
+    }}
+
+    // Build down to slightly below targetD (clamped at poolFloor) so small nudges do not rebuild
+    const buildD = Math.max(poolFloor, Math.min(targetD, targetD * 0.96));
+    const qMax = 1.0 / Math.max(buildD, 0.25);
+    const qMax2 = qMax * qMax;
+    const invUb = mat3Inv(ub);
+    const aVec = [invUb[0][0], invUb[0][1], invUb[0][2]];
+    const bVec = [invUb[1][0], invUb[1][1], invUb[1][2]];
+    const aLen = Math.max(1.0, vecNorm(aVec));
+    const bLen = Math.max(1.0, vecNorm(bVec));
+    const cStar = [ub[0][2], ub[1][2], ub[2][2]];
+    const cStar2 = Math.max(1e-10, cStar[0] * cStar[0] + cStar[1] * cStar[1] + cStar[2] * cStar[2]);
+    const hLim = Math.min(2048, Math.ceil(aLen * qMax));
+    const kLim = Math.min(2048, Math.ceil(bLen * qMax));
+    const hardPoolCap = Math.round(MAX_DYNAMIC_LATTICE_POINTS * 1.05);
+    const sgHelper = buildClientSpaceGroupHelper();
+
+    const tmpH = [], tmpK = [], tmpL = [], tmpGx = [], tmpGy = [], tmpGz = [], tmpQn = [], tmpD = [];
+    const b1x = ub[0][0], b1y = ub[1][0], b1z = ub[2][0];
+    const b2x = ub[0][1], b2y = ub[1][1], b2z = ub[2][1];
+    const b3x = ub[0][2], b3y = ub[1][2], b3z = ub[2][2];
+
+    outerLoop:
+    for (let h = -hLim; h <= hLim; h++) {{
+      const hbx = h * b1x, hby = h * b1y, hbz = h * b1z;
+      for (let k = -kLim; k <= kLim; k++) {{
+        const px = hbx + k * b2x;
+        const py = hby + k * b2y;
+        const pz = hbz + k * b2z;
+        const pDotB3 = px * b3x + py * b3y + pz * b3z;
+        const p2 = px * px + py * py + pz * pz;
+        const disc = pDotB3 * pDotB3 - cStar2 * (p2 - qMax2);
+        if (disc < 0) continue;
+        const sq = Math.sqrt(disc);
+        const lLo = Math.max(-4096, Math.ceil((-pDotB3 - sq) / cStar2 - 1e-7));
+        const lHi = Math.min(4096, Math.floor((-pDotB3 + sq) / cStar2 + 1e-7));
+        for (let l = lLo; l <= lHi; l++) {{
+          if (h === 0 && k === 0 && l === 0) continue;
+          if (sgHelper.isAbsent(h, k, l)) continue;
+          const gx = px + l * b3x;
+          const gy = py + l * b3y;
+          const gz = pz + l * b3z;
+          const g2 = gx * gx + gy * gy + gz * gz;
+          if (g2 <= 1e-12 || g2 > qMax2 * 1.000002) continue;
+          const qn = Math.sqrt(g2);
+          tmpH.push(h); tmpK.push(k); tmpL.push(l);
+          tmpGx.push(gx); tmpGy.push(gy); tmpGz.push(gz);
+          tmpQn.push(qn); tmpD.push(1.0 / qn);
+          if (tmpD.length >= hardPoolCap) break outerLoop;
+        }}
+      }}
+    }}
+
+    const n = tmpD.length;
+    const order = new Int32Array(n);
+    for (let i = 0; i < n; i++) order[i] = i;
+    order.sort((ia, ib) => tmpD[ib] - tmpD[ia]);
+
+    const hArr = new Int16Array(n);
+    const kArr = new Int16Array(n);
+    const lArr = new Int16Array(n);
+    const gxArr = new Float32Array(n);
+    const gyArr = new Float32Array(n);
+    const gzArr = new Float32Array(n);
+    const qnArr = new Float32Array(n);
+    const dArr = new Float32Array(n);
+    const asuHArr = new Int16Array(n);
+    const asuKArr = new Int16Array(n);
+    const asuLArr = new Int16Array(n);
+    const asuFrArr = new Uint8Array(n);
+    const asuBijArr = new Int8Array(n);
+    const orbColArr = new Uint8Array(n);
+    const harmOrdArr = new Uint8Array(n);
+
+    for (let outIdx = 0; outIdx < n; outIdx++) {{
+      const srcIdx = order[outIdx];
+      const hv = tmpH[srcIdx], kv = tmpK[srcIdx], lv = tmpL[srcIdx];
+      hArr[outIdx] = hv; kArr[outIdx] = kv; lArr[outIdx] = lv;
+      gxArr[outIdx] = tmpGx[srcIdx]; gyArr[outIdx] = tmpGy[srcIdx]; gzArr[outIdx] = tmpGz[srcIdx];
+      qnArr[outIdx] = tmpQn[srcIdx]; dArr[outIdx] = tmpD[srcIdx];
+      const [ah, ak, al, isFr, bijP, colIdx] = sgHelper.toAsu(hv, kv, lv);
+      asuHArr[outIdx] = ah; asuKArr[outIdx] = ak; asuLArr[outIdx] = al;
+      asuFrArr[outIdx] = isFr; asuBijArr[outIdx] = bijP; orbColArr[outIdx] = colIdx;
+      const g = Math.max(1, gcd3(hv, kv, lv));
+      if (g === 1) {{
+        harmOrdArr[outIdx] = 1;
+      }} else {{
+        const h0 = Math.trunc(hv / g), k0 = Math.trunc(kv / g), l0 = Math.trunc(lv / g);
+        let ordAllowed = 0;
+        for (let m = 1; m <= Math.min(g, 64); m++) {{
+          if (!sgHelper.isAbsent(m * h0, m * k0, m * l0)) ordAllowed++;
+        }}
+        harmOrdArr[outIdx] = Math.min(255, Math.max(1, ordAllowed));
+      }}
+    }}
+
+    const effMinD = n >= hardPoolCap && n > 0 ? dArr[n - 1] : buildD;
+    _dynHklPool = {{
+      ubKey, minD: effMinD, count: n, sgHelper,
+      hArr, kArr, lArr, gxArr, gyArr, gzArr, qnArr, dArr,
+      asuHArr, asuKArr, asuLArr, asuFrArr, asuBijArr, orbColArr, harmOrdArr,
+    }};
+    return _dynHklPool;
+  }}
+
+  function countPoolPrefixForDMin(pool, dMinCut) {{
+    if (!pool || pool.count === 0) return 0;
+    const dArr = pool.dArr;
+    const thr = dMinCut - 1e-5;
+    if (dArr[pool.count - 1] >= thr) return pool.count;
+    if (dArr[0] < thr) return 0;
+    let lo = 0, hi = pool.count;
+    while (lo < hi) {{
+      const mid = (lo + hi) >>> 1;
+      if (dArr[mid] >= thr) lo = mid + 1;
+      else hi = mid;
+    }}
+    return lo;
+  }}
+
+  let lastClientBankMaskRaw = null;
+  const serverBankPixelMaskCache = new Map();
+
+  function defaultRelBorderForInstrument(instName) {{
+    const s = String(instName || "").trim().toUpperCase();
+    return (s === "MANDI" || s === "TOPAZ" || s === "SNAP") ? 0.06 : 0.03;
+  }}
+
+  function getActiveRelBorderWidth() {{
+    const el = document.getElementById("inp-border");
+    const fallback = (DATA && typeof DATA.rel_border_width === "number")
+      ? DATA.rel_border_width
+      : defaultRelBorderForInstrument(DATA && DATA.instrument);
+    if (!el) return fallback;
+    const raw = String(el.value ?? "").trim();
+    if (!raw) return fallback;
+    const v = Number(raw);
+    return Number.isFinite(v) ? Math.max(0.0, Math.min(0.25, v)) : fallback;
+  }}
+
+  function getBankPixelValidityMask(bid) {{
+    if (lastClientBankMaskRaw && lastClientBankMaskRaw.has(bid)) {{
+      const mEntry = lastClientBankMaskRaw.get(bid);
+      if (mEntry && mEntry.data && mEntry.H > 0 && mEntry.W > 0) {{
+        return {{ H: mEntry.H, W: mEntry.W, bits: null, clsArr: mEntry.data, dead: false }};
+      }}
+    }}
+    if (serverBankPixelMaskCache.has(bid)) {{
+      return serverBankPixelMaskCache.get(bid);
+    }}
+    const deadList = DATA && DATA.em_mask_summary && Array.isArray(DATA.em_mask_summary.dead_banks)
+      ? DATA.em_mask_summary.dead_banks
+      : null;
+    if (deadList && deadList.some(x => Number(x) === bid)) {{
+      const deadObj = {{ H: 0, W: 0, bits: null, clsArr: null, dead: true }};
+      serverBankPixelMaskCache.set(bid, deadObj);
+      return deadObj;
+    }}
+    const srcMap = DATA && DATA.pixel_mask_bits && typeof DATA.pixel_mask_bits === "object"
+      ? DATA.pixel_mask_bits
+      : null;
+    const entry = srcMap ? srcMap[String(bid)] : null;
+    if (!entry) {{
+      serverBankPixelMaskCache.set(bid, null);
+      return null;
+    }}
+    if (entry.dead) {{
+      const deadObj = {{ H: Number(entry.h) || 0, W: Number(entry.w) || 0, bits: null, clsArr: null, dead: true }};
+      serverBankPixelMaskCache.set(bid, deadObj);
+      return deadObj;
+    }}
+    const H = Number(entry.h) || 0;
+    const W = Number(entry.w) || 0;
+    if (H <= 0 || W <= 0 || typeof entry.b64 !== "string" || !entry.b64) {{
+      serverBankPixelMaskCache.set(bid, null);
+      return null;
+    }}
+    try {{
+      const binStr = atob(entry.b64);
+      const bits = new Uint8Array(binStr.length);
+      for (let i = 0; i < binStr.length; i++) bits[i] = binStr.charCodeAt(i);
+      const obj = {{ H, W, bits, clsArr: null, dead: false }};
+      serverBankPixelMaskCache.set(bid, obj);
+      return obj;
+    }} catch (_e) {{
+      serverBankPixelMaskCache.set(bid, null);
+      return null;
+    }}
+  }}
+
+  function isDetectorPixelValid(validMask, rowF, colF) {{
+    if (!validMask) return true;
+    if (validMask.dead) return false;
+    const ri = Math.min(validMask.H - 1, Math.max(0, Math.round(rowF)));
+    const ci = Math.min(validMask.W - 1, Math.max(0, Math.round(colF)));
+    const pFlat = ri * validMask.W + ci;
+    if (validMask.bits) {{
+      const byteIdx = pFlat >> 3;
+      if (byteIdx >= validMask.bits.length) return true;
+      return (validMask.bits[byteIdx] & (128 >> (pFlat & 7))) !== 0;
+    }}
+    if (validMask.clsArr) {{
+      return validMask.clsArr[pFlat] === 0;
+    }}
+    return true;
+  }}
+
+  function buildActiveDetectorRaycastPanels(sLab) {{
+    const activeBankSet = new Set();
+    if (Array.isArray(PANELS)) {{
+      const anyTex = PANELS.some(p => Boolean(p && (p.texture_b64 || p._grayCanvas)));
+      for (let i = 0; i < PANELS.length; i++) {{
+        const pn = PANELS[i];
+        if (!pn || typeof pn.bank !== "number") continue;
+        if (anyTex && !pn.texture_b64 && !pn._grayCanvas) continue;
+        activeBankSet.add(Number(pn.bank));
+      }}
+    }}
+    let cfgSrc = DATA.detector_configs && Object.keys(DATA.detector_configs).length > 0
+      ? DATA.detector_configs
+      : ((DATA.beamline_detectors && DATA.beamline_detectors[DATA.instrument]) || null);
+    if (!cfgSrc) return [];
+
+    const relBorder = getActiveRelBorderWidth();
+    const sx = sLab[0] || 0.0, sy = sLab[1] || 0.0, sz = sLab[2] || 0.0;
+    const out = [];
+    const keys = Object.keys(cfgSrc);
+    for (let i = 0; i < keys.length; i++) {{
+      const bid = parseInt(keys[i], 10);
+      if (!Number.isFinite(bid)) continue;
+      if (activeBankSet.size > 0 && !activeBankSet.has(bid)) continue;
+      const validMask = getBankPixelValidityMask(bid);
+      if (validMask && validMask.dead) continue;
+      const cfg = cfgSrc[keys[i]];
+      if (!cfg || !Array.isArray(cfg.center) || !Array.isArray(cfg.vhat)) continue;
+      const isCurved = String(cfg.panel || cfg.panel_type || "flat").toLowerCase().includes("curv") ||
+                       String(cfg.panel || cfg.panel_type || "flat").toLowerCase().includes("cyl");
+      const m = Math.max(2, Number(cfg.m) || 256);
+      const n = Math.max(2, Number(cfg.n) || 256);
+      const bw = relBorder > 0.0 ? Math.floor(relBorder * Math.min(n, m)) : 0;
+      const minRow = bw;
+      const maxRow = bw > 0 ? (n - 1 - bw) : n;
+      const minCol = bw;
+      const maxCol = bw > 0 ? (m - 1 - bw) : m;
+      if (minRow >= maxRow || minCol >= maxCol) continue;
+      const width = Number(cfg.width) || 0.2;
+      const height = Number(cfg.height) || 0.2;
+      const dw = width / (m - 1);
+      const dh = height / (n - 1);
+      const center = [Number(cfg.center[0]), Number(cfg.center[1]), Number(cfg.center[2])];
+      const vhat = [Number(cfg.vhat[0]), Number(cfg.vhat[1]), Number(cfg.vhat[2])];
+
+      if (!isCurved) {{
+        if (!Array.isArray(cfg.uhat)) continue;
+        const uhat = [Number(cfg.uhat[0]), Number(cfg.uhat[1]), Number(cfg.uhat[2])];
+        const norm = vecCross(uhat, vhat);
+        const csDotN = (center[0] - sx) * norm[0] + (center[1] - sy) * norm[1] + (center[2] - sz) * norm[2];
+        // Bounding cone from sample sLab covering all 4 corners of flat panel
+        const corners = [
+          [center[0] - sx, center[1] - sy, center[2] - sz],
+          [center[0] + width * uhat[0] - sx, center[1] + width * uhat[1] - sy, center[2] + width * uhat[2] - sz],
+          [center[0] + height * vhat[0] - sx, center[1] + height * vhat[1] - sy, center[2] + height * vhat[2] - sz],
+          [center[0] + width * uhat[0] + height * vhat[0] - sx, center[1] + width * uhat[1] + height * vhat[1] - sy, center[2] + width * uhat[2] + height * vhat[2] - sz],
+        ];
+        const midRay = vecUnit([
+          center[0] + 0.5 * width * uhat[0] + 0.5 * height * vhat[0] - sx,
+          center[1] + 0.5 * width * uhat[1] + 0.5 * height * vhat[1] - sy,
+          center[2] + 0.5 * width * uhat[2] + 0.5 * height * vhat[2] - sz,
+        ]);
+        let minCos = 1.0;
+        for (let c = 0; c < 4; c++) {{
+          const cu = vecUnit(corners[c]);
+          const dc = vecDot(midRay, cu);
+          if (dc < minCos) minCos = dc;
+        }}
+        // Pad cone angle slightly so near-grazing corners never miss
+        const maxAng = Math.min(Math.PI, Math.acos(Math.max(-1.0, Math.min(1.0, minCos))) + 0.045);
+        out.push({{
+          bid, isCurved: false, m, n, minRow, maxRow, minCol, maxCol, validMask, width, height, dw, dh,
+          center, uhat, vhat, norm, csDotN, midRay, cosCone: Math.cos(maxAng),
+        }});
+      }} else {{
+        const radius = Number(cfg.radius) || 0.4;
+        const rhat = Array.isArray(cfg.rhat) ? [Number(cfg.rhat[0]), Number(cfg.rhat[1]), Number(cfg.rhat[2])] : [0, 0, 1];
+        const what = vecCross(vhat, rhat);
+        const bVec = vecCross([sx, sy, sz], vhat);
+        const qc = vecDot(bVec, bVec) - radius * radius;
+        out.push({{
+          bid, isCurved: true, m, n, minRow, maxRow, minCol, maxCol, validMask, width, height, dw, dh,
+          center, vhat, rhat, what, radius, bVec, qc,
+        }});
+      }}
+    }}
+    return out;
+  }}
+
+  // Spatially stratified O(N) solid-angle selector:
+  // Ranks reflections within 256x128 = 32,768 equal-area spherical cells (highest d first per cell),
+  // guaranteeing uniform 4*pi detector/Wulff coverage across forward AND back-scattering banks
+  // while keeping low-order landmarks at rank 0 as d_min decreases.
+  function selectSpatiallyStratifiedOrder(nRaw, hitD, dirX, dirY, dirZ, ox, oy, oz, nKeep, alreadyDescD) {{
+    const byD = new Int32Array(nRaw);
+    if (alreadyDescD) {{
+      for (let i = 0; i < nRaw; i++) byD[i] = i;
+    }} else if (nRaw <= 12000) {{
+      for (let i = 0; i < nRaw; i++) byD[i] = i;
+      byD.sort((ia, ib) => hitD[ib] - hitD[ia]);
+    }} else {{
+      let dLo = Infinity, dHi = -Infinity;
+      for (let i = 0; i < nRaw; i++) {{
+        const dv = hitD[i];
+        if (dv < dLo) dLo = dv;
+        if (dv > dHi) dHi = dv;
+      }}
+      const NB = 4096;
+      const spanD = Math.max(1e-9, dHi - dLo);
+      const scaleB = (NB - 1) / spanD;
+      const bCounts = new Int32Array(NB);
+      const bIdx = new Uint16Array(nRaw);
+      for (let i = 0; i < nRaw; i++) {{
+        const b = Math.max(0, Math.min(NB - 1, ((dHi - hitD[i]) * scaleB) | 0));
+        bIdx[i] = b;
+        bCounts[b]++;
+      }}
+      const bOff = new Int32Array(NB);
+      let acc = 0;
+      for (let b = 0; b < NB; b++) {{
+        bOff[b] = acc;
+        acc += bCounts[b];
+      }}
+      for (let i = 0; i < nRaw; i++) {{
+        byD[bOff[bIdx[i]]++] = i;
+      }}
+    }}
+    if (nRaw <= nKeep) return byD;
+
+    const uArr = new Float32Array(nRaw);
+    const vArr = new Float32Array(nRaw);
+    let minU = 1.0, maxU = 0.0, minV = 1.0, maxV = 0.0;
+    const invTwoPi = 1.0 / (2.0 * Math.PI);
+    for (let i = 0; i < nRaw; i++) {{
+      const dx = dirX[i] - ox;
+      const dy = dirY[i] - oy;
+      const dz = dirZ[i] - oz;
+      const invR = 1.0 / Math.max(1e-12, Math.hypot(dx, dy, dz));
+      const u = (Math.atan2(dx, dz) + Math.PI) * invTwoPi;
+      const v = (dy * invR + 1.0) * 0.5;
+      uArr[i] = u;
+      vArr[i] = v;
+      if (u < minU) minU = u;
+      if (u > maxU) maxU = u;
+      if (v < minV) minV = v;
+      if (v > maxV) maxV = v;
+    }}
+    const localTile = (maxU - minU) < 0.55 && (maxV - minV) < 0.55;
+    const uBase = localTile ? minU : 0.0;
+    const vBase = localTile ? minV : 0.0;
+    const invSpanU = localTile ? (1.0 / Math.max(1e-6, maxU - minU)) : 1.0;
+    const invSpanV = localTile ? (1.0 / Math.max(1e-6, maxV - minV)) : 1.0;
+
+    const cellCounts = new Uint16Array(32768);
+    const ranks = new Uint16Array(nRaw);
+    let maxRank = 0;
+    for (let p = 0; p < nRaw; p++) {{
+      const idx = byD[p];
+      const cx = Math.max(0, Math.min(255, (((uArr[idx] - uBase) * invSpanU) * 256.0) | 0));
+      const cy = Math.max(0, Math.min(127, (((vArr[idx] - vBase) * invSpanV) * 128.0) | 0));
+      const cell = (cy << 8) | cx;
+      const r = cellCounts[cell];
+      ranks[p] = r;
+      if (r > maxRank) maxRank = r;
+      if (r < 65535) cellCounts[cell] = r + 1;
+    }}
+
+    const rBuckets = maxRank + 1;
+    const rCounts = new Int32Array(rBuckets);
+    for (let p = 0; p < nRaw; p++) rCounts[ranks[p]]++;
+    const rOff = new Int32Array(rBuckets);
+    let rAcc = 0;
+    for (let r = 0; r < rBuckets; r++) {{
+      rOff[r] = rAcc;
+      rAcc += rCounts[r];
+    }}
+    const out = new Int32Array(nKeep);
+    for (let p = 0; p < nRaw; p++) {{
+      const dst = rOff[ranks[p]]++;
+      if (dst < nKeep) out[dst] = byD[p];
+    }}
+    return out;
+  }}
+
+  function raycastRunFromDynamicPool(pool, nActive, Rrun, sLab, panelsGeom, wlMin, wlMax, dMinEff, runIdx, isActiveFrame, maxOutPeaks) {{
+    if (!pool || nActive <= 0 || panelsGeom.length === 0) return [];
+    const kiRaw = Array.isArray(DATA.ki) && DATA.ki.length === 3 ? DATA.ki : [0.0, 0.0, 1.0];
+    const ki = vecUnit([Number(kiRaw[0]) || 0, Number(kiRaw[1]) || 0, Number(kiRaw[2]) || 1]);
+    // ki in crystal frame: Rrun^T * ki
+    const kicx = Rrun[0][0] * ki[0] + Rrun[1][0] * ki[1] + Rrun[2][0] * ki[2];
+    const kicy = Rrun[0][1] * ki[0] + Rrun[1][1] * ki[1] + Rrun[2][1] * ki[2];
+    const kicz = Rrun[0][2] * ki[0] + Rrun[1][2] * ki[1] + Rrun[2][2] * ki[2];
+    const sx0 = sLab[0] || 0.0, sy0 = sLab[1] || 0.0, sz0 = sLab[2] || 0.0;
+
+    // Precompute crystal zone unit axes for fast zone membership on active frame
+    const zoneChecks = [];
+    if (isActiveFrame && Array.isArray(ZONES)) {{
+      for (let z = 0; z < ZONES.length; z++) {{
+        const zn = ZONES[z];
+        if (!zn) continue;
+        if (Array.isArray(zn.uvw) && zn.uvw.length === 3) {{
+          zoneChecks.push({{ zid: zn.zone_id, u: zn.uvw[0], v: zn.uvw[1], w: zn.uvw[2], useUvw: true }});
+        }} else if (Array.isArray(zn.axis_crystal_xyz) && zn.axis_crystal_xyz.length === 3) {{
+          const au = vecUnit(zn.axis_crystal_xyz);
+          zoneChecks.push({{ zid: zn.zone_id, ax: au[0], ay: au[1], az: au[2], useUvw: false }});
+        }}
+      }}
+    }}
+    const sinZoneTol = Math.sin(0.75 * Math.PI / 180.0);
+
+    const {{
+      hArr, kArr, lArr, gxArr, gyArr, gzArr, qnArr, dArr,
+      asuHArr, asuKArr, asuLArr, asuFrArr, asuBijArr, orbColArr, harmOrdArr, sgHelper,
+    }} = pool;
+
+    const nPanels = panelsGeom.length;
+    const hitPoolIdx = [];
+    const hitPIdx = [];
+    const hitRow = [];
+    const hitCol = [];
+    const hitPtX = [];
+    const hitPtY = [];
+    const hitPtZ = [];
+    const hitGlx = [];
+    const hitGly = [];
+    const hitGlz = [];
+    const hitLam = [];
+    const hitD = [];
+    const hitDirX = isActiveFrame ? hitPtX : [];
+    const hitDirY = isActiveFrame ? hitPtY : [];
+    const hitDirZ = isActiveFrame ? hitPtZ : [];
+
+    for (let i = 0; i < nActive; i++) {{
+      const gx = gxArr[i], gy = gyArr[i], gz = gzArr[i];
+      const gDotKi = gx * kicx + gy * kicy + gz * kicz;
+      if (gDotKi >= -1e-6) continue;
+      const qn = qnArr[i];
+      const q2 = qn * qn;
+      const lam = (-2.0 * gDotKi) / q2;
+      if (lam < wlMin || lam > wlMax) continue;
+
+      // Rotate G_cryst to lab frame: G_lab = Rrun * G_cryst
+      const glx = Rrun[0][0] * gx + Rrun[0][1] * gy + Rrun[0][2] * gz;
+      const gly = Rrun[1][0] * gx + Rrun[1][1] * gy + Rrun[1][2] * gz;
+      const glz = Rrun[2][0] * gx + Rrun[2][1] * gy + Rrun[2][2] * gz;
+
+      let kfx = ki[0] + lam * glx;
+      let kfy = ki[1] + lam * gly;
+      let kfz = ki[2] + lam * glz;
+      const kfn = Math.hypot(kfx, kfy, kfz);
+      if (kfn <= 1e-12) continue;
+      kfx /= kfn; kfy /= kfn; kfz /= kfn;
+
+      for (let pIdx = 0; pIdx < nPanels; pIdx++) {{
+        const det = panelsGeom[pIdx];
+        let tRay = -1.0, rowF = -1.0, colF = -1.0, ptX = 0.0, ptY = 0.0, ptZ = 0.0;
+        if (!det.isCurved) {{
+          const cDot = kfx * det.midRay[0] + kfy * det.midRay[1] + kfz * det.midRay[2];
+          if (cDot < det.cosCone) continue;
+          const denom = kfx * det.norm[0] + kfy * det.norm[1] + kfz * det.norm[2];
+          if (Math.abs(denom) <= 1e-8) continue;
+          tRay = det.csDotN / denom;
+          if (tRay <= 0.0) continue;
+          ptX = sx0 + tRay * kfx;
+          ptY = sy0 + tRay * kfy;
+          ptZ = sz0 + tRay * kfz;
+          const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
+          rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
+          if (rowF < det.minRow || rowF >= det.maxRow) continue;
+          colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
+          if (colF < det.minCol || colF >= det.maxCol) continue;
+        }} else {{
+          const vx = det.vhat[0], vy = det.vhat[1], vz = det.vhat[2];
+          const dx = kfy * vz - kfz * vy;
+          const dy = kfz * vx - kfx * vz;
+          const dz = kfx * vy - kfy * vx;
+          const qa = dx * dx + dy * dy + dz * dz;
+          if (qa <= 1e-12) continue;
+          const qb = 2.0 * (det.bVec[0] * dx + det.bVec[1] * dy + det.bVec[2] * dz);
+          const delta = qb * qb - 4.0 * qa * det.qc;
+          if (delta < 0.0) continue;
+          const sq = Math.sqrt(delta);
+          const t2 = (-qb - sq) / (2.0 * qa);
+          const t1 = (-qb + sq) / (2.0 * qa);
+          tRay = t2 > 0.0 ? t2 : t1;
+          if (tRay <= 0.0) continue;
+          ptX = sx0 + tRay * kfx;
+          ptY = sy0 + tRay * kfy;
+          ptZ = sz0 + tRay * kfz;
+          const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
+          const dotV = rx * vx + ry * vy + rz * vz;
+          rowF = dotV / det.dh;
+          if (rowF < det.minRow || rowF >= det.maxRow) continue;
+          const dpx = rx - dotV * vx, dpy = ry - dotV * vy, dpz = rz - dotV * vz;
+          const dotR = dpx * det.rhat[0] + dpy * det.rhat[1] + dpz * det.rhat[2];
+          const dotW = dpx * det.what[0] + dpy * det.what[1] + dpz * det.what[2];
+          if (Math.abs(dotW) <= 1e-12) continue;
+          let dt = 2.0 * Math.atan(-dotR / dotW);
+          const twoPi = 2.0 * Math.PI;
+          dt = ((dt % twoPi) + twoPi) % twoPi;
+          colF = dt * (det.radius / det.dw);
+          if (colF < det.minCol || colF >= det.maxCol) continue;
+        }}
+        if (det.validMask !== null && !isDetectorPixelValid(det.validMask, rowF, colF)) continue;
+
+        hitPoolIdx.push(i);
+        hitPIdx.push(pIdx);
+        hitRow.push(rowF);
+        hitCol.push(colF);
+        hitPtX.push(ptX);
+        hitPtY.push(ptY);
+        hitPtZ.push(ptZ);
+        hitGlx.push(glx);
+        hitGly.push(gly);
+        hitGlz.push(glz);
+        hitLam.push(lam);
+        hitD.push(dArr[i]);
+        if (!isActiveFrame) {{
+          hitDirX.push(gx);
+          hitDirY.push(gy);
+          hitDirZ.push(gz);
+        }}
+        break;
+      }}
+    }}
+
+    const nRaw = hitPoolIdx.length;
+    if (nRaw === 0) {{
+      const emptyRes = [];
+      emptyRes._rawTotal = 0;
+      return emptyRes;
+    }}
+    const nKeep = Math.min(nRaw, maxOutPeaks);
+    const order = selectSpatiallyStratifiedOrder(
+      nRaw, hitD, hitDirX, hitDirY, hitDirZ,
+      isActiveFrame ? sx0 : 0.0,
+      isActiveFrame ? sy0 : 0.0,
+      isActiveFrame ? sz0 : 0.0,
+      nKeep, true
+    );
+
+    const peaks = [];
+    for (let outIdx = 0; outIdx < nKeep; outIdx++) {{
+      const hIdx = order[outIdx];
+      const i = hitPoolIdx[hIdx];
+      const det = panelsGeom[hitPIdx[hIdx]];
+      const rowF = hitRow[hIdx], colF = hitCol[hIdx];
+      const ptX = hitPtX[hIdx], ptY = hitPtY[hIdx], ptZ = hitPtZ[hIdx];
+      const glx = hitGlx[hIdx], gly = hitGly[hIdx], glz = hitGlz[hIdx];
+      const lam = hitLam[hIdx];
+      const gx = gxArr[i], gy = gyArr[i], gz = gzArr[i];
+      const qn = qnArr[i];
+      const hv = hArr[i], kv = kArr[i], lv = lArr[i];
+      const dVal = dArr[i];
+      const invQn = 1.0 / Math.max(qn, 1e-12);
+      const gHatCryst = [
+        Number((gx * invQn).toFixed(5)),
+        Number((gy * invQn).toFixed(5)),
+        Number((gz * invQn).toFixed(5)),
+      ];
+      const gHatLab = [
+        Number((glx * invQn).toFixed(5)),
+        Number((gly * invQn).toFixed(5)),
+        Number((glz * invQn).toFixed(5)),
+      ];
+      const [sxSt, sySt, hemi] = stereoProj(gHatCryst);
+      const [sxLab, syLab, hemiLab] = stereoProj(gHatLab);
+      const [az, dyDet, elDet] = isActiveFrame ? labToCyl([ptX, ptY, ptZ]) : [0.0, 0.0, 0.0];
+
+      const gGcd = Math.max(1, gcd3(hv, kv, lv));
+      const h0 = Math.trunc(hv / gGcd), k0 = Math.trunc(kv / gGcd), l0 = Math.trunc(lv / gGcd);
+      const lamProd = gGcd * lam;
+      const mLo = Math.max(1, Math.ceil(lamProd / Math.max(wlMax, 1e-6) - 1e-5));
+      const mHiWl = lamProd / Math.max(wlMin, 1e-6);
+      const dEff = Math.min(Math.max(dMinEff, 1e-3), Math.max(dVal, 1e-3));
+      const mHiD = (gGcd * dVal) / Math.max(dEff, 1e-6);
+      const mHi = Math.floor(Math.min(mHiWl, mHiD) + 1e-5);
+      let multAllowed = 0;
+      for (let m = mLo; m <= Math.min(mHi, mLo + 64); m++) {{
+        if (!sgHelper.isAbsent(m * h0, m * k0, m * l0)) multAllowed++;
+      }}
+
+      const ah = asuHArr[i], ak = asuKArr[i], al = asuLArr[i];
+      const orbitId = `${{ah}},${{ak}},${{al}}`;
+      const hkStr = `${{hv}},${{kv}},${{lv}}`;
+      const zoneIds = [];
+      if (isActiveFrame && zoneChecks.length > 0) {{
+        for (let z = 0; z < zoneChecks.length; z++) {{
+          const zc = zoneChecks[z];
+          if (zc.useUvw) {{
+            if (hv * zc.u + kv * zc.v + lv * zc.w === 0) zoneIds.push(zc.zid);
+          }} else if (Math.abs(gHatCryst[0] * zc.ax + gHatCryst[1] * zc.ay + gHatCryst[2] * zc.az) <= sinZoneTol) {{
+            zoneIds.push(zc.zid);
+          }}
+        }}
+      }}
+
+      const pk = {{
+        id: peaks.length,
+        peak_source: "predicted",
+        run_index: runIdx,
+        bank: det.bid,
+        row: Number(rowF.toFixed(2)),
+        col: Number(colF.toFixed(2)),
+        det_x: Number(az.toFixed(3)),
+        det_y: Number(dyDet.toFixed(4)),
+        det_el: Number(elDet.toFixed(3)),
+        q_hat: gHatCryst,
+        q_hat_lab: gHatLab,
+        stereographic: [Number(sxSt.toFixed(5)), Number(sySt.toFixed(5))],
+        hemisphere: hemi,
+        stereo_lab: [Number(sxLab.toFixed(5)), Number(syLab.toFixed(5)), hemiLab],
+        intensity: null,
+        sigma: null,
+        wavelength: Number(lam.toFixed(4)),
+        d_spacing: Number(dVal.toFixed(4)),
+        harmonic_order: harmOrdArr[i] || 1,
+        harmonic_multiplicity: Math.max(1, multAllowed),
+        parallax_depth: Number(Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * Math.max(dVal, 0.2)))).toFixed(4)),
+        hkl: [hv, kv, lv],
+        asu_hkl: [ah, ak, al],
+        asu_orbit_id: orbitId,
+        asu_friedel: Boolean(asuFrArr[i]),
+        asu_bijvoet_parity: Number(asuBijArr[i]),
+        orbit_color_idx: Number(orbColArr[i]),
+        zone_ids: zoneIds,
+        indexed: true,
+        angular_error_deg: 0.0,
+        has_angular_error: false,
+        shape_kind: "circle",
+      }};
+
+      // Cross-link any previously integrated / merged / MTZ measurements
+      const snap = (isActiveFrame ? _baselineMeasCache.byBankHkl.get(`${{det.bid}}|${{hkStr}}`) : null) ||
+                   _baselineMeasCache.byRunHkl.get(`${{runIdx}}|${{hkStr}}`) ||
+                   _baselineMeasCache.byHkl.get(hkStr) ||
+                   _baselineMeasCache.byOrbit.get(orbitId) ||
+                   null;
+      if (snap) {{
+        const sk = Object.keys(snap);
+        for (let m = 0; m < sk.length; m++) {{
+          const k = sk[m];
+          if (!isActiveFrame && (k === "ellipse" || k === "ellipse_sph")) continue;
+          pk[k] = snap[k];
+        }}
+      }}
+      if (pk.mtz_i === undefined || pk.mtz_i === null) {{
+        const mtzHit = (_baselineMeasCache.mtzExactLookup && _baselineMeasCache.mtzExactLookup[hkStr]) ||
+                       (_baselineMeasCache.mtzAsuLookup && _baselineMeasCache.mtzAsuLookup[orbitId]) ||
+                       null;
+        if (Array.isArray(mtzHit) && mtzHit.length >= 2) {{
+          const ivM = Number(mtzHit[0]), svM = Math.max(Number(mtzHit[1]) || 0, 1e-6);
+          pk.mtz_i = ivM;
+          pk.mtz_sigi = Number(mtzHit[1]);
+          pk.mtz_isigi = Number((ivM / svM).toFixed(3));
+          if (pk.merged_i === undefined || pk.merged_i === null) {{
+            pk.merged_i = ivM;
+            pk.merged_sigi = Number(mtzHit[1]);
+          }}
+        }}
+      }}
+
+      peaks.push(pk);
+    }}
+    peaks._rawTotal = nRaw;
+    return peaks;
+  }}
+
+  // Direct closed-form Ewald-shell (h, k) rod slicer + raycaster for large V / d_min^3 (> 2M full-sphere points).
+  // Steps directly in lab reciprocal space (RUB = R_run * U * B) with exact unit-vector Householder rays
+  // kf_hat = ki_hat + lam * g_lab and a 32x32x2 hemisphere directional panel LUT, scanning 10M+ Ewald-shell
+  // lattice points in ~100 ms without materializing 40M+ full-sphere lattice points.
+  function raycastRunDirectEwaldShell(ub, sgHelper, Rrun, sLab, panelsGeom, wlMin, wlMax, dMinEff, runIdx, isActiveFrame, maxOutPeaks, frustumFilter = null) {{
+    if (!ub || !sgHelper || panelsGeom.length === 0) return [];
+    let usePanels = panelsGeom;
+    if (frustumFilter && Array.isArray(PANELS) && PANELS.length > 0) {{
+      const pBoundsByBank = new Map();
+      for (let i = 0; i < PANELS.length; i++) {{
+        const pn = PANELS[i];
+        if (pn && typeof pn.bank === "number") pBoundsByBank.set(Number(pn.bank), pn);
+      }}
+      const filteredPanels = [];
+      for (let i = 0; i < panelsGeom.length; i++) {{
+        const det = panelsGeom[i];
+        const pn = pBoundsByBank.get(Number(det.bid));
+        if (!pn) {{
+          filteredPanels.push(det);
+          continue;
+        }}
+        const pMinY = frustumFilter.isSph
+          ? (typeof pn.el_min === "number" ? pn.el_min - 2.5 : -95.0)
+          : (typeof pn.y_min === "number" ? pn.y_min - 0.03 : -1e9);
+        const pMaxY = frustumFilter.isSph
+          ? (typeof pn.el_max === "number" ? pn.el_max + 2.5 : 95.0)
+          : (typeof pn.y_max === "number" ? pn.y_max + 0.03 : 1e9);
+        if (pMaxY < frustumFilter.dyMin || pMinY > frustumFilter.dyMax) continue;
+        if (
+          !frustumFilter.fullAzVisible &&
+          typeof pn.az_min === "number" &&
+          typeof pn.az_max === "number" &&
+          (pn.az_max - pn.az_min) <= 180.0
+        ) {{
+          const a0 = pn.az_min - 3.0;
+          const a1 = pn.az_max + 3.0;
+          const ov = !(a1 < frustumFilter.dxMin || a0 > frustumFilter.dxMax) ||
+                     !(a1 - 360.0 < frustumFilter.dxMin || a0 - 360.0 > frustumFilter.dxMax) ||
+                     !(a1 + 360.0 < frustumFilter.dxMin || a0 + 360.0 > frustumFilter.dxMax);
+          if (!ov) continue;
+        }}
+        filteredPanels.push(det);
+      }}
+      if (filteredPanels.length === 0) {{
+        const emptyRes = [];
+        emptyRes._rawTotal = 0;
+        return emptyRes;
+      }}
+      usePanels = filteredPanels;
+    }}
+    panelsGeom = usePanels;
+    const qMax = Math.min(1.0 / Math.max(dMinEff, 0.20), 2.0 / Math.max(wlMin, 0.05));
+    if (!(qMax > 1e-6)) return [];
+    const qMax2 = qMax * qMax;
+
+    const kiRaw = Array.isArray(DATA.ki) && DATA.ki.length === 3 ? DATA.ki : [0.0, 0.0, 1.0];
+    const ki = vecUnit([Number(kiRaw[0]) || 0, Number(kiRaw[1]) || 0, Number(kiRaw[2]) || 1]);
+    const kix = ki[0], kiy = ki[1], kiz = ki[2];
+    const sx0 = sLab[0] || 0.0, sy0 = sLab[1] || 0.0, sz0 = sLab[2] || 0.0;
+
+    // Work directly in lab reciprocal space: RUB = Rrun * ub (norm-preserving orthogonal rotation)
+    const rub = mat3Mul(Rrun, ub);
+    const invRub = mat3Inv(rub);
+    const aVec = invRub[0], bVec = invRub[1];
+    const aLen = Math.max(1.0, vecNorm(aVec));
+    const bLen = Math.max(1.0, vecNorm(bVec));
+    const b1x = rub[0][0], b1y = rub[1][0], b1z = rub[2][0];
+    const b2x = rub[0][1], b2y = rub[1][1], b2z = rub[2][1];
+    const b3x = rub[0][2], b3y = rub[1][2], b3z = rub[2][2];
+    const b3DotKi = b3x * kix + b3y * kiy + b3z * kiz;
+    const cStar2 = Math.max(1e-10, b3x * b3x + b3y * b3y + b3z * b3z);
+
+    const rOut = 1.0 / Math.max(wlMin, 0.05);
+    const rOut2 = rOut * rOut;
+    const cOutX = -kix * rOut, cOutY = -kiy * rOut, cOutZ = -kiz * rOut;
+    const hOut = aVec[0] * cOutX + aVec[1] * cOutY + aVec[2] * cOutZ;
+    const kOut = bVec[0] * cOutX + bVec[1] * cOutY + bVec[2] * cOutZ;
+
+    const rIn = 1.0 / Math.max(wlMax, wlMin + 0.01);
+    const rIn2 = rIn * rIn;
+    const cInX = -kix * rIn, cInY = -kiy * rIn, cInZ = -kiz * rIn;
+
+    const hMin = Math.max(-2048, -Math.ceil(aLen * qMax + 1e-5), Math.floor(hOut - aLen * rOut - 1e-5));
+    const hMax = Math.min(2048, Math.ceil(aLen * qMax + 1e-5), Math.ceil(hOut + aLen * rOut + 1e-5));
+    const kMin = Math.max(-2048, -Math.ceil(bLen * qMax + 1e-5), Math.floor(kOut - bLen * rOut - 1e-5));
+    const kMax = Math.min(2048, Math.ceil(bLen * qMax + 1e-5), Math.ceil(kOut + bLen * rOut + 1e-5));
+    if (hMin > hMax || kMin > kMax) return [];
+
+    // Exact global kfy elevation band + 32x32x2 hemisphere (kfx, kfy, kfz<0) directional LUT across flat cones
+    let globalMinKfy = -1.0, globalMaxKfy = 1.0;
+    const nPanels = panelsGeom.length;
+    let allFlat = nPanels > 0;
+    let minBandY = 1.0, maxBandY = -1.0;
+    for (let p = 0; p < nPanels; p++) {{
+      const det = panelsGeom[p];
+      if (det.isCurved) {{ allFlat = false; break; }}
+      const my = Math.max(-1.0, Math.min(1.0, det.midRay[1]));
+      const thetaM = Math.acos(my);
+      const alpha = Math.acos(Math.max(-1.0, Math.min(1.0, det.cosCone)));
+      const hiY = thetaM <= alpha ? 1.0 : Math.cos(thetaM - alpha);
+      const loY = (thetaM + alpha >= Math.PI) ? -1.0 : Math.cos(thetaM + alpha);
+      if (loY < minBandY) minBandY = loY;
+      if (hiY > maxBandY) maxBandY = hiY;
+    }}
+    let flatBucketStart = null, flatBucketEnd = null, flatBucketPanels = null;
+    if (allFlat && minBandY <= maxBandY) {{
+      globalMinKfy = Math.max(-1.0, minBandY - 1e-4);
+      globalMaxKfy = Math.min(1.0, maxBandY + 1e-4);
+      const bucketLists = new Array(2048);
+      let totalRefs = 0;
+      for (let p = 0; p < nPanels; p++) {{
+        const det = panelsGeom[p];
+        const mx = det.midRay[0], my = det.midRay[1], mz = det.midRay[2];
+        const cosC = Math.max(-1.0, Math.min(1.0, det.cosCone));
+        const rChord = Math.sqrt(Math.max(0.0, 2.0 * (1.0 - cosC))) + 0.015;
+        const bx0 = Math.max(0, Math.min(31, Math.floor((mx - rChord + 1.0) * 16.0)));
+        const bx1 = Math.max(0, Math.min(31, Math.floor((mx + rChord + 1.0) * 16.0)));
+        const by0 = Math.max(0, Math.min(31, Math.floor((my - rChord + 1.0) * 16.0)));
+        const by1 = Math.max(0, Math.min(31, Math.floor((my + rChord + 1.0) * 16.0)));
+        const touchPosZ = (mz + rChord) >= -1e-3;
+        const touchNegZ = (mz - rChord) <= 1e-3;
+        for (let by = by0; by <= by1; by++) {{
+          const rowBase = by << 5;
+          for (let bx = bx0; bx <= bx1; bx++) {{
+            if (touchPosZ) {{
+              const c0 = rowBase | bx;
+              if (!bucketLists[c0]) bucketLists[c0] = [];
+              bucketLists[c0].push(p);
+              totalRefs++;
+            }}
+            if (touchNegZ) {{
+              const c1 = 1024 | rowBase | bx;
+              if (!bucketLists[c1]) bucketLists[c1] = [];
+              bucketLists[c1].push(p);
+              totalRefs++;
+            }}
+          }}
+        }}
+      }}
+      flatBucketStart = new Int32Array(2048);
+      flatBucketEnd = new Int32Array(2048);
+      flatBucketPanels = new Int16Array(totalRefs);
+      let cursor = 0;
+      for (let c = 0; c < 2048; c++) {{
+        flatBucketStart[c] = cursor;
+        const lst = bucketLists[c];
+        if (lst) {{
+          for (let j = 0; j < lst.length; j++) flatBucketPanels[cursor++] = lst[j];
+        }}
+        flatBucketEnd[c] = cursor;
+      }}
+    }}
+
+    // Order h outward from 0 so low-|h| fundamental zones are prioritized if safety cap triggers
+    const hOrder = [];
+    if (0 >= hMin && 0 <= hMax) hOrder.push(0);
+    const maxAbsH = Math.max(Math.abs(hMin), Math.abs(hMax));
+    for (let step = 1; step <= maxAbsH; step++) {{
+      if (step >= hMin && step <= hMax) hOrder.push(step);
+      if (-step >= hMin && -step <= hMax) hOrder.push(-step);
+    }}
+
+    const hitH = [], hitK = [], hitL = [], hitPIdx = [];
+    const hitRow = [], hitCol = [], hitPtX = [], hitPtY = [], hitPtZ = [];
+    const hitGx = [], hitGy = [], hitGz = [], hitGlx = [], hitGly = [], hitGlz = [];
+    const hitQn = [], hitD = [], hitLam = [];
+
+    let nEvals = 0;
+    const dMinCut = Math.max(0.15, dMinEff) - 1e-5;
+    const qCut2 = Math.min(qMax2 * 1.000002, 1.0 / (dMinCut * dMinCut));
+
+    rodScan:
+    for (let hi = 0; hi < hOrder.length; hi++) {{
+      const h = hOrder[hi];
+      const hbx = h * b1x, hby = h * b1y, hbz = h * b1z;
+      for (let k = kMin; k <= kMax; k++) {{
+        const px = hbx + k * b2x;
+        const py = hby + k * b2y;
+        const pz = hbz + k * b2z;
+
+        const pDotB3 = px * b3x + py * b3y + pz * b3z;
+        const p2 = px * px + py * py + pz * pz;
+        const discRes = pDotB3 * pDotB3 - cStar2 * (p2 - qMax2);
+        if (discRes < 0.0) continue;
+
+        const pox = px - cOutX, poy = py - cOutY, poz = pz - cOutZ;
+        const poDotB3 = pox * b3x + poy * b3y + poz * b3z;
+        const po2 = pox * pox + poy * poy + poz * poz;
+        const discOut = poDotB3 * poDotB3 - cStar2 * (po2 - rOut2);
+        if (discOut < 0.0) continue;
+
+        const sqRes = Math.sqrt(discRes);
+        const sqOut = Math.sqrt(discOut);
+        const lLo = Math.max(
+          -4096,
+          Math.ceil((-pDotB3 - sqRes) / cStar2 - 1e-7),
+          Math.ceil((-poDotB3 - sqOut) / cStar2 - 1e-7)
+        );
+        const lHi = Math.min(
+          4096,
+          Math.floor((-pDotB3 + sqRes) / cStar2 + 1e-7),
+          Math.floor((-poDotB3 + sqOut) / cStar2 + 1e-7)
+        );
+        if (lLo > lHi) continue;
+
+        // Inner Ewald sphere hole (wl > wlMax)
+        const pix = px - cInX, piy = py - cInY, piz = pz - cInZ;
+        const piDotB3 = pix * b3x + piy * b3y + piz * b3z;
+        const pi2 = pix * pix + piy * piy + piz * piz;
+        const discIn = piDotB3 * piDotB3 - cStar2 * (pi2 - rIn2);
+        let segCount = 1;
+        let s0Lo = lLo, s0Hi = lHi, s1Lo = 1, s1Hi = 0;
+        if (discIn > 0.0) {{
+          const sqIn = Math.sqrt(discIn);
+          const exclLo = Math.ceil((-piDotB3 - sqIn) / cStar2 + 1e-5);
+          const exclHi = Math.floor((-piDotB3 + sqIn) / cStar2 - 1e-5);
+          if (exclLo <= exclHi) {{
+            s0Lo = lLo;
+            s0Hi = Math.min(lHi, exclLo - 1);
+            s1Lo = Math.max(lLo, exclHi + 1);
+            s1Hi = lHi;
+            segCount = 2;
+          }}
+        }}
+
+        const pDotKi = px * kix + py * kiy + pz * kiz;
+        for (let seg = 0; seg < segCount; seg++) {{
+          const curLo = seg === 0 ? s0Lo : s1Lo;
+          const curHi = seg === 0 ? s0Hi : s1Hi;
+          if (curLo > curHi) continue;
+          let glx = px + curLo * b3x;
+          let gly = py + curLo * b3y;
+          let glz = pz + curLo * b3z;
+          let gDotKi = pDotKi + curLo * b3DotKi;
+          for (let l = curLo; l <= curHi; l++, glx += b3x, gly += b3y, glz += b3z, gDotKi += b3DotKi) {{
+            if (h === 0 && k === 0 && l === 0) continue;
+            if (++nEvals > MAX_EWALD_SHELL_EVALS) break rodScan;
+            if (gDotKi >= -1e-6) continue;
+            const g2 = glx * glx + gly * gly + glz * glz;
+            if (g2 <= 1e-12 || g2 > qCut2) continue;
+            // qn > 1e-8 && sth = -gDotKi / qn > 1e-5 => gDotKi^2 > 1e-10 * g2
+            if (gDotKi * gDotKi <= 1e-10 * g2) continue;
+            const lam = (-2.0 * gDotKi) / g2;
+            if (lam < wlMin || lam > wlMax) continue;
+
+            // Householder reflection of unit ki across g_lab: |kf| === 1 identically!
+            const kfy = kiy + lam * gly;
+            if (kfy < globalMinKfy || kfy > globalMaxKfy) continue;
+            const kfx = kix + lam * glx;
+            const kfz = kiz + lam * glz;
+
+            if (flatBucketStart !== null) {{
+              const bx = Math.max(0, Math.min(31, ((kfx + 1.0) * 16.0) | 0));
+              const by = Math.max(0, Math.min(31, ((kfy + 1.0) * 16.0) | 0));
+              const cell = (kfz < 0.0 ? 1024 : 0) | (by << 5) | bx;
+              const bStart = flatBucketStart[cell];
+              const bEnd = flatBucketEnd[cell];
+              if (bStart === bEnd) continue;
+              if (sgHelper.isAbsent(h, k, l)) continue;
+              for (let bi = bStart; bi < bEnd; bi++) {{
+                const pIdx = flatBucketPanels[bi];
+                const det = panelsGeom[pIdx];
+                const cDot = kfx * det.midRay[0] + kfy * det.midRay[1] + kfz * det.midRay[2];
+                if (cDot < det.cosCone) continue;
+                const denom = kfx * det.norm[0] + kfy * det.norm[1] + kfz * det.norm[2];
+                if (Math.abs(denom) <= 1e-8) continue;
+                const tRay = det.csDotN / denom;
+                if (tRay <= 0.0) continue;
+                const ptX = sx0 + tRay * kfx;
+                const ptY = sy0 + tRay * kfy;
+                const ptZ = sz0 + tRay * kfz;
+                const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
+                const rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
+                if (rowF < det.minRow || rowF >= det.maxRow) continue;
+                const colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
+                if (colF < det.minCol || colF >= det.maxCol) continue;
+                if (det.validMask !== null && !isDetectorPixelValid(det.validMask, rowF, colF)) continue;
+
+                if (frustumFilter) {{
+                  const [azF, dyF, elF] = labToCyl([ptX, ptY, ptZ]);
+                  const pyF = frustumFilter.isSph ? elF : dyF;
+                  if (pyF < frustumFilter.dyMin || pyF > frustumFilter.dyMax) break;
+                  if (!frustumFilter.fullAzVisible) {{
+                    const inAzF = (azF >= frustumFilter.dxMin && azF <= frustumFilter.dxMax) ||
+                                  (azF - 360.0 >= frustumFilter.dxMin && azF - 360.0 <= frustumFilter.dxMax) ||
+                                  (azF + 360.0 >= frustumFilter.dxMin && azF + 360.0 <= frustumFilter.dxMax);
+                    if (!inAzF) break;
+                  }}
+                }}
+
+                const qn = Math.sqrt(g2);
+                const dVal = 1.0 / qn;
+                const gx = Rrun[0][0] * glx + Rrun[1][0] * gly + Rrun[2][0] * glz;
+                const gy = Rrun[0][1] * glx + Rrun[1][1] * gly + Rrun[2][1] * glz;
+                const gz = Rrun[0][2] * glx + Rrun[1][2] * gly + Rrun[2][2] * glz;
+                hitH.push(h); hitK.push(k); hitL.push(l); hitPIdx.push(pIdx);
+                hitRow.push(rowF); hitCol.push(colF);
+                hitPtX.push(ptX); hitPtY.push(ptY); hitPtZ.push(ptZ);
+                hitGx.push(gx); hitGy.push(gy); hitGz.push(gz);
+                hitGlx.push(glx); hitGly.push(gly); hitGlz.push(glz);
+                hitQn.push(qn); hitD.push(dVal); hitLam.push(lam);
+                break;
+              }}
+              continue;
+            }}
+
+            if (sgHelper.isAbsent(h, k, l)) continue;
+            for (let pIdx = 0; pIdx < nPanels; pIdx++) {{
+              const det = panelsGeom[pIdx];
+              let tRay = -1.0, rowF = -1.0, colF = -1.0, ptX = 0.0, ptY = 0.0, ptZ = 0.0;
+              if (!det.isCurved) {{
+                const cDot = kfx * det.midRay[0] + kfy * det.midRay[1] + kfz * det.midRay[2];
+                if (cDot < det.cosCone) continue;
+                const denom = kfx * det.norm[0] + kfy * det.norm[1] + kfz * det.norm[2];
+                if (Math.abs(denom) <= 1e-8) continue;
+                tRay = det.csDotN / denom;
+                if (tRay <= 0.0) continue;
+                ptX = sx0 + tRay * kfx;
+                ptY = sy0 + tRay * kfy;
+                ptZ = sz0 + tRay * kfz;
+                const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
+                rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
+                if (rowF < det.minRow || rowF >= det.maxRow) continue;
+                colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
+                if (colF < det.minCol || colF >= det.maxCol) continue;
+              }} else {{
+                const vx = det.vhat[0], vy = det.vhat[1], vz = det.vhat[2];
+                const dx = kfy * vz - kfz * vy;
+                const dy = kfz * vx - kfx * vz;
+                const dz = kfx * vy - kfy * vx;
+                const qa = dx * dx + dy * dy + dz * dz;
+                if (qa <= 1e-12) continue;
+                const qb = 2.0 * (det.bVec[0] * dx + det.bVec[1] * dy + det.bVec[2] * dz);
+                const delta = qb * qb - 4.0 * qa * det.qc;
+                if (delta < 0.0) continue;
+                const sq = Math.sqrt(delta);
+                const t2 = (-qb - sq) / (2.0 * qa);
+                const t1 = (-qb + sq) / (2.0 * qa);
+                tRay = t2 > 0.0 ? t2 : t1;
+                if (tRay <= 0.0) continue;
+                ptX = sx0 + tRay * kfx;
+                ptY = sy0 + tRay * kfy;
+                ptZ = sz0 + tRay * kfz;
+                const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
+                const dotV = rx * vx + ry * vy + rz * vz;
+                rowF = dotV / det.dh;
+                if (rowF < det.minRow || rowF >= det.maxRow) continue;
+                const dpx = rx - dotV * vx, dpy = ry - dotV * vy, dpz = rz - dotV * vz;
+                const dotR = dpx * det.rhat[0] + dpy * det.rhat[1] + dpz * det.rhat[2];
+                const dotW = dpx * det.what[0] + dpy * det.what[1] + dpz * det.what[2];
+                if (Math.abs(dotW) <= 1e-12) continue;
+                let dt = 2.0 * Math.atan(-dotR / dotW);
+                const twoPi = 2.0 * Math.PI;
+                dt = ((dt % twoPi) + twoPi) % twoPi;
+                colF = dt * (det.radius / det.dw);
+                if (colF < det.minCol || colF >= det.maxCol) continue;
+              }}
+              if (det.validMask !== null && !isDetectorPixelValid(det.validMask, rowF, colF)) continue;
+
+              if (frustumFilter) {{
+                const [azF, dyF, elF] = labToCyl([ptX, ptY, ptZ]);
+                const pyF = frustumFilter.isSph ? elF : dyF;
+                if (pyF < frustumFilter.dyMin || pyF > frustumFilter.dyMax) break;
+                if (!frustumFilter.fullAzVisible) {{
+                  const inAzF = (azF >= frustumFilter.dxMin && azF <= frustumFilter.dxMax) ||
+                                (azF - 360.0 >= frustumFilter.dxMin && azF - 360.0 <= frustumFilter.dxMax) ||
+                                (azF + 360.0 >= frustumFilter.dxMin && azF + 360.0 <= frustumFilter.dxMax);
+                  if (!inAzF) break;
+                }}
+              }}
+
+              const qn = Math.sqrt(g2);
+              const dVal = 1.0 / qn;
+              const gx = Rrun[0][0] * glx + Rrun[1][0] * gly + Rrun[2][0] * glz;
+              const gy = Rrun[0][1] * glx + Rrun[1][1] * gly + Rrun[2][1] * glz;
+              const gz = Rrun[0][2] * glx + Rrun[1][2] * gly + Rrun[2][2] * glz;
+              hitH.push(h); hitK.push(k); hitL.push(l); hitPIdx.push(pIdx);
+              hitRow.push(rowF); hitCol.push(colF);
+              hitPtX.push(ptX); hitPtY.push(ptY); hitPtZ.push(ptZ);
+              hitGx.push(gx); hitGy.push(gy); hitGz.push(gz);
+              hitGlx.push(glx); hitGly.push(gly); hitGlz.push(glz);
+              hitQn.push(qn); hitD.push(dVal); hitLam.push(lam);
+              break;
+            }}
+          }}
+        }}
+      }}
+    }}
+
+    const nRaw = hitD.length;
+    if (nRaw === 0) {{
+      const emptyRes = [];
+      emptyRes._rawTotal = 0;
+      return emptyRes;
+    }}
+    const nKeep = Math.min(nRaw, maxOutPeaks);
+    const order = selectSpatiallyStratifiedOrder(
+      nRaw,
+      hitD,
+      isActiveFrame ? hitPtX : hitGx,
+      isActiveFrame ? hitPtY : hitGy,
+      isActiveFrame ? hitPtZ : hitGz,
+      isActiveFrame ? sx0 : 0.0,
+      isActiveFrame ? sy0 : 0.0,
+      isActiveFrame ? sz0 : 0.0,
+      nKeep,
+      false
+    );
+
+    const zoneChecks = [];
+    if (isActiveFrame && Array.isArray(ZONES)) {{
+      for (let z = 0; z < ZONES.length; z++) {{
+        const zn = ZONES[z];
+        if (!zn) continue;
+        if (Array.isArray(zn.uvw) && zn.uvw.length === 3) {{
+          zoneChecks.push({{ zid: zn.zone_id, u: zn.uvw[0], v: zn.uvw[1], w: zn.uvw[2], useUvw: true }});
+        }} else if (Array.isArray(zn.axis_crystal_xyz) && zn.axis_crystal_xyz.length === 3) {{
+          const au = vecUnit(zn.axis_crystal_xyz);
+          zoneChecks.push({{ zid: zn.zone_id, ax: au[0], ay: au[1], az: au[2], useUvw: false }});
+        }}
+      }}
+    }}
+    const sinZoneTol = Math.sin(0.75 * Math.PI / 180.0);
+
+    const peaks = [];
+    for (let outIdx = 0; outIdx < nKeep; outIdx++) {{
+      const idx = order[outIdx];
+      const hv = hitH[idx], kv = hitK[idx], lv = hitL[idx];
+      const det = panelsGeom[hitPIdx[idx]];
+      const qn = hitQn[idx], dVal = hitD[idx], lam = hitLam[idx];
+      const invQn = 1.0 / Math.max(qn, 1e-12);
+      const gHatCryst = [
+        Number((hitGx[idx] * invQn).toFixed(5)),
+        Number((hitGy[idx] * invQn).toFixed(5)),
+        Number((hitGz[idx] * invQn).toFixed(5)),
+      ];
+      const gHatLab = [
+        Number((hitGlx[idx] * invQn).toFixed(5)),
+        Number((hitGly[idx] * invQn).toFixed(5)),
+        Number((hitGlz[idx] * invQn).toFixed(5)),
+      ];
+      const [sxSt, sySt, hemi] = stereoProj(gHatCryst);
+      const [sxLab, syLab, hemiLab] = stereoProj(gHatLab);
+      const [az, dyDet, elDet] = isActiveFrame
+        ? labToCyl([hitPtX[idx], hitPtY[idx], hitPtZ[idx]])
+        : [0.0, 0.0, 0.0];
+
+      const gGcd = Math.max(1, gcd3(hv, kv, lv));
+      const h0 = Math.trunc(hv / gGcd), k0 = Math.trunc(kv / gGcd), l0 = Math.trunc(lv / gGcd);
+      let ordAllowed = 1;
+      if (gGcd > 1) {{
+        let cntOrd = 0;
+        for (let m = 1; m <= Math.min(gGcd, 64); m++) {{
+          if (!sgHelper.isAbsent(m * h0, m * k0, m * l0)) cntOrd++;
+        }}
+        ordAllowed = Math.min(255, Math.max(1, cntOrd));
+      }}
+      const lamProd = gGcd * lam;
+      const mLo = Math.max(1, Math.ceil(lamProd / Math.max(wlMax, 1e-6) - 1e-5));
+      const mHiWl = lamProd / Math.max(wlMin, 1e-6);
+      const dEff = Math.min(Math.max(dMinEff, 1e-3), Math.max(dVal, 1e-3));
+      const mHiD = (gGcd * dVal) / Math.max(dEff, 1e-6);
+      const mHi = Math.floor(Math.min(mHiWl, mHiD) + 1e-5);
+      let multAllowed = 0;
+      for (let m = mLo; m <= Math.min(mHi, mLo + 64); m++) {{
+        if (!sgHelper.isAbsent(m * h0, m * k0, m * l0)) multAllowed++;
+      }}
+
+      const [ah, ak, al, isFr, bijP, colIdx] = sgHelper.toAsu(hv, kv, lv);
+      const orbitId = `${{ah}},${{ak}},${{al}}`;
+      const hkStr = `${{hv}},${{kv}},${{lv}}`;
+      const zoneIds = [];
+      if (isActiveFrame && zoneChecks.length > 0) {{
+        for (let z = 0; z < zoneChecks.length; z++) {{
+          const zc = zoneChecks[z];
+          if (zc.useUvw) {{
+            if (hv * zc.u + kv * zc.v + lv * zc.w === 0) zoneIds.push(zc.zid);
+          }} else if (Math.abs(gHatCryst[0] * zc.ax + gHatCryst[1] * zc.ay + gHatCryst[2] * zc.az) <= sinZoneTol) {{
+            zoneIds.push(zc.zid);
+          }}
+        }}
+      }}
+
+      const pk = {{
+        id: peaks.length,
+        peak_source: "predicted",
+        run_index: runIdx,
+        bank: det.bid,
+        row: Number(hitRow[idx].toFixed(2)),
+        col: Number(hitCol[idx].toFixed(2)),
+        det_x: Number(az.toFixed(3)),
+        det_y: Number(dyDet.toFixed(4)),
+        det_el: Number(elDet.toFixed(3)),
+        q_hat: gHatCryst,
+        q_hat_lab: gHatLab,
+        stereographic: [Number(sxSt.toFixed(5)), Number(sySt.toFixed(5))],
+        hemisphere: hemi,
+        stereo_lab: [Number(sxLab.toFixed(5)), Number(syLab.toFixed(5)), hemiLab],
+        intensity: null,
+        sigma: null,
+        wavelength: Number(lam.toFixed(4)),
+        d_spacing: Number(dVal.toFixed(4)),
+        harmonic_order: ordAllowed,
+        harmonic_multiplicity: Math.max(1, multAllowed),
+        parallax_depth: Number(Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * Math.max(dVal, 0.2)))).toFixed(4)),
+        hkl: [hv, kv, lv],
+        asu_hkl: [ah, ak, al],
+        asu_orbit_id: orbitId,
+        asu_friedel: Boolean(isFr),
+        asu_bijvoet_parity: Number(bijP),
+        orbit_color_idx: Number(colIdx),
+        zone_ids: zoneIds,
+        indexed: true,
+        angular_error_deg: 0.0,
+        has_angular_error: false,
+        shape_kind: "circle",
+      }};
+
+      const snap = (isActiveFrame ? _baselineMeasCache.byBankHkl.get(`${{det.bid}}|${{hkStr}}`) : null) ||
+                   _baselineMeasCache.byRunHkl.get(`${{runIdx}}|${{hkStr}}`) ||
+                   _baselineMeasCache.byHkl.get(hkStr) ||
+                   _baselineMeasCache.byOrbit.get(orbitId) ||
+                   null;
+      if (snap) {{
+        const sk = Object.keys(snap);
+        for (let m = 0; m < sk.length; m++) {{
+          const k = sk[m];
+          if (!isActiveFrame && (k === "ellipse" || k === "ellipse_sph")) continue;
+          pk[k] = snap[k];
+        }}
+      }}
+      if (pk.mtz_i === undefined || pk.mtz_i === null) {{
+        const mtzHit = (_baselineMeasCache.mtzExactLookup && _baselineMeasCache.mtzExactLookup[hkStr]) ||
+                       (_baselineMeasCache.mtzAsuLookup && _baselineMeasCache.mtzAsuLookup[orbitId]) ||
+                       null;
+        if (Array.isArray(mtzHit) && mtzHit.length >= 2) {{
+          const ivM = Number(mtzHit[0]), svM = Math.max(Number(mtzHit[1]) || 0, 1e-6);
+          pk.mtz_i = ivM;
+          pk.mtz_sigi = Number(mtzHit[1]);
+          pk.mtz_isigi = Number((ivM / svM).toFixed(3));
+          if (pk.merged_i === undefined || pk.merged_i === null) {{
+            pk.merged_i = ivM;
+            pk.merged_sigi = Number(mtzHit[1]);
+          }}
+        }}
+      }}
+      peaks.push(pk);
+    }}
+    peaks._rawTotal = nRaw;
+    return peaks;
+  }}
+
+  function canRepredictDynamic() {{
+    const art = String(DATA.artifact_kind || "").toLowerCase();
+    if (art === "raw_nexus" || art === "merged" || art === "empty") {{
+      if (!getActiveUbMatrix()) return false;
+    }}
+    return Boolean(getActiveUbMatrix());
+  }}
+
+  function repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, activeFramePeaks) {{
+    const rMap = DATA.goniometer_R_per_run && typeof DATA.goniometer_R_per_run === "object"
+      ? DATA.goniometer_R_per_run
+      : null;
+    const runKeys = rMap ? Object.keys(rMap).sort((a, b) => Number(a) - Number(b)) : [];
+    if (runKeys.length <= 1) {{
+      PREDICTED_SAMPLE_PEAKS = activeFramePeaks;
+      if (state.peakSource === "predicted") {{
+        SAMPLE_PEAKS.length = 0;
+        for (let i = 0; i < activeFramePeaks.length; i++) SAMPLE_PEAKS.push(activeFramePeaks[i]);
+      }}
+      return;
+    }}
+    const ub = pool ? null : getActiveUbMatrix();
+    const sgHelper = pool ? pool.sgHelper : buildClientSpaceGroupHelper();
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : {{}};
+    const defSLab = Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0];
+    const perRunCap = Math.max(120, Math.ceil(MAX_DYNAMIC_SAMPLE_PEAKS / Math.max(1, runKeys.length)));
+    const allPeaks = [];
+    const activeSliceLen = Math.min(activeFramePeaks.length, perRunCap, MAX_DYNAMIC_SAMPLE_PEAKS);
+    if (activeFramePeaks.length <= activeSliceLen) {{
+      for (let i = 0; i < activeSliceLen; i++) {{
+        allPeaks.push(activeFramePeaks[i]);
+      }}
+    }} else {{
+      const step = activeFramePeaks.length / activeSliceLen;
+      for (let i = 0; i < activeSliceLen; i++) {{
+        allPeaks.push(activeFramePeaks[Math.min(activeFramePeaks.length - 1, Math.floor(i * step))]);
+      }}
+    }}
+    let cachedPanels0 = null;
+    for (let r = 0; r < runKeys.length; r++) {{
+      const rk = runKeys[r];
+      const rIdx = parseInt(rk, 10);
+      if (rIdx === activeRunIdx) continue;
+      const Rrun = rMap[rk];
+      if (!Array.isArray(Rrun) || Rrun.length !== 3) continue;
+      const sRun = Array.isArray(sMap[rk]) ? sMap[rk] : defSLab;
+      const sameZeroOffset = Math.hypot(sRun[0] || 0, sRun[1] || 0, sRun[2] || 0) < 1e-7 &&
+                             Math.hypot(defSLab[0] || 0, defSLab[1] || 0, defSLab[2] || 0) < 1e-7;
+      let panelsGeom = null;
+      if (sameZeroOffset) {{
+        if (!cachedPanels0) cachedPanels0 = buildActiveDetectorRaycastPanels(defSLab);
+        panelsGeom = cachedPanels0;
+      }} else {{
+        panelsGeom = buildActiveDetectorRaycastPanels(sRun);
+      }}
+      const budgetLeft = MAX_DYNAMIC_SAMPLE_PEAKS - allPeaks.length;
+      if (budgetLeft <= 0) break;
+      const runHits = pool
+        ? raycastRunFromDynamicPool(
+            pool, nActive, Rrun, sRun, panelsGeom,
+            wlMin, wlMax, dMinEff, rIdx, false, Math.min(perRunCap, budgetLeft)
+          )
+        : raycastRunDirectEwaldShell(
+            ub, sgHelper, Rrun, sRun, panelsGeom,
+            wlMin, wlMax, dMinEff, rIdx, false, Math.min(perRunCap, budgetLeft)
+          );
+      for (let h = 0; h < runHits.length; h++) {{
+        runHits[h].id = allPeaks.length;
+        allPeaks.push(runHits[h]);
+      }}
+    }}
+    PREDICTED_SAMPLE_PEAKS = allPeaks;
+    if (state.peakSource === "predicted") {{
+      SAMPLE_PEAKS.length = 0;
+      for (let i = 0; i < allPeaks.length; i++) SAMPLE_PEAKS.push(allPeaks[i]);
+      _dynPredEpoch++;
+      _peakDataAvailabilitySig = "";
+      _wulffPoolCache.sig = "";
+      _wulffBvhCache.sig = "";
+      _wulffLodCache.sig = "";
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      updateHUD();
+    }}
+  }}
+
+  function repredictPeaksDynamic(opts = null) {{
+    if (!canRepredictDynamic()) return false;
+    const dFloor = getDynamicDminFloor();
+    const dMinEff = Math.max(dFloor, Number(state.dMin) || dFloor);
+    const wlMin = Math.max(0.05, Number(state.lamMin) || 2.0);
+    const wlMax = Math.max(wlMin + 0.05, Number(state.lamMax) || 4.5);
+
+    const ub = getActiveUbMatrix();
+    if (!ub) return false;
+    const pool = ensureDynamicHklPool(dMinEff);
+    const nActive = pool ? countPoolPrefixForDMin(pool, dMinEff) : 0;
+    const activeRunIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const Ractive = getActiveGoniometerR();
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : null;
+    const sActive = (sMap && Array.isArray(sMap[String(activeRunIdx)]))
+      ? sMap[String(activeRunIdx)]
+      : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0]);
+    const panelsGeom = buildActiveDetectorRaycastPanels(sActive);
+    if (panelsGeom.length === 0) return false;
+
+    const framePeaks = pool
+      ? raycastRunFromDynamicPool(
+          pool, nActive, Ractive, sActive, panelsGeom,
+          wlMin, wlMax, dMinEff, activeRunIdx, true, MAX_DYNAMIC_FRAME_PEAKS
+        )
+      : raycastRunDirectEwaldShell(
+          ub, buildClientSpaceGroupHelper(), Ractive, sActive, panelsGeom,
+          wlMin, wlMax, dMinEff, activeRunIdx, true, MAX_DYNAMIC_FRAME_PEAKS
+        );
+    _dynEwaldRawTotal = typeof framePeaks._rawTotal === "number" ? framePeaks._rawTotal : framePeaks.length;
+    _dynEwaldTruncated = Boolean(_dynEwaldRawTotal > framePeaks.length);
+    _dynViewportPatchCache.sig = "";
+    _dynViewportPatchCache.bvh = null;
+    const curUbSig = Array.isArray(DATA.ub_matrix)
+      ? DATA.ub_matrix.flat().map(v => Number(v || 0).toFixed(6)).join(",")
+      : "";
+    const ubChangedFromBase = Boolean(_payloadBaseParams.ubSig && curUbSig && curUbSig !== _payloadBaseParams.ubSig);
+    const shellChangedFromBase = Boolean(
+      ubChangedFromBase ||
+      Math.abs(dMinEff - Number(_payloadBaseParams.dMin || 0)) > 1e-4 ||
+      Math.abs(wlMin - Number(_payloadBaseParams.lamMin || 0)) > 1e-4 ||
+      Math.abs(wlMax - Number(_payloadBaseParams.lamMax || 0)) > 1e-4
+    );
+    if (Boolean(DATA.has_tof_events) || DATA.angular_error_mode === "tof_3d") {{
+      scheduleLiveTofDeltaThetaSync(false);
+    }} else {{
+      estimateActiveFrameAngularErrorsJS(framePeaks, panelsGeom, Ractive, sActive, shellChangedFromBase);
+    }}
+    PREDICTED_PEAKS = framePeaks;
+
+    // Refresh zone peak counts and live per-zone RMS for whichever peak source is active
+    const zoneStatsPeaks = state.peakSource === "integrated"
+      ? INTEGRATED_PEAKS.filter(isPeakVisible)
+      : framePeaks;
+    refreshZonesAngularStatsJS(zoneStatsPeaks);
+
+    const rMap = DATA.goniometer_R_per_run && typeof DATA.goniometer_R_per_run === "object"
+      ? DATA.goniometer_R_per_run
+      : null;
+    const nRuns = rMap ? Object.keys(rMap).length : 1;
+    if (_dynMultiRunTimer) {{
+      clearTimeout(_dynMultiRunTimer);
+      _dynMultiRunTimer = null;
+    }}
+
+    _dynPendingMultiRunFn = null;
+    const prevMultiRunSample = (
+      Array.isArray(PREDICTED_SAMPLE_PEAKS) &&
+      PREDICTED_SAMPLE_PEAKS.length > 0 &&
+      PREDICTED_SAMPLE_PEAKS !== PREDICTED_PEAKS
+    ) ? PREDICTED_SAMPLE_PEAKS : null;
+    if (nRuns <= 1 || (pool && nActive * nRuns <= 600000 && (state.wulffScope === "all_runs" || state.peakSource === "predicted"))) {{
+      repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
+    }} else if (state.peakSource === "integrated" || state.wulffScope !== "all_runs") {{
+      // Defer multi-run predicted raycast while viewing Integrated peaks or 1-Frame scope;
+      // flush on demand as soon as the user switches to Predicted + All-Runs.
+      if (!prevMultiRunSample) PREDICTED_SAMPLE_PEAKS = framePeaks;
+      _dynPendingMultiRunFn = () => {{
+        _dynPendingMultiRunFn = null;
+        repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
+      }};
+    }} else {{
+      // Keep interactive dragging 60fps on very large multi-run scans without collapsing
+      // existing multi-run Wulff spots to a single frame; complete All-Runs raycast on settle.
+      if (!prevMultiRunSample) PREDICTED_SAMPLE_PEAKS = framePeaks;
+      _dynPendingMultiRunFn = () => {{
+        if (_dynMultiRunTimer) {{
+          clearTimeout(_dynMultiRunTimer);
+          _dynMultiRunTimer = null;
+        }}
+        _dynPendingMultiRunFn = null;
+        repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
+      }};
+      _dynMultiRunTimer = setTimeout(() => {{
+        _dynMultiRunTimer = null;
+        _dynPendingMultiRunFn = null;
+        repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
+      }}, pool ? 90 : 140);
+    }}
+
+    _dynPredEpoch++;
+    // Never auto-switch peakSource when changing d_min or wavelength:
+    // - In Integrated ("integrated") mode, filter existing integrated peaks (1-Frame and All-Runs)
+    //   via isPeakVisible without inventing unintegrated peaks.
+    // - In Predicted ("predicted") mode, update PEAKS and SAMPLE_PEAKS across runs.
+    if (state.peakSource === "predicted") {{
+      if (
+        opts && opts.userAdjusted &&
+        (
+          dMinEff < _payloadBaseParams.dMin - 0.015 ||
+          wlMin < _payloadBaseParams.lamMin - 0.015 ||
+          wlMax > _payloadBaseParams.lamMax + 0.015
+        ) &&
+        (
+          state.wulffColorMode === "isigi" ||
+          state.wulffColorMode === "residual" ||
+          state.wulffColorMode === "scale"
+        )
+      ) {{
+        state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
+      }}
+      PEAKS.length = 0;
+      for (let i = 0; i < PREDICTED_PEAKS.length; i++) PEAKS.push(PREDICTED_PEAKS[i]);
+      const srcSample = PREDICTED_SAMPLE_PEAKS && PREDICTED_SAMPLE_PEAKS.length > 0 ? PREDICTED_SAMPLE_PEAKS : PREDICTED_PEAKS;
+      SAMPLE_PEAKS.length = 0;
+      for (let i = 0; i < srcSample.length; i++) SAMPLE_PEAKS.push(srcSample[i]);
+      syncPeakSourceButtons();
+    }} else {{
+      // Ensure PEAKS / SAMPLE_PEAKS remain bound to full integrated buckets (filtered live by isPeakVisible)
+      PEAKS.length = 0;
+      for (let i = 0; i < INTEGRATED_PEAKS.length; i++) PEAKS.push(INTEGRATED_PEAKS[i]);
+      const srcIntegSample = INTEGRATED_SAMPLE_PEAKS && INTEGRATED_SAMPLE_PEAKS.length > 0 ? INTEGRATED_SAMPLE_PEAKS : INTEGRATED_PEAKS;
+      SAMPLE_PEAKS.length = 0;
+      for (let i = 0; i < srcIntegSample.length; i++) SAMPLE_PEAKS.push(srcIntegSample[i]);
+      syncPeakSourceButtons();
+    }}
+
+    _peakDataAvailabilitySig = "";
+    _detVisiblePeaksSig = "";
+    _detBvhCache.sig = "";
+    _detLodCache.sig = "";
+    _wulffPoolCache.sig = "";
+    _wulffBvhCache.sig = "";
+    _wulffLodCache.sig = "";
+    _lastDetRenderSig = "";
+    _lastWulffRenderSig = "";
+    return true;
+  }}
 
   const INSTRUMENT_WAVELENGTH_DEFAULTS = {{
     IMAGINE: [2.0, 4.0],
@@ -5655,7 +14095,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         summary: "Paste cell in any field",
       }};
     }}
-    const norm = raw.toLowerCase().replace(/\\s+/g, "");
+    const norm = raw.toLowerCase().replace(/[\\s_]+/g, "");
     if (/^\\d+$/.test(norm)) {{
       const num = parseInt(norm, 10);
       if (num >= 1 && num <= 2) return symmetryRulesForSetting("triclinic", "triclinic");
@@ -5750,23 +14190,36 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const isMergedInit = String(DATA.artifact_kind || "").toLowerCase() === "merged_careless" &&
     Array.isArray(PEAKS) &&
     PEAKS.some(p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual));
+  const hasInitMtz = Array.isArray(PEAKS) && PEAKS.some(p => p && typeof p.mtz_isigi === "number" && Number.isFinite(p.mtz_isigi));
+  const initColorMode = (DATA.default_color_mode === "mtz_isigi" && hasInitMtz)
+    ? "mtz_isigi"
+    : (isMergedInit ? "residual" : "wavelength");
   const state = {{
     projection: "{initial_proj}", // "cylindrical" (CG4D) | "spherical" (MANDI)
     maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
     showZoneArcs: true,           // single vibrant arc per zone (not multi-band rainbow)
+    showNodalPoints: true,        // Laue zone intersections + {{a*, b*, c*}} reciprocal nodal circles
+    holzOrders: new Set(),        // Higher-Order Laue Zones: 1 -> ±1, 2 -> ±2
     showPixelMask: false,         // translucent two-color EM pixel mask overlay (dark=cyan, bright=lime)
+    hiResTextures: Number(DATA.render_binning || 4) <= 1, // native 1x detector textures vs fast 4x downsampled preview
+    hiresLoading: false,
+    hiresReqSeq: 0,
     heatmapStyle: "magma",        // "magma" | "cyan" | "gray"
+    peakSource: String((DATA.default_peak_source && DATA.default_peak_source !== "mtz") ? DATA.default_peak_source : ((String(DATA.artifact_kind || "").toLowerCase() === "integrator" || String(DATA.artifact_kind || "").toLowerCase() === "merged_careless") ? "integrated" : "predicted")), // "predicted" | "integrated"
     detAlpha: 0.85,
     showStereo: isMergedInit,
     wulffExpanded: isMergedInit,
     wulffScope: isMergedInit ? "all_runs" : "single_frame", // "single_frame" (1-Frame) | "all_runs" (All-Runs)
+    showWulffFriedel: true,       // plot antipodal Friedel mates (-h,-k,-l) on Wulff sphere with distinct link color
     wulffFrame: "sample",         // always project in Sample frame (coupled via goniometer R)
     wulffCoupled: true,           // 360° periodic detector pan <-> Wulff yaw always coupled
-    wulffColorMode: isMergedInit ? "residual" : "wavelength", // "wavelength" | "orbit" | "isigi" | "residual" | "scale"
+    wulffColorMode: initColorMode, // "wavelength" | "orbit" | "isigi" | "mtz_isigi" | "residual" | "scale"
+    colorCrossover: 0.38,         // 0.05 (boost all/weak peaks) .. 0.38 (default log crossover) .. 0.95 (strong peaks only)
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
     histMetric: "cc_half",        // "cc_half" | "completeness" | "isigi"
+    hoveredHistBin: null,         // 0..nBins-1 when hovering #canvas-hist resolution bar
     lamMin: Number(wlRange[0]),
     lamMax: Number(wlRange[1]),
     dMin: initDminVal,
@@ -5774,6 +14227,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     parallaxStrength: 1.0,
     activeZones: new Set(initialZoneIds),
     selectedZoneId: null,
+    hoveredZoneId: null,
+    hoveredZoneHolzN: 0,
+    hoveredZonePos: null,
+    hoveredNodalKey: null,
+    hoveredNodalObj: null,
     hoveredPeakId: null,
     selectedPeakId: null,
     hoveredPeakObj: null,
@@ -5799,11 +14257,55 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     terminalScrollTop: 0,
   }};
 
+  const DEFAULT_COLOR_CROSSOVER = 0.38;
+  const ORBIT_PALETTE = [
+    "#ff38b4", "#00e5ff", "#fbbf24", "#10b981", "#a855f7", "#f97316",
+    "#38bdf8", "#84cc16", "#f43f5e", "#14b8a6", "#eab308", "#6366f1"
+  ];
+  let _peakDataAvailabilitySig = "";
+  let _peakDataAvailability = {{
+    hasIsigi: false,
+    hasMtzIsigi: false,
+    hasResiduals: false,
+    hasScales: false,
+    isigiTop: 40.0,
+    mtzIsigiTop: 40.0,
+    isigiMin: -3.0,
+    isigiQ25: 0.0,
+    isigiMedian: 3.0,
+    isigiQ75: 7.0,
+    isigiMax: 20.0,
+    isigiBounds: null,
+    mtzIsigiMin: -3.0,
+    mtzIsigiQ25: 0.0,
+    mtzIsigiMedian: 3.0,
+    mtzIsigiQ75: 7.0,
+    mtzIsigiMax: 20.0,
+    mtzIsigiBounds: null,
+    resMin: -3.0,
+    resMax: 3.0,
+    resMedian: 0.0,
+    resMean: 0.0,
+  }};
+
   // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
   const bankCanvases = new Map();
   const warpedBankCanvases = new Map();
   const maskBankCanvases = new Map();
   const warpedMaskCanvases = new Map();
+  const uvUpscaledCanvases = new Map();
+  let _panelTexEpoch = 1;
+  let _detLayerCacheCanvas = null;
+  let _detLayerCacheKey = "";
+  let _panelScratchCanvas = null;
+
+  function invalidatePanelRenderCaches() {{
+    warpedBankCanvases.clear();
+    warpedMaskCanvases.clear();
+    uvUpscaledCanvases.clear();
+    _panelTexEpoch += 1;
+    _detLayerCacheKey = "";
+  }}
 
   function colorizeMaskImage(img) {{
     const c = document.createElement("canvas");
@@ -5830,6 +14332,41 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return c;
   }}
 
+  const borderMaskCache = new Map();
+  let _userTouchedBorder = false;
+
+  function getBorderMaskCanvas(panel, relBorder) {{
+    if (!(relBorder > 0)) return null;
+    const rawW = (panel && (panel.n_cols || (panel._grayCanvas && panel._grayCanvas.width))) || 256;
+    const rawH = (panel && (panel.n_rows || (panel._grayCanvas && panel._grayCanvas.height))) || 256;
+    const rawBw = Math.floor(relBorder * Math.min(rawW, rawH));
+    if (rawBw <= 0) return null;
+    const maxDim = Math.max(rawW, rawH, 1);
+    const scale = maxDim > 512 ? (512 / maxDim) : (maxDim < 64 ? (64 / maxDim) : 1.0);
+    const W = Math.max(32, Math.round(rawW * scale));
+    const H = Math.max(32, Math.round(rawH * scale));
+    const bw = Math.min(Math.floor(Math.min(W, H) * 0.45), Math.max(1, Math.round(rawBw * scale)));
+    const key = `${{W}}x${{H}}_${{bw}}`;
+    let c = borderMaskCache.get(key);
+    if (c) return c;
+    c = document.createElement("canvas");
+    c.width = W;
+    c.height = H;
+    const ctx = c.getContext("2d");
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "rgba(251, 146, 60, 0.40)";
+    ctx.fillRect(0, 0, W, bw);
+    ctx.fillRect(0, H - bw, W, bw);
+    ctx.fillRect(0, bw, bw, Math.max(0, H - 2 * bw));
+    ctx.fillRect(W - bw, bw, bw, Math.max(0, H - 2 * bw));
+    ctx.strokeStyle = "rgba(251, 146, 60, 0.92)";
+    ctx.lineWidth = Math.max(1, Math.round(Math.min(W, H) / 160));
+    if (ctx.setLineDash) ctx.setLineDash([4, 3]);
+    ctx.strokeRect(bw + 0.5, bw + 0.5, Math.max(1, W - 2 * bw - 1), Math.max(1, H - 2 * bw - 1));
+    borderMaskCache.set(key, c);
+    return c;
+  }}
+
   function hasPixelMask() {{
     if (maskBankCanvases.size > 0) return true;
     if (DATA.em_mask_summary && DATA.em_mask_summary.available) return true;
@@ -5841,21 +14378,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const rowEl = document.getElementById("mask-legend-row");
     const darkEl = document.getElementById("lbl-mask-dark");
     const brightEl = document.getElementById("lbl-mask-bright");
+    const edgeEl = document.getElementById("lbl-mask-edge");
     const avail = hasPixelMask();
+    const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
+    const relBorder = getActiveRelBorderWidth();
+    const borderPct = relBorder * 100.0;
     const sum = (DATA && DATA.em_mask_summary) || {{}};
     const darkPct = typeof sum.dark_fraction === "number" ? (sum.dark_fraction * 100) : 0;
     const brightPct = typeof sum.bright_fraction === "number" ? (sum.bright_fraction * 100) : 0;
     if (btnMask) {{
       btnMask.classList.toggle("active-btn", Boolean(state.showPixelMask));
-      btnMask.style.opacity = avail || state.showPixelMask ? "1" : "0.52";
+      btnMask.style.opacity = (avail || hasPanels || state.showPixelMask) ? "1" : "0.52";
       btnMask.title = avail
-        ? `Show/Hide translucent EM pixel mask overlay (Dark: ${{darkPct.toFixed(1)}}%, Static Bright: ${{brightPct.toFixed(2)}}%)`
-        : "EM pixel mask not available in current dataset — run 2. Solve or load a solved HDF5";
+        ? `Show/Hide pixel & border mask overlay (Dark: ${{darkPct.toFixed(1)}}%, Static Bright: ${{brightPct.toFixed(2)}}%, Edge border: ${{borderPct.toFixed(1)}}%)`
+        : `Show/Hide detector panel edge mask (${{borderPct.toFixed(1)}}% border; run 2. Solve to add EM Dark/Bright pixel mask)`;
     }}
     if (rowEl) {{
       rowEl.style.display = state.showPixelMask ? "flex" : "none";
-      if (darkEl) darkEl.textContent = avail ? `Dark ${{darkPct.toFixed(1)}}%` : "No EM mask";
-      if (brightEl) brightEl.textContent = avail ? `Bright ${{brightPct.toFixed(2)}}%` : "Run Solve";
+      if (darkEl) darkEl.textContent = avail ? `Dark ${{darkPct.toFixed(1)}}%` : "Dark —";
+      if (brightEl) brightEl.textContent = avail ? `Bright ${{brightPct.toFixed(2)}}%` : "Bright —";
+      if (edgeEl) {{
+        const p0 = hasPanels ? PANELS[0] : null;
+        const dim = p0 && (p0.n_rows || p0.n_cols) ? Math.min(p0.n_rows || 9999, p0.n_cols || 9999) : 0;
+        const pxTxt = dim > 0 ? ` (${{Math.floor(relBorder * dim)}}px)` : "";
+        edgeEl.textContent = `Edge ${{borderPct.toFixed(1)}}%${{pxTxt}}`;
+      }}
     }}
   }}
 
@@ -5892,6 +14439,411 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   const rawBankImages = new Map();
+  const rawBankGrayMaps = new Map();
+  let lastClientBankImgs = null;
+
+  function cacheBankGrayscaleMap(bank, img) {{
+    if (!img) return;
+    const w = img.width || 0;
+    const h = img.height || 0;
+    if (w < 4 || h < 4) return;
+    try {{
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      const d = ctx.getImageData(0, 0, w, h).data;
+      const gray = new Uint8Array(w * h);
+      for (let i = 0, p = 0; i < d.length; i += 4, p++) {{
+        gray[p] = d[i];
+      }}
+      rawBankGrayMaps.set(Number(bank), {{ w, h, data: gray }});
+    }} catch (_e) {{}}
+  }}
+
+  function detPixelToLabJS(det, rowF, colF) {{
+    const dvX = rowF * det.dh * det.vhat[0];
+    const dvY = rowF * det.dh * det.vhat[1];
+    const dvZ = rowF * det.dh * det.vhat[2];
+    if (!det.isCurved) {{
+      return [
+        det.center[0] + colF * det.dw * det.uhat[0] + dvX,
+        det.center[1] + colF * det.dw * det.uhat[1] + dvY,
+        det.center[2] + colF * det.dw * det.uhat[2] + dvZ,
+      ];
+    }}
+    const ang = (colF * det.dw) / Math.max(det.radius, 1e-6);
+    const sA = Math.sin(ang) * det.radius;
+    const cA = (Math.cos(ang) - 1.0) * det.radius;
+    return [
+      det.center[0] + sA * det.what[0] + cA * det.rhat[0] + dvX,
+      det.center[1] + sA * det.what[1] + cA * det.rhat[1] + dvY,
+      det.center[2] + sA * det.what[2] + cA * det.rhat[2] + dvZ,
+    ];
+  }}
+
+  function refreshZonesAngularStatsJS(peaks) {{
+    if (!Array.isArray(ZONES) || ZONES.length === 0 || !Array.isArray(peaks)) return;
+    const zCounts = new Map();
+    const zSqSum = new Map();
+    const zErrN = new Map();
+    for (let i = 0; i < peaks.length; i++) {{
+      const pk = peaks[i];
+      const zids = pk && pk.zone_ids;
+      if (!Array.isArray(zids)) continue;
+      const hasErr = Boolean(pk.has_angular_error) && typeof pk.angular_error_deg === "number" && Number.isFinite(pk.angular_error_deg);
+      const e2 = hasErr ? pk.angular_error_deg * pk.angular_error_deg : 0.0;
+      for (let j = 0; j < zids.length; j++) {{
+        const zid = zids[j];
+        zCounts.set(zid, (zCounts.get(zid) || 0) + 1);
+        if (hasErr) {{
+          zSqSum.set(zid, (zSqSum.get(zid) || 0.0) + e2);
+          zErrN.set(zid, (zErrN.get(zid) || 0) + 1);
+        }}
+      }}
+    }}
+    for (let z = 0; z < ZONES.length; z++) {{
+      const zn = ZONES[z];
+      if (!zn) continue;
+      zn.n_peaks = zCounts.get(zn.zone_id) || 0;
+      const nE = zErrN.get(zn.zone_id) || 0;
+      if (nE > 0) {{
+        zn.angular_rms_deg = Number(Math.sqrt((zSqSum.get(zn.zone_id) || 0.0) / nE).toFixed(4));
+      }}
+    }}
+  }}
+
+  let _tofDeltaThetaTimer = null;
+  let _tofDeltaThetaAbort = null;
+  let _tofDeltaThetaReqSeq = 0;
+  let _lastTofDeltaThetaSig = "";
+
+  function _buildTofDeltaThetaSig() {{
+    const activeRunIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const ub = getActiveUbMatrix();
+    const ubStr = Array.isArray(ub) ? ub.flat().map(v => Number(v || 0).toFixed(6)).join(",") : "";
+    const Rrun = getActiveGoniometerR();
+    const rStr = Array.isArray(Rrun) ? Rrun.flat().map(v => Number(v || 0).toFixed(5)).join(",") : "";
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : null;
+    const sLab = (sMap && Array.isArray(sMap[String(activeRunIdx)]))
+      ? sMap[String(activeRunIdx)]
+      : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0]);
+    const sStr = sLab.map(v => Number(v || 0).toFixed(6)).join(",");
+    const l1Val = typeof DATA.tof_l1 === "number" ? DATA.tof_l1.toFixed(5) : "auto";
+    const zTol = Number(state.zoneTolDeg || 0.75).toFixed(3);
+    return `${{activeRunIdx}}|${{Number(state.dMin || 0).toFixed(4)}}|${{Number(state.lamMin || 0).toFixed(4)}}|${{Number(state.lamMax || 0).toFixed(4)}}|${{zTol}}|${{ubStr}}|${{rStr}}|${{sStr}}|${{l1Val}}`;
+  }}
+
+  function applyTofErrorsMapToPeaks(peaks, errMap) {{
+    if (!Array.isArray(peaks) || !errMap || typeof errMap !== "object") return 0;
+    let nMatched = 0;
+    for (let i = 0; i < peaks.length; i++) {{
+      const pk = peaks[i];
+      if (!pk || pk.peak_source === "integrated" || pk.source === "integrated") continue;
+      const hkl = pk.hkl;
+      if (!Array.isArray(hkl) || hkl.length < 3) continue;
+      const hkStr = `${{hkl[0]}},${{hkl[1]}},${{hkl[2]}}`;
+      const bKey = `${{pk.bank}}|${{hkStr}}`;
+      const val = errMap[bKey];
+      if (typeof val === "number" && Number.isFinite(val)) {{
+        pk.angular_error_deg = Number(val.toFixed(4));
+        pk.has_angular_error = true;
+        nMatched++;
+        const prevSnap = _baselineMeasCache.byBankHkl.get(bKey);
+        if (prevSnap) {{
+          prevSnap.angular_error_deg = pk.angular_error_deg;
+          prevSnap.has_angular_error = true;
+        }} else {{
+          _baselineMeasCache.byBankHkl.set(bKey, {{
+            angular_error_deg: pk.angular_error_deg,
+            has_angular_error: true,
+          }});
+        }}
+      }} else {{
+        pk.angular_error_deg = 0.0;
+        pk.has_angular_error = false;
+        const prevSnap = _baselineMeasCache.byBankHkl.get(bKey);
+        if (prevSnap) {{
+          delete prevSnap.angular_error_deg;
+          delete prevSnap.has_angular_error;
+        }}
+      }}
+    }}
+    return nMatched;
+  }}
+
+  function scheduleLiveTofDeltaThetaSync(immediate = false) {{
+    if (!(Boolean(DATA.has_tof_events) || DATA.angular_error_mode === "tof_3d")) return;
+    if (typeof fetch !== "function") return;
+    const ub = getActiveUbMatrix();
+    if (!ub) return;
+    const reqSig = _buildTofDeltaThetaSig();
+    if (reqSig === _lastTofDeltaThetaSig) return;
+
+    if (_tofDeltaThetaTimer) {{
+      clearTimeout(_tofDeltaThetaTimer);
+      _tofDeltaThetaTimer = null;
+    }}
+    const runFetch = () => {{
+      _tofDeltaThetaTimer = null;
+      if (_tofDeltaThetaAbort) {{
+        try {{ _tofDeltaThetaAbort.abort(); }} catch (_e) {{}}
+      }}
+      const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+      _tofDeltaThetaAbort = ctrl;
+      const seq = ++_tofDeltaThetaReqSeq;
+
+      const activeRunIdx = typeof state.selectedFrameIndex === "number"
+        ? state.selectedFrameIndex
+        : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+      const Rrun = getActiveGoniometerR();
+      const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+        ? DATA.sample_offset_lab_per_run
+        : null;
+      const sLab = (sMap && Array.isArray(sMap[String(activeRunIdx)]))
+        ? sMap[String(activeRunIdx)]
+        : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0]);
+      const zoneAxes = Array.isArray(ZONES)
+        ? ZONES
+            .filter(z => z && Array.isArray(z.axis_crystal_xyz) && z.axis_crystal_xyz.length === 3)
+            .map(z => z.axis_crystal_xyz)
+        : [];
+
+      fetch("api/tof_delta_theta", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          frame_index: activeRunIdx,
+          d_min: Number(state.dMin),
+          wavelength_range: [Number(state.lamMin), Number(state.lamMax)],
+          ub_matrix: ub,
+          R_run: Rrun,
+          sample_offset_lab: sLab,
+          ki: DATA.ki,
+          instrument: DATA.instrument,
+          space_group: DATA.space_group,
+          cell: DATA.cell,
+          detector_configs: DATA.detector_configs || null,
+          tof_l1: typeof DATA.tof_l1 === "number" ? DATA.tof_l1 : null,
+          zone_tolerance_deg: Number(state.zoneTolDeg || 0.75),
+          zone_axes_crystal: zoneAxes,
+        }}),
+        signal: ctrl ? ctrl.signal : undefined,
+      }})
+        .then(r => (r && r.ok ? r.json() : null))
+        .then(res => {{
+          if (seq !== _tofDeltaThetaReqSeq || !res || !res.ok || !res.errors) return;
+          _lastTofDeltaThetaSig = reqSig;
+          if (res.angular_error_mode) DATA.angular_error_mode = res.angular_error_mode;
+          if (res.tof_gate) DATA.tof_gate = res.tof_gate;
+          applyTofErrorsMapToPeaks(PREDICTED_PEAKS, res.errors);
+          if (state.peakSource === "predicted" && PEAKS !== PREDICTED_PEAKS) {{
+            applyTofErrorsMapToPeaks(PEAKS, res.errors);
+          }}
+          refreshZonesAngularStatsJS(state.peakSource === "predicted" ? PEAKS : PREDICTED_PEAKS);
+          _peakDataAvailabilitySig = "";
+          updateHUD();
+          renderZoneList();
+          renderDetector();
+          if (state.showStereo) renderStereo();
+        }})
+        .catch(() => {{}});
+    }};
+
+    if (immediate) {{
+      runFetch();
+    }} else {{
+      _tofDeltaThetaTimer = setTimeout(runFetch, 75);
+    }}
+  }}
+
+  function estimateActiveFrameAngularErrorsJS(peaks, panelsGeomOpt, RrunOpt, sLabOpt, forceOverwrite = false) {{
+    if (Boolean(DATA.has_tof_events) || DATA.angular_error_mode === "tof_3d") return 0;
+    if (!Array.isArray(peaks) || peaks.length === 0 || rawBankGrayMaps.size === 0) return 0;
+    const activeRunIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const Rrun = RrunOpt || getActiveGoniometerR();
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : null;
+    const sLab = sLabOpt || (
+      (sMap && Array.isArray(sMap[String(activeRunIdx)]))
+        ? sMap[String(activeRunIdx)]
+        : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0])
+    );
+    const panelsGeom = panelsGeomOpt || buildActiveDetectorRaycastPanels(sLab);
+    if (!panelsGeom || panelsGeom.length === 0) return 0;
+    const detByBank = new Map();
+    for (let i = 0; i < panelsGeom.length; i++) detByBank.set(Number(panelsGeom[i].bid), panelsGeom[i]);
+
+    const kiRaw = Array.isArray(DATA.ki) && DATA.ki.length === 3 ? DATA.ki : [0.0, 0.0, 1.0];
+    const ki = vecUnit([Number(kiRaw[0]) || 0, Number(kiRaw[1]) || 0, Number(kiRaw[2]) || 1]);
+    const sx = Number(sLab[0]) || 0.0, sy = Number(sLab[1]) || 0.0, sz = Number(sLab[2]) || 0.0;
+    const scratchVals = new Float32Array(441);
+    const scratchDev = new Float32Array(441);
+    const predsByBank = new Map();
+    for (let i = 0; i < peaks.length; i++) {{
+      const p0 = peaks[i];
+      if (!p0) continue;
+      const bk0 = Number(p0.bank);
+      const gm0 = rawBankGrayMaps.get(bk0);
+      const dt0 = detByBank.get(bk0);
+      if (!gm0 || !dt0) continue;
+      const sR0 = dt0.n > 1 ? (gm0.h - 1) / (dt0.n - 1) : 1.0;
+      const sC0 = dt0.m > 1 ? (gm0.w - 1) / (dt0.m - 1) : 1.0;
+      const rawR0 = typeof p0.row === "number" ? p0.row : Number(p0.pixel_r);
+      const rawC0 = typeof p0.col === "number" ? p0.col : Number(p0.pixel_c);
+      const rr0 = rawR0 * sR0;
+      const cc0 = rawC0 * sC0;
+      if (!Number.isFinite(rr0) || !Number.isFinite(cc0)) continue;
+      let arr = predsByBank.get(bk0);
+      if (!arr) {{
+        arr = [];
+        predsByBank.set(bk0, arr);
+      }}
+      arr.push(rr0, cc0);
+    }}
+    let nUpdated = 0;
+
+    for (let i = 0; i < peaks.length; i++) {{
+      const pk = peaks[i];
+      if (!pk || pk.peak_source === "integrated" || pk.source === "integrated") continue;
+      if (!forceOverwrite && pk.has_angular_error && typeof pk.angular_error_deg === "number" && Number.isFinite(pk.angular_error_deg)) {{
+        continue;
+      }}
+      const bk = Number(pk.bank);
+      const gmap = rawBankGrayMaps.get(bk);
+      const det = detByBank.get(bk);
+      const gh = (Array.isArray(pk.q_hat) && pk.q_hat.length >= 3) ? pk.q_hat : pk.g_hat_crystal;
+      if (!gmap || !det || !Array.isArray(gh) || gh.length < 3) continue;
+      const W = gmap.w, H = gmap.h;
+      if (W < 8 || H < 8) continue;
+      const scaleR = det.n > 1 ? (H - 1) / (det.n - 1) : 1.0;
+      const scaleC = det.m > 1 ? (W - 1) / (det.m - 1) : 1.0;
+      const rawR = typeof pk.row === "number" ? pk.row : Number(pk.pixel_r);
+      const rawC = typeof pk.col === "number" ? pk.col : Number(pk.pixel_c);
+      const rIm = rawR * scaleR;
+      const cIm = rawC * scaleC;
+      if (!(rIm >= 1.0 && rIm <= H - 2.0 && cIm >= 1.0 && cIm <= W - 2.0)) continue;
+
+      const r0 = Math.round(rIm), c0 = Math.round(cIm);
+      const rad = Math.max(2, Math.min(10, Math.round(0.032 * Math.min(H, W))));
+      const rad2 = rad * rad;
+      let cnt = 0;
+      let maxU8 = 0;
+      for (let dr = -rad; dr <= rad; dr++) {{
+        const rr = Math.max(0, Math.min(H - 1, r0 + dr));
+        const rowOff = rr * W;
+        for (let dc = -rad; dc <= rad; dc++) {{
+          if (dr * dr + dc * dc > rad2) continue;
+          const cc = Math.max(0, Math.min(W - 1, c0 + dc));
+          const u8 = gmap.data[rowOff + cc];
+          if (u8 > maxU8) maxU8 = u8;
+          // Invert log1p texture mapping so bright Bragg cores dominate background
+          scratchVals[cnt++] = Math.expm1((u8 / 255.0) * 5.0);
+        }}
+      }}
+      if (cnt < 5 || maxU8 < 26) {{
+        if (forceOverwrite) pk.has_angular_error = false;
+        continue;
+      }}
+      const sorted = Array.from(scratchVals.subarray(0, cnt)).sort((a, b) => a - b);
+      const bg = sorted[cnt >> 1];
+      for (let k = 0; k < cnt; k++) scratchDev[k] = Math.abs(sorted[k] - bg);
+      const sortedDev = Array.from(scratchDev.subarray(0, cnt)).sort((a, b) => a - b);
+      const mad = 1.4826 * sortedDev[cnt >> 1];
+      const thr = bg + Math.max(4.0 * mad, Math.max(0.45, 0.20 * Math.max(bg, 1.0)));
+
+      let wSum = 0.0, wrSum = 0.0, wcSum = 0.0;
+      for (let dr = -rad; dr <= rad; dr++) {{
+        const rr = Math.max(0, Math.min(H - 1, r0 + dr));
+        const rowOff = rr * W;
+        for (let dc = -rad; dc <= rad; dc++) {{
+          if (dr * dr + dc * dc > rad2) continue;
+          const cc = Math.max(0, Math.min(W - 1, c0 + dc));
+          const val = Math.expm1((gmap.data[rowOff + cc] / 255.0) * 5.0);
+          const ex = val - thr;
+          if (ex > 0.0) {{
+            const w = ex * ex;
+            wSum += w;
+            wrSum += w * rr;
+            wcSum += w * cc;
+          }}
+        }}
+      }}
+      if (wSum <= 0.0) {{
+        if (forceOverwrite) pk.has_angular_error = false;
+        continue;
+      }}
+      const rCentIm = wrSum / wSum;
+      const cCentIm = wcSum / wSum;
+      const bankPreds = predsByBank.get(bk);
+      if (bankPreds && bankPreds.length > 2) {{
+        const drSelf = rCentIm - rIm;
+        const dcSelf = cCentIm - cIm;
+        const dSelf2 = drSelf * drSelf + dcSelf * dcSelf;
+        let hijacked = false;
+        for (let k = 0; k < bankPreds.length; k += 2) {{
+          const drk = rCentIm - bankPreds[k];
+          if (drk * drk >= dSelf2 - 1e-5) continue;
+          const dck = cCentIm - bankPreds[k + 1];
+          if (drk * drk + dck * dck < dSelf2 - 1e-5) {{
+            hijacked = true;
+            break;
+          }}
+        }}
+        if (hijacked) {{
+          if (forceOverwrite) pk.has_angular_error = false;
+          continue;
+        }}
+      }}
+      const rCentDet = rCentIm / Math.max(scaleR, 1e-9);
+      const cCentDet = cCentIm / Math.max(scaleC, 1e-9);
+      const xyzObs = detPixelToLabJS(det, rCentDet, cCentDet);
+      const rx = xyzObs[0] - sx, ry = xyzObs[1] - sy, rz = xyzObs[2] - sz;
+      const rn = Math.hypot(rx, ry, rz);
+      if (rn <= 1e-9) continue;
+      const qlx = rx / rn - ki[0], qly = ry / rn - ki[1], qlz = rz / rn - ki[2];
+      // Crystal frame q_obs = Rrun^T * q_lab
+      const qcx = Rrun[0][0] * qlx + Rrun[1][0] * qly + Rrun[2][0] * qlz;
+      const qcy = Rrun[0][1] * qlx + Rrun[1][1] * qly + Rrun[2][1] * qlz;
+      const qcz = Rrun[0][2] * qlx + Rrun[1][2] * qly + Rrun[2][2] * qlz;
+      const qcn = Math.hypot(qcx, qcy, qcz);
+      if (qcn <= 1e-9) continue;
+      const ghn = Math.hypot(gh[0], gh[1], gh[2]);
+      if (ghn <= 1e-9) continue;
+      const cosAng = Math.max(-1.0, Math.min(1.0, (qcx * gh[0] + qcy * gh[1] + qcz * gh[2]) / (qcn * ghn)));
+      const angDeg = Math.acos(cosAng) * (180.0 / Math.PI);
+      if (Number.isFinite(angDeg)) {{
+        pk.angular_error_deg = Number(angDeg.toFixed(4));
+        pk.has_angular_error = true;
+        nUpdated++;
+      }}
+    }}
+    return nUpdated;
+  }}
+
+  function syncHiResButtonUI() {{
+    const btn = document.getElementById("btn-hires-tex");
+    const lbl = document.getElementById("lbl-hires-tex");
+    if (!btn) return;
+    btn.classList.toggle("active-btn", Boolean(state.hiResTextures));
+    if (lbl) lbl.textContent = state.hiresLoading ? "Hi-Res…" : "Hi-Res";
+    btn.title = state.hiResTextures
+      ? "Native 1× Hi-Res detector pixel textures active (click for fast 4× binned preview)"
+      : "Fast 4× downsampled detector preview active (click for native 1× Hi-Res microscope view)";
+  }}
+
+  function getRenderBinningQuery() {{
+    return state.hiResTextures ? "&render_binning=1" : "&render_binning=4";
+  }}
+
   function decodeAllBankTextures() {{
     let pending = 0;
     PANELS.forEach(p => {{
@@ -5900,10 +14852,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const img = new Image();
       img.onload = () => {{
         rawBankImages.set(p.bank, img);
+        cacheBankGrayscaleMap(p.bank, img);
         bankCanvases.set(p.bank, colorizeGrayscaleImage(img, state.heatmapStyle));
-        warpedBankCanvases.clear();
+        invalidatePanelRenderCaches();
         pending--;
-        if (pending <= 0 || pending % 8 === 0) {{
+        if (pending <= 0) {{
+          if (estimateActiveFrameAngularErrorsJS(PEAKS) > 0) {{
+            refreshZonesAngularStatsJS(PEAKS);
+            _peakDataAvailabilitySig = "";
+            updateHUD();
+            renderZoneList();
+          }}
+          renderDetector();
+        }} else if (pending % 8 === 0) {{
           renderDetector();
         }}
       }};
@@ -5912,14 +14873,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     PANELS.forEach(p => {{
       if (p._maskCanvas) {{
         maskBankCanvases.set(p.bank, p._maskCanvas);
-        warpedMaskCanvases.clear();
+        invalidatePanelRenderCaches();
         return;
       }}
       if (!p.mask_b64) return;
       const mimg = new Image();
       mimg.onload = () => {{
         maskBankCanvases.set(p.bank, colorizeMaskImage(mimg));
-        warpedMaskCanvases.clear();
+        invalidatePanelRenderCaches();
         syncPixelMaskUI();
         if (state.showPixelMask) renderDetector();
       }};
@@ -5932,49 +14893,142 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     rawBankImages.forEach((img, bank) => {{
       bankCanvases.set(bank, colorizeGrayscaleImage(img, state.heatmapStyle));
     }});
-    warpedBankCanvases.clear();
+    invalidatePanelRenderCaches();
   }}
 
   decodeAllBankTextures();
 
-  // Initialize sliders & synchronized Params inputs
+  // Initialize sliders & wavelength interval controls
   const slDetAlpha = document.getElementById("slider-det-alpha");
-  const slParallax = document.getElementById("slider-parallax");
+  const slColorEmphasis = document.getElementById("slider-color-emphasis");
   const slDmin = document.getElementById("slider-dmin");
-  const inpDminEl = document.getElementById("inp-dmin");
-  const inpLminEl = document.getElementById("inp-lmin");
-  const inpLmaxEl = document.getElementById("inp-lmax");
+  const wlSliderWrap = document.getElementById("wl-interval-slider");
+  const slWlMin = document.getElementById("slider-wl-min");
+  const slWlMax = document.getElementById("slider-wl-max");
+  const wlTrackFill = document.getElementById("wl-track-fill");
+  const wlKnobMin = document.getElementById("wl-knob-min");
+  const wlKnobMax = document.getElementById("wl-knob-max");
+  const MIN_WL_SPAN = 0.05;
+
+  function getWavelengthSliderBounds() {{
+    const defWl = getDefaultWavelengthForInstrument(DATA.instrument);
+    const baseLo = Number(_payloadBaseParams.lamMin) || defWl[0] || 2.0;
+    const baseHi = Number(_payloadBaseParams.lamMax) || defWl[1] || 4.5;
+    const curLo = (Number.isFinite(state.lamMin) && state.lamMin > 0) ? state.lamMin : baseLo;
+    const curHi = (Number.isFinite(state.lamMax) && state.lamMax > curLo) ? state.lamMax : Math.max(curLo + MIN_WL_SPAN, baseHi);
+    const domMin = Math.min(0.20, Math.max(0.05, Math.floor(Math.min(defWl[0] || 0.20, baseLo, curLo) * 20) / 20));
+    const domMax = Math.max(6.0, Math.ceil(Math.max((defWl[1] || 4.5) * 1.35, baseHi * 1.15, curHi) * 2) / 2);
+    return [domMin, domMax];
+  }}
 
   function updateWavelengthLabels() {{
-    DATA.wavelength_range = [state.lamMin, state.lamMax];
+    const [domMin, domMax] = getWavelengthSliderBounds();
+    const span = Math.max(MIN_WL_SPAN, domMax - domMin);
+    const lo = Math.max(0.05, Number.isFinite(state.lamMin) && state.lamMin > 0 ? state.lamMin : domMin);
+    const hi = Math.max(lo + MIN_WL_SPAN, Number.isFinite(state.lamMax) ? state.lamMax : lo + 1.0);
+    state.lamMin = lo;
+    state.lamMax = hi;
+    DATA.wavelength_range = [lo, hi];
     const wlReadEl = document.getElementById("wl-readout");
     if (wlReadEl) {{
-      wlReadEl.textContent = `λ: ${{state.lamMin.toFixed(1)}}–${{state.lamMax.toFixed(1)}} Å`;
+      const hasActiveInp = typeof wlReadEl.querySelector === "function" && wlReadEl.querySelector("input.inline-slider-input");
+      if (!hasActiveInp) {{
+        const minSpan = document.getElementById("wl-val-min");
+        const maxSpan = document.getElementById("wl-val-max");
+        if (minSpan && maxSpan) {{
+          minSpan.textContent = lo.toFixed(2);
+          maxSpan.textContent = hi.toFixed(2);
+          minSpan.title = `λ_min = ${{lo.toFixed(2)}} Å — click to enter exact value`;
+          maxSpan.title = `λ_max = ${{hi.toFixed(2)}} Å — click to enter exact value`;
+        }} else {{
+          wlReadEl.textContent = `[${{lo.toFixed(2)}}, ${{hi.toFixed(2)}}] Å`;
+        }}
+      }}
     }}
-    if (inpLminEl && document.activeElement !== inpLminEl) {{
-      inpLminEl.value = state.lamMin.toFixed(2);
+    if (slWlMin) {{
+      slWlMin.min = domMin.toFixed(2);
+      slWlMin.max = domMax.toFixed(2);
+      slWlMin.value = lo.toFixed(2);
     }}
-    if (inpLmaxEl && document.activeElement !== inpLmaxEl) {{
-      inpLmaxEl.value = state.lamMax.toFixed(2);
+    if (slWlMax) {{
+      slWlMax.min = domMin.toFixed(2);
+      slWlMax.max = domMax.toFixed(2);
+      slWlMax.value = hi.toFixed(2);
+    }}
+    const pctLo = Math.max(0, Math.min(100, ((lo - domMin) / span) * 100));
+    const pctHi = Math.max(pctLo, Math.min(100, ((hi - domMin) / span) * 100));
+    if (wlTrackFill) {{
+      wlTrackFill.style.left = `${{pctLo.toFixed(2)}}%`;
+      wlTrackFill.style.width = `${{Math.max(0, pctHi - pctLo).toFixed(2)}}%`;
+    }}
+    if (wlKnobMin) {{
+      wlKnobMin.style.left = `${{pctLo.toFixed(2)}}%`;
+      wlKnobMin.title = `Minimum wavelength λ_min = ${{lo.toFixed(2)}} Å (drag [ or use Left/Right arrows)`;
+    }}
+    if (wlKnobMax) {{
+      wlKnobMax.style.left = `${{pctHi.toFixed(2)}}%`;
+      wlKnobMax.title = `Maximum wavelength λ_max = ${{hi.toFixed(2)}} Å (drag ] or use Left/Right arrows)`;
+    }}
+    if (typeof updateColorscaleSliderGradient === "function") {{
+      updateColorscaleSliderGradient();
     }}
   }}
 
+  function syncWavelengthControls(nextMin, nextMax, activeEnd = null) {{
+    const [domMin, domMax] = getWavelengthSliderBounds();
+    let lo = Number.isFinite(nextMin) ? Number(nextMin) : state.lamMin;
+    let hi = Number.isFinite(nextMax) ? Number(nextMax) : state.lamMax;
+    if (activeEnd === "min") {{
+      hi = Math.max(domMin + MIN_WL_SPAN, Number.isFinite(state.lamMax) ? state.lamMax : hi);
+      lo = Math.max(domMin, Math.min(lo, hi - MIN_WL_SPAN));
+    }} else if (activeEnd === "max") {{
+      lo = Math.max(domMin, Number.isFinite(state.lamMin) ? state.lamMin : lo);
+      hi = Math.min(domMax, Math.max(hi, lo + MIN_WL_SPAN));
+    }} else {{
+      lo = Math.max(0.05, lo);
+      hi = Math.max(lo + MIN_WL_SPAN, hi);
+    }}
+    state.lamMin = Math.round(lo * 100) / 100;
+    state.lamMax = Math.round(hi * 100) / 100;
+    updateWavelengthLabels();
+  }}
+
   function syncDminControls(nextDmin, sourceEl = null) {{
-    const v = Math.max(0.2, Math.min(10.0, Number(nextDmin) || 1.0));
+    const dFloor = getDynamicDminFloor();
+    const rawVal = Number(nextDmin);
+    const clampedVal = Math.max(dFloor, Math.min(25.0, Number.isFinite(rawVal) && rawVal > 0 ? rawVal : dFloor));
+    const snappedVal = sourceEl === slDmin
+      ? Math.round(clampedVal * 20) / 20
+      : Math.round(clampedVal * 100) / 100;
+    const v = Math.max(dFloor, Math.round(snappedVal * 100) / 100);
+    const clampedAtFloor = Number.isFinite(rawVal) && rawVal > 0 && rawVal <= dFloor + 1e-4;
     state.dMin = v;
     DATA.d_min = v;
     if (sourceEl) {{
       state.dMinUserSeq = (state.dMinUserSeq || 0) + 1;
     }}
     const lblD = document.getElementById("lbl-dmin-val");
-    if (lblD) lblD.textContent = `${{v.toFixed(2)}} Å`;
-    if (slDmin && sourceEl !== slDmin) {{
-      if (v < parseFloat(slDmin.min)) slDmin.min = Math.max(0.2, v - 0.2).toFixed(2);
-      if (v > parseFloat(slDmin.max)) slDmin.max = (v + 1.0).toFixed(2);
-      slDmin.value = v.toFixed(2);
+    const kinFloor = 0.5 * Math.max(0.05, Number(state.lamMin) || 2.0);
+    if (lblD) {{
+      const hasActiveInp = typeof lblD.querySelector === "function" && lblD.querySelector("input.inline-slider-input");
+      if (!hasActiveInp) {{
+        lblD.textContent = `${{v.toFixed(2)}} Å`;
+      }}
+      lblD.title = v < kinFloor - 0.005
+        ? `Active resolution cutoff d_min = ${{v.toFixed(2)}} Å (backscatter kinematic limit λ_min/2 = ${{kinFloor.toFixed(2)}} Å at current λ_min = ${{Number(state.lamMin).toFixed(2)}} Å) — click to enter exact value`
+        : `Active resolution cutoff d_min = ${{v.toFixed(2)}} Å (hard floor ${{dFloor.toFixed(2)}} Å; Ewald-shell LOD active) — click to enter exact value`;
     }}
-    if (inpDminEl && sourceEl !== inpDminEl) {{
-      inpDminEl.value = v.toFixed(2);
+    if (slDmin) {{
+      const slMinAligned = Math.ceil(dFloor * 20 - 1e-9) / 20;
+      slDmin.min = slMinAligned.toFixed(2);
+      slDmin.step = "0.05";
+      if (v > parseFloat(slDmin.max)) {{
+        slDmin.max = (Math.ceil((v + 1.0) * 20 - 1e-9) / 20).toFixed(2);
+      }}
+      if (sourceEl !== slDmin || clampedAtFloor || Math.abs(parseFloat(slDmin.value) - v) > 1e-4) {{
+        slDmin.value = v.toFixed(2);
+      }}
+      slDmin.title = `High-resolution cutoff d_min [Å] (0.05 Å slider steps; click value for 0.01 Å input) — Ewald-shell predictor & viewport LOD down to ${{dFloor.toFixed(2)}} Å`;
     }}
   }}
 
@@ -6724,18 +15778,33 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }};
     const sgEl = document.getElementById("inp-sg");
     const defWl = getDefaultWavelengthForInstrument(DATA.instrument);
-    const lminVal = getNum("inp-lmin", state.lamMin || defWl[0]);
-    const lmaxVal = Math.max(lminVal + 0.05, getNum("inp-lmax", state.lamMax || defWl[1]));
+    const slWlMinEl = document.getElementById("slider-wl-min");
+    const slWlMaxEl = document.getElementById("slider-wl-max");
+    const rawSlMin = slWlMinEl ? parseFloat(slWlMinEl.value) : NaN;
+    const rawSlMax = slWlMaxEl ? parseFloat(slWlMaxEl.value) : NaN;
+    const lminVal = (typeof document !== "undefined" && document.activeElement === slWlMinEl && Number.isFinite(rawSlMin) && rawSlMin > 0)
+      ? rawSlMin
+      : ((Number.isFinite(state.lamMin) && state.lamMin > 0)
+        ? state.lamMin
+        : ((Number.isFinite(rawSlMin) && rawSlMin > 0) ? rawSlMin : defWl[0]));
+    const lmaxCandidate = (typeof document !== "undefined" && document.activeElement === slWlMaxEl && Number.isFinite(rawSlMax) && rawSlMax > 0)
+      ? rawSlMax
+      : ((Number.isFinite(state.lamMax) && state.lamMax > 0)
+        ? state.lamMax
+        : ((Number.isFinite(rawSlMax) && rawSlMax > 0) ? rawSlMax : defWl[1]));
+    const lmaxVal = Math.max(lminVal + 0.05, lmaxCandidate);
     state.lamMin = lminVal;
     state.lamMax = lmaxVal;
-    const rawInpDmin = inpDminEl ? parseFloat(inpDminEl.value) : NaN;
     const rawSlDmin = slDmin ? parseFloat(slDmin.value) : NaN;
     const dminVal = (typeof document !== "undefined" && document.activeElement === slDmin && Number.isFinite(rawSlDmin) && rawSlDmin > 0)
       ? rawSlDmin
-      : ((Number.isFinite(rawInpDmin) && rawInpDmin > 0)
-        ? rawInpDmin
-        : ((Number.isFinite(state.dMin) && state.dMin > 0) ? state.dMin : Number((lminVal * 0.5).toFixed(2))));
+      : ((Number.isFinite(state.dMin) && state.dMin > 0)
+        ? state.dMin
+        : ((Number.isFinite(rawSlDmin) && rawSlDmin > 0) ? rawSlDmin : Number((lminVal * 0.5).toFixed(2))));
     syncDminControls(dminVal);
+    const binEl = document.getElementById("inp-binning");
+    const rawBin = binEl ? parseInt(String(binEl.value || "").trim(), 10) : NaN;
+    const solveBinning = (Number.isFinite(rawBin) && rawBin >= 1) ? rawBin : null;
     return {{
       instrument: DATA.instrument || "CG4D",
       space_group: (sgEl && sgEl.value.trim()) || DATA.space_group || "P 21 21 21",
@@ -6746,101 +15815,490 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       beta: getNum("inp-beta", cell[4]),
       gamma: getNum("inp-gamma", cell[5]),
       d_min: dminVal,
-      rel_border_width: Math.max(0.0, Math.min(0.25, getNum("inp-border", 0.03))),
+      rel_border_width: Math.max(0.0, Math.min(0.25, getNum("inp-border", defaultRelBorderForInstrument(DATA.instrument)))),
+      binning: solveBinning,
+      has_tof_data: Boolean(DATA.has_tof_data),
+      merge_mode: DATA.has_tof_data ? "mono" : "poly",
       wavelength_min: lminVal,
       wavelength_max: lmaxVal,
     }};
   }}
 
-  // Vibrant spectral color preset for wavelength / zone highlights
+  function getColorCrossover() {{
+    const raw = Number(state.colorCrossover);
+    return Number.isFinite(raw) ? Math.max(0.05, Math.min(0.95, raw)) : DEFAULT_COLOR_CROSSOVER;
+  }}
+
+  // Monotone power crossover curve t(u) = u^(ln(0.5)/ln(c)):
+  // Pins t(0) = 0, t(c) = 0.5 EXACTLY underneath the slider knob at position c, and t(1) = 1.
+  function applyCrossoverCurve(u0) {{
+    const u = Math.max(0.0, Math.min(1.0, u0));
+    if (u <= 0.0) return 0.0;
+    if (u >= 1.0) return 1.0;
+    const c = getColorCrossover();
+    const gamma = Math.LN2 / Math.max(0.05, -Math.log(c));
+    return Math.pow(u, gamma);
+  }}
+
+  // Vibrant spectral color preset for wavelength / zone highlights (crossover knob shifts spectral midpoint)
   function wavelengthToColor(lam, alpha = 1.0) {{
-    const t = Math.max(0, Math.min(1, (lam - state.lamMin) / Math.max(0.05, state.lamMax - state.lamMin)));
+    const u = Math.max(0, Math.min(1, (lam - state.lamMin) / Math.max(0.05, state.lamMax - state.lamMin)));
+    const t = applyCrossoverCurve(u);
     const hue = (1.0 - t) * 265;
     return `hsla(${{hue.toFixed(1)}}, 95%, 60%, ${{alpha}})`;
   }}
 
-  const ORBIT_PALETTE = [
-    "#ff38b4", "#00e5ff", "#fbbf24", "#10b981", "#a855f7", "#f97316",
-    "#38bdf8", "#84cc16", "#f43f5e", "#14b8a6", "#eab308", "#6366f1"
-  ];
-
-  // Diverging Blue–White–Red colormap for Careless standardized residual (I_obs - I_pred)/sigma
-  function residualToColor(resVal, alpha = 1.0) {{
-    if (typeof resVal !== "number" || !Number.isFinite(resVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
-    const clamped = Math.max(-3.0, Math.min(3.0, resVal));
-    if (clamped < 0) {{
-      const u = Math.min(1.0, -clamped / 3.0);
+  // Diverging Blue–White–Red colormap for Careless standardized residual (I_obs - I_pred)/sigma,
+  // spanning outlier-robust [resMin, resMax] with the neutral White midpoint calibrated to dataset median resMedian.
+  function residualToColor(resVal, alpha = 1.0, bounds = null) {{
+    if (typeof resVal !== "number" || !Number.isFinite(resVal)) return `rgba(148, 163, 184, 0.000)`;
+    const b = bounds || getPeakDataAvailability();
+    const lo = Number.isFinite(b && b.resMin) ? b.resMin : -3.0;
+    const hi = Number.isFinite(b && b.resMax) ? b.resMax : 3.0;
+    const rawMid = Number.isFinite(b && b.resMedian) ? b.resMedian : (b && b.resMean);
+    const mid = Number.isFinite(rawMid) ? Math.max(lo, Math.min(hi, rawMid)) : 0.5 * (lo + hi);
+    const clamped = Math.max(lo, Math.min(hi, resVal));
+    if (clamped < mid) {{
+      const negSpan = mid - lo;
+      const frac = negSpan > 1e-6 ? Math.min(1.0, (mid - clamped) / negSpan) : 0.0;
+      const u = applyCrossoverCurve(frac);
       const r = Math.round(248 * (1 - u) + 30 * u);
       const g = Math.round(250 * (1 - u) + 170 * u);
-      const b = Math.round(252 * (1 - u) + 255 * u);
-      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha}})`;
+      const bl = Math.round(252 * (1 - u) + 255 * u);
+      return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{alpha.toFixed(3)}})`;
     }} else {{
-      const u = Math.min(1.0, clamped / 3.0);
+      const posSpan = hi - mid;
+      const frac = posSpan > 1e-6 ? Math.min(1.0, (clamped - mid) / posSpan) : 0.0;
+      const u = applyCrossoverCurve(frac);
       const r = Math.round(248 * (1 - u) + 244 * u);
       const g = Math.round(250 * (1 - u) + 63 * u);
-      const b = Math.round(252 * (1 - u) + 94 * u);
-      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha}})`;
+      const bl = Math.round(252 * (1 - u) + 94 * u);
+      return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{alpha.toFixed(3)}})`;
     }}
   }}
 
-  function scaleToColor(scaleVal, alpha = 1.0) {{
-    if (typeof scaleVal !== "number" || !Number.isFinite(scaleVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
-    const t = Math.max(0.0, Math.min(1.0, (Math.log10(Math.max(1e-4, scaleVal)) + 2.0) / 3.0));
-    const hue = (1.0 - t) * 195 + t * 45;
-    return `hsla(${{hue.toFixed(1)}}, 92%, 58%, ${{alpha}})`;
+  function scaleToColor(scaleVal, alpha = 1.0, peakSrc = state.peakSource) {{
+    if (typeof scaleVal !== "number" || !Number.isFinite(scaleVal)) return `rgba(148, 163, 184, 0.000)`;
+    const tRaw = Math.max(0.0, Math.min(1.0, (Math.log10(Math.max(1e-4, scaleVal)) + 2.0) / 3.0));
+    const t = applyCrossoverCurve(tRaw);
+    const isInteg = String(peakSrc || state.peakSource) === "integrated";
+    // Pred (circles): Indigo-Violet (258°) -> Electric Cyan (188°); Integ (ellipses): Teal (195°) -> Electric Lime (82°)
+    const hue = isInteg ? ((1.0 - t) * 195 + t * 82) : ((1.0 - t) * 258 + t * 188);
+    const sat = isInteg ? 92 : 95;
+    const lit = isInteg ? 58 : 60;
+    return `hsla(${{hue.toFixed(1)}}, ${{sat}}%, ${{lit}}%, ${{alpha.toFixed(3)}})`;
   }}
 
   function peakUnscaledIsigi(p) {{
-    if (!p || typeof p.intensity !== "number" || typeof p.sigma !== "number" || p.sigma <= 0) return NaN;
+    if (!p) return NaN;
+    if (
+      typeof p.intensity !== "number" ||
+      !Number.isFinite(p.intensity) ||
+      typeof p.sigma !== "number" ||
+      !Number.isFinite(p.sigma) ||
+      p.sigma <= 0
+    ) {{
+      return NaN;
+    }}
     return p.intensity / Math.max(p.sigma, 1e-6);
   }}
 
-  function isigiToColor(isigiVal, alpha = 1.0) {{
-    if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
-    const t = Math.max(0.0, Math.min(1.0, Math.log10(Math.max(1.0, isigiVal)) / Math.log10(40.0)));
-    const hue = (1.0 - t) * 215 + t * 48;
-    const light = 50 + t * 14;
-    return `hsla(${{hue.toFixed(1)}}, 95%, ${{light.toFixed(1)}}%, ${{alpha}})`;
+  function peakMtzIsigi(p) {{
+    if (!p) return NaN;
+    if (typeof p.mtz_isigi === "number" && Number.isFinite(p.mtz_isigi)) {{
+      return p.mtz_isigi;
+    }}
+    if (
+      typeof p.mtz_i === "number" &&
+      Number.isFinite(p.mtz_i) &&
+      typeof p.mtz_sigi === "number" &&
+      Number.isFinite(p.mtz_sigi) &&
+      p.mtz_sigi > 0
+    ) {{
+      return p.mtz_i / Math.max(p.mtz_sigi, 1e-6);
+    }}
+    return NaN;
+  }}
+
+  function computeQuantileScaleBounds(rawVals, defLo = -3.0, defMid = 3.0, defHi = 20.0) {{
+    if (!Array.isArray(rawVals) || rawVals.length === 0) {{
+      return {{
+        min: defLo,
+        q25: 0.5 * (defLo + defMid),
+        median: defMid,
+        q75: 0.5 * (defMid + defHi),
+        max: defHi,
+      }};
+    }}
+    const sorted = rawVals.slice().sort((a, b) => a - b);
+    const qAt = (q) => {{
+      if (sorted.length === 1) return sorted[0];
+      const pos = Math.max(0.0, Math.min(1.0, q)) * (sorted.length - 1);
+      const base = Math.floor(pos);
+      const rest = pos - base;
+      const next = sorted[Math.min(sorted.length - 1, base + 1)];
+      return sorted[base] + rest * (next - sorted[base]);
+    }};
+    const med = qAt(0.5);
+    const q25Raw = qAt(0.25);
+    const q75Raw = qAt(0.75);
+    let lo = sorted.length >= 20 ? qAt(0.015) : sorted[0];
+    let hi = sorted.length >= 20 ? qAt(0.985) : sorted[sorted.length - 1];
+    if (sorted.length >= 4) {{
+      const iqr = Math.max(0.0, q75Raw - q25Raw);
+      const absDevs = sorted.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+      const mPos = 0.5 * (absDevs.length - 1);
+      const mBase = Math.floor(mPos);
+      const mad = absDevs[mBase] + (mPos - mBase) * (absDevs[Math.min(absDevs.length - 1, mBase + 1)] - absDevs[mBase]);
+      const sigmaMad = 1.4826 * mad;
+      const spread = Math.max(sigmaMad, iqr / 1.349);
+      if (spread > 1e-6) {{
+        lo = Math.max(lo, med - 5.0 * spread);
+        hi = Math.min(hi, med + 5.0 * spread);
+      }}
+    }}
+    let minV = Math.min(lo, med);
+    let maxV = Math.max(hi, med);
+    if (maxV - minV < 1e-6) {{
+      minV = med - 1.0;
+      maxV = med + 1.0;
+    }} else if (med - minV < 1e-6) {{
+      minV = med - Math.max(1.0, 0.25 * (maxV - med));
+    }} else if (maxV - med < 1e-6) {{
+      maxV = med + Math.max(1.0, 0.25 * (med - minV));
+    }}
+    const negSpan = Math.max(1e-6, med - minV);
+    const posSpan = Math.max(1e-6, maxV - med);
+    const q25 = Math.max(minV + 0.05 * negSpan, Math.min(med - 0.05 * negSpan, q25Raw));
+    const q75 = Math.max(med + 0.05 * posSpan, Math.min(maxV - 0.05 * posSpan, q75Raw));
+    return {{
+      min: minV,
+      q25,
+      median: med,
+      q75,
+      max: maxV,
+    }};
+  }}
+
+  function getPeakDataAvailability() {{
+    const p0 = PEAKS.length > 0 ? PEAKS[0] : null;
+    const pN = PEAKS.length > 0 ? PEAKS[PEAKS.length - 1] : null;
+    const s0 = SAMPLE_PEAKS.length > 0 ? SAMPLE_PEAKS[0] : null;
+    const sN = SAMPLE_PEAKS.length > 0 ? SAMPLE_PEAKS[SAMPLE_PEAKS.length - 1] : null;
+    const dynEp = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
+    const r0 = p0 && typeof p0.careless_residual === "number" && Number.isFinite(p0.careless_residual) ? p0.careless_residual.toFixed(3) : "";
+    const rs0 = s0 && typeof s0.careless_residual === "number" && Number.isFinite(s0.careless_residual) ? s0.careless_residual.toFixed(3) : "";
+    const i0 = p0 && Number.isFinite(peakUnscaledIsigi(p0)) ? peakUnscaledIsigi(p0).toFixed(3) : "";
+    const m0 = p0 && Number.isFinite(peakMtzIsigi(p0)) ? peakMtzIsigi(p0).toFixed(3) : "";
+    const dSig = `${{Number(state.dMin || 0).toFixed(3)}},${{Number(state.lamMin || 0).toFixed(3)}},${{Number(state.lamMax || 0).toFixed(3)}}`;
+    const sig = `${{dynEp}}|${{dSig}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}|${{i0}}|${{m0}}`;
+    if (
+      _peakDataAvailabilitySig === sig &&
+      _peakDataAvailability._p0 === p0 &&
+      _peakDataAvailability._s0 === s0
+    ) {{
+      return _peakDataAvailability;
+    }}
+    let hasIsigi = false, hasMtz = false, hasRes = false, hasScl = false;
+    const peaksIsigiSamples = [], allPeaksIsigiSamples = [];
+    const sampleIsigiSamples = [], allSampleIsigiSamples = [];
+    const peaksMtzSamples = [], allPeaksMtzSamples = [];
+    const sampleMtzSamples = [], allSampleMtzSamples = [];
+    const peaksResSamples = [], allPeaksResSamples = [];
+    const sampleResSamples = [], allSampleResSamples = [];
+    const scanArr = (arr, isSamplePool) => {{
+      if (!Array.isArray(arr)) return;
+      const sampleStep = arr.length > 16384 ? Math.ceil(arr.length / 16384) : 1;
+      for (let i = 0; i < arr.length; i++) {{
+        const p = arr[i];
+        if (!p) continue;
+        const vis = typeof isPeakVisible === "function" ? isPeakVisible(p) : true;
+        const iv = peakUnscaledIsigi(p);
+        if (Number.isFinite(iv)) {{
+          hasIsigi = true;
+          if (i % sampleStep === 0) {{
+            if (isSamplePool) {{
+              allSampleIsigiSamples.push(iv);
+              if (vis) sampleIsigiSamples.push(iv);
+            }} else {{
+              allPeaksIsigiSamples.push(iv);
+              if (vis) peaksIsigiSamples.push(iv);
+            }}
+          }}
+        }}
+        const mv = peakMtzIsigi(p);
+        if (Number.isFinite(mv)) {{
+          hasMtz = true;
+          if (i % sampleStep === 0) {{
+            if (isSamplePool) {{
+              allSampleMtzSamples.push(mv);
+              if (vis) sampleMtzSamples.push(mv);
+            }} else {{
+              allPeaksMtzSamples.push(mv);
+              if (vis) peaksMtzSamples.push(mv);
+            }}
+          }}
+        }}
+        if (typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)) {{
+          hasRes = true;
+          if (i % sampleStep === 0) {{
+            if (isSamplePool) {{
+              allSampleResSamples.push(p.careless_residual);
+              if (vis) sampleResSamples.push(p.careless_residual);
+            }} else {{
+              allPeaksResSamples.push(p.careless_residual);
+              if (vis) peaksResSamples.push(p.careless_residual);
+            }}
+          }}
+        }}
+        if (!hasScl && typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale)) hasScl = true;
+      }}
+    }};
+    scanArr(PEAKS, false);
+    if (SAMPLE_PEAKS !== PEAKS) scanArr(SAMPLE_PEAKS, true);
+    const quantileSorted = (sorted, q) => {{
+      if (sorted.length === 0) return NaN;
+      if (sorted.length === 1) return sorted[0];
+      const pos = Math.max(0.0, Math.min(1.0, q)) * (sorted.length - 1);
+      const base = Math.floor(pos);
+      const rest = pos - base;
+      const next = sorted[Math.min(sorted.length - 1, base + 1)];
+      return sorted[base] + rest * (next - sorted[base]);
+    }};
+    let resMin = -3.0, resMax = 3.0, resMedian = 0.0;
+    const visResVals = sampleResSamples.length > 0 ? sampleResSamples : peaksResSamples;
+    const fallbackResVals = allSampleResSamples.length > 0 ? allSampleResSamples : allPeaksResSamples;
+    const resVals = visResVals.length > 0 ? visResVals : fallbackResVals;
+    if (hasRes && resVals.length > 0) {{
+      resVals.sort((a, b) => a - b);
+      resMedian = quantileSorted(resVals, 0.5);
+      let lo = resVals.length >= 20 ? quantileSorted(resVals, 0.015) : resVals[0];
+      let hi = resVals.length >= 20 ? quantileSorted(resVals, 0.985) : resVals[resVals.length - 1];
+      if (resVals.length >= 4) {{
+        const iqr = Math.max(0.0, quantileSorted(resVals, 0.75) - quantileSorted(resVals, 0.25));
+        const absDevs = resVals.map((v) => Math.abs(v - resMedian)).sort((a, b) => a - b);
+        const sigmaMad = 1.4826 * quantileSorted(absDevs, 0.5);
+        const spread = Math.max(sigmaMad, iqr / 1.349);
+        if (spread > 1e-6) {{
+          lo = Math.max(lo, resMedian - 5.0 * spread);
+          hi = Math.min(hi, resMedian + 5.0 * spread);
+        }}
+      }}
+      resMin = Math.min(lo, resMedian);
+      resMax = Math.max(hi, resMedian);
+      if (resMax - resMin < 1e-6) {{
+        resMin = resMedian - 1.0;
+        resMax = resMedian + 1.0;
+      }}
+    }}
+    // Prefer visible active-frame PEAKS for I/σ when >=20 visible peaks exist, else visible SAMPLE_PEAKS, else unfiltered
+    const visIsigiVals = peaksIsigiSamples.length >= 20
+      ? peaksIsigiSamples
+      : (sampleIsigiSamples.length > peaksIsigiSamples.length ? sampleIsigiSamples : peaksIsigiSamples);
+    const fallbackIsigiVals = allPeaksIsigiSamples.length >= 20
+      ? allPeaksIsigiSamples
+      : (allSampleIsigiSamples.length > allPeaksIsigiSamples.length ? allSampleIsigiSamples : allPeaksIsigiSamples);
+    const isigiVals = visIsigiVals.length > 0 ? visIsigiVals : fallbackIsigiVals;
+    const visMtzVals = sampleMtzSamples.length >= peaksMtzSamples.length && sampleMtzSamples.length > 0
+      ? sampleMtzSamples
+      : peaksMtzSamples;
+    const fallbackMtzVals = allSampleMtzSamples.length >= allPeaksMtzSamples.length && allSampleMtzSamples.length > 0
+      ? allSampleMtzSamples
+      : allPeaksMtzSamples;
+    const mtzVals = visMtzVals.length > 0 ? visMtzVals : fallbackMtzVals;
+    const isigiBounds = computeQuantileScaleBounds(isigiVals, -3.0, 3.0, 20.0);
+    const mtzIsigiBounds = computeQuantileScaleBounds(mtzVals, -3.0, 3.0, 20.0);
+    _peakDataAvailabilitySig = sig;
+    _peakDataAvailability = {{
+      _p0: p0,
+      _s0: s0,
+      hasIsigi,
+      hasMtzIsigi: hasMtz,
+      hasResiduals: hasRes,
+      hasScales: hasScl,
+      isigiTop: Math.max(12.0, isigiBounds.max),
+      mtzIsigiTop: Math.max(12.0, mtzIsigiBounds.max),
+      isigiMin: isigiBounds.min,
+      isigiQ25: isigiBounds.q25,
+      isigiMedian: isigiBounds.median,
+      isigiQ75: isigiBounds.q75,
+      isigiMax: isigiBounds.max,
+      isigiBounds,
+      mtzIsigiMin: mtzIsigiBounds.min,
+      mtzIsigiQ25: mtzIsigiBounds.q25,
+      mtzIsigiMedian: mtzIsigiBounds.median,
+      mtzIsigiQ75: mtzIsigiBounds.q75,
+      mtzIsigiMax: mtzIsigiBounds.max,
+      mtzIsigiBounds,
+      resMin,
+      resMax,
+      resMedian,
+      resMean: resMedian,
+    }};
+    return _peakDataAvailability;
+  }}
+
+  // Warm Geyser-inspired diverging I/σ colormap, piecewise quantile-normalized over
+  // [lo (Q1.5), Q25, median (Q50), Q75, hi (Q98.5)] so [Q25, Q75] always sits inside the
+  // central warm band (distinct from Blue–White–Red ΔI/σ):
+  //   lo (weak/negative tail): Sea-Teal (20, 184, 166) -> Warm Sage-Cream (162, 220, 178) ->
+  //   median (bulk of peaks): Warm Sunlit Champagne-Gold (254, 232, 170) ->
+  //   hi (strong Bragg peaks): Vivid Solar Tangerine (251, 140, 36) -> Fiery Flame-Vermilion (232, 56, 24).
+  function isigiToColor(isigiVal, alpha = 1.0, bounds = null) {{
+    if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal)) {{
+      return "rgba(148, 163, 184, 0.000)";
+    }}
+    const bulkFrac = 0.28;
+    let b = null;
+    if (bounds && typeof bounds === "object") {{
+      b = Number.isFinite(bounds.median)
+        ? bounds
+        : (bounds.isigiBounds || {{
+            min: bounds.isigiMin,
+            q25: bounds.isigiQ25,
+            median: bounds.isigiMedian,
+            q75: bounds.isigiQ75,
+            max: bounds.isigiMax,
+          }});
+    }} else if (typeof bounds === "number" && Number.isFinite(bounds)) {{
+      const topHi = Math.max(12.0, bounds);
+      b = {{ min: -3.0, q25: 0.0, median: 3.0, q75: 0.30 * topHi, max: topHi }};
+    }} else {{
+      const av = getPeakDataAvailability();
+      b = state.wulffColorMode === "mtz_isigi" ? av.mtzIsigiBounds : av.isigiBounds;
+    }}
+    const lo = Number.isFinite(b && b.min) ? b.min : -3.0;
+    const hi = Number.isFinite(b && b.max) ? b.max : 20.0;
+    const rawMid = Number.isFinite(b && b.median) ? b.median : 0.5 * (lo + hi);
+    const mid = Math.max(lo, Math.min(hi, rawMid));
+    const q25 = Number.isFinite(b && b.q25) ? Math.max(lo, Math.min(mid, b.q25)) : 0.5 * (lo + mid);
+    const q75 = Number.isFinite(b && b.q75) ? Math.max(mid, Math.min(hi, b.q75)) : 0.5 * (mid + hi);
+    const c = getColorCrossover();
+    const knobGamma = (-Math.log(DEFAULT_COLOR_CROSSOVER)) / Math.max(0.05, -Math.log(c));
+    const clamped = Math.max(lo, Math.min(hi, isigiVal));
+    const effAlpha = Math.max(0.0, Math.min(1.0, alpha));
+    let r, g, bl;
+    if (clamped < mid) {{
+      let qFrac = 0.0;
+      if (clamped >= q25 && mid - q25 > 1e-6) {{
+        qFrac = bulkFrac * ((mid - clamped) / (mid - q25));
+      }} else if (q25 - lo > 1e-6) {{
+        qFrac = bulkFrac + (1.0 - bulkFrac) * ((q25 - clamped) / (q25 - lo));
+      }} else if (mid - lo > 1e-6) {{
+        qFrac = (mid - clamped) / (mid - lo);
+      }}
+      qFrac = Math.max(0.0, Math.min(1.0, qFrac));
+      const u = qFrac <= 0.0 ? 0.0 : (qFrac >= 1.0 ? 1.0 : Math.pow(qFrac, knobGamma));
+      if (u <= 0.5) {{
+        // Warm Sunlit Champagne-Gold (254, 232, 170) -> Warm Sage-Cream (162, 220, 178)
+        const s = u / 0.5;
+        r = Math.round(254 + (162 - 254) * s);
+        g = Math.round(232 + (220 - 232) * s);
+        bl = Math.round(170 + (178 - 170) * s);
+      }} else {{
+        // Warm Sage-Cream (162, 220, 178) -> Luminous Sea-Teal (20, 184, 166)
+        const s = (u - 0.5) / 0.5;
+        r = Math.round(162 + (20 - 162) * s);
+        g = Math.round(220 + (184 - 220) * s);
+        bl = Math.round(178 + (166 - 178) * s);
+      }}
+    }} else {{
+      let qFrac = 0.0;
+      if (clamped <= q75 && q75 - mid > 1e-6) {{
+        qFrac = bulkFrac * ((clamped - mid) / (q75 - mid));
+      }} else if (hi - q75 > 1e-6) {{
+        qFrac = bulkFrac + (1.0 - bulkFrac) * ((clamped - q75) / (hi - q75));
+      }} else if (hi - mid > 1e-6) {{
+        qFrac = (clamped - mid) / (hi - mid);
+      }}
+      qFrac = Math.max(0.0, Math.min(1.0, qFrac));
+      const u = qFrac <= 0.0 ? 0.0 : (qFrac >= 1.0 ? 1.0 : Math.pow(qFrac, knobGamma));
+      if (u <= 0.5) {{
+        // Warm Sunlit Champagne-Gold (254, 232, 170) -> Vivid Solar Tangerine (251, 140, 36)
+        const s = u / 0.5;
+        r = Math.round(254 + (251 - 254) * s);
+        g = Math.round(232 + (140 - 232) * s);
+        bl = Math.round(170 + (36 - 170) * s);
+      }} else {{
+        // Vivid Solar Tangerine (251, 140, 36) -> Fiery Flame-Vermilion (232, 56, 24)
+        const s = (u - 0.5) / 0.5;
+        r = Math.round(251 + (232 - 251) * s);
+        g = Math.round(140 + (56 - 140) * s);
+        bl = Math.round(36 + (24 - 36) * s);
+      }}
+    }}
+    return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{effAlpha.toFixed(3)}})`;
   }}
 
   function hasIntegratedIsigi() {{
-    const art = String(DATA.artifact_kind || "").toLowerCase();
-    if (art === "integrator" || art === "merged_careless") return true;
-    const checkArr = arr => Array.isArray(arr) && arr.some(
-      p => p && Array.isArray(p.ellipse) && typeof p.intensity === "number" && typeof p.sigma === "number" && p.sigma > 0
-    );
-    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+    return getPeakDataAvailability().hasIsigi;
+  }}
+
+  function hasMtzIsigi() {{
+    return getPeakDataAvailability().hasMtzIsigi;
   }}
 
   function hasCarelessResiduals() {{
-    const checkArr = arr => Array.isArray(arr) && arr.some(
-      p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)
-    );
-    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+    return getPeakDataAvailability().hasResiduals;
   }}
 
   function hasCarelessScales() {{
-    const checkArr = arr => Array.isArray(arr) && arr.some(
-      p => p && typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale)
-    );
-    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+    return getPeakDataAvailability().hasScales;
   }}
 
   function hasMergedCarelessData() {{
     return hasCarelessResiduals() || hasCarelessScales();
   }}
 
+  const WULFF_ALL_RUNS_MIN_ISIGI = Number(DATA.all_runs_min_isigi || 2.5);
+
+  function isWulffSnrCutActive() {{
+    return state.wulffScope === "all_runs" && state.peakSource === "integrated" && hasIntegratedIsigi();
+  }}
+
+  function isPeakUncertainForScope(p) {{
+    if (!p || !isWulffSnrCutActive()) return false;
+    const snr = peakUnscaledIsigi(p);
+    return !(typeof snr === "number" && Number.isFinite(snr) && snr >= WULFF_ALL_RUNS_MIN_ISIGI);
+  }}
+
+  function peakEmphasisAlphaForCategorical(p, alpha) {{
+    const c = getColorCrossover();
+    if (Math.abs(c - DEFAULT_COLOR_CROSSOVER) < 1e-3 || !p) return alpha;
+    const avail = getPeakDataAvailability();
+    const mv = peakMtzIsigi(p);
+    const snr = Number.isFinite(mv) ? mv : peakUnscaledIsigi(p);
+    const topS = Number.isFinite(mv) ? avail.mtzIsigiTop : avail.isigiTop;
+    if (Number.isFinite(snr)) {{
+      const uLog = Math.max(0.0, Math.min(1.0, Math.log10(1.0 + Math.max(0.0, snr)) / Math.log10(1.0 + Math.max(12.0, topS))));
+      return alpha * Math.min(1.0, 0.15 + 0.85 * applyCrossoverCurve(uLog));
+    }}
+    return alpha;
+  }}
+
+  function hexToRgba(hex, alpha = 1.0) {{
+    const clean = String(hex || "#38bdf8").replace("#", "");
+    const r = parseInt(clean.slice(0, 2), 16) || 56;
+    const g = parseInt(clean.slice(2, 4), 16) || 189;
+    const b = parseInt(clean.slice(4, 6), 16) || 248;
+    return `rgba(${{r}}, ${{g}}, ${{b}}, ${{Math.max(0.0, Math.min(1.0, alpha)).toFixed(3)}})`;
+  }}
+
   function peakStrokeColor(p, alpha = 0.95) {{
     const mode = state.wulffColorMode || "wavelength";
+    const avail = getPeakDataAvailability();
     if (mode === "orbit") {{
       const idx = typeof p.orbit_color_idx === "number"
         ? ((p.orbit_color_idx % ORBIT_PALETTE.length) + ORBIT_PALETTE.length) % ORBIT_PALETTE.length
         : 0;
-      const hex = ORBIT_PALETTE[idx];
-      return alpha >= 0.9 ? hex : `${{hex}}99`;
+      const effA = peakEmphasisAlphaForCategorical(p, alpha);
+      return hexToRgba(ORBIT_PALETTE[idx], effA);
+    }}
+    if (mode === "mtz_isigi") {{
+      return isigiToColor(peakMtzIsigi(p), alpha, avail.mtzIsigiBounds);
     }}
     if (mode === "isigi") {{
-      return isigiToColor(peakUnscaledIsigi(p), alpha);
+      return isigiToColor(peakUnscaledIsigi(p), alpha, avail.isigiBounds);
     }}
     if (mode === "residual") {{
       return residualToColor(p.careless_residual, alpha);
@@ -6851,48 +16309,193 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return wavelengthToColor(p.wavelength, alpha);
   }}
 
+  function buildColorscaleGradientSpec(mode, crossoverVal) {{
+    const prevC = state.colorCrossover;
+    state.colorCrossover = crossoverVal;
+    const c = getColorCrossover();
+    const avail = getPeakDataAvailability();
+    const stops = [];
+    const N = 16;
+    let label = "";
+    let tooltip = "";
+    const fmtCompactMetric = (v) => {{
+      const clean = Math.abs(v) < 0.05 ? 0.0 : v;
+      const absV = Math.abs(clean);
+      if (absV >= 1000) return `${{(clean / 1000).toFixed(1)}}k`;
+      if (absV >= 100) return clean.toFixed(0);
+      return clean.toFixed(1);
+    }};
+    if (mode === "isigi" || mode === "mtz_isigi") {{
+      const bulkFrac = 0.28;
+      const b = mode === "mtz_isigi"
+        ? (avail.mtzIsigiBounds || {{
+            min: Number.isFinite(avail.mtzIsigiMin) ? avail.mtzIsigiMin : -3.0,
+            q25: Number.isFinite(avail.mtzIsigiQ25) ? avail.mtzIsigiQ25 : 0.0,
+            median: Number.isFinite(avail.mtzIsigiMedian) ? avail.mtzIsigiMedian : 3.0,
+            q75: Number.isFinite(avail.mtzIsigiQ75) ? avail.mtzIsigiQ75 : 7.0,
+            max: Number.isFinite(avail.mtzIsigiMax) ? avail.mtzIsigiMax : 20.0,
+          }})
+        : (avail.isigiBounds || {{
+            min: Number.isFinite(avail.isigiMin) ? avail.isigiMin : -3.0,
+            q25: Number.isFinite(avail.isigiQ25) ? avail.isigiQ25 : 0.0,
+            median: Number.isFinite(avail.isigiMedian) ? avail.isigiMedian : 3.0,
+            q75: Number.isFinite(avail.isigiQ75) ? avail.isigiQ75 : 7.0,
+            max: Number.isFinite(avail.isigiMax) ? avail.isigiMax : 20.0,
+          }});
+      const lo = Number.isFinite(b.min) ? b.min : -3.0;
+      const hi = Number.isFinite(b.max) ? b.max : 20.0;
+      const mid = Math.max(lo, Math.min(hi, Number.isFinite(b.median) ? b.median : 0.5 * (lo + hi)));
+      const q25 = Number.isFinite(b.q25) ? Math.max(lo, Math.min(mid, b.q25)) : 0.5 * (lo + mid);
+      const q75 = Number.isFinite(b.q75) ? Math.max(mid, Math.min(hi, b.q75)) : 0.5 * (mid + hi);
+      for (let k = 0; k <= N; k++) {{
+        const u = k / N;
+        let snr;
+        if (u <= 0.5) {{
+          const qFrac = (0.5 - u) / 0.5;
+          snr = qFrac <= bulkFrac
+            ? (mid - (mid - q25) * (qFrac / Math.max(1e-6, bulkFrac)))
+            : (q25 - (q25 - lo) * ((qFrac - bulkFrac) / Math.max(1e-6, 1.0 - bulkFrac)));
+        }} else {{
+          const qFrac = (u - 0.5) / 0.5;
+          snr = qFrac <= bulkFrac
+            ? (mid + (q75 - mid) * (qFrac / Math.max(1e-6, bulkFrac)))
+            : (q75 + (hi - q75) * ((qFrac - bulkFrac) / Math.max(1e-6, 1.0 - bulkFrac)));
+        }}
+        stops.push(`${{isigiToColor(snr, 1.0, b)}} ${{(u * 100).toFixed(1)}}%`);
+      }}
+      const prefix = mode === "mtz_isigi" ? ".mtz I/σ" : "I/σ";
+      label = `${{fmtCompactMetric(lo)}} · ${{fmtCompactMetric(mid)}} · ${{fmtCompactMetric(hi)}}`;
+      tooltip = `${{prefix}} quantile-normalized range [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at median ${{fmtCompactMetric(mid)}} (bulk IQR [${{fmtCompactMetric(q25)}}, ${{fmtCompactMetric(q75)}}])`;
+    }} else if (mode === "residual") {{
+      const lo = Number.isFinite(avail.resMin) ? avail.resMin : -3.0;
+      const hi = Number.isFinite(avail.resMax) ? avail.resMax : 3.0;
+      const rawMid = Number.isFinite(avail.resMedian) ? avail.resMedian : avail.resMean;
+      const mid = Number.isFinite(rawMid) ? Math.max(lo, Math.min(hi, rawMid)) : 0.5 * (lo + hi);
+      for (let k = 0; k <= N; k++) {{
+        const u = k / N;
+        const res = u <= 0.5
+          ? (lo + (u / 0.5) * (mid - lo))
+          : (mid + ((u - 0.5) / 0.5) * (hi - mid));
+        stops.push(`${{residualToColor(res, 1.0, avail)}} ${{(u * 100).toFixed(1)}}%`);
+      }}
+      label = `${{fmtCompactMetric(lo)}} · ${{fmtCompactMetric(mid)}} · ${{fmtCompactMetric(hi)}}`;
+      tooltip = `ΔI/σ outlier-robust range [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at median ${{fmtCompactMetric(mid)}}σ`;
+    }} else if (mode === "scale") {{
+      for (let k = 0; k <= N; k++) {{
+        const u = k / N;
+        const scl = Math.pow(10.0, -2.0 + 3.0 * u);
+        stops.push(`${{scaleToColor(scl, 1.0)}} ${{(u * 100).toFixed(1)}}%`);
+      }}
+      const crossScl = Math.pow(10.0, -2.0 + 3.0 * c);
+      label = `× ~ ${{crossScl >= 1 ? crossScl.toFixed(1) : crossScl.toFixed(2)}}`;
+    }} else if (mode === "orbit") {{
+      const hasSnr = avail.hasMtzIsigi || avail.hasIsigi;
+      for (let k = 0; k <= N; k++) {{
+        const u = k / N;
+        const idx = Math.min(ORBIT_PALETTE.length - 1, Math.floor(u * ORBIT_PALETTE.length));
+        const a = hasSnr ? Math.min(1.0, 0.15 + 0.85 * applyCrossoverCurve(u)) : 1.0;
+        stops.push(`${{hexToRgba(ORBIT_PALETTE[idx], a)}} ${{(u * 100).toFixed(1)}}%`);
+      }}
+      label = hasSnr ? `Orbit (${{Math.round(c * 100)}}%)` : "Orbit (Opaque)";
+    }} else {{
+      const lMin = Number.isFinite(state.lamMin) ? state.lamMin : 1.0;
+      const lMax = Number.isFinite(state.lamMax) ? state.lamMax : 4.5;
+      for (let k = 0; k <= N; k++) {{
+        const u = k / N;
+        const lam = lMin + u * Math.max(0.05, lMax - lMin);
+        stops.push(`${{wavelengthToColor(lam, 1.0)}} ${{(u * 100).toFixed(1)}}%`);
+      }}
+      const crossLam = lMin + c * Math.max(0.05, lMax - lMin);
+      label = `λ ~ ${{crossLam.toFixed(2)}} Å`;
+    }}
+    state.colorCrossover = prevC;
+    return {{
+      gradient: `linear-gradient(90deg, ${{stops.join(", ")}})`,
+      label,
+      tooltip,
+    }};
+  }}
+
+  function updateColorscaleSliderGradient() {{
+    const c = getColorCrossover();
+    const spec = buildColorscaleGradientSpec(state.wulffColorMode || "wavelength", c);
+    if (slColorEmphasis) {{
+      slColorEmphasis.style.setProperty("--cs-gradient", spec.gradient);
+    }}
+    const lbl = document.getElementById("lbl-color-emphasis");
+    if (lbl) {{
+      lbl.textContent = spec.label;
+      lbl.title = spec.tooltip || "";
+    }}
+  }}
+
   function syncWulffUI() {{
     const stereoEl = document.getElementById("stereo-inset");
     const btnTop = document.getElementById("btn-stereo-toggle");
     const btnScope = document.getElementById("btn-wulff-scope");
+    const btnFriedel = document.getElementById("btn-wulff-friedel");
     const btnExpand = document.getElementById("btn-wulff-expand");
     const selColor = document.getElementById("sel-wulff-color");
     const selSpotColor = document.getElementById("sel-spot-color");
     const titleEl = document.getElementById("stereo-title");
     const hasIsigi = hasIntegratedIsigi();
+    const hasMtz = hasMtzIsigi();
     const hasRes = hasCarelessResiduals();
     const hasScl = hasCarelessScales();
     if (
       (state.wulffColorMode === "isigi" && !hasIsigi) ||
+      (state.wulffColorMode === "mtz_isigi" && !hasMtz) ||
       (state.wulffColorMode === "residual" && !hasRes) ||
       (state.wulffColorMode === "scale" && !hasScl)
     ) {{
-      state.wulffColorMode = "wavelength";
+      state.wulffColorMode = hasMtz ? "mtz_isigi" : "wavelength";
     }}
     if (stereoEl) {{
       stereoEl.classList.toggle("hidden", !state.showStereo);
       stereoEl.classList.toggle("expanded", Boolean(state.wulffExpanded));
     }}
     if (btnTop) btnTop.classList.toggle("active-btn", Boolean(state.showStereo));
+    const snrCutActive = isWulffSnrCutActive();
     if (btnScope) {{
       const isAll = state.wulffScope === "all_runs";
       btnScope.textContent = isAll ? "All-Runs" : "1-Frame";
       btnScope.classList.toggle("active-btn", isAll);
+      btnScope.title = isAll
+        ? `Multi-run Wulff spots${{snrCutActive ? ` filtered to I/σ ≥ ${{WULFF_ALL_RUNS_MIN_ISIGI}} (uncertain I/σ < ${{WULFF_ALL_RUNS_MIN_ISIGI}} spots dimmed on detector)` : ""}}. Click for 1-Frame`
+        : "Single-frame Wulff spots (all detector spots at full brightness). Click for All-Runs";
+    }}
+    if (btnFriedel) {{
+      btnFriedel.classList.toggle("active-btn", Boolean(state.showWulffFriedel));
     }}
     if (btnExpand) {{
-      btnExpand.textContent = state.wulffExpanded ? "Corner" : "Split";
-      btnExpand.classList.toggle("active-btn", Boolean(state.wulffExpanded));
+      const isExp = Boolean(state.wulffExpanded);
+      const caretPts = isExp ? "3.5 6 8 10.5 12.5 6" : "3.5 10.5 8 6 12.5 10.5";
+      btnExpand.innerHTML = `<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="${{caretPts}}"/></svg>`;
+      btnExpand.setAttribute("data-caret", isExp ? "down" : "up");
+      const expTip = isExp
+        ? "Reduce Wulff Net to docked Corner View"
+        : "Magnify Wulff Net to side-by-side Split View";
+      btnExpand.title = expTip;
+      btnExpand.setAttribute("aria-label", expTip);
+      btnExpand.classList.toggle("active-btn", isExp);
     }}
     if (typeof _cachedPlotBox !== "undefined") {{
       _cachedPlotBox = null;
       _cachedPlotBoxKey = "";
     }}
+    const mtzOptLabel = DATA.mtz_overlay_name
+      ? `Color: .mtz I/σ (${{String(DATA.mtz_overlay_name).slice(0, 18)}})`
+      : "Color: .mtz I/σ";
     [selColor, selSpotColor].forEach(sel => {{
       if (!sel) return;
       Array.from(sel.options).forEach(opt => {{
         if (opt.value === "isigi") {{
           opt.disabled = !hasIsigi;
           opt.style.color = hasIsigi ? "" : "#64748b";
+        }} else if (opt.value === "mtz_isigi") {{
+          opt.disabled = !hasMtz;
+          opt.textContent = mtzOptLabel;
+          opt.style.color = hasMtz ? "" : "#64748b";
         }} else if (opt.value === "residual") {{
           opt.disabled = !hasRes;
           opt.style.color = hasRes ? "" : "#64748b";
@@ -6904,9 +16507,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       sel.value = state.wulffColorMode || "wavelength";
     }});
     if (titleEl) {{
-      const scopeLbl = state.wulffScope === "all_runs" ? "ALL-RUNS" : "1-FRAME";
+      const scopeLbl = state.wulffScope === "all_runs"
+        ? (snrCutActive ? `ALL-RUNS · I/σ ≥ ${{WULFF_ALL_RUNS_MIN_ISIGI}}` : "ALL-RUNS")
+        : "1-FRAME";
       titleEl.textContent = `WULFF NET · ${{scopeLbl}}`;
     }}
+    updateColorscaleSliderGradient();
     updateMergeScoreboard();
   }}
 
@@ -6920,7 +16526,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return;
     }}
     bar.style.display = "flex";
-    const cc = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
+    const ccNum = typeof m.cc_half_overall === "number" && Number.isFinite(m.cc_half_overall) ? m.cc_half_overall : null;
+    const cc = ccNum !== null ? ccNum.toFixed(3) : "—";
+    const ccCol = ccNum === null ? "var(--accent-gold)" : (ccNum >= 0.8 ? "#34d399" : (ccNum >= 0.3 ? "#fbbf24" : "#f43f5e"));
     const ccs = typeof m.cc_half_spearman === "number" ? m.cc_half_spearman.toFixed(3) : null;
     const isig = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
     const comp = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
@@ -6931,7 +16539,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ? `${{(m.harmonic_overlap_fraction * 100).toFixed(1)}}%`
       : "—";
     bar.innerHTML = `
-      <span><strong style="color:var(--accent-cyan);">CARELESS MERGE:</strong> CC½=<strong style="color:var(--accent-gold);">${{cc}}</strong>${{ccs ? ` (ρ=${{ccs}})` : ""}}</span>
+      <span><strong style="color:var(--accent-cyan);">CARELESS MERGE:</strong> CC½=<strong style="color:${{ccCol}};">${{cc}}</strong>${{ccs ? ` (ρ=${{ccs}})` : ""}}</span>
       <span>⟨I/σ⟩=<strong style="color:var(--accent-gold);">${{isig}}</strong></span>
       <span>Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{nAsu}} ASU / ${{nObs}} obs)</span>
       <span>Multiplicity=<strong>${{mult}}</strong> • Harmonics=<strong>${{harmPct}}</strong></span>
@@ -6942,6 +16550,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const isSph = state.projection === "spherical";
     const btn = document.getElementById("btn-proj-toggle");
     btn.textContent = isSph ? "Sph" : "Cyl";
+    btn.title = isSph
+      ? "Projection: Spherical (Azimuth φ vs Elevation ψ [deg]) — click to switch to Cylindrical (Azimuth φ vs Y [m])"
+      : "Projection: Cylindrical (Azimuth φ vs Height Y [m]) — click to switch to Spherical (Azimuth φ vs Elevation ψ [deg])";
     document.getElementById("val-proj").textContent = isSph ? "SPH" : "CYL";
     document.getElementById("detector-header-title").textContent = isSph
       ? "SPHERICAL DETECTOR PROJECTION (AZIMUTH φ [deg] vs ELEVATION ψ [deg])"
@@ -6961,17 +16572,67 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     updateHUD();
   }}
 
+  let _zoneHolzCountsCacheSig = "";
+  let _zoneHolzCountsMap = new Map();
+  function getZoneHolzLayerCountMap(zoneId) {{
+    if (!Array.isArray(ZONES) || ZONES.length === 0) return null;
+    const visPeaks = getVisibleDetectorPeaks();
+    const sig = `${{_detVisiblePeaksSig}}|${{ZONES.length}}`;
+    if (_zoneHolzCountsCacheSig !== sig) {{
+      _zoneHolzCountsCacheSig = sig;
+      _zoneHolzCountsMap = new Map();
+      const validZones = [];
+      for (let zi = 0; zi < ZONES.length; zi++) {{
+        const zn = ZONES[zi];
+        if (zn && Array.isArray(zn.uvw) && zn.uvw.length === 3) {{
+          const m = {{ "1": 0, "-1": 0, "2": 0, "-2": 0 }};
+          _zoneHolzCountsMap.set(zn.zone_id, m);
+          validZones.push({{ u: zn.uvw[0], v: zn.uvw[1], w: zn.uvw[2], m }});
+        }}
+      }}
+      for (let pi = 0; pi < visPeaks.length; pi++) {{
+        const hkl = visPeaks[pi] && visPeaks[pi].hkl;
+        if (!Array.isArray(hkl) || hkl.length !== 3) continue;
+        const h = hkl[0], k = hkl[1], l = hkl[2];
+        for (let zi = 0; zi < validZones.length; zi++) {{
+          const vz = validZones[zi];
+          const nOrd = h * vz.u + k * vz.v + l * vz.w;
+          if (nOrd === 1) vz.m["1"]++;
+          else if (nOrd === -1) vz.m["-1"]++;
+          else if (nOrd === 2) vz.m["2"]++;
+          else if (nOrd === -2) vz.m["-2"]++;
+        }}
+      }}
+    }}
+    return _zoneHolzCountsMap.get(zoneId) || null;
+  }}
+
   function renderZoneList() {{
     const container = document.getElementById("zone-list");
     container.innerHTML = "";
+    const hasHolz = state.holzOrders instanceof Set && state.holzOrders.size > 0;
     const filtered = ZONES.filter(z => (z.order || 1) <= state.maxZoneOrder);
     filtered.forEach(z => {{
       const item = document.createElement("div");
       const isAct = state.activeZones.has(z.zone_id);
       item.className = "zone-item" + (isAct ? " zone-active" : "");
       const color = z.rainbow_color;
-      const rightStat = z.n_peaks > 0 ? `${{z.n_peaks}}p` : `o${{z.order || 1}}`;
-      item.title = `${{z.label}} (order ${{z.order || 1}}) • ${{z.n_peaks}} spots • Δθ=${{z.angular_rms_deg.toFixed(2)}}°`;
+      let holzSpots = 0;
+      if (hasHolz) {{
+        const hm = getZoneHolzLayerCountMap(z.zone_id);
+        if (hm) {{
+          state.holzOrders.forEach(nOrd => {{
+            holzSpots += (hm[String(nOrd)] || 0) + (hm[String(-nOrd)] || 0);
+          }});
+        }}
+      }}
+      const rightStat = hasHolz && (z.n_peaks > 0 || holzSpots > 0)
+        ? `${{z.n_peaks}}+${{holzSpots}}p`
+        : (z.n_peaks > 0 ? `${{z.n_peaks}}p` : `o${{z.order || 1}}`);
+      const spotsTitle = hasHolz
+        ? `${{z.n_peaks}} ZOLZ + ${{holzSpots}} HOLZ spots`
+        : `${{z.n_peaks}} spots`;
+      item.title = `${{z.label}} (order ${{z.order || 1}}) • ${{spotsTitle}} • Δθ=${{z.angular_rms_deg.toFixed(2)}}°`;
       item.innerHTML = `
         <div style="display:flex;align-items:center;min-width:0;overflow:hidden;">
           <span class="zone-swatch" style="background:${{color}};"></span>
@@ -7129,7 +16790,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       .map(z => z.label)
       .join(", ") || "None";
     const elVal = typeof p.det_el === "number" ? p.det_el : 0.0;
-    const snrStr = p.sigma && p.sigma > 0 ? ` (I/σ=${{(p.intensity / p.sigma).toFixed(1)}})` : "";
+    const hasMeasInten = typeof p.intensity === "number" && Number.isFinite(p.intensity);
+    const snrStr = hasMeasInten && typeof p.sigma === "number" && p.sigma > 0
+      ? ` (I/σ=${{(p.intensity / p.sigma).toFixed(1)}})`
+      : "";
+    const intenStr = hasMeasInten ? ` • I=<strong>${{Math.round(p.intensity)}}</strong>${{snrStr}}` : "";
     let shapeStr = "";
     if (typeof p.sigma_major_px === "number" && typeof p.sigma_minor_px === "number") {{
       if (p.shape_kind === "ellipse") {{
@@ -7138,7 +16803,41 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         shapeStr = ` • 2σ=<strong style="color:#38bdf8;">${{(2 * p.sigma_major_px).toFixed(1)}}px (iso)</strong>`;
       }}
     }}
-    const asuStr = Array.isArray(p.asu_hkl) ? ` → ASU <strong style="color:#38bdf8;">(${{p.asu_hkl.join(",")}})</strong>` : "";
+    const bijParity = Number(p.asu_bijvoet_parity || 0);
+    const bijHandTag = bijParity > 0
+      ? ` <strong style="color:#ff7ad9;">I⁺</strong>`
+      : (bijParity < 0 ? ` <strong style="color:#ff7ad9;">I⁻</strong>` : "");
+    const asuStr = Array.isArray(p.asu_hkl)
+      ? ` → ASU <strong style="color:#38bdf8;">(${{p.asu_hkl.join(",")}})</strong>${{bijHandTag}}`
+      : "";
+    let bijBadgeStr = "";
+    if (bijParity !== 0 && p.asu_orbit_id) {{
+      const visFrame = getVisibleDetectorPeaks();
+      let nFrameBij = 0;
+      for (let i = 0; i < visFrame.length; i++) {{
+        if (!isSameReflection(visFrame[i], p) && isBijvoetMatePair(p, visFrame[i])) nFrameBij++;
+      }}
+      let nRunsBij = 0;
+      if (nFrameBij === 0) {{
+        const allSrc = getActiveWulffSourceArray();
+        const seenBijHkl = new Set();
+        for (let i = 0; i < allSrc.length; i++) {{
+          const cand = allSrc[i];
+          if (!isPeakVisible(cand)) continue;
+          if (!isSameReflection(cand, p) && isBijvoetMatePair(p, cand)) {{
+            const hk = Array.isArray(cand.hkl) ? cand.hkl.join(",") : String(i);
+            seenBijHkl.add(`${{cand.run_index || 0}}:${{hk}}`);
+          }}
+        }}
+        nRunsBij = seenBijHkl.size;
+      }}
+      if (nFrameBij > 0 || nRunsBij > 0) {{
+        const bijLbl = nFrameBij > 0
+          ? `±Bijvoet ×${{nFrameBij}} (frame)`
+          : `±Bijvoet ×${{nRunsBij}} (runs)`;
+        bijBadgeStr = ` • <span class="bijvoet-badge" style="display:inline-block;padding:0 5px;border-radius:3px;border:1px solid #ff4db8;background:rgba(255,77,184,0.18);color:#ff7ad9;font-weight:700;">${{bijLbl}}</span>`;
+      }}
+    }}
     let mergeStr = "";
     if (typeof p.careless_residual === "number") {{
       const rCol = p.careless_residual >= 0 ? "#f43f5e" : "#38bdf8";
@@ -7147,25 +16846,68 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         mergeStr += ` (I_asu=${{p.merged_i.toFixed(1)}}±${{p.merged_sigi.toFixed(1)}})`;
       }}
     }}
+    let mtzStr = "";
+    const mtzSnr = peakMtzIsigi(p);
+    if (Number.isFinite(mtzSnr)) {{
+      mtzStr = ` • MTZ I/σ=<strong style="color:#a3e635;">${{mtzSnr.toFixed(1)}}</strong>`;
+      if (typeof p.mtz_i === "number" && typeof p.mtz_sigi === "number") {{
+        mtzStr += ` (${{p.mtz_i.toFixed(1)}}±${{p.mtz_sigi.toFixed(1)}})`;
+      }}
+    }}
     const detXVal = typeof p.det_x === "number" ? p.det_x : 0.0;
     const detYVal = typeof p.det_y === "number" ? p.det_y : 0.0;
     const errDeg = typeof p.angular_error_deg === "number" ? p.angular_error_deg : 0.0;
-    const harmMult = p.harmonic_multiplicity || p.harmonic_order || 1;
+    const harmMult = p.harmonic_multiplicity || 1;
     setStatusLine(
       `[BANK #${{p.bank || 1}} • RUN #${{(p.run_index || 0) + 1}}]`,
-      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I=<strong>${{Math.round(p.intensity)}}</strong>${{snrStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
+      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}}${{bijBadgeStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong>${{intenStr}}${{mtzStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
     );
   }}
 
-  function updateZoneInspector(z) {{
+  function updateZoneInspector(z, holzN = 0) {{
     if (!z) return;
+    const eqStr = holzN ? `G · ${{z.label}} = ${{holzN > 0 ? "+" : ""}}${{holzN}} (HOLZ)` : `G · ${{z.label}} = 0`;
+    const dStr = typeof z.d_direct === "number" && z.d_direct > 0 ? ` • |t_uvw|=<strong>${{z.d_direct.toFixed(2)}} Å</strong>` : "";
+    const rmsVal = typeof z.angular_rms_deg === "number" ? z.angular_rms_deg.toFixed(3) : "0.000";
     setStatusLine(
-      `[ZONE ${{z.label}}]`,
-      `<strong style="color:var(--accent-gold);">Zone ${{z.label}}</strong> • Captures <strong>${{z.n_peaks}}</strong> spots (RMS Δθ=${{z.angular_rms_deg.toFixed(3)}}°) • |t_uvw|=<strong>${{z.d_direct.toFixed(2)}} Å</strong> • G · ${{z.label}} = 0`
+      `[ZONE ${{z.label}}${{holzN ? ` N=${{holzN > 0 ? "+" : ""}}${{holzN}}` : ""}}]`,
+      `<strong style="color:var(--accent-gold);">Zone ${{z.label}}</strong> • Captures <strong>${{z.n_peaks || 0}}</strong> spots (RMS Δθ=${{rmsVal}}°)${{dStr}} • ${{eqStr}}`
     );
+  }}
+
+  function updateNodalInspector(nodal) {{
+    if (!nodal) return;
+    const hklStr = Array.isArray(nodal.hkl) ? `(${{nodal.hkl.join(", ")}})` : "";
+    const symHtml = nodal.principalHtml || nodal.principalSymbol || "";
+    const titleStr = symHtml
+      ? `${{symHtml}} ${{hklStr}}`
+      : `Nodal ${{hklStr}}`;
+    const dStr = typeof nodal.d1 === "number" && nodal.d1 > 0
+      ? ` • d₁=<strong>${{nodal.d1.toFixed(2)}} Å</strong>`
+      : "";
+    const lamStr = typeof nodal.lam1 === "number" && nodal.lam1 > 0
+      ? ` • λ₁=<strong>${{nodal.lam1.toFixed(3)}} Å</strong>`
+      : "";
+    const locStr = nodal.onPanel
+      ? `Bank #${{nodal.bank || 1}}`
+      : `Inter-panel gap (${{(nodal.gapDeg || 0).toFixed(1)}}°, ${{Math.round((nodal.gapPanelFrac || 0) * 100)}}% panel width to Bank #${{nodal.nearBank || 1}})`;
+    const zCount = Array.isArray(nodal.zoneLabels) ? nodal.zoneLabels.length : 0;
+    const zonesStr = zCount > 0
+      ? nodal.zoneLabels.slice(0, 4).join(" × ") + (zCount > 4 ? ` (+${{zCount - 4}} more, ${{zCount}} zones total)` : ` (${{zCount}} zones)`)
+      : "principal reciprocal axis";
+    setStatusLine(
+      `[NODAL ${{nodal.principalSymbol || hklStr}}]`,
+      `<strong style="color:var(--accent-gold);">${{titleStr}}</strong> • ${{locStr}}${{dStr}}${{lamStr}} • φ=${{nodal.det_x.toFixed(1)}}°, ψ=${{nodal.det_el.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zonesStr}}</span>`
+    );
+    if (nodal.principalHtml) {{
+      const cb = document.getElementById("combo-badge");
+      if (cb) cb.innerHTML = `[NODAL ${{nodal.principalHtml}}]`;
+    }}
   }}
 
   function isPeakVisible(p) {{
+    if (p.mtz_only && state.wulffColorMode !== "mtz_isigi") return false;
+    if (state.wulffColorMode === "mtz_isigi" && !Number.isFinite(peakMtzIsigi(p))) return false;
     if (p.wavelength < state.lamMin || p.wavelength > state.lamMax) return false;
     if (typeof p.d_spacing === "number" && p.d_spacing > 0 && typeof state.dMin === "number" && state.dMin > 0) {{
       if (p.d_spacing < state.dMin - 1e-4) return false;
@@ -7195,12 +16937,260 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return false;
   }}
 
+  function getActiveOrbitReferencePeak() {{
+    const hov = state.hoveredPeakObj;
+    if (hov && hov.asu_orbit_id && hov.asu_orbit_id === state.activeOrbitId) return hov;
+    const sel = state.selectedPeakObj;
+    if (sel && sel.asu_orbit_id && sel.asu_orbit_id === state.activeOrbitId) return sel;
+    return hov || sel || null;
+  }}
+
+  function isBijvoetMatePair(refPeak, matePeak) {{
+    if (!refPeak || !matePeak) return false;
+    if (!refPeak.asu_orbit_id || refPeak.asu_orbit_id !== matePeak.asu_orbit_id) return false;
+    const rp = Number(refPeak.asu_bijvoet_parity || 0);
+    const mp = Number(matePeak.asu_bijvoet_parity || 0);
+    return rp !== 0 && mp !== 0 && rp !== mp;
+  }}
+
+  let _activeZoneObjsKey = "";
+  let _activeZoneObjsRef = null;
+  let _activeZoneObjsList = [];
+  function getActiveZoneObjectsCached() {{
+    const key = Array.from(state.activeZones || []).join(",");
+    if (_activeZoneObjsRef === ZONES && _activeZoneObjsKey === key) {{
+      return _activeZoneObjsList;
+    }}
+    _activeZoneObjsRef = ZONES;
+    _activeZoneObjsKey = key;
+    _activeZoneObjsList = Array.isArray(ZONES)
+      ? ZONES.filter(z => state.activeZones && state.activeZones.has(z.zone_id))
+      : [];
+    return _activeZoneObjsList;
+  }}
+
   function isPeakCapturedByActiveZone(p) {{
-    if (!p.zone_ids || p.zone_ids.length === 0) return false;
-    for (let i = 0; i < p.zone_ids.length; i++) {{
-      if (state.activeZones.has(p.zone_ids[i])) return true;
+    if (p.zone_ids && p.zone_ids.length > 0) {{
+      for (let i = 0; i < p.zone_ids.length; i++) {{
+        if (state.activeZones.has(p.zone_ids[i])) return true;
+      }}
+    }}
+    if (
+      state.holzOrders instanceof Set &&
+      state.holzOrders.size > 0 &&
+      state.activeZones &&
+      state.activeZones.size > 0 &&
+      Array.isArray(p.hkl) &&
+      p.hkl.length === 3
+    ) {{
+      const actZ = getActiveZoneObjectsCached();
+      const h = p.hkl[0], k = p.hkl[1], l = p.hkl[2];
+      for (let i = 0; i < actZ.length; i++) {{
+        const uvw = actZ[i].uvw;
+        if (!Array.isArray(uvw) || uvw.length !== 3) continue;
+        const nLayer = Math.abs(h * uvw[0] + k * uvw[1] + l * uvw[2]);
+        if (nLayer > 0 && state.holzOrders.has(nLayer)) return true;
+      }}
     }}
     return false;
+  }}
+
+  const UI_TOOLTIP_DELAY_MS = 1500;
+  const uiHoverTooltip = document.getElementById("ui-hover-tooltip");
+  let _uiTipTimer = null;
+  let _uiTipActiveEl = null;
+  let _uiTipVisible = false;
+  let _uiTipStashedEls = [];
+
+  function positionUiHoverTooltip(el) {{
+    if (!uiHoverTooltip || !el || typeof el.getBoundingClientRect !== "function") return;
+    const rect = el.getBoundingClientRect();
+    const tipRect = uiHoverTooltip.getBoundingClientRect();
+    const vw = window.innerWidth || document.documentElement.clientWidth || 1024;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 768;
+    let left = rect.left + (rect.width - tipRect.width) * 0.5;
+    left = Math.max(8, Math.min(vw - tipRect.width - 8, left));
+    let top = rect.bottom + 7;
+    if (top + tipRect.height > vh - 8 && rect.top - tipRect.height - 7 >= 8) {{
+      top = rect.top - tipRect.height - 7;
+    }}
+    uiHoverTooltip.style.left = `${{Math.round(left)}}px`;
+    uiHoverTooltip.style.top = `${{Math.round(top)}}px`;
+  }}
+
+  function hideUiHoverTooltip() {{
+    if (_uiTipTimer) {{
+      clearTimeout(_uiTipTimer);
+      _uiTipTimer = null;
+    }}
+    _uiTipVisible = false;
+    if (uiHoverTooltip) uiHoverTooltip.style.display = "none";
+    for (let i = 0; i < _uiTipStashedEls.length; i++) {{
+      const sEl = _uiTipStashedEls[i];
+      if (sEl && !sEl.getAttribute("title") && sEl.dataset && sEl.dataset.uiTip) {{
+        sEl.setAttribute("title", sEl.dataset.uiTip);
+      }}
+      if (sEl && sEl.dataset) delete sEl.dataset.uiTip;
+    }}
+    _uiTipStashedEls = [];
+    _uiTipActiveEl = null;
+  }}
+
+  function setElementTooltip(el, text) {{
+    if (!el) return;
+    const clean = text ? String(text) : "";
+    if (_uiTipActiveEl === el || _uiTipStashedEls.indexOf(el) !== -1) {{
+      if (el.dataset) el.dataset.uiTip = clean;
+      if (typeof el.removeAttribute === "function") el.removeAttribute("title");
+      if (_uiTipActiveEl === el && _uiTipVisible && uiHoverTooltip) {{
+        if (clean) {{
+          uiHoverTooltip.textContent = clean;
+          positionUiHoverTooltip(el);
+        }} else {{
+          hideUiHoverTooltip();
+        }}
+      }}
+    }} else {{
+      el.title = clean;
+    }}
+  }}
+
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {{
+    document.addEventListener("pointerover", (e) => {{
+      const rawTarget = e && e.target && typeof e.target.closest === "function"
+        ? e.target.closest("[title], [data-ui-tip]")
+        : null;
+      if (rawTarget === _uiTipActiveEl) return;
+      hideUiHoverTooltip();
+      if (!rawTarget) return;
+      const tipText = (rawTarget.dataset && rawTarget.dataset.uiTip) || rawTarget.getAttribute("title") || "";
+      if (!tipText) return;
+      _uiTipActiveEl = rawTarget;
+      let cur = rawTarget;
+      while (cur && cur !== document.body && cur.nodeType === 1) {{
+        const tAttr = typeof cur.getAttribute === "function" ? cur.getAttribute("title") : null;
+        if (tAttr) {{
+          if (cur.dataset) cur.dataset.uiTip = tAttr;
+          cur.removeAttribute("title");
+          _uiTipStashedEls.push(cur);
+        }}
+        cur = cur.parentElement;
+      }}
+      _uiTipTimer = setTimeout(() => {{
+        _uiTipTimer = null;
+        if (_uiTipActiveEl !== rawTarget || !uiHoverTooltip) return;
+        const latest = (rawTarget.dataset && rawTarget.dataset.uiTip) || rawTarget.getAttribute("title") || tipText;
+        if (!latest) return;
+        uiHoverTooltip.textContent = latest;
+        uiHoverTooltip.style.display = "block";
+        _uiTipVisible = true;
+        positionUiHoverTooltip(rawTarget);
+      }}, UI_TOOLTIP_DELAY_MS);
+    }});
+    document.addEventListener("pointerout", (e) => {{
+      if (!_uiTipActiveEl) return;
+      const rel = e ? e.relatedTarget : null;
+      if (rel && typeof _uiTipActiveEl.contains === "function" && _uiTipActiveEl.contains(rel)) return;
+      hideUiHoverTooltip();
+    }});
+    document.addEventListener("pointerdown", hideUiHoverTooltip, true);
+    document.addEventListener("wheel", hideUiHoverTooltip, {{ passive: true }});
+    document.addEventListener("keydown", hideUiHoverTooltip, true);
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {{
+      window.addEventListener("blur", hideUiHoverTooltip);
+    }}
+  }}
+
+  function syncTopBarTooltips(stats) {{
+    const subEl = document.querySelector(".subtitle-tag");
+    if (subEl) {{
+      const cellTxt = Array.isArray(DATA.cell) && DATA.cell.length === 6
+        ? ` • Cell: a=${{DATA.cell[0].toFixed(2)}}, b=${{DATA.cell[1].toFixed(2)}}, c=${{DATA.cell[2].toFixed(2)}} Å, α=${{DATA.cell[3].toFixed(1)}}°, β=${{DATA.cell[4].toFixed(1)}}°, γ=${{DATA.cell[5].toFixed(1)}}°`
+        : "";
+      setElementTooltip(subEl, `${{subEl.textContent || ""}}${{cellTxt}} — Active instrument, space group, and workflow stage`);
+    }}
+    const appTitle = document.getElementById("app-title");
+    const appVer = document.getElementById("app-version");
+    if (appTitle) {{
+      const verStr = appVer ? (appVer.textContent || "").trim() : "";
+      setElementTooltip(appTitle, `sUBhkl ${{verStr}} — Quasi-Laue & TOF single-crystal neutron diffraction indexing, integration, and scaling`);
+      if (appVer) setElementTooltip(appVer, `sUBhkl version ${{verStr}}`);
+    }}
+    const peaksPill = document.getElementById("hud-peaks-pill");
+    if (peaksPill && stats) {{
+      const srcDesc = state.peakSource === "integrated" ? "integrated" : "predicted";
+      const wlLo = Number(state.lamMin || 0).toFixed(2);
+      const wlHi = Number(state.lamMax || 0).toFixed(2);
+      const dCut = Number(state.dMin || 0).toFixed(2);
+      setElementTooltip(
+        peaksPill,
+        `PEAKS ${{stats.peaksText}}: ${{stats.nCap}} indexed reflections captured by enabled Laue zones [uvw] (numerator) ` +
+        `out of ${{stats.nVis}} visible ${{srcDesc}} reflections on this frame within λ=${{wlLo}}–${{wlHi}} Å and d ≥ ${{dCut}} Å (denominator)`
+      );
+    }}
+    const rmsPill = document.getElementById("hud-rms-pill");
+    if (rmsPill && stats) {{
+      const isTof3d = DATA.angular_error_mode === "tof_3d";
+      const tg = DATA.tof_gate && typeof DATA.tof_gate === "object" ? DATA.tof_gate : null;
+      const gateDesc = (isTof3d && tg && typeof tg.lo === "number" && typeof tg.hi === "number")
+        ? `, gate [${{(tg.lo * 100).toFixed(1)}}%, ${{tg.hi >= 0 ? "+" : ""}}${{(tg.hi * 100).toFixed(1)}}%]` +
+          (typeof tg.l1 === "number" ? `, L1=${{tg.l1.toFixed(2)}} m` : "")
+        : "";
+      setElementTooltip(
+        rmsPill,
+        isTof3d
+          ? (stats.nErr > 0
+              ? `Δθ (3D ToF) = ${{stats.rmsText}} (across ${{stats.nErr}} ToF-gated 3D-matched spots in active zones${{gateDesc}}): RMS directional angle arccos(q̂_obs · Ĝ_pred) on the reciprocal sphere using 3D ToF peak placement & Voronoi matching`
+              : "Δθ (3D ToF): RMS directional angle arccos(q̂_obs · Ĝ_pred) across ToF-gated 3D-matched active-zone spots (run 2. Solve or enable zones covering observed spots)")
+          : (stats.nErr > 0
+              ? `Δθ = ${{stats.rmsText}} (across ${{stats.nErr}} matched detector spots in active zones): RMS angular offset between observed spot centroids and theoretical UB·hkl Bragg directions (lower = tighter indexing; updates live during Solve)`
+              : "Δθ: RMS angular offset between observed detector spot centroids and theoretical UB·hkl Bragg directions across active-zone spots (run 2. Solve or enable zones covering observed spots)")
+      );
+    }}
+    const zonesPill = document.getElementById("hud-zones-pill");
+    if (zonesPill && stats) {{
+      setElementTooltip(
+        zonesPill,
+        `ZONES ${{stats.zonesText}}: ${{state.activeZones.size}} active Laue zone conics [uvw] displayed on the detector and Wulff map (max Miller index order |u|,|v|,|w| ≤ ${{state.maxZoneOrder}})`
+      );
+    }}
+    const gonioPill = document.getElementById("hud-gonio-pill");
+    if (gonioPill && stats) {{
+      setElementTooltip(
+        gonioPill,
+        `GONIO: ${{stats.gonioText}} — Goniometer motor angles / crystal setting for the active frame`
+      );
+    }}
+    const selFrame = document.getElementById("sel-frame");
+    const frameCtrl = document.getElementById("hud-frame-ctrl");
+    if (selFrame) {{
+      const selOpt = selFrame.options && selFrame.selectedIndex >= 0 ? selFrame.options[selFrame.selectedIndex] : null;
+      const fTxt = selOpt ? selOpt.textContent : "1 / 1";
+      const fTotal = (DATA.frames && DATA.frames.length) ? DATA.frames.length : 1;
+      const fCur = (typeof DATA.frame_index === "number" ? DATA.frame_index : 0) + 1;
+      const fullFrameTip = `FRAME (${{fCur}} / ${{fTotal}}): ${{fTxt}} — Switch active run / goniometer orientation`;
+      setElementTooltip(selFrame, fullFrameTip);
+      if (frameCtrl) setElementTooltip(frameCtrl, fullFrameTip);
+    }}
+    const selData = document.getElementById("sel-galaxy-h5");
+    if (selData) {{
+      const optD = selData.options && selData.selectedIndex >= 0 ? selData.options[selData.selectedIndex] : null;
+      const dTxt = optD && optD.value && !String(optD.value).startsWith("__action_") ? `${{optD.textContent}} — ` : "";
+      setElementTooltip(selData, `${{dTxt}}Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus/.mtz files, or select from Galaxy History`);
+    }}
+    const btnArcs = document.getElementById("btn-zone-arcs");
+    if (btnArcs) {{
+      setElementTooltip(btnArcs, `Arcs (${{state.showZoneArcs ? "Shown" : "Hidden"}}): Show/Hide single-arc Laue zone curves [uvw] on the detector`);
+    }}
+    const btnCmap = document.getElementById("btn-heatmap-cmap");
+    if (btnCmap) {{
+      const cmapNames = {{ magma: "Magma", cyan: "Cyan Glow", gray: "Film (Monochrome)" }};
+      setElementTooltip(btnCmap, `Heatmap (${{cmapNames[state.heatmapStyle] || state.heatmapStyle}}): Cycle detector intensity colormap (Magma / Cyan Glow / Film)`);
+    }}
+    const btnStereo = document.getElementById("btn-stereo-toggle");
+    if (btnStereo) {{
+      setElementTooltip(btnStereo, `Wulff (${{state.showStereo ? "Shown" : "Hidden"}}): Show/Hide 3D Crystal Wulff Stereogram Inset`);
+    }}
   }}
 
   function updateHUD() {{
@@ -7209,21 +17199,33 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const nVis = visiblePeaks.length;
     const nCap = capturedPeaks.length;
     const pct = nVis > 0 ? ((nCap / nVis) * 100).toFixed(1) : "0.0";
+    const peaksText = `${{nCap}} / ${{nVis}} (${{pct}}%)`;
 
-    document.getElementById("val-indexed").textContent = `${{nCap}} / ${{nVis}} (${{pct}}%)`;
-    const rms = nCap > 0
-      ? Math.sqrt(capturedPeaks.reduce((s, p) => s + p.angular_error_deg * p.angular_error_deg, 0) / nCap)
+    document.getElementById("val-indexed").textContent = peaksText;
+    const errPeaks = capturedPeaks.filter(
+      p => (p.peak_source === "integrated" || p.has_angular_error === true) &&
+           typeof p.angular_error_deg === "number" &&
+           Number.isFinite(p.angular_error_deg)
+    );
+    const nErr = errPeaks.length;
+    const rms = nErr > 0
+      ? Math.sqrt(errPeaks.reduce((s, p) => s + p.angular_error_deg * p.angular_error_deg, 0) / nErr)
       : 0.0;
-    document.getElementById("val-rms").textContent = `${{rms.toFixed(3)}}°`;
+    const rmsText = nErr > 0 ? `${{rms.toFixed(3)}}°` : "—";
+    document.getElementById("val-rms").textContent = rmsText;
+    const zonesText = `${{state.activeZones.size}} (≤${{state.maxZoneOrder}})`;
     const elZones = document.getElementById("val-zones");
-    if (elZones) elZones.textContent = `${{state.activeZones.size}} (≤${{state.maxZoneOrder}})`;
+    if (elZones) elZones.textContent = zonesText;
     const elGonio = document.getElementById("val-gonio");
+    let gonioText = "—";
     if (elGonio) {{
       const frames = DATA.frames || [];
       const fIdx = typeof DATA.frame_index === "number" ? DATA.frame_index : 0;
       const curF = frames[fIdx];
-      elGonio.textContent = (curF && curF.motor_summary) || DATA.goniometer_summary || "—";
+      gonioText = (curF && curF.motor_summary) || DATA.goniometer_summary || "—";
+      elGonio.textContent = gonioText;
     }}
+    syncTopBarTooltips({{ peaksText, nCap, nVis, rmsText, nErr, zonesText, gonioText }});
     drawHistogram(visiblePeaks);
     if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
@@ -7237,7 +17239,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const topBar = document.querySelector(".top-bar");
     if (topBar) {{
       topBar.style.setProperty("--top-bar-scale", "1");
-      const availW = Math.max(0, topBar.clientWidth - 16);
+      const availW = Math.max(0, topBar.clientWidth - 24);
       const brand = topBar.querySelector(".brand-block");
       const hud = topBar.querySelector(".hud-metrics");
       const ctrls = topBar.querySelector(".controls-cluster");
@@ -7245,12 +17247,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         (brand ? brand.scrollWidth : 0) +
         (hud ? hud.scrollWidth : 0) +
         (ctrls ? ctrls.scrollWidth : 0) +
-        16;
+        30;
+      let scale = 1.0;
       if (availW > 0 && naturalW > availW) {{
-        let scale = Math.max(0.45, Math.min(1.0, (availW / naturalW) * 0.985));
+        scale = Math.max(0.45, Math.min(1.0, (availW / naturalW) * 0.98));
         topBar.style.setProperty("--top-bar-scale", scale.toFixed(3));
-        if (topBar.scrollWidth > topBar.clientWidth) {{
-          scale = Math.max(0.40, scale * (topBar.clientWidth / topBar.scrollWidth) * 0.985);
+      }}
+      if (topBar.scrollWidth > topBar.clientWidth && topBar.clientWidth > 0) {{
+        scale = Math.max(0.40, scale * (topBar.clientWidth / topBar.scrollWidth) * 0.98);
+        topBar.style.setProperty("--top-bar-scale", scale.toFixed(3));
+      }}
+      if (brand && hud && ctrls && topBar.clientWidth > 0) {{
+        const br = brand.getBoundingClientRect();
+        const hr = hud.getBoundingClientRect();
+        const cr = ctrls.getBoundingClientRect();
+        const overlapPx =
+          Math.max(0, br.right + 4 - hr.left) +
+          Math.max(0, hr.right + 4 - cr.left);
+        if (overlapPx > 0.5) {{
+          scale = Math.max(0.40, scale * (topBar.clientWidth / (topBar.clientWidth + overlapPx + 12)));
           topBar.style.setProperty("--top-bar-scale", scale.toFixed(3));
         }}
       }}
@@ -7321,6 +17336,122 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   const histCanvas = document.getElementById("canvas-hist");
+  const histBarHeader = document.getElementById("hist-bar-header");
+  const histBinTooltip = document.getElementById("hist-bin-tooltip");
+
+  function getMergeResolutionBins() {{
+    const m = DATA.merge_metrics;
+    if (!m) return [];
+    if (Array.isArray(m.cc_half_bins) && m.cc_half_bins.length > 0) return m.cc_half_bins;
+    if (Array.isArray(m.resolution_bins) && m.resolution_bins.length > 0) return m.resolution_bins;
+    return [];
+  }}
+
+  function formatHistBinSummary(b, idx, nBins, metric) {{
+    const dMaxRaw = b && b.d_max !== undefined && b.d_max !== null ? Number(b.d_max) : NaN;
+    const dMinRaw = b && b.d_min !== undefined && b.d_min !== null ? Number(b.d_min) : NaN;
+    const edgesText = (Number.isFinite(dMaxRaw) && Number.isFinite(dMinRaw))
+      ? `${{dMaxRaw.toFixed(2)}}–${{dMinRaw.toFixed(2)}} Å`
+      : `Bin ${{idx + 1}}/${{nBins}}`;
+    let statLabel = "CC½";
+    let statValue = "n/a";
+    let statColor = "#94a3b8";
+    if (metric === "completeness") {{
+      statLabel = "Compl.";
+      const hasC = b && b.completeness_pct !== null && b.completeness_pct !== undefined && Number.isFinite(Number(b.completeness_pct));
+      if (hasC) {{
+        const cVal = Number(b.completeness_pct);
+        statValue = `${{cVal.toFixed(1)}}%`;
+        statColor = cVal >= 50 ? "#34d399" : "#38bdf8";
+      }}
+    }} else if (metric === "isigi") {{
+      statLabel = "⟨I/σ⟩";
+      const hasS = b && b.mean_isigi !== null && b.mean_isigi !== undefined && Number.isFinite(Number(b.mean_isigi));
+      if (hasS) {{
+        const sVal = Number(b.mean_isigi);
+        statValue = sVal.toFixed(2);
+        statColor = sVal >= 5 ? "#fbbf24" : "#38bdf8";
+      }}
+    }} else {{
+      const hasCc = b && b.cc_half !== null && b.cc_half !== undefined && Number.isFinite(Number(b.cc_half));
+      if (hasCc) {{
+        const ccRaw = Number(b.cc_half);
+        statValue = ccRaw.toFixed(3);
+        statColor = ccRaw >= 0.8 ? "#34d399" : (ccRaw >= 0.3 ? "#fbbf24" : "#f43f5e");
+      }}
+    }}
+    const nRefl = (b && b.n_refl !== null && b.n_refl !== undefined && Number.isFinite(Number(b.n_refl)))
+      ? Number(b.n_refl)
+      : null;
+    const nTheo = (b && b.n_theo !== null && b.n_theo !== undefined && Number.isFinite(Number(b.n_theo)) && Number(b.n_theo) > 0)
+      ? Number(b.n_theo)
+      : null;
+    const reflText = nRefl !== null
+      ? (nTheo !== null ? `${{nRefl}}/${{nTheo}} refl` : `${{nRefl}} refl`)
+      : "";
+    return {{
+      binNum: idx + 1,
+      nBins,
+      edgesText,
+      statLabel,
+      statValue,
+      statColor,
+      reflText,
+      shortLine: `${{edgesText}} • ${{statLabel}}=${{statValue}}`,
+    }};
+  }}
+
+  function hideHistBinTooltip() {{
+    if (histBinTooltip) {{
+      histBinTooltip.style.display = "none";
+    }}
+  }}
+
+  function updateHistBinTooltip(binIdx) {{
+    if (!histBinTooltip || !histCanvas) return;
+    const bins = getMergeResolutionBins();
+    if (!bins.length || binIdx === null || binIdx === undefined || binIdx < 0 || binIdx >= bins.length) {{
+      hideHistBinTooltip();
+      return;
+    }}
+    const metric = state.histMetric || "cc_half";
+    const info = formatHistBinSummary(bins[binIdx], binIdx, bins.length, metric);
+    histBinTooltip.innerHTML =
+      `<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">` +
+        `<span style="color:#cbd5e1;">Bin ${{info.binNum}}/${{info.nBins}}: <strong style="color:#f8fafc;">${{info.edgesText}}</strong></span>` +
+        `<strong style="color:${{info.statColor}};">${{info.statLabel}} = ${{info.statValue}}</strong>` +
+      `</div>` +
+      `<div style="font-size:0.57rem;color:var(--text-dim);margin-top:1px;">` +
+        `${{info.reflText ? `${{info.reflText}} • ` : ""}}click to cycle metric ↻` +
+      `</div>`;
+    histBinTooltip.style.borderColor = info.statColor;
+    histBinTooltip.style.display = "block";
+    const rect = histCanvas.getBoundingClientRect();
+    const w = Math.max(200, rect.width || (histCanvas.parentElement ? histCanvas.parentElement.clientWidth : 260));
+    const barW = (w - 16) / Math.max(1, bins.length);
+    const barCenterX = (rect.left || 0) + 8 + (binIdx + 0.5) * barW;
+    const tipW = histBinTooltip.offsetWidth || 210;
+    const tipH = histBinTooltip.offsetHeight || 34;
+    const vw = window.innerWidth || 1280;
+    const leftPx = Math.max(8, Math.min(vw - tipW - 8, Math.round(barCenterX - tipW * 0.5)));
+    const topPx = Math.max(8, Math.round((rect.top || 60) - tipH - 6));
+    histBinTooltip.style.left = `${{leftPx}}px`;
+    histBinTooltip.style.top = `${{topPx}}px`;
+  }}
+
+  function resolveHistBinAtClientX(clientX) {{
+    if (!histCanvas) return null;
+    const bins = getMergeResolutionBins();
+    if (!bins.length) return null;
+    const rect = histCanvas.getBoundingClientRect();
+    const w = Math.max(200, rect.width || (histCanvas.parentElement ? histCanvas.parentElement.clientWidth : 260));
+    const localX = clientX - (rect.left || 0);
+    if (!Number.isFinite(localX) || localX < 2 || localX > w - 2) return null;
+    const barW = (w - 16) / Math.max(1, bins.length);
+    const rawIdx = Math.floor((localX - 8) / Math.max(1e-6, barW));
+    return Math.max(0, Math.min(bins.length - 1, rawIdx));
+  }}
+
   if (histCanvas) {{
     histCanvas.addEventListener("click", () => {{
       if (!DATA.merge_metrics) return;
@@ -7328,15 +17459,41 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.histMetric = order[(order.indexOf(state.histMetric || "cc_half") + 1) % order.length];
       drawHistogram(PEAKS.filter(isPeakVisible));
     }});
+    histCanvas.addEventListener("mousemove", (ev) => {{
+      const idx = resolveHistBinAtClientX(ev.clientX);
+      if (idx !== state.hoveredHistBin) {{
+        state.hoveredHistBin = idx;
+        drawHistogram(PEAKS.filter(isPeakVisible));
+      }} else if (idx !== null) {{
+        updateHistBinTooltip(idx);
+      }}
+    }});
+    histCanvas.addEventListener("mouseleave", () => {{
+      if (state.hoveredHistBin !== null) {{
+        state.hoveredHistBin = null;
+        hideHistBinTooltip();
+        drawHistogram(PEAKS.filter(isPeakVisible));
+      }} else {{
+        hideHistBinTooltip();
+      }}
+    }});
   }}
   function drawHistogram(visiblePeaks) {{
     const m = DATA.merge_metrics;
-    const hasMergeBins = Boolean(m && Array.isArray(m.cc_half_bins) && m.cc_half_bins.length > 0);
+    const mergeBins = getMergeResolutionBins();
+    const hasMergeBins = mergeBins.length > 0;
+    if (typeof histBarHeader !== "undefined" && histBarHeader) {{
+      histBarHeader.style.display = hasMergeBins ? "flex" : "none";
+    }}
     if (histCanvas) {{
       histCanvas.style.display = hasMergeBins ? "block" : "none";
       histCanvas.style.height = hasMergeBins ? "50px" : "40px";
     }}
-    if (!histCanvas || !hasMergeBins) return;
+    if (!histCanvas || !hasMergeBins) {{
+      state.hoveredHistBin = null;
+      hideHistBinTooltip();
+      return;
+    }}
     const rect = histCanvas.getBoundingClientRect();
     const w = Math.max(200, rect.width || (histCanvas.parentElement ? histCanvas.parentElement.clientWidth : 260));
     const h = Math.max(45, rect.height || 50);
@@ -7348,69 +17505,98 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.clearRect(0, 0, w, h);
 
     if (hasMergeBins) {{
-      const bins = m.cc_half_bins;
+      const bins = mergeBins;
       const nBins = bins.length;
+      const hovIdx = (typeof state.hoveredHistBin === "number" && state.hoveredHistBin >= 0 && state.hoveredHistBin < nBins)
+        ? state.hoveredHistBin
+        : null;
       const barW = (w - 16) / Math.max(1, nBins);
       const metric = state.histMetric || "cc_half";
       const maxComp = Math.max(20, ...bins.map(b => Number(b.completeness_pct || 0)));
       const maxIsig = Math.max(5, ...bins.map(b => Number(b.mean_isigi || 0)));
+      if (hovIdx !== null) {{
+        ctx.fillStyle = "rgba(148, 163, 184, 0.14)";
+        ctx.fillRect(8 + hovIdx * barW, 1, Math.max(3, barW), h - 15);
+      }}
       for (let i = 0; i < nBins; i++) {{
         const x = 8 + i * barW;
+        const bw = Math.max(2, barW - 2);
+        let bh = 1;
+        let fillCol = "#1e293b";
         if (metric === "completeness") {{
           const cVal = Math.max(0, Number(bins[i].completeness_pct || 0));
           const frac = Math.min(1, cVal / maxComp);
-          const bh = cVal > 0 ? Math.max(2, frac * (h - 20)) : 1;
-          const y = h - 14 - bh;
-          ctx.fillStyle = cVal > 0 ? (cVal >= 50 ? "#34d399" : "#38bdf8") : "#1e293b";
-          ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+          bh = cVal > 0 ? Math.max(2, frac * (h - 20)) : 1;
+          fillCol = cVal > 0 ? (cVal >= 50 ? "#34d399" : "#38bdf8") : "#1e293b";
         }} else if (metric === "isigi") {{
           const sVal = Math.max(0, Number(bins[i].mean_isigi || 0));
           const frac = Math.min(1, sVal / maxIsig);
-          const bh = sVal > 0 ? Math.max(2, frac * (h - 20)) : 1;
-          const y = h - 14 - bh;
-          ctx.fillStyle = sVal > 0 ? (sVal >= 5 ? "#fbbf24" : "#38bdf8") : "#1e293b";
-          ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+          bh = sVal > 0 ? Math.max(2, frac * (h - 20)) : 1;
+          fillCol = sVal > 0 ? (sVal >= 5 ? "#fbbf24" : "#38bdf8") : "#1e293b";
         }} else {{
           const rawCc = bins[i].cc_half;
           const hasCc = rawCc !== null && rawCc !== undefined && Number.isFinite(Number(rawCc));
           const ccVal = hasCc ? Math.max(0, Math.min(1, Number(rawCc))) : 0;
-          const bh = hasCc ? Math.max(2, ccVal * (h - 20)) : 1;
-          const y = h - 14 - bh;
-          ctx.fillStyle = !hasCc ? "#1e293b" : (ccVal >= 0.8 ? "#34d399" : (ccVal >= 0.5 ? "#fbbf24" : "#f43f5e"));
-          ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+          bh = hasCc ? Math.max(2, ccVal * (h - 20)) : 1;
+          fillCol = !hasCc ? "#1e293b" : (ccVal >= 0.8 ? "#34d399" : (ccVal >= 0.3 ? "#fbbf24" : "#f43f5e"));
+        }}
+        const y = h - 14 - bh;
+        ctx.globalAlpha = (hovIdx !== null && i !== hovIdx) ? 0.55 : 1.0;
+        ctx.fillStyle = fillCol;
+        ctx.fillRect(x + 1, y, bw, bh);
+        if (i === hovIdx) {{
+          ctx.globalAlpha = 1.0;
+          ctx.strokeStyle = "#f8fafc";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x + 1, y, bw, bh);
         }}
       }}
-      ctx.fillStyle = "#94a3b8";
+      ctx.globalAlpha = 1.0;
       ctx.font = "9px monospace";
-      const d0 = bins[0] && bins[0].d_max ? `${{Number(bins[0].d_max).toFixed(1)}}Å` : "low-q";
-      const d1 = bins[nBins - 1] && bins[nBins - 1].d_min ? `${{Number(bins[nBins - 1].d_min).toFixed(2)}}Å` : "d_min";
-      ctx.fillText(d0, 6, h - 3);
-      let midLbl = "";
-      let midCol = "#38bdf8";
-      if (metric === "completeness") {{
-        const compOv = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
-        midLbl = `Compl. vs d (${{compOv}}) ↻`;
-        midCol = "#34d399";
-      }} else if (metric === "isigi") {{
-        const isigOv = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
-        midLbl = `⟨I/σ⟩ vs d (${{isigOv}}) ↻`;
-        midCol = "#fbbf24";
+      if (hovIdx !== null) {{
+        const info = formatHistBinSummary(bins[hovIdx], hovIdx, nBins, metric);
+        ctx.fillStyle = info.statColor;
+        const txtX = Math.max(6, Math.round((w - info.shortLine.length * 5.4) * 0.5));
+        ctx.fillText(info.shortLine, txtX, h - 3);
+        updateHistBinTooltip(hovIdx);
       }} else {{
-        const ccOv = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
-        midLbl = `CC½ vs d (${{ccOv}}) ↻`;
-        midCol = "#38bdf8";
+        hideHistBinTooltip();
+        ctx.fillStyle = "#94a3b8";
+        const d0 = bins[0] && bins[0].d_max ? `${{Number(bins[0].d_max).toFixed(1)}}Å` : "low-q";
+        const d1 = bins[nBins - 1] && bins[nBins - 1].d_min ? `${{Number(bins[nBins - 1].d_min).toFixed(2)}}Å` : "d_min";
+        ctx.fillText(d0, 6, h - 3);
+        let midLbl = "";
+        let midCol = "#38bdf8";
+        if (metric === "completeness") {{
+          const compOv = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
+          midLbl = `Compl. vs d (${{compOv}}) ↻`;
+          midCol = "#34d399";
+        }} else if (metric === "isigi") {{
+          const isigOv = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
+          midLbl = `⟨I/σ⟩ vs d (${{isigOv}}) ↻`;
+          midCol = "#fbbf24";
+        }} else {{
+          const ccOv = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
+          midLbl = `CC½ vs d (${{ccOv}}) ↻`;
+          midCol = "#38bdf8";
+        }}
+        ctx.fillStyle = midCol;
+        ctx.fillText(midLbl, Math.max(36, w * 0.24), h - 3);
+        ctx.fillStyle = "#94a3b8";
+        ctx.fillText(d1, Math.max(w - 36, 60), h - 3);
       }}
-      ctx.fillStyle = midCol;
-      ctx.fillText(midLbl, Math.max(36, w * 0.24), h - 3);
-      ctx.fillStyle = "#94a3b8";
-      ctx.fillText(d1, Math.max(w - 36, 60), h - 3);
       return;
     }}
 
     const nBins = 20;
     const maxDeg = 1.5;
     const bins = new Array(nBins).fill(0);
-    visiblePeaks.forEach(p => {{
+    const histPeaks = visiblePeaks.filter(
+      p => (p.peak_source === "integrated" || p.has_angular_error === true) &&
+           typeof p.angular_error_deg === "number" &&
+           Number.isFinite(p.angular_error_deg)
+    );
+    histPeaks.forEach(p => {{
       const b = Math.min(nBins - 1, Math.floor((p.angular_error_deg / maxDeg) * nBins));
       if (b >= 0) bins[b]++;
     }});
@@ -7428,7 +17614,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.fillStyle = "#94a3b8";
     ctx.font = "10px monospace";
     ctx.fillText("0.0°", 6, h - 3);
-    ctx.fillText("Δθ error", w * 0.42, h - 3);
+    const isTof3dHist = DATA.angular_error_mode === "tof_3d";
+    ctx.fillText(isTof3dHist ? "Δθ (3D ToF)" : "Δθ error", isTof3dHist ? w * 0.36 : w * 0.42, h - 3);
     ctx.fillText("1.5°", w - 28, h - 3);
   }}
 
@@ -7476,8 +17663,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     _cachedCylRadiusM = null;
     _cachedPlotBox = null;
     _cachedPlotBoxKey = "";
-    if (typeof warpedBankCanvases !== "undefined") warpedBankCanvases.clear();
-    if (typeof warpedMaskCanvases !== "undefined") warpedMaskCanvases.clear();
+    if (typeof invalidatePanelRenderCaches === "function") invalidatePanelRenderCaches();
   }}
 
   function recomputeProjectionBounds() {{
@@ -7585,17 +17771,1097 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const y0 = box.originY + (1.0 - v) * box.plotH;
     const cx = w * 0.5;
     const cy = h * 0.5;
-    const shiftX = state.parallaxX * state.parallaxStrength * layerOffset * 18.0;
-    const shiftY = state.parallaxY * state.parallaxStrength * layerOffset * 12.0;
+    const shiftX = state.parallaxX * state.parallaxStrength * layerOffset * 54.0;
+    const shiftY = state.parallaxY * state.parallaxStrength * layerOffset * 38.0;
     return [
       cx + (x0 - cx) * state.detZoom + state.detPanX + shiftX,
       cy + (y0 - cy) * state.detZoom + state.detPanY + shiftY,
     ];
   }}
 
-  function drawSingleZoneArc(ctx, pts, zone, isContinuousGap = false) {{
+  function getCenteredDetectorAzimuthDeg() {{
+    if (!detCanvas) return 0.0;
+    const rect = detCanvas.getBoundingClientRect();
+    const w = rect.width || 800;
+    const h = rect.height || 500;
+    const bounds = getActiveBounds();
+    const box = getDetectorPlotBox(w, h);
+    const cx = w * 0.5;
+    const viewCenterX = box.originX + 0.5 * box.plotW;
+    const zoom = Math.max(1e-6, state.detZoom || 1.0);
+    const x0 = cx + (viewCenterX - cx - (state.detPanX || 0.0)) / zoom;
+    const u = (x0 - box.originX) / Math.max(1.0, box.plotW);
+    const rawChi = bounds.minX + u * (bounds.maxX - bounds.minX);
+    return ((((rawChi + 180.0) % 360.0) + 360.0) % 360.0) - 180.0;
+  }}
+
+  function setDetectorCenterAzimuthDeg(chiDeg) {{
+    if (!detCanvas) return;
+    const rect = detCanvas.getBoundingClientRect();
+    const w = rect.width || 800;
+    const h = rect.height || 500;
+    const bounds = getActiveBounds();
+    const box = getDetectorPlotBox(w, h);
+    const cx = w * 0.5;
+    const viewCenterX = box.originX + 0.5 * box.plotW;
+    const zoom = Math.max(1e-6, state.detZoom || 1.0);
+    const wrappedChi = ((((Number(chiDeg) || 0.0) + 180.0) % 360.0) + 360.0) % 360.0 - 180.0;
+    const u = (wrappedChi - bounds.minX) / Math.max(1e-6, bounds.maxX - bounds.minX);
+    const x0 = box.originX + u * box.plotW;
+    state.detPanX = (viewCenterX - cx) - (x0 - cx) * zoom;
+  }}
+
+  // Exact Bragg scattering-vector azimuth α(χ) in the lab XZ plane (incident beam k_i = +z_lab):
+  // A scattered ray at horizontal detector cylinder angle χ = atan2(x, z) ∈ [-180°, +180°]
+  // has scattering vector q = k_f - k_i with components:
+  //   q_x = sin(χ),  q_z = cos(χ) - 1 = -2 sin²(χ/2) ≤ 0,
+  // giving lab azimuth atan2(q_x, q_z):
+  //   χ ≥ 0  ->  α_+g(χ) = +90° + 0.5 * χ  ∈ [+90°, +180°]   (antipode -g sits at -90° + 0.5 * χ ∈ [-90°, 0°])
+  //   χ < 0  ->  α_+g(χ) = -90° + 0.5 * χ  ∈ (-180°, -90°)   (antipode -g sits at +90° + 0.5 * χ ∈ (-0°, +90°))
+  // Because 3D inversion -g = (-g_x, -g_y, -g_z) flips vertical elevation g_y -> -g_y,
+  // centering on χ ≥ 0 looks at +90° + 0.5*χ and centering on χ < 0 looks at -90° + 0.5*χ
+  // so direct (+g) reflections are always upright (+y) and dead-center on the Wulff map,
+  // while plotting virtual Friedel mates (-g) populates the |α| < 90° hemisphere continuously across ±90°!
+  function detectorChiToWulffAzimuthDeg(chiDeg) {{
+    const wrapped = (((((Number(chiDeg) || 0.0) + 180.0) % 360.0) + 360.0) % 360.0) - 180.0;
+    return wrapped >= 0.0 ? 90.0 + 0.5 * wrapped : -90.0 + 0.5 * wrapped;
+  }}
+
+  // Smooth 2:1 S¹ -> S¹ inverse map from Wulff camera azimuth α ∈ [-180°, +180°) to detector χ ∈ [-180°, +180°):
+  // Continuous everywhere (including across α = 0° -> χ = ±180° and α = ±180° -> χ = ±180°) with dχ/dα = +2!
+  function wulffAzimuthToDetectorChiDeg(azDeg) {{
+    const wrapped = (((((Number(azDeg) || 0.0) + 180.0) % 360.0) + 360.0) % 360.0) - 180.0;
+    const rawChi = wrapped >= 0.0 ? 2.0 * (wrapped - 90.0) : 2.0 * (wrapped + 90.0);
+    return ((((rawChi + 180.0) % 360.0) + 360.0) % 360.0) - 180.0;
+  }}
+
+  function syncWulffYawFromDetector() {{
+    state.wulffYawDeg = detectorChiToWulffAzimuthDeg(getCenteredDetectorAzimuthDeg());
+  }}
+
+  function resolveAvailablePeakSource(preferredSource) {{
+    const hasPred = (typeof PREDICTED_PEAKS !== "undefined" && Array.isArray(PREDICTED_PEAKS) && PREDICTED_PEAKS.length > 0) ||
+      (typeof PREDICTED_SAMPLE_PEAKS !== "undefined" && Array.isArray(PREDICTED_SAMPLE_PEAKS) && PREDICTED_SAMPLE_PEAKS.length > 0) ||
+      (typeof canRepredictDynamic === "function" && canRepredictDynamic());
+    const hasInteg = (typeof INTEGRATED_PEAKS !== "undefined" && Array.isArray(INTEGRATED_PEAKS) && INTEGRATED_PEAKS.length > 0) ||
+      (typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" && Array.isArray(INTEGRATED_SAMPLE_PEAKS) && INTEGRATED_SAMPLE_PEAKS.length > 0);
+    const req = String(preferredSource || "").toLowerCase();
+    if (req === "integrated" && hasInteg) return "integrated";
+    if (req === "predicted" && hasPred) return "predicted";
+    const defSrc = String(DATA.default_peak_source || "").toLowerCase();
+    if (defSrc === "integrated" && hasInteg) return "integrated";
+    if (defSrc === "predicted" && hasPred) return "predicted";
+    if (hasInteg) return "integrated";
+    if (hasPred) return "predicted";
+    return req === "integrated" ? "integrated" : "predicted";
+  }}
+
+  function syncPeakSourceButtons() {{
+    const btnPred = document.getElementById("btn-peaks-pred");
+    const btnInteg = document.getElementById("btn-peaks-integ");
+    const nPred = typeof PREDICTED_PEAKS !== "undefined" && Array.isArray(PREDICTED_PEAKS) ? PREDICTED_PEAKS.length : 0;
+    const nInteg = typeof INTEGRATED_PEAKS !== "undefined" && Array.isArray(INTEGRATED_PEAKS) ? INTEGRATED_PEAKS.length : 0;
+    const nIntegSample = typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" && Array.isArray(INTEGRATED_SAMPLE_PEAKS) ? INTEGRATED_SAMPLE_PEAKS.length : 0;
+    const art = String(DATA.artifact_kind || "").toLowerCase();
+    const canDyn = typeof canRepredictDynamic === "function" && canRepredictDynamic();
+    const hasPred = nPred > 0 || canDyn || (nInteg === 0 && art !== "integrator" && art !== "merged_careless");
+    const hasInteg = nInteg > 0 || nIntegSample > 0 || (nPred === 0 && (art === "integrator" || art === "merged_careless"));
+    if (btnPred) {{
+      btnPred.disabled = !hasPred;
+      btnPred.classList.toggle("active-btn", state.peakSource === "predicted");
+      btnPred.title = `Show predicted reflections as circles (${{nPred}} on frame; also projected on Wulff map)`;
+    }}
+    if (btnInteg) {{
+      btnInteg.disabled = !hasInteg;
+      btnInteg.classList.toggle("active-btn", state.peakSource === "integrated");
+      btnInteg.title = `Show successfully integrated reflections as 2σ ellipses (${{nInteg}} on frame)`;
+    }}
+    const legIcon = document.getElementById("legend-peak-shape-icon");
+    const legLbl = document.getElementById("legend-peak-shape-label");
+    const isIntegSrc = state.peakSource === "integrated";
+    if (legIcon) {{
+      legIcon.style.width = isIntegSrc ? "13px" : "10px";
+      legIcon.style.height = isIntegSrc ? "8px" : "10px";
+      legIcon.style.borderColor = isIntegSrc ? "#fbbf24" : "#00e5ff";
+    }}
+    if (legLbl) {{
+      legLbl.textContent = isIntegSrc
+        ? "Front Layer: Integrated 2σ Ellipses (hold Ctrl/Shift for parallax)"
+        : "Front Layer: Predicted Bragg Rings (hold Ctrl/Shift for parallax)";
+    }}
+  }}
+
+  function applyPeakSource(preferredSource, shouldRender = true) {{
+    const resolved = resolveAvailablePeakSource(preferredSource);
+    const prevSource = state.peakSource;
+    state.peakSource = resolved;
+    if (resolved === "predicted") {{
+      if (
+        (typeof PREDICTED_PEAKS === "undefined" || !Array.isArray(PREDICTED_PEAKS) || PREDICTED_PEAKS.length === 0) &&
+        typeof canRepredictDynamic === "function" &&
+        canRepredictDynamic() &&
+        typeof repredictPeaksDynamic === "function"
+      ) {{
+        repredictPeaksDynamic({{ preserveSource: true }});
+      }}
+      if (state.wulffScope === "all_runs" && typeof _dynPendingMultiRunFn === "function") {{
+        _dynPendingMultiRunFn();
+      }}
+    }}
+    const srcPeaks = resolved === "integrated"
+      ? (typeof INTEGRATED_PEAKS !== "undefined" ? INTEGRATED_PEAKS : [])
+      : (typeof PREDICTED_PEAKS !== "undefined" ? PREDICTED_PEAKS : []);
+    const srcSample = resolved === "integrated"
+      ? (typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" ? INTEGRATED_SAMPLE_PEAKS : [])
+      : (typeof PREDICTED_SAMPLE_PEAKS !== "undefined" ? PREDICTED_SAMPLE_PEAKS : []);
+    PEAKS.length = 0;
+    (srcPeaks || []).forEach(p => PEAKS.push(p));
+    SAMPLE_PEAKS.length = 0;
+    (srcSample && srcSample.length > 0 ? srcSample : PEAKS).forEach(p => SAMPLE_PEAKS.push(p));
+    if (typeof refreshZonesAngularStatsJS === "function") {{
+      const visSrc = typeof isPeakVisible === "function"
+        ? (srcPeaks || []).filter(isPeakVisible)
+        : (srcPeaks || []);
+      refreshZonesAngularStatsJS(visSrc);
+    }}
+    if (typeof _peakDataAvailabilitySig !== "undefined") _peakDataAvailabilitySig = "";
+    if (typeof _detVisiblePeaksSig !== "undefined") _detVisiblePeaksSig = "";
+    if (typeof _detBvhCache !== "undefined" && _detBvhCache) _detBvhCache.sig = "";
+    if (typeof _detLodCache !== "undefined" && _detLodCache) _detLodCache.sig = "";
+    if (typeof _wulffPoolCache !== "undefined" && _wulffPoolCache) _wulffPoolCache.sig = "";
+    if (typeof _wulffBvhCache !== "undefined" && _wulffBvhCache) _wulffBvhCache.sig = "";
+    if (typeof _wulffLodCache !== "undefined" && _wulffLodCache) _wulffLodCache.sig = "";
+    if (typeof _lastDetRenderSig !== "undefined") _lastDetRenderSig = "";
+    if (typeof _lastWulffRenderSig !== "undefined") _lastWulffRenderSig = "";
+    if (prevSource !== resolved) {{
+      state.hoveredPeakId = null;
+      state.hoveredPeakObj = null;
+      state.selectedPeakId = null;
+      state.selectedPeakObj = null;
+      state.activeOrbitId = null;
+    }}
+    if ((state.wulffColorMode === "residual" || state.wulffColorMode === "scale") && !hasMergedCarelessData()) {{
+      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
+    }} else if (state.wulffColorMode === "mtz_isigi" && !hasMtzIsigi()) {{
+      state.wulffColorMode = "wavelength";
+    }} else if (state.wulffColorMode === "isigi" && !hasIntegratedIsigi()) {{
+      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
+    }}
+    syncPeakSourceButtons();
+    if (shouldRender) {{
+      syncWulffUI();
+      renderZoneList();
+      updateHUD();
+      renderDetector();
+    }}
+  }}
+
+  function gcd2Int(a, b) {{
+    let x = Math.abs(Math.trunc(a));
+    let y = Math.abs(Math.trunc(b));
+    while (y !== 0) {{
+      const t = x % y;
+      x = y;
+      y = t;
+    }}
+    return x;
+  }}
+
+  function gcd3Int(a, b, c) {{
+    return gcd2Int(gcd2Int(a, b), c);
+  }}
+
+  function primitiveCanonicalHkl(h, k, l) {{
+    const hi = Math.round(h), ki = Math.round(k), li = Math.round(l);
+    if (hi === 0 && ki === 0 && li === 0) return null;
+    const g = gcd3Int(hi, ki, li) || 1;
+    let ph = Math.trunc(hi / g);
+    let pk = Math.trunc(ki / g);
+    let pl = Math.trunc(li / g);
+    if (ph < 0 || (ph === 0 && pk < 0) || (ph === 0 && pk === 0 && pl < 0)) {{
+      ph = -ph;
+      pk = -pk;
+      pl = -pl;
+    }}
+    return [ph, pk, pl];
+  }}
+
+  function getActiveIncidentBeam() {{
+    const raw = (Array.isArray(DATA.ki) && DATA.ki.length === 3)
+      ? DATA.ki
+      : ((Array.isArray(DATA.incident_beam) && DATA.incident_beam.length === 3) ? DATA.incident_beam : [0.0, 0.0, 1.0]);
+    const ux = Number(raw[0]) || 0.0;
+    const uy = Number(raw[1]) || 0.0;
+    const uz = Number(raw[2]);
+    return vecUnit([ux, uy, Number.isFinite(uz) ? uz : 1.0]);
+  }}
+
+  function getActiveSampleOffsetLab() {{
+    const activeRunIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : null;
+    const raw = (sMap && Array.isArray(sMap[String(activeRunIdx)]) && sMap[String(activeRunIdx)].length >= 3)
+      ? sMap[String(activeRunIdx)]
+      : ((Array.isArray(DATA.sample_offset_lab) && DATA.sample_offset_lab.length >= 3)
+        ? DATA.sample_offset_lab
+        : ((Array.isArray(DATA.sample_offset) && DATA.sample_offset.length >= 3) ? DATA.sample_offset : [0.0, 0.0, 0.0]));
+    return [Number(raw[0]) || 0.0, Number(raw[1]) || 0.0, Number(raw[2]) || 0.0];
+  }}
+
+  function computeDetectorConfigsSignature(cfgs) {{
+    if (!cfgs || typeof cfgs !== "object") return "none";
+    const keys = Object.keys(cfgs).sort();
+    if (keys.length === 0) return "empty";
+    let h = 2166136261 >>> 0;
+    const mixNum = (v) => {{
+      const q = Math.round((Number(v) || 0.0) * 1e6);
+      h = Math.imul(h ^ (q & 0xffff), 16777619) >>> 0;
+      h = Math.imul(h ^ ((q >>> 16) & 0xffff), 16777619) >>> 0;
+    }};
+    for (let i = 0; i < keys.length; i++) {{
+      const dc = cfgs[keys[i]];
+      if (!dc) continue;
+      mixNum(parseInt(keys[i], 10) || i);
+      mixNum(dc.width);
+      mixNum(dc.height);
+      mixNum(dc.radius);
+      if (Array.isArray(dc.center)) {{ mixNum(dc.center[0]); mixNum(dc.center[1]); mixNum(dc.center[2]); }}
+      if (Array.isArray(dc.uhat)) {{ mixNum(dc.uhat[0]); mixNum(dc.uhat[1]); mixNum(dc.uhat[2]); }}
+      if (Array.isArray(dc.vhat)) {{ mixNum(dc.vhat[0]); mixNum(dc.vhat[1]); mixNum(dc.vhat[2]); }}
+      if (Array.isArray(dc.rhat)) {{ mixNum(dc.rhat[0]); mixNum(dc.rhat[1]); mixNum(dc.rhat[2]); }}
+    }}
+    return `${{keys.length}}:${{h.toString(16)}}`;
+  }}
+
+  let _fullFacePanelsCacheKey = "";
+  let _fullFacePanelsCache = [];
+  function buildFullFaceDetectorRaycastPanels(sLab) {{
+    const cfgs = DATA.detector_configs;
+    if (!cfgs || typeof cfgs !== "object") return [];
+    const sx0 = Number(sLab[0]) || 0.0;
+    const sy0 = Number(sLab[1]) || 0.0;
+    const sz0 = Number(sLab[2]) || 0.0;
+    const geomSig = computeDetectorConfigsSignature(cfgs);
+    const key = `${{geomSig}}|${{sx0.toFixed(6)}},${{sy0.toFixed(6)}},${{sz0.toFixed(6)}}`;
+    if (_fullFacePanelsCacheKey === key && _fullFacePanelsCache.length > 0) {{
+      return _fullFacePanelsCache;
+    }}
+    const out = [];
+    for (const [kStr, dc] of Object.entries(cfgs)) {{
+      if (!dc || !Array.isArray(dc.center) || !Array.isArray(dc.vhat)) continue;
+      const bid = parseInt(kStr, 10);
+      if (!Number.isFinite(bid)) continue;
+      const m = Math.max(2, Number(dc.m) || 256);
+      const n = Math.max(2, Number(dc.n) || 256);
+      const width = Number(dc.width) || 0.2;
+      const height = Number(dc.height) || 0.2;
+      const pType = String(dc.panel_type || dc.panel || "flat").toLowerCase();
+      const center = dc.center.map(Number);
+      const vhat = dc.vhat.map(Number);
+      if (pType.includes("curv") || pType.includes("cyl")) {{
+        const radius = Number(dc.radius) || Math.hypot(center[0], center[2]) || 0.4;
+        const rhat = Array.isArray(dc.rhat)
+          ? [Number(dc.rhat[0]), Number(dc.rhat[1]), Number(dc.rhat[2])]
+          : [0.0, 0.0, 1.0];
+        const what = vecCross(vhat, rhat);
+        const bVec = vecCross([sx0, sy0, sz0], vhat);
+        const qc = vecDot(bVec, bVec) - radius * radius;
+        out.push({{
+          bid, isCurved: true, m, n, width, height, radius,
+          center, vhat, rhat, what, bVec, qc,
+        }});
+      }} else {{
+        if (!Array.isArray(dc.uhat)) continue;
+        const uhat = dc.uhat.map(Number);
+        const nhat = vecUnit(vecCross(uhat, vhat));
+        const relCx = center[0] - sx0;
+        const relCy = center[1] - sy0;
+        const relCz = center[2] - sz0;
+        const planeNum = relCx * nhat[0] + relCy * nhat[1] + relCz * nhat[2];
+        const midPt = [
+          center[0] + 0.5 * width * uhat[0] + 0.5 * height * vhat[0],
+          center[1] + 0.5 * width * uhat[1] + 0.5 * height * vhat[1],
+          center[2] + 0.5 * width * uhat[2] + 0.5 * height * vhat[2],
+        ];
+        out.push({{
+          bid, isCurved: false, m, n, width, height,
+          center, midPt, uhat, vhat, nhat, planeNum,
+        }});
+      }}
+    }}
+    _fullFacePanelsCacheKey = key;
+    _fullFacePanelsCache = out;
+    return out;
+  }}
+
+  function raycastSingleDirToFullPanels(kfx, kfy, kfz, sx0, sy0, sz0, fullPanels) {{
+    let bestT = 1e30;
+    let bestHit = null;
+    for (let pIdx = 0; pIdx < fullPanels.length; pIdx++) {{
+      const pan = fullPanels[pIdx];
+      if (pan.isCurved) {{
+        const vx = pan.vhat[0], vy = pan.vhat[1], vz = pan.vhat[2];
+        const dx = kfy * vz - kfz * vy;
+        const dy = kfz * vx - kfx * vz;
+        const dz = kfx * vy - kfy * vx;
+        const qa = dx * dx + dy * dy + dz * dz;
+        if (qa <= 1e-12) continue;
+        const qb = 2.0 * (pan.bVec[0] * dx + pan.bVec[1] * dy + pan.bVec[2] * dz);
+        const delta = qb * qb - 4.0 * qa * pan.qc;
+        if (delta < 0.0) continue;
+        const sq = Math.sqrt(delta);
+        const t2 = (-qb - sq) / (2.0 * qa);
+        const t1 = (-qb + sq) / (2.0 * qa);
+        const tRay = t2 > 1e-6 ? t2 : (t1 > 1e-6 ? t1 : -1.0);
+        if (tRay <= 1e-6 || tRay >= bestT) continue;
+        const ptX = sx0 + tRay * kfx;
+        const ptY = sy0 + tRay * kfy;
+        const ptZ = sz0 + tRay * kfz;
+        const rx = ptX - pan.center[0], ry = ptY - pan.center[1], rz = ptZ - pan.center[2];
+        const dotV = rx * vx + ry * vy + rz * vz;
+        if (dotV < 0.0 || dotV > pan.height) continue;
+        const dpx = rx - dotV * vx, dpy = ry - dotV * vy, dpz = rz - dotV * vz;
+        const dotR = dpx * pan.rhat[0] + dpy * pan.rhat[1] + dpz * pan.rhat[2];
+        const dotW = dpx * pan.what[0] + dpy * pan.what[1] + dpz * pan.what[2];
+        if (Math.abs(dotW) <= 1e-12) continue;
+        let dt = 2.0 * Math.atan(-dotR / dotW);
+        const twoPi = 2.0 * Math.PI;
+        dt = ((dt % twoPi) + twoPi) % twoPi;
+        const arcU = dt * pan.radius;
+        if (arcU < 0.0 || arcU > pan.width) continue;
+        bestT = tRay;
+        bestHit = {{ hit: true, bid: pan.bid, pt: [ptX, ptY, ptZ] }};
+      }} else {{
+        const denom = kfx * pan.nhat[0] + kfy * pan.nhat[1] + kfz * pan.nhat[2];
+        if (Math.abs(denom) < 1e-8) continue;
+        const tRay = pan.planeNum / denom;
+        if (tRay <= 1e-6 || tRay >= bestT) continue;
+        const ptX = sx0 + tRay * kfx;
+        const ptY = sy0 + tRay * kfy;
+        const ptZ = sz0 + tRay * kfz;
+        const dx = ptX - pan.center[0];
+        const dy = ptY - pan.center[1];
+        const dz = ptZ - pan.center[2];
+        const du = dx * pan.uhat[0] + dy * pan.uhat[1] + dz * pan.uhat[2];
+        if (du < 0.0 || du > pan.width) continue;
+        const dv = dx * pan.vhat[0] + dy * pan.vhat[1] + dz * pan.vhat[2];
+        if (dv < 0.0 || dv > pan.height) continue;
+        bestT = tRay;
+        bestHit = {{ hit: true, bid: pan.bid, pt: [ptX, ptY, ptZ] }};
+      }}
+    }}
+    return bestHit;
+  }}
+
+  function estimateDetectorRadiusM(fullPanels) {{
+    if (Array.isArray(fullPanels) && fullPanels.length > 0) {{
+      let sumR = 0.0, cnt = 0;
+      for (let i = 0; i < fullPanels.length; i++) {{
+        const fp = fullPanels[i];
+        const r = fp.isCurved
+          ? fp.radius
+          : Math.hypot(fp.midPt[0], fp.midPt[2]);
+        if (r > 0.02) {{ sumR += r; cnt++; }}
+      }}
+      if (cnt > 0) return sumR / cnt;
+    }}
+    if (Array.isArray(PANELS) && PANELS.length > 0) {{
+      for (let i = 0; i < PANELS.length; i++) {{
+        const p = PANELS[i];
+        if (typeof p.el_max === "number" && Math.abs(p.el_max) > 1.0 && typeof p.y_max === "number" && Math.abs(p.y_max) > 0.01) {{
+          const rEst = Math.abs(p.y_max) / Math.max(0.05, Math.tan(Math.abs(p.el_max) * Math.PI / 180.0));
+          if (Number.isFinite(rEst) && rEst > 0.05 && rEst < 10.0) return rEst;
+        }}
+      }}
+    }}
+    return 0.45;
+  }}
+
+  function wrapDeltaDeg(a, b) {{
+    let d = (a - b) % 360.0;
+    if (d > 180.0) d -= 360.0;
+    if (d < -180.0) d += 360.0;
+    return d;
+  }}
+
+  function projectRayToDetectorWithGap(kf, sLab, fullPanels) {{
+    const kfx = kf[0], kfy = kf[1], kfz = kf[2];
+    const sx0 = Number(sLab[0]) || 0.0;
+    const sy0 = Number(sLab[1]) || 0.0;
+    const sz0 = Number(sLab[2]) || 0.0;
+    const directHit = fullPanels.length > 0
+      ? raycastSingleDirToFullPanels(kfx, kfy, kfz, sx0, sy0, sz0, fullPanels)
+      : null;
+    if (directHit) {{
+      const [azDeg, yM, elDeg] = labToCyl(directHit.pt);
+      return {{
+        visible: true,
+        onPanel: true,
+        bank: directHit.bid,
+        nearBank: directHit.bid,
+        det_x: azDeg,
+        det_y: yM,
+        det_el: elDeg,
+        gapDeg: 0.0,
+        gapPanelFrac: 0.0,
+        nearAz: azDeg,
+        nearY: yM,
+        nearEl: elDeg,
+      }};
+    }}
+
+    // Estimate 3D intersection distance t from the physically closest panel plane/cylinder
+    const rFallback = estimateDetectorRadiusM(fullPanels);
+    let tEst = -1.0;
+    let bestFlatOverFrac = 1e9;
+    let hasFlatFullPanels = false;
+    if (fullPanels.length > 0) {{
+      let bestCos = -2.0;
+      let fallbackT = -1.0;
+      for (let i = 0; i < fullPanels.length; i++) {{
+        const fp = fullPanels[i];
+        if (fp.isCurved) {{
+          const vx = fp.vhat[0], vy = fp.vhat[1], vz = fp.vhat[2];
+          const dx = kfy * vz - kfz * vy;
+          const dy = kfz * vx - kfx * vz;
+          const dz = kfx * vy - kfy * vx;
+          const qa = dx * dx + dy * dy + dz * dz;
+          if (qa > 1e-12) {{
+            const qb = 2.0 * (fp.bVec[0] * dx + fp.bVec[1] * dy + fp.bVec[2] * dz);
+            const delta = qb * qb - 4.0 * qa * fp.qc;
+            if (delta >= 0.0) {{
+              const sq = Math.sqrt(delta);
+              const t2 = (-qb - sq) / (2.0 * qa);
+              const t1 = (-qb + sq) / (2.0 * qa);
+              const tRay = t2 > 1e-6 ? t2 : (t1 > 1e-6 ? t1 : -1.0);
+              if (tRay > 1e-6) {{
+                tEst = tRay;
+                break;
+              }}
+            }}
+          }}
+        }} else {{
+          hasFlatFullPanels = true;
+          const denom = kfx * fp.nhat[0] + kfy * fp.nhat[1] + kfz * fp.nhat[2];
+          if (Math.abs(denom) > 0.08) {{
+            const tRay = fp.planeNum / denom;
+            if (tRay > 1e-4) {{
+              const px = sx0 + tRay * kfx - fp.center[0];
+              const py = sy0 + tRay * kfy - fp.center[1];
+              const pz = sz0 + tRay * kfz - fp.center[2];
+              const du = px * fp.uhat[0] + py * fp.uhat[1] + pz * fp.uhat[2];
+              const dv = px * fp.vhat[0] + py * fp.vhat[1] + pz * fp.vhat[2];
+              const overU = du < 0.0 ? -du : (du > fp.width ? du - fp.width : 0.0);
+              const overV = dv < 0.0 ? -dv : (dv > fp.height ? dv - fp.height : 0.0);
+              const overFrac = Math.hypot(overU / Math.max(1e-4, fp.width), overV / Math.max(1e-4, fp.height));
+              if (overFrac < bestFlatOverFrac) {{
+                bestFlatOverFrac = overFrac;
+                tEst = tRay;
+              }}
+            }}
+          }}
+          const relMid = [fp.midPt[0] - sx0, fp.midPt[1] - sy0, fp.midPt[2] - sz0];
+          const distC = Math.hypot(relMid[0], relMid[1], relMid[2]);
+          if (distC > 1e-4) {{
+            const cosAng = (kfx * relMid[0] + kfy * relMid[1] + kfz * relMid[2]) / distC;
+            if (cosAng > bestCos) {{
+              bestCos = cosAng;
+              fallbackT = distC;
+            }}
+          }}
+        }}
+      }}
+      if (!(tEst > 1e-4) && fallbackT > 1e-4) {{
+        tEst = fallbackT;
+      }}
+    }}
+    if (!(tEst > 1e-4)) {{
+      const horiz = Math.hypot(kfx, kfz);
+      tEst = horiz > 0.12 ? (rFallback / horiz) : rFallback;
+    }}
+    const ptEst = [sx0 + tEst * kfx, sy0 + tEst * kfy, sz0 + tEst * kfz];
+    const [azDeg, yM, elDeg] = labToCyl(ptEst);
+
+    if (!Array.isArray(PANELS) || PANELS.length === 0) {{
+      return {{
+        visible: Math.abs(elDeg) <= 75.0,
+        onPanel: true,
+        bank: 1,
+        nearBank: 1,
+        det_x: azDeg,
+        det_y: yM,
+        det_el: elDeg,
+        gapDeg: 0.0,
+        gapPanelFrac: 0.0,
+        nearAz: azDeg,
+        nearY: yM,
+        nearEl: elDeg,
+      }};
+    }}
+
+    // Check against PANELS 2D bounds (including synthetic demos without detector_configs and inter-bank gaps)
+    let minGapDeg = 1e9;
+    let minGapPanelFrac = 1e9;
+    let nearAz = azDeg;
+    let nearY = yM;
+    let nearEl = elDeg;
+    let nearBank = PANELS[0].bank ?? PANELS[0].id ?? 1;
+    let insidePanel2D = false;
+
+    for (let i = 0; i < PANELS.length; i++) {{
+      const p = PANELS[i];
+      const azMin = Number(p.az_min), azMax = Number(p.az_max);
+      const yMin = Number(p.y_min), yMax = Number(p.y_max);
+      const elMin = typeof p.el_min === "number" ? p.el_min : (Math.atan2(yMin, rFallback) * 180.0 / Math.PI);
+      const elMax = typeof p.el_max === "number" ? p.el_max : (Math.atan2(yMax, rFallback) * 180.0 / Math.PI);
+
+      // Azimuth clamp with 360° periodicity
+      let clampedAz = azDeg;
+      let dAz = 0.0;
+      const midAz = 0.5 * (azMin + azMax);
+      const halfSpanAz = Math.max(0.0, 0.5 * (azMax - azMin));
+      const relAz = wrapDeltaDeg(azDeg, midAz);
+      if (Math.abs(relAz) > halfSpanAz) {{
+        dAz = Math.abs(relAz) - halfSpanAz;
+        clampedAz = azDeg - Math.sign(relAz) * dAz;
+      }}
+
+      let clampedY = Math.max(yMin, Math.min(yMax, yM));
+      let clampedEl = Math.max(elMin, Math.min(elMax, elDeg));
+      let dEl = 0.0;
+      if (elDeg < elMin) dEl = elMin - elDeg;
+      else if (elDeg > elMax) dEl = elDeg - elMax;
+      if (yM < yMin || yM > yMax) {{
+        const dyDeg = (Math.abs(yM - clampedY) / Math.max(0.08, rFallback)) * (180.0 / Math.PI);
+        dEl = Math.max(dEl, dyDeg);
+      }}
+
+      if (dAz === 0.0 && dEl === 0.0 && fullPanels.length === 0) {{
+        insidePanel2D = true;
+        minGapDeg = 0.0;
+        minGapPanelFrac = 0.0;
+        nearAz = azDeg;
+        nearY = yM;
+        nearEl = elDeg;
+        nearBank = p.bank ?? p.id ?? (i + 1);
+        break;
+      }}
+      const gDeg = Math.hypot(dAz, dEl);
+      // Distance normalized by panel dimensions (capping monolithic curved azimuth spans at 24°)
+      const effSpanAz = Math.min(24.0, Math.max(2.0, azMax - azMin));
+      const fracAz = dAz / effSpanAz;
+      const hasValidY = Number.isFinite(yMin) && Number.isFinite(yMax) && (yMax - yMin) > 1e-4;
+      const fracVert = hasValidY
+        ? (Math.abs(yM - clampedY) / Math.max(0.02, yMax - yMin))
+        : (dEl / Math.min(24.0, Math.max(2.0, elMax - elMin)));
+      const panelFrac = Math.hypot(fracAz, fracVert);
+      if (panelFrac < minGapPanelFrac || (Math.abs(panelFrac - minGapPanelFrac) < 1e-6 && gDeg < minGapDeg)) {{
+        minGapPanelFrac = panelFrac;
+        minGapDeg = gDeg;
+        nearAz = clampedAz;
+        nearY = clampedY;
+        nearEl = clampedEl;
+        nearBank = p.bank ?? p.id ?? (i + 1);
+      }}
+    }}
+
+    if (insidePanel2D) {{
+      return {{
+        visible: true,
+        onPanel: true,
+        bank: nearBank,
+        nearBank,
+        det_x: azDeg,
+        det_y: yM,
+        det_el: elDeg,
+        gapDeg: 0.0,
+        gapPanelFrac: 0.0,
+        nearAz,
+        nearY,
+        nearEl,
+      }};
+    }}
+
+    if (hasFlatFullPanels && bestFlatOverFrac < 1e8) {{
+      minGapPanelFrac = Math.max(minGapPanelFrac, bestFlatOverFrac);
+    }}
+
+    // Suppress nodals beyond 25% of a panel width/height away from any active detector panel
+    const MAX_NODAL_GAP_FRAC = 0.25;
+    return {{
+      visible: minGapPanelFrac <= MAX_NODAL_GAP_FRAC,
+      onPanel: false,
+      bank: null,
+      nearBank,
+      det_x: azDeg,
+      det_y: yM,
+      det_el: elDeg,
+      gapDeg: minGapDeg,
+      gapPanelFrac: minGapPanelFrac,
+      nearAz,
+      nearY,
+      nearEl,
+    }};
+  }}
+
+  function measurePrincipalStarSymbol(ctx, baseChar, basePx, supPx) {{
+    ctx.font = `bold ${{basePx}}px monospace`;
+    const bw = ctx.measureText(baseChar).width;
+    ctx.font = `bold ${{supPx}}px sans-serif`;
+    const sw = ctx.measureText("⋆").width;
+    return bw + sw + 0.5;
+  }}
+
+  function drawPrincipalStarSymbol(ctx, baseChar, x, y, basePx, supPx) {{
+    ctx.font = `bold ${{basePx}}px monospace`;
+    const bw = ctx.measureText(baseChar).width;
+    ctx.fillText(baseChar, x, y);
+    ctx.font = `bold ${{supPx}}px sans-serif`;
+    ctx.fillText("⋆", x + bw + 0.5, y - Math.round(0.42 * basePx));
+    const sw = ctx.measureText("⋆").width;
+    return bw + sw + 0.5;
+  }}
+
+  let _nodalPointsCacheSig = "";
+  let _nodalPointsCache = [];
+  function getVisibleNodalPoints() {{
+    if (!state.showNodalPoints) return [];
+    const ub = getActiveUbMatrix();
+    const Rg = getActiveGoniometerR();
+    const ki = getActiveIncidentBeam();
+    const sLab = getActiveSampleOffsetLab();
+    const detCfgSig = computeDetectorConfigsSignature(DATA.detector_configs);
+    const actZoneKey = Array.from(state.activeZones || []).join(",");
+    const ubSig = ub
+      ? `${{ub[0][0].toFixed(6)}},${{ub[1][1].toFixed(6)}},${{ub[2][2].toFixed(6)}},${{ub[0][1].toFixed(6)}},${{ub[0][2].toFixed(6)}},${{ub[1][2].toFixed(6)}}`
+      : "noub";
+    const sig = [
+      ubSig,
+      Rg[0][0].toFixed(5), Rg[0][1].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[1][2].toFixed(5), Rg[2][2].toFixed(5),
+      ki[0].toFixed(5), ki[1].toFixed(5), ki[2].toFixed(5),
+      sLab[0].toFixed(6), sLab[1].toFixed(6), sLab[2].toFixed(6),
+      detCfgSig,
+      actZoneKey,
+      ZONES.length,
+      PANELS.length,
+      typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0,
+    ].join("|");
+    if (_nodalPointsCacheSig === sig) {{
+      return _nodalPointsCache;
+    }}
+
+    const fullPanels = buildFullFaceDetectorRaycastPanels(sLab);
+    const actZones = getActiveZoneObjectsCached();
+    const zoneAxisByUvw = new Map();
+    for (let i = 0; i < ZONES.length; i++) {{
+      const z = ZONES[i];
+      if (Array.isArray(z.uvw) && z.uvw.length === 3 && Array.isArray(z.axis_xyz) && z.axis_xyz.length === 3) {{
+        zoneAxisByUvw.set(z.uvw.join(","), z.axis_xyz);
+      }}
+    }}
+
+    function resolveZoneAxisLab(z) {{
+      if (ub && Array.isArray(z.uvw) && z.uvw.length === 3) {{
+        const invUb = mat3Inv(ub);
+        if (invUb) {{
+          const u = z.uvw[0], v = z.uvw[1], w = z.uvw[2];
+          const tc = [
+            invUb[0][0] * u + invUb[1][0] * v + invUb[2][0] * w,
+            invUb[0][1] * u + invUb[1][1] * v + invUb[2][1] * w,
+            invUb[0][2] * u + invUb[1][2] * v + invUb[2][2] * w,
+          ];
+          return vecUnit(mat3Vec(Rg, tc));
+        }}
+      }}
+      if (Array.isArray(z.axis_xyz) && z.axis_xyz.length === 3) {{
+        return vecUnit(z.axis_xyz);
+      }}
+      return null;
+    }}
+
+    function buildCandidateFromHklOrDir(hkl0, fallbackGLab, principalSpec) {{
+      const principalSymbol = principalSpec ? principalSpec.sym : null;
+      const principalBase = principalSpec ? principalSpec.base : null;
+      const principalHtml = principalSpec ? principalSpec.html : null;
+      let gCryst0 = null;
+      let gLab0 = null;
+      let d1 = null;
+      if (ub && Array.isArray(hkl0)) {{
+        gCryst0 = mat3Vec(ub, hkl0);
+        const gn = vecNorm(gCryst0);
+        if (gn > 1e-9) {{
+          d1 = 1.0 / gn;
+          gLab0 = mat3Vec(Rg, gCryst0);
+        }}
+      }}
+      if (!gLab0 && Array.isArray(fallbackGLab)) {{
+        const fn = vecNorm(fallbackGLab);
+        if (fn > 1e-8) {{
+          gLab0 = fallbackGLab;
+          gCryst0 = mat3Vec(mat3T(Rg), gLab0);
+        }}
+      }}
+      if (!gLab0) return null;
+      const gHat0 = vecUnit(gLab0);
+      const dot0 = vecDot(ki, gHat0);
+      if (Math.abs(dot0) < 1e-4) return null;
+      const sgn = dot0 < 0.0 ? 1 : -1;
+      const gHat = [sgn * gHat0[0], sgn * gHat0[1], sgn * gHat0[2]];
+      const gCrystSigned = gCryst0 ? [sgn * gCryst0[0], sgn * gCryst0[1], sgn * gCryst0[2]] : null;
+      const sinTheta = -vecDot(ki, gHat);
+      if (!(sinTheta > 1e-4 && sinTheta < 0.9999)) return null;
+      const kf = vecUnit([
+        ki[0] + 2.0 * sinTheta * gHat[0],
+        ki[1] + 2.0 * sinTheta * gHat[1],
+        ki[2] + 2.0 * sinTheta * gHat[2],
+      ]);
+      // Exclude extreme near-forward beamstop cone (2θ < 1.8°)
+      if (vecDot(kf, ki) > 0.9995) return null;
+
+      const proj = projectRayToDetectorWithGap(kf, sLab, fullPanels);
+      if (!proj || !proj.visible) return null;
+
+      const signedHkl = Array.isArray(hkl0) ? [sgn * hkl0[0], sgn * hkl0[1], sgn * hkl0[2]] : null;
+      const zoneLabels = [];
+      const zoneIds = [];
+      let leadColor = principalSymbol ? "#fbbf24" : "#38bdf8";
+      let bestOrder = 999;
+      for (let zi = 0; zi < actZones.length; zi++) {{
+        const z = actZones[zi];
+        let inZone = false;
+        if (signedHkl && Array.isArray(z.uvw) && z.uvw.length === 3) {{
+          inZone = (signedHkl[0] * z.uvw[0] + signedHkl[1] * z.uvw[1] + signedHkl[2] * z.uvw[2]) === 0;
+        }} else {{
+          const tLab = resolveZoneAxisLab(z);
+          if (tLab) inZone = Math.abs(vecDot(gHat, tLab)) < 1e-3;
+        }}
+        if (inZone) {{
+          zoneIds.push(z.zone_id);
+          zoneLabels.push(z.label);
+          const zOrd = z.order || 1;
+          if (!principalSymbol && zOrd < bestOrder) {{
+            bestOrder = zOrd;
+            leadColor = z.rainbow_color || leadColor;
+          }}
+        }}
+      }}
+      // For principal {{a*, b*, c*}} axes when zones are hidden/deselected, still show canonical zone axes in tooltip
+      if (principalSymbol && zoneLabels.length === 0 && signedHkl) {{
+        for (let zi = 0; zi < ZONES.length && zoneLabels.length < 3; zi++) {{
+          const z = ZONES[zi];
+          if (Array.isArray(z.uvw) && (signedHkl[0] * z.uvw[0] + signedHkl[1] * z.uvw[1] + signedHkl[2] * z.uvw[2]) === 0) {{
+            zoneLabels.push(z.label);
+          }}
+        }}
+      }}
+
+      const key = signedHkl
+        ? `${{Math.abs(hkl0[0]) !== 0 || Math.abs(hkl0[1]) !== 0 || Math.abs(hkl0[2]) !== 0 ? hkl0.join(",") : ""}}`
+        : `${{proj.det_x.toFixed(2)}}_${{proj.det_el.toFixed(2)}}`;
+      const maxIdx = signedHkl
+        ? Math.max(Math.abs(signedHkl[0]), Math.abs(signedHkl[1]), Math.abs(signedHkl[2]))
+        : 9;
+      const lam1 = d1 !== null ? 2.0 * d1 * sinTheta : null;
+
+      return {{
+        key,
+        hkl: signedHkl,
+        canonHkl: hkl0,
+        isPrincipal: Boolean(principalSymbol),
+        principalBase: principalBase || null,
+        principalSymbol: principalSymbol || null,
+        principalHtml: principalHtml || null,
+        color: principalSymbol ? "#fbbf24" : leadColor,
+        det_x: proj.det_x,
+        det_y: proj.det_y,
+        det_el: proj.det_el,
+        onPanel: proj.onPanel,
+        bank: proj.bank,
+        nearBank: proj.nearBank,
+        gapDeg: proj.gapDeg,
+        gapPanelFrac: proj.gapPanelFrac || 0.0,
+        nearAz: proj.nearAz,
+        nearY: proj.nearY,
+        nearEl: proj.nearEl,
+        d1,
+        lam1,
+        gCrystUnit: gCrystSigned ? vecUnit(gCrystSigned) : null,
+        zoneIds,
+        zoneLabels,
+        crossingCount: zoneIds.length,
+        maxIdx,
+      }};
+    }}
+
+    const seenKeys = new Set();
+    const principals = [];
+    const PRINCIPAL_SPECS = [
+      {{ hkl: [1, 0, 0], base: "a", sym: "a⋆", html: 'a<sup style="font-size:0.72em;line-height:0;">⋆</sup>', crossA: "0,1,0", crossB: "0,0,1" }},
+      {{ hkl: [0, 1, 0], base: "b", sym: "b⋆", html: 'b<sup style="font-size:0.72em;line-height:0;">⋆</sup>', crossA: "0,0,1", crossB: "1,0,0" }},
+      {{ hkl: [0, 0, 1], base: "c", sym: "c⋆", html: 'c<sup style="font-size:0.72em;line-height:0;">⋆</sup>', crossA: "1,0,0", crossB: "0,1,0" }},
+    ];
+    for (let pi = 0; pi < PRINCIPAL_SPECS.length; pi++) {{
+      const sp = PRINCIPAL_SPECS[pi];
+      let fallbackG = null;
+      if (!ub) {{
+        const ta = zoneAxisByUvw.get(sp.crossA);
+        const tb = zoneAxisByUvw.get(sp.crossB);
+        if (ta && tb) fallbackG = vecCross(ta, tb);
+      }}
+      const cand = buildCandidateFromHklOrDir(sp.hkl, fallbackG, sp);
+      if (cand) {{
+        seenKeys.add(cand.key);
+        principals.push(cand);
+      }}
+    }}
+
+    const secondaries = [];
+    if (state.showZoneArcs && actZones.length >= 2) {{
+      const labAxes = actZones.map(z => resolveZoneAxisLab(z));
+      for (let i = 0; i < actZones.length; i++) {{
+        const z1 = actZones[i];
+        const t1 = labAxes[i];
+        for (let j = i + 1; j < actZones.length; j++) {{
+          const z2 = actZones[j];
+          const t2 = labAxes[j];
+          let hkl0 = null;
+          if (Array.isArray(z1.uvw) && Array.isArray(z2.uvw)) {{
+            const cx = z1.uvw[1] * z2.uvw[2] - z1.uvw[2] * z2.uvw[1];
+            const cy = z1.uvw[2] * z2.uvw[0] - z1.uvw[0] * z2.uvw[2];
+            const cz = z1.uvw[0] * z2.uvw[1] - z1.uvw[1] * z2.uvw[0];
+            hkl0 = primitiveCanonicalHkl(cx, cy, cz);
+            if (!hkl0) continue;
+            const cKey = hkl0.join(",");
+            if (seenKeys.has(cKey)) continue;
+          }}
+          const fallbackG = (t1 && t2) ? vecCross(t1, t2) : null;
+          if (!hkl0 && (!fallbackG || vecNorm(fallbackG) < 1e-5)) continue;
+          const cand = buildCandidateFromHklOrDir(hkl0, fallbackG, null);
+          if (hkl0) seenKeys.add(hkl0.join(","));
+          if (cand && cand.crossingCount >= 2) {{
+            if (!hkl0) {{
+              if (seenKeys.has(cand.key)) continue;
+              seenKeys.add(cand.key);
+            }}
+            secondaries.push(cand);
+          }}
+        }}
+      }}
+    }}
+
+    secondaries.sort((a, b) => {{
+      if (b.crossingCount !== a.crossingCount) return b.crossingCount - a.crossingCount;
+      if (a.maxIdx !== b.maxIdx) return a.maxIdx - b.maxIdx;
+      return (b.d1 || 0) - (a.d1 || 0);
+    }});
+
+    const merged = principals.concat(secondaries.slice(0, 20));
+    _nodalPointsCacheSig = sig;
+    _nodalPointsCache = merged;
+    return merged;
+  }}
+
+  let _holzCacheSig = "";
+  let _holzCacheList = [];
+  function getHolzSegmentsForActiveZones() {{
+    if (
+      !state.showZoneArcs ||
+      !(state.holzOrders instanceof Set) ||
+      state.holzOrders.size === 0 ||
+      !state.activeZones ||
+      state.activeZones.size === 0
+    ) {{
+      return [];
+    }}
+    const ordersArr = Array.from(state.holzOrders).filter(n => n > 0).sort((a, b) => a - b);
+    if (ordersArr.length === 0) return [];
+    const ub = getActiveUbMatrix();
+    const invUb = ub ? mat3Inv(ub) : null;
+    const Rg = getActiveGoniometerR();
+    const ki = getActiveIncidentBeam();
+    const sLab = getActiveSampleOffsetLab();
+    const detCfgSig = computeDetectorConfigsSignature(DATA.detector_configs);
+    const wlMin = Math.max(0.05, Number(state.lamMin) || 0.5);
+    const wlMax = Math.max(wlMin, Number(state.lamMax) || wlMin);
+    const dMin = Math.max(0.05, Number(state.dMin) || 0.5);
+    const ubSig = ub
+      ? `${{ub[0][0].toFixed(6)}},${{ub[1][1].toFixed(6)}},${{ub[2][2].toFixed(6)}},${{ub[0][2].toFixed(6)}}`
+      : "noub";
+    const sig = [
+      ordersArr.join(","),
+      Array.from(state.activeZones).join(","),
+      wlMin.toFixed(4),
+      wlMax.toFixed(4),
+      dMin.toFixed(4),
+      ubSig,
+      Rg[0][0].toFixed(5), Rg[0][1].toFixed(5), Rg[0][2].toFixed(5), Rg[1][2].toFixed(5), Rg[2][2].toFixed(5),
+      ki[0].toFixed(5), ki[1].toFixed(5), ki[2].toFixed(5),
+      sLab[0].toFixed(6), sLab[1].toFixed(6), sLab[2].toFixed(6),
+      detCfgSig,
+      PANELS.length,
+      ZONES.length,
+    ].join("|");
+    if (_holzCacheSig === sig) return _holzCacheList;
+
+    const fullPanels = buildFullFaceDetectorRaycastPanels(sLab);
+    const sx0 = Number(sLab[0]) || 0.0;
+    const sy0 = Number(sLab[1]) || 0.0;
+    const sz0 = Number(sLab[2]) || 0.0;
+    const rFallback = estimateDetectorRadiusM(fullPanels);
+    const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
+    const actZones = getActiveZoneObjectsCached();
+    const out = [];
+
+    for (let zi = 0; zi < actZones.length; zi++) {{
+      const zone = actZones[zi];
+      let tLab = null;
+      let dDirect = Number(zone.d_direct) || 0.0;
+      if (invUb && Array.isArray(zone.uvw) && zone.uvw.length === 3) {{
+        const u = zone.uvw[0], v = zone.uvw[1], w = zone.uvw[2];
+        const tc = [
+          invUb[0][0] * u + invUb[1][0] * v + invUb[2][0] * w,
+          invUb[0][1] * u + invUb[1][1] * v + invUb[2][1] * w,
+          invUb[0][2] * u + invUb[1][2] * v + invUb[2][2] * w,
+        ];
+        const dn = vecNorm(tc);
+        if (dn > 1e-6) {{
+          dDirect = dn;
+          tLab = vecUnit(mat3Vec(Rg, tc));
+        }}
+      }}
+      if (!tLab && Array.isArray(zone.axis_xyz) && zone.axis_xyz.length === 3) {{
+        tLab = vecUnit(zone.axis_xyz);
+      }}
+      if (!tLab || !(dDirect > 1e-4)) continue;
+
+      const ref = Math.abs(tLab[0]) < 0.9 ? [1.0, 0.0, 0.0] : [0.0, 1.0, 0.0];
+      const e1 = vecUnit(vecCross(tLab, ref));
+      const e2 = vecUnit(vecCross(tLab, e1));
+      const kiDotT = vecDot(ki, tLab);
+
+      for (let oi = 0; oi < ordersArr.length; oi++) {{
+        const absN = ordersArr[oi];
+        const spread = (absN * (wlMax - wlMin)) / dDirect;
+        const wlSpecs = spread < 0.008
+          ? [{{ lam: 0.5 * (wlMin + wlMax), edgeKind: "mid" }}]
+          : [
+              {{ lam: wlMin, edgeKind: "min" }},
+              {{ lam: wlMax, edgeKind: "max" }},
+            ];
+        const signs = [absN, -absN];
+        for (let si = 0; si < signs.length; si++) {{
+          const holzN = signs[si];
+          for (let wi = 0; wi < wlSpecs.length; wi++) {{
+            const {{ lam, edgeKind }} = wlSpecs[wi];
+            const cVal = kiDotT + (holzN * lam) / dDirect;
+            if (Math.abs(cVal) >= 0.9996) continue;
+            const sVal = Math.sqrt(Math.max(0.0, 1.0 - cVal * cVal));
+            // d >= dMin <=> sin(theta) <= lam / (2*dMin) <=> cos(2*theta) >= 1 - lam^2 / (2*dMin^2)
+            const cos2ThetaMin = 1.0 - (lam * lam) / (2.0 * dMin * dMin);
+
+            const cylSegs = [];
+            const sphSegs = [];
+            let curCyl = [];
+            let curSph = [];
+            let prevBid = null;
+            let prevAz = null;
+            const nSamples = 240;
+
+            const flushSeg = () => {{
+              if (curCyl.length >= 2) {{
+                cylSegs.push(curCyl);
+                sphSegs.push(curSph);
+              }}
+              curCyl = [];
+              curSph = [];
+              prevBid = null;
+              prevAz = null;
+            }};
+
+            for (let step = 0; step <= nSamples; step++) {{
+              const ang = (step / nSamples) * Math.PI * 2.0;
+              const ca = Math.cos(ang), sa = Math.sin(ang);
+              const kfx = cVal * tLab[0] + sVal * (ca * e1[0] + sa * e2[0]);
+              const kfy = cVal * tLab[1] + sVal * (ca * e1[1] + sa * e2[1]);
+              const kfz = cVal * tLab[2] + sVal * (ca * e1[2] + sa * e2[2]);
+              const cos2Theta = kfx * ki[0] + kfy * ki[1] + kfz * ki[2];
+              if (cos2Theta > 0.9995 || cos2Theta < cos2ThetaMin) {{
+                flushSeg();
+                continue;
+              }}
+
+              let azDeg = 0.0, yM = 0.0, elDeg = 0.0, bid = 0;
+              if (fullPanels.length > 0) {{
+                const hit = raycastSingleDirToFullPanels(kfx, kfy, kfz, sx0, sy0, sz0, fullPanels);
+                if (!hit) {{
+                  flushSeg();
+                  continue;
+                }}
+                [azDeg, yM, elDeg] = labToCyl(hit.pt);
+                bid = hit.bid;
+              }} else {{
+                const horiz = Math.hypot(kfx, kfz);
+                if (horiz < 0.08) {{
+                  flushSeg();
+                  continue;
+                }}
+                const tCyl = rFallback / horiz;
+                [azDeg, yM, elDeg] = labToCyl([sx0 + tCyl * kfx, sy0 + tCyl * kfy, sz0 + tCyl * kfz]);
+                if (hasPanels) {{
+                  let matchBank = null;
+                  for (let pi = 0; pi < PANELS.length; pi++) {{
+                    const p = PANELS[pi];
+                    if (azDeg >= p.az_min && azDeg <= p.az_max && yM >= p.y_min && yM <= p.y_max) {{
+                      matchBank = p.id || (pi + 1);
+                      break;
+                    }}
+                  }}
+                  if (matchBank === null) {{
+                    flushSeg();
+                    continue;
+                  }}
+                  bid = matchBank;
+                }}
+              }}
+
+              if (prevBid !== null && (bid !== prevBid || Math.abs(azDeg - prevAz) > 90.0)) {{
+                flushSeg();
+              }}
+              curCyl.push([azDeg, yM]);
+              curSph.push([azDeg, elDeg]);
+              prevBid = bid;
+              prevAz = azDeg;
+            }}
+            flushSeg();
+
+            if (cylSegs.length > 0) {{
+              out.push({{
+                zone,
+                holzN,
+                absN,
+                lam,
+                edgeKind,
+                cylSegs,
+                sphSegs,
+              }});
+            }}
+          }}
+        }}
+      }}
+    }}
+
+    _holzCacheSig = sig;
+    _holzCacheList = out;
+    return out;
+  }}
+
+  function drawSingleZoneArc(ctx, pts, zone, isContinuousGap = false, holzSpec = null) {{
     if (!pts || pts.length < 2) return;
-    const isSelected = state.selectedZoneId === zone.zone_id;
+    const isHoveredZone = state.hoveredZoneId === zone.zone_id && (holzSpec ? state.hoveredZoneHolzN === holzSpec.holzN : state.hoveredZoneHolzN === 0);
+    const isSelected = state.selectedZoneId === zone.zone_id || isHoveredZone;
     const zOrder = zone.order || 1;
     ctx.save();
     ctx.beginPath();
@@ -7610,6 +18876,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ctx.lineWidth = 1.0;
       ctx.globalAlpha = 0.22;
       ctx.setLineDash([4, 4]);
+    }} else if (holzSpec) {{
+      const absN = holzSpec.absN || 1;
+      const isOuter = holzSpec.edgeKind === "max";
+      const baseW = absN === 1 ? (isOuter ? 1.15 : 1.55) : (isOuter ? 1.0 : 1.3);
+      ctx.lineWidth = isSelected ? baseW + 1.1 : baseW;
+      ctx.globalAlpha = isSelected ? 0.95 : (isOuter ? 0.42 : (absN === 1 ? 0.72 : 0.58));
+      ctx.setLineDash(absN === 1 ? (isOuter ? [2, 4] : [6, 4]) : (isOuter ? [1.5, 4] : [3, 3, 1, 3]));
     }} else {{
       const baseW = zOrder === 1 ? 2.2 : (zOrder === 2 ? 1.6 : 1.25);
       ctx.lineWidth = isSelected ? baseW + 1.2 : baseW;
@@ -7619,20 +18892,83 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.restore();
   }}
 
-  function warpTextureOntoPanel(texCanvas, panel, isSph, smooth) {{
+  function getCrispUVCanvas(cachePrefix, srcCanvas, scaleK) {{
+    const k = Math.max(1, Math.round(scaleK || 1));
+    if (k <= 1) return srcCanvas;
+    const key = `${{cachePrefix}}_k${{k}}`;
+    if (uvUpscaledCanvases.has(key)) {{
+      return uvUpscaledCanvases.get(key);
+    }}
+    const up = document.createElement("canvas");
+    up.width = Math.max(1, srcCanvas.width * k);
+    up.height = Math.max(1, srcCanvas.height * k);
+    const uctx = up.getContext("2d");
+    uctx.imageSmoothingEnabled = false;
+    uctx.drawImage(srcCanvas, 0, 0, up.width, up.height);
+    if (uvUpscaledCanvases.size > 96) {{
+      uvUpscaledCanvases.clear();
+    }}
+    uvUpscaledCanvases.set(key, up);
+    return up;
+  }}
+
+  function getPanelScreenAspect(panel) {{
+    const bounds = getActiveBounds();
+    const spanX = Math.max(10.0, bounds.maxX - bounds.minX);
+    const spanY = Math.max(1e-4, bounds.maxY - bounds.minY);
     const [vMin, vMax] = getPanelVertRange(panel);
     const azSpan = Math.max(1e-5, panel.az_max - panel.az_min);
     const vSpan = Math.max(1e-5, vMax - vMin);
-    const W = Math.max(1, texCanvas.width);
-    const H = Math.max(1, texCanvas.height);
-    const spW = W > 512 ? Math.min(2048, W) : Math.min(384, Math.max(192, W * 2));
-    const spH = H > 512 ? Math.min(1024, H) : Math.min(384, Math.max(192, H * 2));
+    const dataAspect = Math.max(0.25, Math.min(12.0, getDetectorDataAspect()));
+    const relW = (azSpan / spanX) * dataAspect;
+    const relH = vSpan / spanY;
+    return Math.max(0.1, Math.min(10.0, relW / Math.max(1e-6, relH)));
+  }}
+
+  function expandClampedUVTri(uA, vA, uB, vB, uC, vC, padU, padV, maxW, maxH, a, b, c, d, e, f) {{
+    const uc = (uA + uB + uC) / 3.0;
+    const vc = (vA + vB + vC) / 3.0;
+    const mapVert = (u, v) => {{
+      const du = u - uc;
+      const dv = v - vc;
+      const nu = Math.max(0, Math.min(maxW, u + (du >= 0 ? padU : -padU)));
+      const nv = Math.max(0, Math.min(maxH, v + (dv >= 0 ? padV : -padV)));
+      return [a * nu + c * nv + e, b * nu + d * nv + f];
+    }};
+    return [mapVert(uA, vA), mapVert(uB, vB), mapVert(uC, vC)];
+  }}
+
+  function warpTextureOntoPanel(texCanvas, panel, isSph, smooth) {{
+    const [vMin, vMax] = getPanelVertRange(panel);
+    const azSpan = Math.max(1e-5, panel.az_min - panel.az_max ? panel.az_max - panel.az_min : 1e-5);
+    const vSpan = Math.max(1e-5, vMax - vMin);
+    const W0 = Math.max(1, texCanvas.width);
+    const H0 = Math.max(1, texCanvas.height);
+    const hiRes = Boolean(state.hiResTextures);
+    const aspect = getPanelScreenAspect(panel);
+    const baseMax = hiRes
+      ? Math.min(2048, Math.max(768, Math.max(W0, H0) * 3))
+      : (Math.max(W0, H0) > 512 ? Math.min(2048, Math.max(W0, H0)) : Math.min(512, Math.max(256, Math.max(W0, H0) * 3)));
+    const spW = aspect >= 1.0
+      ? Math.round(baseMax)
+      : Math.max(64, Math.round(baseMax * aspect));
+    const spH = aspect >= 1.0
+      ? Math.max(64, Math.round(baseMax / aspect))
+      : Math.round(baseMax);
+
+    const maxK = Math.max(1, Math.min(4, Math.floor(2048 / Math.max(W0, H0))));
+    const srcCanvas = (!smooth || hiRes)
+      ? getCrispUVCanvas(`warp_${{panel.bank}}_${{state.heatmapStyle}}_${{hiRes ? "hi" : "lo"}}`, texCanvas, Math.min(maxK, 2))
+      : texCanvas;
+    const W = Math.max(1, srcCanvas.width);
+    const H = Math.max(1, srcCanvas.height);
 
     const wc = document.createElement("canvas");
     wc.width = spW;
     wc.height = spH;
     const wctx = wc.getContext("2d");
-    wctx.imageSmoothingEnabled = Boolean(smooth);
+    wctx.imageSmoothingEnabled = true;
+    wctx.imageSmoothingQuality = "high";
 
     const toSp = pt => [
       ((pt[0] - panel.az_min) / azSpan) * spW,
@@ -7676,21 +19012,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
         wctx.save();
         wctx.transform(ax, ay, cx, cy, ex, ey);
-        wctx.drawImage(texCanvas, 0, 0, W, H);
+        wctx.drawImage(srcCanvas, 0, 0, W, H);
         wctx.restore();
       }} else {{
         const du = W / nCols;
         const dv = H / nRows;
-        const expandTri = (A, B, C) => {{
-          const mx = (A[0] + B[0] + C[0]) / 3;
-          const my = (A[1] + B[1] + C[1]) / 3;
-          const pad = 0.65;
-          return [A, B, C].map(P => {{
-            const dx = P[0] - mx, dy = P[1] - my;
-            const len = Math.hypot(dx, dy) || 1;
-            return [P[0] + (dx / len) * pad, P[1] + (dy / len) * pad];
-          }});
-        }};
         for (let ir = 0; ir < nRows; ir++) {{
           const v0 = ir * dv;
           const v1 = (ir + 1) * dv;
@@ -7702,13 +19028,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const P11 = SGrid[ir + 1][ic + 1];
             const P10 = SGrid[ir + 1][ic];
 
-            const [T1A, T1B, T1C] = expandTri(P00, P01, P10);
             const a1 = (P01[0] - P00[0]) / du;
             const b1 = (P01[1] - P00[1]) / du;
             const c1 = (P10[0] - P00[0]) / dv;
             const d1 = (P10[1] - P00[1]) / dv;
             const e1 = P00[0] - a1 * u0 - c1 * v0;
             const f1 = P00[1] - b1 * u0 - d1 * v0;
+            const padU1 = Math.min(du * 0.2, 0.7 / Math.max(0.05, Math.hypot(a1, b1)));
+            const padV1 = Math.min(dv * 0.2, 0.7 / Math.max(0.05, Math.hypot(c1, d1)));
+            const [T1A, T1B, T1C] = expandClampedUVTri(u0, v0, u1, v0, u0, v1, padU1, padV1, W, H, a1, b1, c1, d1, e1, f1);
             wctx.save();
             wctx.beginPath();
             wctx.moveTo(T1A[0], T1A[1]);
@@ -7716,17 +19044,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             wctx.lineTo(T1C[0], T1C[1]);
             wctx.closePath();
             wctx.clip();
+            wctx.globalCompositeOperation = "copy";
             wctx.transform(a1, b1, c1, d1, e1, f1);
-            wctx.drawImage(texCanvas, 0, 0, W, H);
+            wctx.drawImage(srcCanvas, 0, 0, W, H);
             wctx.restore();
 
-            const [T2A, T2B, T2C] = expandTri(P01, P11, P10);
             const a2 = (P11[0] - P10[0]) / du;
             const b2 = (P11[1] - P10[1]) / du;
             const c2 = (P11[0] - P01[0]) / dv;
             const d2 = (P11[1] - P01[1]) / dv;
             const e2 = P11[0] - a2 * u1 - c2 * v1;
             const f2 = P11[1] - b2 * u1 - d2 * v1;
+            const padU2 = Math.min(du * 0.2, 0.7 / Math.max(0.05, Math.hypot(a2, b2)));
+            const padV2 = Math.min(dv * 0.2, 0.7 / Math.max(0.05, Math.hypot(c2, d2)));
+            const [T2A, T2B, T2C] = expandClampedUVTri(u1, v0, u1, v1, u0, v1, padU2, padV2, W, H, a2, b2, c2, d2, e2, f2);
             wctx.save();
             wctx.beginPath();
             wctx.moveTo(T2A[0], T2A[1]);
@@ -7734,8 +19065,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             wctx.lineTo(T2C[0], T2C[1]);
             wctx.closePath();
             wctx.clip();
+            wctx.globalCompositeOperation = "copy";
             wctx.transform(a2, b2, c2, d2, e2, f2);
-            wctx.drawImage(texCanvas, 0, 0, W, H);
+            wctx.drawImage(srcCanvas, 0, 0, W, H);
             wctx.restore();
           }}
         }}
@@ -7750,23 +19082,256 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
       wctx.save();
       wctx.transform(ax, ay, cx, cy, ex, ey);
-      wctx.drawImage(texCanvas, 0, 0, W, H);
+      wctx.drawImage(srcCanvas, 0, 0, W, H);
       wctx.restore();
     }} else {{
-      wctx.drawImage(texCanvas, 0, 0, spW, spH);
+      wctx.drawImage(srcCanvas, 0, 0, spW, spH);
     }}
     wctx.restore();
     return wc;
   }}
 
+  // Render a detector bank's native (u, v) pixel canvas directly onto screen coordinates
+  // without quantizing through an intermediate screen-aligned (az, el) raster.
+  function drawPanelTextureDirect(
+    targetCtx,
+    texCanvas,
+    cachePrefix,
+    panel,
+    isSph,
+    shiftAz,
+    w,
+    h,
+    dpr,
+    viewMinX,
+    viewMinY,
+    viewMaxX,
+    viewMaxY,
+    x0,
+    y0,
+    pw,
+    ph,
+    outlineScreenPts,
+    alpha,
+    crispTexels
+  ) {{
+    if (!texCanvas || alpha <= 0.005) return;
+    const W0 = Math.max(1, texCanvas.width);
+    const H0 = Math.max(1, texCanvas.height);
+    const toBase = pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, 0.0);
+
+    const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
+    const meshPts = isSph && panel.mesh_sph ? panel.mesh_sph : panel.mesh;
+    const hasMesh = Array.isArray(meshPts) && meshPts.length >= 2 && Array.isArray(meshPts[0]) && meshPts[0].length >= 2;
+    const SGrid = hasMesh ? meshPts.map(row => row.map(toBase)) : null;
+
+    let C0 = null, C1 = null, C2 = null, C3 = null;
+    if (SGrid) {{
+      const nR = SGrid.length - 1;
+      const nC = SGrid[0].length - 1;
+      C0 = SGrid[0][0];
+      C1 = SGrid[nR][0];
+      C2 = SGrid[nR][nC];
+      C3 = SGrid[0][nC];
+    }} else if (cornersPts && cornersPts.length === 4) {{
+      [C0, C1, C2, C3] = cornersPts.map(toBase);
+    }}
+
+    let uDevPx = (Math.abs(pw) * dpr) / W0;
+    let vDevPx = (Math.abs(ph) * dpr) / H0;
+    if (C0 && C1 && C2 && C3) {{
+      uDevPx = (dpr * 0.5 * (Math.hypot(C3[0] - C0[0], C3[1] - C0[1]) + Math.hypot(C2[0] - C1[0], C2[1] - C1[1]))) / W0;
+      vDevPx = (dpr * 0.5 * (Math.hypot(C1[0] - C0[0], C1[1] - C0[1]) + Math.hypot(C2[0] - C3[0], C2[1] - C3[1]))) / H0;
+    }}
+    const texelDevPx = Math.max(uDevPx, vDevPx);
+
+    let scaleK = 1;
+    if (crispTexels) {{
+      const maxK = Math.max(1, Math.min(8, Math.floor(2048 / Math.max(W0, H0))));
+      const rawK = texelDevPx >= 6.0 ? 8 : (texelDevPx >= 3.0 ? 4 : (texelDevPx >= 1.45 ? 2 : 1));
+      scaleK = Math.min(maxK, rawK);
+    }}
+    const srcCanvas = getCrispUVCanvas(cachePrefix, texCanvas, scaleK);
+    const W = Math.max(1, srcCanvas.width);
+    const H = Math.max(1, srcCanvas.height);
+
+    let useCurvedMesh = false;
+    if (SGrid) {{
+      const nRows = SGrid.length - 1;
+      const nCols = SGrid[0].length - 1;
+      const nonPara = Math.hypot((C3[0] + C1[0] - C2[0]) - C0[0], (C3[1] + C1[1] - C2[1]) - C0[1]);
+      const midR = Math.floor(nRows / 2), midC = Math.floor(nCols / 2);
+      const topBow = Math.hypot(SGrid[0][midC][0] - 0.5 * (C0[0] + C3[0]), SGrid[0][midC][1] - 0.5 * (C0[1] + C3[1]));
+      const botBow = Math.hypot(SGrid[nRows][midC][0] - 0.5 * (C1[0] + C2[0]), SGrid[nRows][midC][1] - 0.5 * (C1[1] + C2[1]));
+      const lftBow = Math.hypot(SGrid[midR][0][0] - 0.5 * (C0[0] + C1[0]), SGrid[midR][0][1] - 0.5 * (C0[1] + C1[1]));
+      const rgtBow = Math.hypot(SGrid[midR][nCols][0] - 0.5 * (C3[0] + C2[0]), SGrid[midR][nCols][1] - 0.5 * (C3[1] + C2[1]));
+      const maxBow = Math.max(topBow, botBow, lftBow, rgtBow);
+      useCurvedMesh = !(nonPara < 1.2 && maxBow < 1.0);
+    }}
+
+    if (!useCurvedMesh) {{
+      targetCtx.save();
+      if (outlineScreenPts && outlineScreenPts.length >= 4) {{
+        targetCtx.beginPath();
+        outlineScreenPts.forEach((pt, idx) => {{
+          if (idx === 0) targetCtx.moveTo(pt[0], pt[1]);
+          else targetCtx.lineTo(pt[0], pt[1]);
+        }});
+        targetCtx.closePath();
+        targetCtx.clip();
+      }}
+      targetCtx.globalAlpha = alpha;
+      targetCtx.imageSmoothingEnabled = true;
+      targetCtx.imageSmoothingQuality = "high";
+      if (C0 && C1 && C2 && C3) {{
+        const ax = ((C3[0] - C0[0]) + (C2[0] - C1[0])) * 0.5 / W;
+        const ay = ((C3[1] - C0[1]) + (C2[1] - C1[1])) * 0.5 / W;
+        const cx = ((C1[0] - C0[0]) + (C2[0] - C3[0])) * 0.5 / H;
+        const cy = ((C1[1] - C0[1]) + (C2[1] - C3[1])) * 0.5 / H;
+        const ex = (C0[0] + (C3[0] + C1[0] - C2[0])) * 0.5;
+        const ey = (C0[1] + (C3[1] + C1[1] - C2[1])) * 0.5;
+        targetCtx.transform(ax, ay, cx, cy, ex, ey);
+        targetCtx.drawImage(srcCanvas, 0, 0, W, H);
+      }} else {{
+        targetCtx.drawImage(srcCanvas, x0, y0, pw, ph);
+      }}
+      targetCtx.restore();
+      return;
+    }}
+
+    // Curvilinear mesh: composite into device-aligned scratch bbox with "copy" so
+    // semi-transparent dark texels never double-alpha along mesh triangle seams.
+    let bx0 = Math.min(x0, x0 + pw) - 2;
+    let bx1 = Math.max(x0, x0 + pw) + 2;
+    let by0 = Math.min(y0, y0 + ph) - 2;
+    let by1 = Math.max(y0, y0 + ph) + 2;
+    if (outlineScreenPts && outlineScreenPts.length >= 4) {{
+      for (let i = 0; i < outlineScreenPts.length; i++) {{
+        const ox = outlineScreenPts[i][0], oy = outlineScreenPts[i][1];
+        if (ox - 2 < bx0) bx0 = ox - 2;
+        if (ox + 2 > bx1) bx1 = ox + 2;
+        if (oy - 2 < by0) by0 = oy - 2;
+        if (oy + 2 > by1) by1 = oy + 2;
+      }}
+    }}
+    const visX0 = Math.floor(Math.max(viewMinX, bx0) * dpr) / dpr;
+    const visY0 = Math.floor(Math.max(viewMinY, by0) * dpr) / dpr;
+    const visX1 = Math.ceil(Math.min(viewMaxX, bx1) * dpr) / dpr;
+    const visY1 = Math.ceil(Math.min(viewMaxY, by1) * dpr) / dpr;
+    const sw = Math.round((visX1 - visX0) * dpr);
+    const sh = Math.round((visY1 - visY0) * dpr);
+    if (sw < 1 || sh < 1) return;
+
+    if (!_panelScratchCanvas) {{
+      _panelScratchCanvas = document.createElement("canvas");
+    }}
+    if (_panelScratchCanvas.width < sw || _panelScratchCanvas.height < sh) {{
+      _panelScratchCanvas.width = Math.max(_panelScratchCanvas.width || 0, sw);
+      _panelScratchCanvas.height = Math.max(_panelScratchCanvas.height || 0, sh);
+    }}
+    const sctx = _panelScratchCanvas.getContext("2d");
+    sctx.setTransform(1, 0, 0, 1, 0, 0);
+    sctx.clearRect(0, 0, sw, sh);
+    sctx.save();
+    sctx.beginPath();
+    sctx.rect(0, 0, sw, sh);
+    sctx.clip();
+    sctx.setTransform(dpr, 0, 0, dpr, -visX0 * dpr, -visY0 * dpr);
+    sctx.imageSmoothingEnabled = true;
+    sctx.imageSmoothingQuality = "high";
+
+    const nRows = SGrid.length - 1;
+    const nCols = SGrid[0].length - 1;
+    const du = W / nCols;
+    const dv = H / nRows;
+    for (let ir = 0; ir < nRows; ir++) {{
+      const v0 = ir * dv;
+      const v1 = (ir + 1) * dv;
+      for (let ic = 0; ic < nCols; ic++) {{
+        const P00 = SGrid[ir][ic];
+        const P01 = SGrid[ir][ic + 1];
+        const P11 = SGrid[ir + 1][ic + 1];
+        const P10 = SGrid[ir + 1][ic];
+        const qMinX = Math.min(P00[0], P01[0], P11[0], P10[0]);
+        const qMaxX = Math.max(P00[0], P01[0], P11[0], P10[0]);
+        const qMinY = Math.min(P00[1], P01[1], P11[1], P10[1]);
+        const qMaxY = Math.max(P00[1], P01[1], P11[1], P10[1]);
+        if (qMaxX < visX0 - 2 || qMinX > visX1 + 2 || qMaxY < visY0 - 2 || qMinY > visY1 + 2) {{
+          continue;
+        }}
+        const u0 = ic * du;
+        const u1 = (ic + 1) * du;
+
+        const a1 = (P01[0] - P00[0]) / du;
+        const b1 = (P01[1] - P00[1]) / du;
+        const c1 = (P10[0] - P00[0]) / dv;
+        const d1 = (P10[1] - P00[1]) / dv;
+        const e1 = P00[0] - a1 * u0 - c1 * v0;
+        const f1 = P00[1] - b1 * u0 - d1 * v0;
+        const padU1 = Math.min(du * 0.2, 0.7 / Math.max(0.05, dpr * Math.hypot(a1, b1)));
+        const padV1 = Math.min(dv * 0.2, 0.7 / Math.max(0.05, dpr * Math.hypot(c1, d1)));
+        const [T1A, T1B, T1C] = expandClampedUVTri(u0, v0, u1, v0, u0, v1, padU1, padV1, W, H, a1, b1, c1, d1, e1, f1);
+        sctx.save();
+        sctx.beginPath();
+        sctx.moveTo(T1A[0], T1A[1]);
+        sctx.lineTo(T1B[0], T1B[1]);
+        sctx.lineTo(T1C[0], T1C[1]);
+        sctx.closePath();
+        sctx.clip();
+        sctx.globalCompositeOperation = "copy";
+        sctx.transform(a1, b1, c1, d1, e1, f1);
+        sctx.drawImage(srcCanvas, 0, 0, W, H);
+        sctx.restore();
+
+        const a2 = (P11[0] - P10[0]) / du;
+        const b2 = (P11[1] - P10[1]) / du;
+        const c2 = (P11[0] - P01[0]) / dv;
+        const d2 = (P11[1] - P01[1]) / dv;
+        const e2 = P11[0] - a2 * u1 - c2 * v1;
+        const f2 = P11[1] - b2 * u1 - d2 * v1;
+        const padU2 = Math.min(du * 0.2, 0.7 / Math.max(0.05, dpr * Math.hypot(a2, b2)));
+        const padV2 = Math.min(dv * 0.2, 0.7 / Math.max(0.05, dpr * Math.hypot(c2, d2)));
+        const [T2A, T2B, T2C] = expandClampedUVTri(u1, v0, u1, v1, u0, v1, padU2, padV2, W, H, a2, b2, c2, d2, e2, f2);
+        sctx.save();
+        sctx.beginPath();
+        sctx.moveTo(T2A[0], T2A[1]);
+        sctx.lineTo(T2B[0], T2B[1]);
+        sctx.lineTo(T2C[0], T2C[1]);
+        sctx.closePath();
+        sctx.clip();
+        sctx.globalCompositeOperation = "copy";
+        sctx.transform(a2, b2, c2, d2, e2, f2);
+        sctx.drawImage(srcCanvas, 0, 0, W, H);
+        sctx.restore();
+      }}
+    }}
+    sctx.restore();
+
+    targetCtx.save();
+    if (outlineScreenPts && outlineScreenPts.length >= 4) {{
+      targetCtx.beginPath();
+      outlineScreenPts.forEach((pt, idx) => {{
+        if (idx === 0) targetCtx.moveTo(pt[0], pt[1]);
+        else targetCtx.lineTo(pt[0], pt[1]);
+      }});
+      targetCtx.closePath();
+      targetCtx.clip();
+    }}
+    targetCtx.globalAlpha = alpha;
+    targetCtx.imageSmoothingEnabled = false;
+    targetCtx.drawImage(_panelScratchCanvas, 0, 0, sw, sh, visX0, visY0, sw / dpr, sh / dpr);
+    targetCtx.restore();
+  }}
+
   function getWarpedPanelCanvas(panel, isSph) {{
     const texCanvas = bankCanvases.get(panel.bank);
     if (!texCanvas) return null;
-    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}_${{state.heatmapStyle}}`;
+    const resKey = state.hiResTextures ? "hi" : "lo";
+    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}_${{state.heatmapStyle}}_${{resKey}}`;
     if (warpedBankCanvases.has(cacheKey)) {{
       return warpedBankCanvases.get(cacheKey);
     }}
-    const wc = warpTextureOntoPanel(texCanvas, panel, isSph, true);
+    const wc = warpTextureOntoPanel(texCanvas, panel, isSph, !state.hiResTextures);
     warpedBankCanvases.set(cacheKey, wc);
     return wc;
   }}
@@ -7774,7 +19339,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function getWarpedMaskCanvas(panel, isSph) {{
     const mCanvas = maskBankCanvases.get(panel.bank);
     if (!mCanvas) return null;
-    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}`;
+    const resKey = state.hiResTextures ? "hi" : "lo";
+    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}_${{resKey}}`;
     if (warpedMaskCanvases.has(cacheKey)) {{
       return warpedMaskCanvases.get(cacheKey);
     }}
@@ -7783,11 +19349,670 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return wc;
   }}
 
-  function renderDetectorCanvas() {{
+  let _lastDetRenderSig = "";
+  let _detVisiblePeaksSig = "";
+  let _detVisiblePeaksFirst = null;
+  let _detVisiblePeaksCache = [];
+  let _detVisibleSortedDSig = "";
+  let _detVisibleSortedDCache = [];
+
+  function getVisibleDetectorPeaks() {{
+    const firstRef = PEAKS.length > 0 ? PEAKS[0] : null;
+    const dynEp = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
+    const sig = `${{dynEp}}|${{PEAKS.length}}|${{state.peakSource}}|${{state.wulffColorMode}}|${{state.dMin}}|${{state.lamMin}}|${{state.lamMax}}|${{DATA.mtz_overlay_name || ""}}`;
+    if (_detVisiblePeaksSig === sig && _detVisiblePeaksFirst === firstRef) {{
+      return _detVisiblePeaksCache;
+    }}
+    _detVisiblePeaksSig = sig;
+    _detVisiblePeaksFirst = firstRef;
+    _detVisiblePeaksCache = PEAKS.filter(isPeakVisible)
+      .slice()
+      .sort((a, b) => b.parallax_depth - a.parallax_depth);
+    _detVisibleSortedDSig = sig;
+    _detVisibleSortedDCache = [];
+    for (let i = 0; i < _detVisiblePeaksCache.length; i++) {{
+      const dv = _detVisiblePeaksCache[i].d_spacing;
+      if (typeof dv === "number" && Number.isFinite(dv) && dv > 0) {{
+        _detVisibleSortedDCache.push(dv);
+      }}
+    }}
+    _detVisibleSortedDCache.sort((a, b) => b - a);
+    return _detVisiblePeaksCache;
+  }}
+
+  function _computePeakLodPriority(p, tieIdx, hasActiveZones, useSnr) {{
+    let pri = (typeof p.d_spacing === "number" && Number.isFinite(p.d_spacing) && p.d_spacing > 0)
+      ? p.d_spacing
+      : 0.0;
+    if (useSnr) {{
+      const snr = _peakSnrScore(p);
+      if (Number.isFinite(snr) && snr > 0) {{
+        pri += Math.min(1e5, snr) * 100.0;
+      }}
+    }}
+    // Keep global Tier-1 landmarks strictly above newly streamed Tier-2 viewport-patch fill-ins
+    // so crossing the Tier-2 zoom threshold never swaps out an already-visible landmark.
+    if (!p._isViewportPatchPeak) {{
+      pri += 1e5;
+    }}
+    if (hasActiveZones && isPeakCapturedByActiveZone(p)) {{
+      pri += 1e8;
+    }}
+    // Deterministic permutation-invariant tie-breaker across Tier-1/Tier-2 re-indexings
+    const hkl = p.hkl;
+    const intrinsicTie = Array.isArray(hkl) && hkl.length >= 3
+      ? (((Number(p.bank) || 0) * 1073741824) +
+         ((Number(hkl[0]) + 512) * 1048576) +
+         ((Number(hkl[1]) + 512) * 1024) +
+         (Number(hkl[2]) + 512)) * 1e-13
+      : (tieIdx * 1e-9);
+    return pri - intrinsicTie;
+  }}
+
+  // Build a compressed canonical dyadic spherical BVH over [-180, 180] deg x [-90, 90] deg.
+  // Because split planes are fixed dyadic subdivisions of the sphere (independent of sample density),
+  // lowering d_min, panning, zooming, and crossing the Tier-1 -> Tier-2 frustum-stream handoff
+  // are all 100% pop-free: existing landmarks never shift cells or disappear.
+  function buildDetectorSphericalBVH(peaks) {{
+    const n = peaks.length;
+    if (n === 0) return null;
+    const hasActiveZones = Boolean(state.showZoneArcs && state.activeZones && state.activeZones.size > 0);
+    const useSnr = (
+      state.peakSource === "integrated" ||
+      state.wulffColorMode === "isigi" ||
+      state.wulffColorMode === "mtz_isigi" ||
+      state.wulffColorMode === "residual"
+    );
+
+    const bounds = getActiveBounds();
+    const rootAz0 = Number.isFinite(bounds.minX) ? bounds.minX : -180.0;
+    const rootAzSpan = Math.max(360.0, (Number(bounds.maxX) || 180.0) - rootAz0);
+    const rootAz1 = rootAz0 + rootAzSpan;
+
+    const azArr = new Float32Array(n);
+    const yCylArr = new Float32Array(n);
+    const ySphArr = new Float32Array(n);
+    const dArr = new Float32Array(n);
+    const priArr = new Float64Array(n);
+    const idxBuf = new Int32Array(n);
+
+    for (let i = 0; i < n; i++) {{
+      const p = peaks[i];
+      azArr[i] = Number(p.det_x) || 0.0;
+      yCylArr[i] = Number(p.det_y) || 0.0;
+      ySphArr[i] = Math.max(-90.0, Math.min(90.0, Number(p.det_el) || 0.0));
+      dArr[i] = (typeof p.d_spacing === "number" && p.d_spacing > 0) ? p.d_spacing : 0.0;
+      priArr[i] = _computePeakLodPriority(p, i, hasActiveZones, useSnr);
+      idxBuf[i] = i;
+    }}
+
+    const cap = Math.max(2, 2 * n);
+    const leftChild = new Int32Array(cap);
+    const rightChild = new Int32Array(cap);
+    const minAz = new Float32Array(cap);
+    const maxAz = new Float32Array(cap);
+    const minYCyl = new Float32Array(cap);
+    const maxYCyl = new Float32Array(cap);
+    const minYSph = new Float32Array(cap);
+    const maxYSph = new Float32Array(cap);
+    const canSpanAz = new Float32Array(cap);
+    const canSpanEl = new Float32Array(cap);
+    const maxD = new Float32Array(cap);
+    const repIdx = new Int32Array(cap);
+    const subCount = new Int32Array(cap);
+    let nodeCount = 0;
+
+    function buildNode(lo, hi, inAz0, inAz1, inEl0, inEl1, depth) {{
+      const u = nodeCount++;
+      let a0 = Infinity, a1 = -Infinity;
+      let yc0 = Infinity, yc1 = -Infinity;
+      let ys0 = Infinity, ys1 = -Infinity;
+      let dMax = 0.0;
+      let bestIdx = idxBuf[lo];
+      let bestPri = -Infinity;
+
+      for (let k = lo; k < hi; k++) {{
+        const idx = idxBuf[k];
+        const az = azArr[idx];
+        const yc = yCylArr[idx];
+        const ys = ySphArr[idx];
+        const dv = dArr[idx];
+        const pr = priArr[idx];
+        if (az < a0) a0 = az;
+        if (az > a1) a1 = az;
+        if (yc < yc0) yc0 = yc;
+        if (yc > yc1) yc1 = yc;
+        if (ys < ys0) ys0 = ys;
+        if (ys > ys1) ys1 = ys;
+        if (dv > dMax) dMax = dv;
+        if (pr > bestPri) {{
+          bestPri = pr;
+          bestIdx = idx;
+        }}
+      }}
+
+      minAz[u] = a0; maxAz[u] = a1;
+      minYCyl[u] = yc0; maxYCyl[u] = yc1;
+      minYSph[u] = ys0; maxYSph[u] = ys1;
+      // Record incoming canonical cell angular spans (data-independent stopping size!)
+      canSpanAz[u] = inAz1 - inAz0;
+      canSpanEl[u] = inEl1 - inEl0;
+      maxD[u] = dMax;
+      repIdx[u] = bestIdx;
+      subCount[u] = hi - lo;
+
+      if (hi - lo <= 1) {{
+        leftChild[u] = -1;
+        rightChild[u] = -1;
+        return u;
+      }}
+
+      // Path-compress empty canonical halves until a dyadic split actually partitions [lo, hi)
+      let cAz0 = inAz0, cAz1 = inAz1, cEl0 = inEl0, cEl1 = inEl1;
+      let midIdx = -1;
+      let childLBox = null;
+      let childRBox = null;
+      for (let step = 0; step < 22 && depth + step < 30; step++) {{
+        const spAz = cAz1 - cAz0;
+        const spEl = cEl1 - cEl0;
+        if (spAz < 1e-4 && spEl < 1e-4) break;
+        const splitAz = spAz >= spEl;
+        const midVal = splitAz ? 0.5 * (cAz0 + cAz1) : 0.5 * (cEl0 + cEl1);
+        // Fast check using tight data bounds [a0..a1] / [ys0..ys1] before scanning!
+        if (splitAz) {{
+          if (a1 <= midVal) {{ cAz1 = midVal; continue; }}
+          if (a0 > midVal) {{ cAz0 = midVal; continue; }}
+        }} else {{
+          if (ys1 <= midVal) {{ cEl1 = midVal; continue; }}
+          if (ys0 > midVal) {{ cEl0 = midVal; continue; }}
+        }}
+        const coordArr = splitAz ? azArr : ySphArr;
+        let i = lo, j = hi - 1;
+        while (i <= j) {{
+          while (i <= j && coordArr[idxBuf[i]] <= midVal) i++;
+          while (i <= j && coordArr[idxBuf[j]] > midVal) j--;
+          if (i < j) {{
+            const tmp = idxBuf[i];
+            idxBuf[i] = idxBuf[j];
+            idxBuf[j] = tmp;
+            i++;
+            j--;
+          }}
+        }}
+        if (i > lo && i < hi) {{
+          midIdx = i;
+          if (splitAz) {{
+            childLBox = [cAz0, midVal, cEl0, cEl1];
+            childRBox = [midVal, cAz1, cEl0, cEl1];
+          }} else {{
+            childLBox = [cAz0, cAz1, cEl0, midVal];
+            childRBox = [cAz0, cAz1, midVal, cEl1];
+          }}
+          break;
+        }}
+        if (i <= lo) {{
+          if (splitAz) cAz0 = midVal; else cEl0 = midVal;
+        }} else {{
+          if (splitAz) cAz1 = midVal; else cEl1 = midVal;
+        }}
+      }}
+
+      if (midIdx < 0) {{
+        // Coincident harmonics or stacked radial banks: split deterministically by priority/median
+        midIdx = (lo + hi) >> 1;
+        childLBox = [cAz0, cAz1, cEl0, cEl1];
+        childRBox = [cAz0, cAz1, cEl0, cEl1];
+      }}
+
+      const c0 = buildNode(lo, midIdx, childLBox[0], childLBox[1], childLBox[2], childLBox[3], depth + 1);
+      const c1 = buildNode(midIdx, hi, childRBox[0], childRBox[1], childRBox[2], childRBox[3], depth + 1);
+      if (priArr[repIdx[c1]] > priArr[repIdx[c0]]) {{
+        leftChild[u] = c1;
+        rightChild[u] = c0;
+      }} else {{
+        leftChild[u] = c0;
+        rightChild[u] = c1;
+      }}
+      return u;
+    }}
+
+    buildNode(0, n, rootAz0, rootAz1, -90.0, 90.0, 0);
+    return {{
+      peaks,
+      n,
+      nodeCount,
+      azArr,
+      yCylArr,
+      ySphArr,
+      dArr,
+      priArr,
+      leftChild,
+      rightChild,
+      minAz,
+      maxAz,
+      minYCyl,
+      maxYCyl,
+      minYSph,
+      maxYSph,
+      canSpanAz,
+      canSpanEl,
+      maxD,
+      repIdx,
+      subCount,
+      stack: new Int32Array(Math.min(cap, 256)),
+    }};
+  }}
+
+  function queryDetectorSphericalBVH(
+    bvh, isSph, dxMin, dxMax, fullAzVisible, dyMin, dyMax,
+    activeDmin, affScaleX, absAffScaleY, degElScalePx, cellPx
+  ) {{
+    if (!bvh || bvh.nodeCount === 0) {{
+      return {{ visiblePeaks: [], inViewCount: 0, stoppedAny: false, minKeptD: activeDmin }};
+    }}
+    const {{
+      peaks, n, azArr, yCylArr, ySphArr, dArr,
+      leftChild, rightChild, minAz, maxAz, minYCyl, maxYCyl, minYSph, maxYSph,
+      canSpanAz, canSpanEl, maxD, repIdx, subCount,
+    }} = bvh;
+    let stack = bvh.stack;
+    let sp = 0;
+    stack[sp++] = 0;
+
+    const keptMask = new Uint8Array(n);
+    const outIndices = [];
+    let inViewCount = 0;
+    let stoppedAny = false;
+    let minKeptD = Infinity;
+
+    while (sp > 0) {{
+      const u = stack[--sp];
+      if (maxD[u] < activeDmin - 1e-5) continue;
+      const nMinY = isSph ? minYSph[u] : minYCyl[u];
+      const nMaxY = isSph ? maxYSph[u] : maxYCyl[u];
+      if (nMaxY < dyMin || nMinY > dyMax) continue;
+
+      const a0 = minAz[u];
+      const a1 = maxAz[u];
+      let whollyInAz = fullAzVisible;
+      if (!fullAzVisible) {{
+        const ov0 = a1 >= dxMin && a0 <= dxMax;
+        const ovM = (a1 - 360.0) >= dxMin && (a0 - 360.0) <= dxMax;
+        const ovP = (a1 + 360.0) >= dxMin && (a0 + 360.0) <= dxMax;
+        if (!ov0 && !ovM && !ovP) continue;
+        whollyInAz = (
+          (a0 >= dxMin && a1 <= dxMax) ||
+          (a0 - 360.0 >= dxMin && a1 - 360.0 <= dxMax) ||
+          (a0 + 360.0 >= dxMin && a1 + 360.0 <= dxMax)
+        );
+      }}
+      const whollyInY = nMinY >= dyMin && nMaxY <= dyMax;
+
+      const L = leftChild[u];
+      if (L < 0) {{
+        const pIdx = repIdx[u];
+        const dv = dArr[pIdx];
+        if (dv < activeDmin - 1e-5) continue;
+        const py = isSph ? ySphArr[pIdx] : yCylArr[pIdx];
+        if (py < dyMin || py > dyMax) continue;
+        if (!fullAzVisible) {{
+          const dx = azArr[pIdx];
+          const inAz = (dx >= dxMin && dx <= dxMax) ||
+                       (dx - 360.0 >= dxMin && dx - 360.0 <= dxMax) ||
+                       (dx + 360.0 >= dxMin && dx + 360.0 <= dxMax);
+          if (!inAz) continue;
+        }}
+        inViewCount += 1;
+        if (!keptMask[pIdx]) {{
+          keptMask[pIdx] = 1;
+          outIndices.push(pIdx);
+          if (dv < minKeptD) minKeptD = dv;
+        }}
+        continue;
+      }}
+
+      // Evaluate canonical cell screen footprint (strictly data-independent -> 100% pop-free across Tier-1/Tier-2 & d_min!)
+      const wPx = canSpanAz[u] * affScaleX;
+      const hPx = Math.max((nMaxY - nMinY) * absAffScaleY, canSpanEl[u] * degElScalePx);
+      if (cellPx > 0.0 && whollyInAz && whollyInY && wPx <= cellPx && hPx <= cellPx) {{
+        const pIdx = repIdx[u];
+        inViewCount += subCount[u];
+        if (subCount[u] > 1) stoppedAny = true;
+        if (!keptMask[pIdx]) {{
+          keptMask[pIdx] = 1;
+          outIndices.push(pIdx);
+          const dv = dArr[pIdx];
+          if (dv < minKeptD) minKeptD = dv;
+        }}
+        continue;
+      }}
+
+      if (sp + 2 >= stack.length) {{
+        const bigger = new Int32Array(stack.length * 2);
+        bigger.set(stack);
+        stack = bigger;
+        bvh.stack = bigger;
+      }}
+      stack[sp++] = rightChild[u];
+      stack[sp++] = L;
+    }}
+
+    // Always force-keep hovered, selected, and active ASU orbit reflections
+    const activeOrb = state.activeOrbitId;
+    if (state.hoveredPeakId !== null || state.selectedPeakId !== null || state.hoveredPeakObj || state.selectedPeakObj || activeOrb) {{
+      for (let i = 0; i < n; i++) {{
+        if (keptMask[i]) continue;
+        const p = peaks[i];
+        if (
+          isPeakHighlightedTarget(p) ||
+          Boolean(activeOrb && p.asu_orbit_id && p.asu_orbit_id === activeOrb)
+        ) {{
+          keptMask[i] = 1;
+          outIndices.push(i);
+        }}
+      }}
+    }}
+
+    const visiblePeaks = new Array(outIndices.length);
+    for (let k = 0; k < outIndices.length; k++) {{
+      visiblePeaks[k] = peaks[outIndices[k]];
+    }}
+    // Restore 80s parallax back-to-front painter's order (high parallax_depth background first, foreground landmarks on top)
+    visiblePeaks.sort((a, b) => (b.parallax_depth || 0) - (a.parallax_depth || 0));
+
+    return {{
+      visiblePeaks,
+      inViewCount,
+      stoppedAny,
+      minKeptD: Number.isFinite(minKeptD) ? minKeptD : activeDmin,
+    }};
+  }}
+
+  // Gameplay-style nested Spherical BVH LOD on the Detector view:
+  // 1. All resolution shells down to state.dMin populate empty detector solid-angle cells immediately at 1x zoom.
+  // 2. Crowded cells exceeding screen density (`cellPx`) collapse pop-free into their nested landmark representative
+  //    (active-zone > high-SNR > high-d), subdividing smoothly upon zooming in with zero pan flicker.
+  function getDetectorLodState(canvasCssW, canvasCssH) {{
+    const allVisible = getVisibleDetectorPeaks();
+    const sortedD = _detVisibleSortedDCache;
+    const w = Math.max(240, Number(canvasCssW) || 820);
+    const h = Math.max(180, Number(canvasCssH) || 480);
+    const minPoolD = sortedD.length > 0 ? sortedD[sortedD.length - 1] : 0.0;
+    const activeDmin = (typeof state.dMin === "number" && state.dMin > 0) ? state.dMin : minPoolD;
+
+    const dZoom = Math.max(0.4, Number(state.detZoom) || 1.0);
+    const panX = Number(state.detPanX) || 0.0;
+    const panY = Number(state.detPanY) || 0.0;
+    const panBinX = Math.round(panX / 24.0);
+    const panBinY = Math.round(panY / 24.0);
+    const holzLodKey = (state.holzOrders instanceof Set && state.holzOrders.size > 0)
+      ? Array.from(state.holzOrders).sort((a, b) => a - b).join(",")
+      : "";
+    const zonesKey = state.showZoneArcs ? `${{Array.from(state.activeZones).join(",")}}:${{holzLodKey}}` : "off";
+    const hovId = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
+    const selId = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
+    const firstRef = allVisible.length > 0 ? allVisible[0] : null;
+    const lodSig = `${{_detVisiblePeaksSig}}|${{zonesKey}}|${{w}}x${{h}}|${{state.projection}}|${{dZoom.toFixed(4)}}|${{panBinX}},${{panBinY}}|${{hovId}}|${{selId}}|${{state.activeOrbitId || ""}}`;
+    if (_detLodCache.sig === lodSig && _detLodCache.firstRef === firstRef) {{
+      return _detLodCache;
+    }}
+
+    if (allVisible.length === 0) {{
+      _detLodCache.sig = lodSig;
+      _detLodCache.firstRef = firstRef;
+      _detLodCache.visiblePeaks = allVisible;
+      _detLodCache.lodDcut = activeDmin;
+      _detLodCache.isLodThinned = false;
+      _detLodCache.totalCount = 0;
+      _detLodCache.inViewCount = 0;
+      _detLodCache.activeDmin = activeDmin;
+      return _detLodCache;
+    }}
+
+    // Ensure cached global Detector Spherical BVH (pan/zoom/projection invariant!)
+    const bvhSig = `${{_detVisiblePeaksSig}}|${{zonesKey}}`;
+    if (_detBvhCache.sig !== bvhSig || _detBvhCache.firstRef !== firstRef || !_detBvhCache.bvh) {{
+      _detBvhCache.sig = bvhSig;
+      _detBvhCache.firstRef = firstRef;
+      _detBvhCache.bvh = buildDetectorSphericalBVH(allVisible);
+    }}
+
+    // Compute padded viewport bounds in detector (det_x, py) world coordinates
+    const bounds = getActiveBounds();
+    const box = getDetectorPlotBox(w, h);
+    const spanX = Math.max(1e-6, bounds.maxX - bounds.minX);
+    const spanY = Math.max(1e-6, bounds.maxY - bounds.minY);
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const padPx = 96.0;
+    const qPanX = panBinX * 24.0;
+    const qPanY = panBinY * 24.0;
+    const x0Left = cx + (-padPx - cx - qPanX) / dZoom;
+    const x0Right = cx + (w + padPx - cx - qPanX) / dZoom;
+    const dxMin = bounds.minX + ((x0Left - box.originX) / Math.max(1e-6, box.plotW)) * spanX;
+    const dxMax = bounds.minX + ((x0Right - box.originX) / Math.max(1e-6, box.plotW)) * spanX;
+    const fullAzVisible = (dxMax - dxMin) >= 360.0;
+
+    const y0Top = cy + (-padPx - cy - qPanY) / dZoom;
+    const y0Bot = cy + (h + padPx - cy - qPanY) / dZoom;
+    const dyMax = bounds.minY + (1.0 - (y0Top - box.originY) / Math.max(1e-6, box.plotH)) * spanY;
+    const dyMin = bounds.minY + (1.0 - (y0Bot - box.originY) / Math.max(1e-6, box.plotH)) * spanY;
+
+    const isSph = state.projection === "spherical";
+    const sphBounds = (DATA.bounds_spherical && typeof DATA.bounds_spherical.maxY === "number")
+      ? DATA.bounds_spherical
+      : {{ minY: -90.0, maxY: 90.0 }};
+    const spanElDeg = Math.max(10.0, (Number(sphBounds.maxY) || 90.0) - (Number(sphBounds.minY) || -90.0));
+    const affScaleX = (box.plotW / spanX) * dZoom;
+    const absAffScaleY = (box.plotH / spanY) * dZoom;
+    const degElScalePx = (box.plotH / spanElDeg) * dZoom;
+    // Canonical cell threshold: ~18.5 CSS px (yielding ~9-18 px stopped cells, ~900-1400 crisp spots at 1x),
+    // tapering smoothly to 0 by 24x so close doublets and Laue harmonics unpack completely at pixel zoom.
+    const cellPx = dZoom >= 24.0
+      ? 0.0
+      : (dZoom <= 10.0 ? 18.5 : 18.5 * ((24.0 - dZoom) / 14.0));
+
+    let activeBvh = _detBvhCache.bvh;
+    let effectiveTotalCount = Math.max(allVisible.length, _dynEwaldTruncated ? _dynEwaldRawTotal : 0);
+    let effectiveActiveDmin = (typeof state.dMin === "number" && state.dMin > 0) ? state.dMin : minPoolD;
+    let patchTruncated = false;
+
+    // Tier-2 Viewport-Frustum High-Res Streaming:
+    // When global Ewald prediction across all banks exceeded MAX_DYNAMIC_FRAME_PEAKS (e.g. P6122 at 0.50 A)
+    // and the user zooms in (>= 2.4x), stream exact frustum-sliced reflections for the visible panel tile
+    // and cache a dedicated tile Spherical BVH for instant pan/zoom inside the tile.
+    if (
+      _dynEwaldTruncated &&
+      state.peakSource === "predicted" &&
+      dZoom >= 2.4
+    ) {{
+      const dFloor = getDynamicDminFloor();
+      const dMinEff = Math.max(dFloor, Number(state.dMin) || dFloor);
+      effectiveActiveDmin = dMinEff;
+      const tilePanX = Math.round(panX / 128.0) * 128.0;
+      const tilePanY = Math.round(panY / 128.0) * 128.0;
+      const tilePadPx = 220.0;
+      const tx0L = cx + (-tilePadPx - cx - tilePanX) / dZoom;
+      const tx0R = cx + (w + tilePadPx - cx - tilePanX) / dZoom;
+      const tDxMin = bounds.minX + ((tx0L - box.originX) / Math.max(1e-6, box.plotW)) * spanX;
+      const tDxMax = bounds.minX + ((tx0R - box.originX) / Math.max(1e-6, box.plotW)) * spanX;
+      const tFullAz = (tDxMax - tDxMin) >= 360.0;
+      const ty0T = cy + (-tilePadPx - cy - tilePanY) / dZoom;
+      const ty0B = cy + (h + tilePadPx - cy - tilePanY) / dZoom;
+      const tDyMax = bounds.minY + (1.0 - (ty0T - box.originY) / Math.max(1e-6, box.plotH)) * spanY;
+      const tDyMin = bounds.minY + (1.0 - (ty0B - box.originY) / Math.max(1e-6, box.plotH)) * spanY;
+      const patchSig = `${{_dynPredEpoch}}|${{isSph ? "sph" : "cyl"}}|${{tDxMin.toFixed(2)}},${{tDxMax.toFixed(2)}}|${{tDyMin.toFixed(3)}},${{tDyMax.toFixed(3)}}|${{dMinEff.toFixed(3)}}`;
+      if (_dynViewportPatchCache.sig !== patchSig) {{
+        const ub = getActiveUbMatrix();
+        const activeRunIdx = typeof state.selectedFrameIndex === "number"
+          ? state.selectedFrameIndex
+          : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+        const Ractive = getActiveGoniometerR();
+        const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+          ? DATA.sample_offset_lab_per_run
+          : null;
+        const sActive = (sMap && Array.isArray(sMap[String(activeRunIdx)]))
+          ? sMap[String(activeRunIdx)]
+          : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0]);
+        const panelsGeom = buildActiveDetectorRaycastPanels(sActive);
+        const wlMin = Math.max(0.05, Number(state.lamMin) || 2.0);
+        const wlMax = Math.max(wlMin + 0.05, Number(state.lamMax) || 4.5);
+        const rawPatch = (ub && panelsGeom.length > 0)
+          ? raycastRunDirectEwaldShell(
+              ub, buildClientSpaceGroupHelper(), Ractive, sActive, panelsGeom,
+              wlMin, wlMax, dMinEff, activeRunIdx, true, MAX_VIEWPORT_PATCH_PEAKS,
+              {{ dxMin: tDxMin, dxMax: tDxMax, dyMin: tDyMin, dyMax: tDyMax, isSph, fullAzVisible: tFullAz }}
+            )
+          : [];
+        // Merge any global landmarks in the tile so the 2.4x handoff is 100% pop-free
+        const seenKeys = new Set();
+        const mergedPatch = [];
+        for (let k = 0; k < allVisible.length; k++) {{
+          const gp = allVisible[k];
+          const py = isSph ? (Number(gp.det_el) || 0.0) : (Number(gp.det_y) || 0.0);
+          if (py < tDyMin || py > tDyMax) continue;
+          if (!tFullAz) {{
+            const dx = Number(gp.det_x) || 0.0;
+            const inTileAz = (dx >= tDxMin && dx <= tDxMax) ||
+                             (dx - 360.0 >= tDxMin && dx - 360.0 <= tDxMax) ||
+                             (dx + 360.0 >= tDxMin && dx + 360.0 <= tDxMax);
+            if (!inTileAz) continue;
+          }}
+          if (Array.isArray(gp.hkl) && gp.hkl.length === 3) {{
+            seenKeys.add(`${{gp.bank}}|${{gp.hkl[0]}},${{gp.hkl[1]}},${{gp.hkl[2]}}`);
+          }}
+          mergedPatch.push(gp);
+        }}
+        for (let k = 0; k < rawPatch.length; k++) {{
+          const rp = rawPatch[k];
+          rp.id = 1000000 + k;
+          rp._isViewportPatchPeak = true;
+          if (!isPeakVisible(rp)) continue;
+          if (Array.isArray(rp.hkl) && rp.hkl.length === 3) {{
+            const key = `${{rp.bank}}|${{rp.hkl[0]}},${{rp.hkl[1]}},${{rp.hkl[2]}}`;
+            if (seenKeys.has(key)) continue;
+            seenKeys.add(key);
+          }}
+          mergedPatch.push(rp);
+        }}
+        _dynViewportPatchCache = {{
+          sig: patchSig,
+          peaks: mergedPatch,
+          rawTotal: Math.max(
+            mergedPatch.length,
+            typeof rawPatch._rawTotal === "number" ? rawPatch._rawTotal : rawPatch.length
+          ),
+          bvh: buildDetectorSphericalBVH(mergedPatch),
+          bvhZonesSig: `${{zonesKey}}|${{state.wulffColorMode}}`,
+        }};
+      }} else if (
+        !_dynViewportPatchCache.bvh ||
+        _dynViewportPatchCache.bvhZonesSig !== `${{zonesKey}}|${{state.wulffColorMode}}`
+      ) {{
+        _dynViewportPatchCache.bvh = buildDetectorSphericalBVH(_dynViewportPatchCache.peaks);
+        _dynViewportPatchCache.bvhZonesSig = `${{zonesKey}}|${{state.wulffColorMode}}`;
+      }}
+      if (_dynViewportPatchCache.bvh) {{
+        activeBvh = _dynViewportPatchCache.bvh;
+        patchTruncated = _dynViewportPatchCache.rawTotal > _dynViewportPatchCache.peaks.length;
+      }}
+    }}
+
+    const qRes = queryDetectorSphericalBVH(
+      activeBvh, isSph, dxMin, dxMax, fullAzVisible, dyMin, dyMax,
+      effectiveActiveDmin, affScaleX, absAffScaleY, degElScalePx, cellPx
+    );
+    const globalTruncActive = Boolean(_dynEwaldTruncated && state.peakSource === "predicted" && dZoom < 2.4);
+    const rawInViewEst = globalTruncActive
+      ? Math.max(qRes.inViewCount, Math.round(qRes.inViewCount * (_dynEwaldRawTotal / Math.max(1, allVisible.length))))
+      : (patchTruncated ? Math.max(qRes.inViewCount, _dynViewportPatchCache.rawTotal) : qRes.inViewCount);
+    const isLodThinned = Boolean(
+      (qRes.stoppedAny && qRes.visiblePeaks.length < qRes.inViewCount) ||
+      globalTruncActive ||
+      patchTruncated
+    );
+
+    _detLodCache.sig = lodSig;
+    _detLodCache.firstRef = firstRef;
+    _detLodCache.visiblePeaks = qRes.visiblePeaks;
+    _detLodCache.lodDcut = qRes.minKeptD;
+    _detLodCache.isLodThinned = isLodThinned;
+    _detLodCache.totalCount = effectiveTotalCount;
+    _detLodCache.inViewCount = rawInViewEst;
+    _detLodCache.activeDmin = effectiveActiveDmin;
+    return _detLodCache;
+  }}
+
+  let _detZoneArcScreenSegs = [];
+  let _detNodalScreenHits = [];
+
+  function renderDetector() {{
+    renderDetectorCanvas(true);
+  }}
+
+  function renderDetectorCanvas(forceRedraw) {{
     const rect = detCanvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
     const targetW = Math.max(200, Math.round(rect.width * dpr));
     const targetH = Math.max(200, Math.round(rect.height * dpr));
+    const bounds = getActiveBounds();
+    const RgDet = getActiveGoniometerR();
+    const hovRef = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
+    const selRef = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
+    const zonesKey = state.showZoneArcs ? Array.from(state.activeZones).join(",") : "off";
+    const holzKey = (state.showZoneArcs && state.holzOrders instanceof Set && state.holzOrders.size > 0)
+      ? Array.from(state.holzOrders).sort().join(",")
+      : "0";
+    const hovZoneSig = state.hoveredZoneId !== null && state.hoveredZoneId !== undefined
+      ? `${{state.hoveredZoneId}}:${{state.hoveredZoneHolzN || 0}}:${{state.hoveredZonePos ? Math.round(state.hoveredZonePos[0]) + "," + Math.round(state.hoveredZonePos[1]) : ""}}`
+      : "";
+    const sLabDet = getActiveSampleOffsetLab();
+    const detSig = [
+      targetW, targetH,
+      state.projection,
+      bounds.minX.toFixed(3), bounds.maxX.toFixed(3), bounds.minY.toFixed(3), bounds.maxY.toFixed(3),
+      sLabDet[0].toFixed(5), sLabDet[1].toFixed(5), sLabDet[2].toFixed(5),
+      state.detZoom.toFixed(5),
+      state.detPanX.toFixed(2),
+      state.detPanY.toFixed(2),
+      state.detAlpha.toFixed(3),
+      state.heatmapStyle,
+      state.hiResTextures ? 1 : 0,
+      state.showPixelMask ? 1 : 0,
+      state.showNodalPoints ? 1 : 0,
+      holzKey,
+      _panelTexEpoch,
+      PANELS.length,
+      PEAKS.length,
+      state.peakSource,
+      state.wulffScope,
+      state.wulffColorMode,
+      getColorCrossover().toFixed(3),
+      state.dMin,
+      state.lamMin,
+      state.lamMax,
+      state.parallaxX.toFixed(4),
+      state.parallaxY.toFixed(4),
+      state.selectedZoneId || "",
+      hovZoneSig,
+      state.hoveredNodalKey || "",
+      zonesKey,
+      hovRef,
+      selRef,
+      state.activeOrbitId || "",
+      DATA.mtz_overlay_name || "",
+      typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0,
+      RgDet[0][0].toFixed(5), RgDet[0][2].toFixed(5), RgDet[2][2].toFixed(5),
+    ].join("|");
+    if (
+      !forceRedraw &&
+      detSig === _lastDetRenderSig &&
+      detCanvas.width === targetW &&
+      detCanvas.height === targetH
+    ) {{
+      return;
+    }}
+    _lastDetRenderSig = detSig;
     if (detCanvas.width !== targetW || detCanvas.height !== targetH) {{
       detCanvas.width = targetW;
       detCanvas.height = targetH;
@@ -7798,7 +20023,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const h = rect.height;
     ctx.clearRect(0, 0, w, h);
 
-    const bounds = getActiveBounds();
     const isSph = state.projection === "spherical";
     const isCoupled360 = true;
     const azShifts = [-360.0, 0.0, 360.0];
@@ -7835,103 +20059,221 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.restore();
 
     // 2. LAYER 0 (BACK): Detector Bank Pixel Intensity Heatmaps + Panel Outlines
-    ctx.save();
-    azShifts.forEach(shiftAz => {{
-      PANELS.forEach(panel => {{
-        const [vMin, vMax] = getPanelVertRange(panel);
-        const [x0, y0] = detToScreen(panel.az_min + shiftAz, vMax, w, h, -0.35);
-        const [x1, y1] = detToScreen(panel.az_max + shiftAz, vMin, w, h, -0.35);
-        if (
-          Math.max(x0, x1) < -80 ||
-          Math.min(x0, x1) > w + 80 ||
-          Math.max(y0, y1) < -80 ||
-          Math.min(y0, y1) > h + 80
-        ) return;
-        const pw = x1 - x0;
-        const ph = y1 - y0;
+    // Rendered directly from native (u, v) detector coordinates into a device-pixel-aligned
+    // viewport layer cache so rotated/high-latitude banks never quantize onto screen-parallel
+    // intermediate grids and parallax hover blits in O(1).
+    const marginDev = Math.round(Math.ceil(Math.max(28, 0.35 * 54.0 * (state.parallaxStrength || 1.0) + 8)) * dpr);
+    const marginCss = marginDev / dpr;
+    const layerW = targetW + 2 * marginDev;
+    const layerH = targetH + 2 * marginDev;
+    const layerKey = [
+      layerW,
+      layerH,
+      dpr.toFixed(3),
+      state.projection,
+      bounds.minX.toFixed(3),
+      bounds.maxX.toFixed(3),
+      bounds.minY.toFixed(3),
+      bounds.maxY.toFixed(3),
+      state.detZoom.toFixed(5),
+      state.detPanX.toFixed(2),
+      state.detPanY.toFixed(2),
+      state.detAlpha.toFixed(3),
+      state.heatmapStyle,
+      state.hiResTextures ? 1 : 0,
+      state.showPixelMask ? 1 : 0,
+      state.showPixelMask ? getActiveRelBorderWidth().toFixed(4) : "0",
+      _panelTexEpoch,
+      PANELS.length,
+    ].join("|");
 
-        const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
-        const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
+    if (!_detLayerCacheCanvas) {{
+      _detLayerCacheCanvas = document.createElement("canvas");
+    }}
+    if (_detLayerCacheCanvas.width !== layerW || _detLayerCacheCanvas.height !== layerH) {{
+      _detLayerCacheCanvas.width = layerW;
+      _detLayerCacheCanvas.height = layerH;
+      _detLayerCacheKey = "";
+    }}
 
-        const texCanvas = bankCanvases.get(panel.bank);
-        ctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
-        ctx.lineWidth = texCanvas ? 1.1 : 0.7;
+    if (_detLayerCacheKey !== layerKey) {{
+      const lctx = _detLayerCacheCanvas.getContext("2d");
+      lctx.setTransform(1, 0, 0, 1, 0, 0);
+      lctx.clearRect(0, 0, layerW, layerH);
+      lctx.setTransform(dpr, 0, 0, dpr, marginDev, marginDev);
+      const viewMinX = -marginCss;
+      const viewMinY = -marginCss;
+      const viewMaxX = w + marginCss;
+      const viewMaxY = h + marginCss;
+      const resTag = state.hiResTextures ? "hi" : "lo";
 
-        if (outlinePts && outlinePts.length >= 4) {{
-          ctx.beginPath();
-          outlinePts.forEach((pt, idx) => {{
-            const [ox, oy] = detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35);
-            if (idx === 0) ctx.moveTo(ox, oy);
-            else ctx.lineTo(ox, oy);
-          }});
-          ctx.closePath();
-          ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
-          ctx.fill();
-          if (texCanvas && state.detAlpha > 0.01) {{
-            const warpedCanvas = getWarpedPanelCanvas(panel, isSph);
-            if (warpedCanvas) {{
-              ctx.save();
-              ctx.globalAlpha = state.detAlpha;
-              ctx.imageSmoothingEnabled = true;
-              ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
-              ctx.restore();
-            }}
-          }}
-          if (state.showPixelMask) {{
-            const warpedMask = getWarpedMaskCanvas(panel, isSph);
-            if (warpedMask) {{
-              ctx.save();
-              ctx.imageSmoothingEnabled = state.detZoom < 2.0;
-              ctx.drawImage(warpedMask, x0, y0, pw, ph);
-              ctx.restore();
-            }}
-          }}
-          ctx.stroke();
-        }} else {{
-          ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
-          ctx.fillRect(x0, y0, pw, ph);
-          if (texCanvas && state.detAlpha > 0.01) {{
-            const warpedCanvas = getWarpedPanelCanvas(panel, isSph);
-            if (warpedCanvas) {{
-              ctx.save();
-              ctx.globalAlpha = state.detAlpha;
-              ctx.imageSmoothingEnabled = true;
-              ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
-              ctx.restore();
-            }}
-          }}
-          if (state.showPixelMask) {{
-            const warpedMask = getWarpedMaskCanvas(panel, isSph);
-            if (warpedMask) {{
-              ctx.save();
-              ctx.imageSmoothingEnabled = state.detZoom < 2.0;
-              ctx.drawImage(warpedMask, x0, y0, pw, ph);
-              ctx.restore();
-            }}
-          }}
-          ctx.strokeRect(x0, y0, pw, ph);
-        }}
+      azShifts.forEach(shiftAz => {{
+        PANELS.forEach(panel => {{
+          const [vMin, vMax] = getPanelVertRange(panel);
+          const [x0, y0] = detToScreen(panel.az_min + shiftAz, vMax, w, h, 0.0);
+          const [x1, y1] = detToScreen(panel.az_max + shiftAz, vMin, w, h, 0.0);
+          if (
+            Math.max(x0, x1) < viewMinX - 80 ||
+            Math.min(x0, x1) > viewMaxX + 80 ||
+            Math.max(y0, y1) < viewMinY - 80 ||
+            Math.min(y0, y1) > viewMaxY + 80
+          ) return;
+          const pw = x1 - x0;
+          const ph = y1 - y0;
 
-        // Only show bank labels when zoomed in so default view is clean
-        if (state.detZoom > 1.35 && Math.abs(pw) > 34 && Math.abs(ph) > 24) {{
-          ctx.fillStyle = "rgba(148, 163, 184, 0.42)";
-          ctx.font = "8px monospace";
-          if (cornersPts && cornersPts.length === 4) {{
-            const cScreen = cornersPts.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35));
-            const cxLbl = 0.25 * (cScreen[0][0] + cScreen[1][0] + cScreen[2][0] + cScreen[3][0]);
-            const cyLbl = 0.25 * (cScreen[0][1] + cScreen[1][1] + cScreen[2][1] + cScreen[3][1]);
-            ctx.fillText(`b${{panel.bank}}`, cxLbl - 7, cyLbl + 3);
+          const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
+          const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
+          const outlineScreenPts = (outlinePts && outlinePts.length >= 4)
+            ? outlinePts.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, 0.0))
+            : null;
+
+          const texCanvas = bankCanvases.get(panel.bank);
+          lctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
+          lctx.lineWidth = texCanvas ? 1.1 : 0.7;
+
+          if (outlineScreenPts) {{
+            lctx.beginPath();
+            outlineScreenPts.forEach((pt, idx) => {{
+              if (idx === 0) lctx.moveTo(pt[0], pt[1]);
+              else lctx.lineTo(pt[0], pt[1]);
+            }});
+            lctx.closePath();
+            lctx.fillStyle = "rgba(15, 23, 42, 0.72)";
+            lctx.fill();
           }} else {{
-            ctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 9);
+            lctx.fillStyle = "rgba(15, 23, 42, 0.72)";
+            lctx.fillRect(x0, y0, pw, ph);
           }}
-        }}
+
+          if (texCanvas && state.detAlpha > 0.01) {{
+            drawPanelTextureDirect(
+              lctx,
+              texCanvas,
+              `tex_${{panel.bank}}_${{state.heatmapStyle}}_${{resTag}}`,
+              panel,
+              isSph,
+              shiftAz,
+              w,
+              h,
+              dpr,
+              viewMinX,
+              viewMinY,
+              viewMaxX,
+              viewMaxY,
+              x0,
+              y0,
+              pw,
+              ph,
+              outlineScreenPts,
+              state.detAlpha,
+              Boolean(state.hiResTextures)
+            );
+          }}
+
+          if (state.showPixelMask) {{
+            const mCanvas = maskBankCanvases.get(panel.bank);
+            if (mCanvas) {{
+              drawPanelTextureDirect(
+                lctx,
+                mCanvas,
+                `mask_${{panel.bank}}_${{resTag}}`,
+                panel,
+                isSph,
+                shiftAz,
+                w,
+                h,
+                dpr,
+                viewMinX,
+                viewMinY,
+                viewMaxX,
+                viewMaxY,
+                x0,
+                y0,
+                pw,
+                ph,
+                outlineScreenPts,
+                1.0,
+                true
+              );
+            }}
+            const relBorder = getActiveRelBorderWidth();
+            const bCanvas = getBorderMaskCanvas(panel, relBorder);
+            if (bCanvas) {{
+              drawPanelTextureDirect(
+                lctx,
+                bCanvas,
+                `bmask_${{panel.bank}}_${{relBorder.toFixed(4)}}_${{resTag}}`,
+                panel,
+                isSph,
+                shiftAz,
+                w,
+                h,
+                dpr,
+                viewMinX,
+                viewMinY,
+                viewMaxX,
+                viewMaxY,
+                x0,
+                y0,
+                pw,
+                ph,
+                outlineScreenPts,
+                1.0,
+                true
+              );
+            }}
+          }}
+
+          if (outlineScreenPts) {{
+            lctx.beginPath();
+            outlineScreenPts.forEach((pt, idx) => {{
+              if (idx === 0) lctx.moveTo(pt[0], pt[1]);
+              else lctx.lineTo(pt[0], pt[1]);
+            }});
+            lctx.closePath();
+            lctx.stroke();
+          }} else {{
+            lctx.strokeRect(x0, y0, pw, ph);
+          }}
+
+          // Only show bank labels when zoomed in so default view is clean
+          if (state.detZoom > 1.35 && Math.abs(pw) > 34 && Math.abs(ph) > 24) {{
+            lctx.fillStyle = "rgba(148, 163, 184, 0.42)";
+            lctx.font = "8px monospace";
+            if (cornersPts && cornersPts.length === 4) {{
+              const cScreen = cornersPts.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, 0.0));
+              const cxLbl = 0.25 * (cScreen[0][0] + cScreen[1][0] + cScreen[2][0] + cScreen[3][0]);
+              const cyLbl = 0.25 * (cScreen[0][1] + cScreen[1][1] + cScreen[2][1] + cScreen[3][1]);
+              lctx.fillText(`b${{panel.bank}}`, cxLbl - 7, cyLbl + 3);
+            }} else {{
+              lctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 9);
+            }}
+          }}
+        }});
       }});
-    }});
+      _detLayerCacheKey = layerKey;
+    }}
+
+    ctx.save();
+    const rawParallaxX = state.parallaxX * state.parallaxStrength * -0.35 * 54.0;
+    const rawParallaxY = state.parallaxY * state.parallaxStrength * -0.35 * 38.0;
+    const snapParallaxX = Math.round(rawParallaxX * dpr) / dpr;
+    const snapParallaxY = Math.round(rawParallaxY * dpr) / dpr;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(
+      _detLayerCacheCanvas,
+      -marginCss + snapParallaxX,
+      -marginCss + snapParallaxY,
+      layerW / dpr,
+      layerH / dpr
+    );
     ctx.restore();
 
     const OVERLAY_PARALLAX_LAYER = 0.45;
+    _detZoneArcScreenSegs = [];
+    _detNodalScreenHits = [];
 
-    // 3. LAYER 1 (FOREGROUND OVERLAY): Single-Arc Laue Zone Conics [uvw] clipped to detector panels
+    // 3. LAYER 1 (FOREGROUND OVERLAY): Single-Arc Laue Zone Conics [uvw] + HOLZ (±1, ±2) clipped to detector panels
     if (state.showZoneArcs) {{
       const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
       azShifts.forEach(shiftAz => {{
@@ -7945,8 +20287,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             : (hasPanels ? (zone.detector_segments || []) : (zone.detector_segments || contSegs));
           panelSegs.forEach((seg, sIdx) => {{
             const screenPts = seg.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, OVERLAY_PARALLAX_LAYER));
-            drawSingleZoneArc(ctx, screenPts, zone, false);
-            if (shiftAz === 0 && sIdx === 0 && screenPts.length > 2 && (state.selectedZoneId === zone.zone_id || state.detZoom > 1.35)) {{
+            drawSingleZoneArc(ctx, screenPts, zone, false, null);
+            if (screenPts.length >= 2) {{
+              _detZoneArcScreenSegs.push({{ zone, holzN: 0, lam: null, pts: screenPts }});
+            }}
+            if (
+              shiftAz === 0 &&
+              sIdx === 0 &&
+              screenPts.length > 2 &&
+              (state.selectedZoneId === zone.zone_id || state.detZoom > 1.35)
+            ) {{
               const mid = screenPts[Math.floor(screenPts.length * 0.5)];
               ctx.save();
               ctx.font = "bold 9px monospace";
@@ -7958,111 +20308,273 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
           }});
         }});
+
+        const holzItems = getHolzSegmentsForActiveZones();
+        for (let hi = 0; hi < holzItems.length; hi++) {{
+          const item = holzItems[hi];
+          const segList = isSph ? item.sphSegs : item.cylSegs;
+          for (let si = 0; si < segList.length; si++) {{
+            const screenPts = segList[si].map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, OVERLAY_PARALLAX_LAYER));
+            drawSingleZoneArc(ctx, screenPts, item.zone, false, item);
+            if (screenPts.length >= 2) {{
+              _detZoneArcScreenSegs.push({{ zone: item.zone, holzN: item.holzN, lam: item.lam, edgeKind: item.edgeKind, pts: screenPts }});
+            }}
+            if (
+              shiftAz === 0 &&
+              si === 0 &&
+              item.edgeKind !== "max" &&
+              screenPts.length > 3 &&
+              (state.selectedZoneId === item.zone.zone_id || state.detZoom > 1.8)
+            ) {{
+              const mid = screenPts[Math.floor(screenPts.length * 0.5)];
+              const hTag = `${{item.zone.label}}${{item.holzN > 0 ? "+" : ""}}${{item.holzN}}`;
+              ctx.save();
+              ctx.font = "bold 8.5px monospace";
+              ctx.fillStyle = "#070913";
+              ctx.fillText(hTag, mid[0] + 6, mid[1] - 3);
+              ctx.fillStyle = item.zone.rainbow_color;
+              ctx.fillText(hTag, mid[0] + 5, mid[1] - 4);
+              ctx.restore();
+            }}
+          }}
+        }}
       }});
     }}
 
-    // 4. FOREGROUND LAYER: Predicted Bragg Rings hovering together with Laue zone circles
-    const visiblePeaks = PEAKS.filter(isPeakVisible)
-      .slice()
-      .sort((a, b) => b.parallax_depth - a.parallax_depth);
+    // 4. FOREGROUND LAYER: Predicted Bragg Rings / Integrated 2σ Ellipses hovering together with Laue zone circles
+    const detLod = getDetectorLodState(w, h);
+    const visiblePeaks = detLod.visiblePeaks;
     const pendingTooltips = [];
     const queuedTooltipPeakIds = new Set();
+    const plotBox = getDetectorPlotBox(w, h);
+    const spanBoundsX = Math.max(1e-6, bounds.maxX - bounds.minX);
+    const spanBoundsY = Math.max(1e-6, bounds.maxY - bounds.minY);
+    const cxHalf = w * 0.5;
+    const cyHalf = h * 0.5;
+    const fgShiftX = state.parallaxX * state.parallaxStrength * OVERLAY_PARALLAX_LAYER * 54.0;
+    const fgShiftY = state.parallaxY * state.parallaxStrength * OVERLAY_PARALLAX_LAYER * 38.0;
+    const affScaleX = (plotBox.plotW / spanBoundsX) * state.detZoom;
+    const affOffsetX = cxHalf + (plotBox.originX - bounds.minX * (plotBox.plotW / spanBoundsX) - cxHalf) * state.detZoom + state.detPanX + fgShiftX;
+    const affScaleY = -(plotBox.plotH / spanBoundsY) * state.detZoom;
+    const affOffsetY = cyHalf + (plotBox.originY + plotBox.plotH + bounds.minY * (plotBox.plotH / spanBoundsY) - cyHalf) * state.detZoom + state.detPanY + fgShiftY;
+    const crowdCapR = visiblePeaks.length > 450
+      ? Math.max(2.2, 0.28 * Math.sqrt((plotBox.plotW * plotBox.plotH) / visiblePeaks.length))
+      : 20.0;
+    const baseR = Math.max(1.2, Math.min(20.0, crowdCapR, 1.85 * state.detZoom));
+    const isIntegShape = state.peakSource === "integrated";
+    const hasActiveZones = state.activeZones.size > 0;
+    const fillWhenLowAlpha = state.detAlpha < 0.2;
 
-    [0.0, -360.0, 360.0].forEach(shiftAz => {{
-      visiblePeaks.forEach(p => {{
+    ctx.save();
+    let dashedActive = false;
+    const orbitRefPeak = state.activeOrbitId ? getActiveOrbitReferencePeak() : null;
+    const shiftList = [0.0, -360.0, 360.0];
+    for (let sIdx = 0; sIdx < 3; sIdx++) {{
+      const shiftAz = shiftList[sIdx];
+      const shiftPxX = affScaleX * shiftAz + affOffsetX;
+      for (let pIdx = 0; pIdx < visiblePeaks.length; pIdx++) {{
+        const p = visiblePeaks[pIdx];
+        const x = affScaleX * p.det_x + shiftPxX;
+        if (x < -30 || x > w + 30) continue;
         const py = getPeakVert(p);
-        const fgLayer = OVERLAY_PARALLAX_LAYER;
-        const [x, y] = detToScreen(p.det_x + shiftAz, py, w, h, fgLayer);
-        if (x < -30 || x > w + 30) return;
+        const y = affScaleY * py + affOffsetY;
+        if (y < -30 || y > h + 30) continue;
 
         const captured = isPeakCapturedByActiveZone(p);
         const isHovered = isPeakHighlightedTarget(p);
         const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
-        if (!captured && !isHovered && !isOrbitMate && state.activeZones.size === 0) {{
-          return;
+        const isBijvoetMate = isOrbitMate && !isHovered && isBijvoetMatePair(orbitRefPeak, p);
+        if (!captured && !isHovered && !isOrbitMate && !hasActiveZones) {{
+          continue;
         }}
 
-        const baseR = Math.max(1.2, Math.min(20.0, 1.85 * state.detZoom));
-        const r = isHovered ? baseR + 1.8 : (isOrbitMate ? baseR + 1.2 : baseR);
+        const r = isHovered ? baseR + 1.8 : (isBijvoetMate ? baseR + 1.6 : (isOrbitMate ? baseR + 1.2 : baseR));
+        const isUncertain = !isHovered && !isOrbitMate && isPeakUncertainForScope(p);
+        const isIsigiMode = state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi";
+        const strokeAlpha = isUncertain
+          ? (captured ? 0.20 : 0.09)
+          : (captured ? (isIsigiMode ? 1.0 : 0.95) : (isIsigiMode ? 0.55 : 0.42));
 
-        ctx.save();
-        const ellPtsRaw = isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse;
+        const ellPtsRaw = isIntegShape ? (isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse) : null;
         const strokeCol = isHovered
-          ? "#f43f85"
-          : (isOrbitMate ? "#fbbf24" : peakStrokeColor(p, captured ? 0.95 : 0.42));
+          ? "#fbbf24"
+          : (isBijvoetMate ? "#ff4db8" : (isOrbitMate ? "#fbbf24" : peakStrokeColor(p, strokeAlpha)));
+        if (!isHovered && !isOrbitMate && strokeCol.endsWith(", 0.000)")) {{
+          continue;
+        }}
         ctx.strokeStyle = strokeCol;
-        ctx.lineWidth = isHovered ? 2.4 : (isOrbitMate ? 2.1 : (captured ? 1.85 : 1.05));
+        ctx.lineWidth = isHovered
+          ? 2.4
+          : (isBijvoetMate ? 2.3 : (isOrbitMate ? 2.1 : (isUncertain ? (captured ? 1.0 : 0.7) : (captured ? 1.85 : 1.05))));
+        if (isUncertain !== dashedActive) {{
+          ctx.setLineDash(isUncertain ? [2, 2] : []);
+          dashedActive = isUncertain;
+        }}
 
-        if (Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6) {{
-          const scrPts = ellPtsRaw.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, fgLayer));
-          let maxDist = 0.0, minDist = 1e9;
-          for (let m = 0; m < scrPts.length; m++) {{
-            const d = Math.hypot(scrPts[m][0] - x, scrPts[m][1] - y);
-            if (d > maxDist) maxDist = d;
+        if (ellPtsRaw && ellPtsRaw.length >= 6) {{
+          const nEll = ellPtsRaw.length;
+          let minDist = 1e9;
+          for (let m = 0; m < nEll; m++) {{
+            const pt = ellPtsRaw[m];
+            const dx = (affScaleX * pt[0] + shiftPxX) - x;
+            const dy = (affScaleY * pt[1] + affOffsetY) - y;
+            const d = Math.hypot(dx, dy);
             if (d < minDist) minDist = d;
           }}
           const minTarget = isHovered ? baseR + 1.5 : baseR * 0.9;
           const scale = minDist > 1e-3 && minDist < minTarget ? (minTarget / minDist) : 1.0;
           ctx.beginPath();
-          for (let m = 0; m < scrPts.length; m++) {{
-            const sx = x + (scrPts[m][0] - x) * scale;
-            const sy = y + (scrPts[m][1] - y) * scale;
+          for (let m = 0; m < nEll; m++) {{
+            const pt = ellPtsRaw[m];
+            const sx = x + ((affScaleX * pt[0] + shiftPxX) - x) * scale;
+            const sy = y + ((affScaleY * pt[1] + affOffsetY) - y) * scale;
             if (m === 0) ctx.moveTo(sx, sy);
             else ctx.lineTo(sx, sy);
           }}
           ctx.closePath();
           ctx.stroke();
-
-          if (p.shape_kind === "ellipse" && (isHovered || isOrbitMate || state.detZoom > 2.2) && scrPts.length >= 16) {{
-            const nHalf = Math.floor(scrPts.length / 2);
-            const nQuarter = Math.floor(scrPts.length / 4);
-            const p0 = [x + (scrPts[0][0] - x) * scale, y + (scrPts[0][1] - y) * scale];
-            const pHalf = [x + (scrPts[nHalf][0] - x) * scale, y + (scrPts[nHalf][1] - y) * scale];
-            const pQ1 = [x + (scrPts[nQuarter][0] - x) * scale, y + (scrPts[nQuarter][1] - y) * scale];
-            const pQ3 = [x + (scrPts[nQuarter + nHalf][0] - x) * scale, y + (scrPts[nQuarter + nHalf][1] - y) * scale];
-            ctx.save();
-            ctx.strokeStyle = (isHovered || isOrbitMate) ? "rgba(251, 191, 36, 0.75)" : "rgba(56, 189, 248, 0.42)";
-            ctx.lineWidth = 0.85;
-            ctx.beginPath();
-            ctx.moveTo(p0[0], p0[1]); ctx.lineTo(pHalf[0], pHalf[1]);
-            ctx.moveTo(pQ1[0], pQ1[1]); ctx.lineTo(pQ3[0], pQ3[1]);
-            ctx.stroke();
-            ctx.restore();
-          }}
         }} else {{
           ctx.beginPath();
           ctx.arc(x, y, r, 0, Math.PI * 2);
           ctx.stroke();
         }}
 
-        // Highlight symmetry-orbit mates or Laue harmonic overlaps on detector
-        if (isOrbitMate && !isHovered) {{
-          ctx.beginPath();
-          ctx.arc(x, y, r + 3.2, 0, Math.PI * 2);
-          ctx.strokeStyle = "rgba(0, 229, 255, 0.82)";
-          ctx.lineWidth = 1.2;
-          ctx.stroke();
+        if (fillWhenLowAlpha) {{
+          ctx.fillStyle = peakStrokeColor(p, isUncertain ? 0.16 : 0.85);
+          ctx.fill();
         }}
 
-        if (state.detAlpha < 0.2) {{
-          ctx.fillStyle = peakStrokeColor(p, 0.85);
-          ctx.fill();
+        if (isHovered) {{
+          if (dashedActive) {{ ctx.setLineDash([]); dashedActive = false; }}
+          ctx.beginPath();
+          ctx.arc(x, y, r + 3.4, 0, Math.PI * 2);
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.88)";
+          ctx.lineWidth = 1.25;
+          ctx.stroke();
+        }} else if (isOrbitMate) {{
+          if (dashedActive) {{ ctx.setLineDash([]); dashedActive = false; }}
+          ctx.beginPath();
+          ctx.arc(x, y, isBijvoetMate ? (r + 3.8) : (r + 3.2), 0, Math.PI * 2);
+          ctx.strokeStyle = isBijvoetMate
+            ? "rgba(255, 77, 184, 0.96)"
+            : "rgba(0, 229, 255, 0.82)";
+          ctx.lineWidth = isBijvoetMate ? 1.85 : 1.2;
+          ctx.stroke();
         }}
 
         if ((isHovered || isOrbitMate) && !queuedTooltipPeakIds.has(p.id) && x >= 0 && x <= w) {{
           queuedTooltipPeakIds.add(p.id);
-          pendingTooltips.push({{ p, x, y, isHovered }});
+          pendingTooltips.push({{ p, x, y, isHovered, isBijvoetMate }});
+        }}
+      }}
+    }}
+    ctx.restore();
+
+    // 4b. NODAL POINTS LAYER: Big bull's-eye circles (filled with a dot) at Laue zone intersections + {{a*, b*, c*}}
+    const pendingNodalTooltips = [];
+    if (state.showNodalPoints) {{
+      const nodals = getVisibleNodalPoints();
+      if (nodals.length > 0) {{
+        ctx.save();
+        for (let sIdx = 0; sIdx < 3; sIdx++) {{
+          const shiftAz = shiftList[sIdx];
+          const shiftPxX = affScaleX * shiftAz + affOffsetX;
+          for (let nIdx = 0; nIdx < nodals.length; nIdx++) {{
+            const nd = nodals[nIdx];
+            const x = affScaleX * nd.det_x + shiftPxX;
+            const nVert = isSph ? nd.det_el : nd.det_y;
+            const y = affScaleY * nVert + affOffsetY;
+            if (x < -44 || x > w + 44 || y < -44 || y > h + 44) continue;
+
+            // Keep uniform nodal radii (never scaling with intersection count or inflating in wide MANDI gaps)
+            const nodalR = nd.isPrincipal
+              ? Math.max(12.0, Math.min(15.5, 10.8 + 1.2 * Math.sqrt(state.detZoom)))
+              : Math.max(9.0, Math.min(12.0, 7.8 + 1.2 * Math.sqrt(state.detZoom)));
+
+            const isHovNodal = state.hoveredNodalKey !== null && state.hoveredNodalKey === nd.key;
+            const offPanelDim = nd.onPanel
+              ? 1.0
+              : Math.max(0.32, 0.58 - 0.9 * (nd.gapPanelFrac || 0.0));
+            const effAlpha = isHovNodal ? 1.0 : offPanelDim;
+            _detNodalScreenHits.push({{ nodal: nd, x, y, r: nodalR }});
+
+            // Soft circular interior tint (subdued when off-panel in a gap unless hovered)
+            ctx.beginPath();
+            ctx.arc(x, y, nodalR, 0, Math.PI * 2);
+            ctx.fillStyle = nd.isPrincipal
+              ? (isHovNodal ? "rgba(251, 191, 36, 0.24)" : (nd.onPanel ? "rgba(251, 191, 36, 0.12)" : "rgba(251, 191, 36, 0.04)"))
+              : (isHovNodal ? "rgba(56, 189, 248, 0.22)" : (nd.onPanel ? "rgba(15, 23, 42, 0.24)" : "rgba(15, 23, 42, 0.10)"));
+            ctx.fill();
+
+            // Dark contrast halo + colored outer ring
+            ctx.globalAlpha = effAlpha;
+            ctx.beginPath();
+            ctx.arc(x, y, nodalR, 0, Math.PI * 2);
+            ctx.strokeStyle = "rgba(7, 9, 19, 0.88)";
+            ctx.lineWidth = isHovNodal ? 4.2 : 3.2;
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.arc(x, y, nodalR, 0, Math.PI * 2);
+            ctx.strokeStyle = isHovNodal ? "#ffffff" : nd.color;
+            ctx.lineWidth = isHovNodal ? 2.5 : (nd.isPrincipal ? 2.1 : 1.7);
+            ctx.globalAlpha = isHovNodal ? 1.0 : ((nd.isPrincipal ? 0.96 : 0.86) * offPanelDim);
+            ctx.stroke();
+
+            if (isHovNodal) {{
+              ctx.globalAlpha = 1.0;
+              ctx.beginPath();
+              ctx.arc(x, y, nodalR + 3.2, 0, Math.PI * 2);
+              ctx.strokeStyle = nd.color;
+              ctx.lineWidth = 1.4;
+              ctx.stroke();
+            }}
+
+            // Central filled bull's-eye dot
+            ctx.globalAlpha = effAlpha;
+            const dotR = isHovNodal ? 3.5 : (nd.isPrincipal ? 3.0 : 2.4);
+            ctx.beginPath();
+            ctx.arc(x, y, dotR + 1.3, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(7, 9, 19, 0.92)";
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(x, y, dotR, 0, Math.PI * 2);
+            ctx.fillStyle = isHovNodal ? "#ffffff" : nd.color;
+            ctx.fill();
+
+            // Persistent {{a^⋆, b^⋆, c^⋆}} callout pill on principal reciprocal axes (true raised superscript ⋆)
+            if (nd.isPrincipal && nd.principalBase && x >= -10 && x <= w + 10 && y >= 0 && y <= h) {{
+              const sw = measurePrincipalStarSymbol(ctx, nd.principalBase, 10.5, 8);
+              const pw = sw + 8;
+              const ph = 15;
+              const px = Math.min(Math.max(3, x + nodalR + 4), Math.max(3, w - pw - 3));
+              const pyPill = Math.min(Math.max(3, y - 0.5 * ph), Math.max(3, h - ph - 3));
+              ctx.fillStyle = "rgba(7, 9, 19, 0.90)";
+              ctx.fillRect(px, pyPill, pw, ph);
+              ctx.strokeStyle = isHovNodal ? "#ffffff" : "rgba(251, 191, 36, 0.85)";
+              ctx.lineWidth = 1.1;
+              ctx.strokeRect(px, pyPill, pw, ph);
+              ctx.fillStyle = "#fbbf24";
+              drawPrincipalStarSymbol(ctx, nd.principalBase, px + 4, pyPill + 11.5, 10.5, 8);
+            }}
+            ctx.globalAlpha = 1.0;
+
+            if (isHovNodal && x >= -20 && x <= w + 20 && pendingNodalTooltips.length === 0) {{
+              pendingNodalTooltips.push({{ nd, x, y, r: nodalR }});
+            }}
+          }}
         }}
         ctx.restore();
-      }});
-    }});
+      }}
+    }}
 
     // Render tooltips for all hovered + symmetry-equivalent reflections on top of rings
-    pendingTooltips.forEach(({{ p, x, y, isHovered }}) => {{
+    pendingTooltips.forEach(({{ p, x, y, isHovered, isBijvoetMate }}) => {{
       const resBadge = typeof p.careless_residual === "number"
         ? ` ΔI/σ=${{p.careless_residual >= 0 ? "+" : ""}}${{p.careless_residual.toFixed(1)}}σ`
         : "";
-      const tag = `(${{p.hkl.join(",")}}) λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{resBadge}}`;
+      const bijBadge = isBijvoetMate ? " [Bijvoet]" : "";
+      const tag = `(${{p.hkl.join(",")}})${{bijBadge}} λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{resBadge}}`;
       ctx.save();
       ctx.font = "bold 11px monospace";
       const tw = ctx.measureText(tag).width + 10;
@@ -8070,16 +20582,134 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const ty = Math.max(20, y);
       ctx.fillStyle = "rgba(11, 15, 23, 0.92)";
       ctx.fillRect(tx, ty - 20, tw, 18);
-      ctx.strokeStyle = isHovered ? "#fbbf24" : "#00e5ff";
-      ctx.lineWidth = 1.0;
+      ctx.strokeStyle = isHovered ? "#fbbf24" : (isBijvoetMate ? "#ff4db8" : "#00e5ff");
+      ctx.lineWidth = isBijvoetMate ? 1.35 : 1.0;
       ctx.strokeRect(tx, ty - 20, tw, 18);
-      ctx.fillStyle = isHovered ? "#fbbf24" : "#38bdf8";
+      ctx.fillStyle = isHovered ? "#fbbf24" : (isBijvoetMate ? "#ff7ad9" : "#38bdf8");
       ctx.fillText(tag, tx + 5, ty - 7);
       ctx.restore();
     }});
+
+    // Render floating badge when hovering over a Nodal circle (stacked cleanly above any coincident peak tooltip)
+    pendingNodalTooltips.forEach(({{ nd, x, y, r }}) => {{
+      const hklStr = Array.isArray(nd.hkl) ? `(${{nd.hkl.join(",")}})` : "";
+      const zCount = Array.isArray(nd.zoneLabels) ? nd.zoneLabels.length : 0;
+      const zPart = zCount > 0
+        ? ` • ${{nd.zoneLabels.slice(0, 2).join("×")}}${{zCount > 2 ? ` (+${{zCount - 2}} more, ${{zCount}} zones)` : ""}}`
+        : "";
+      const dPart = typeof nd.d1 === "number" && nd.d1 > 0 ? ` • d₁=${{nd.d1.toFixed(2)}}Å` : "";
+      const gapPart = !nd.onPanel ? " [gap]" : "";
+      const tail = `${{hklStr ? " " + hklStr : ""}}${{zPart}}${{dPart}}${{gapPart}}`;
+      ctx.save();
+      let textW = 0;
+      if (nd.principalBase) {{
+        ctx.font = "bold 11px monospace";
+        const preW = ctx.measureText("Nodal ").width;
+        const symW = measurePrincipalStarSymbol(ctx, nd.principalBase, 11, 8.5);
+        ctx.font = "bold 11px monospace";
+        textW = preW + symW + ctx.measureText(tail).width;
+      }} else {{
+        const tag = `Nodal${{tail}}`;
+        ctx.font = "bold 11px monospace";
+        textW = ctx.measureText(tag).width;
+      }}
+      const tw = textW + 12;
+      const tx = Math.min(Math.max(4, x + r + 6), Math.max(4, w - tw - 4));
+      const stackOffset = pendingTooltips.length > 0 ? 22 : 0;
+      const ty = Math.max(22, y - stackOffset);
+      ctx.fillStyle = "rgba(11, 15, 23, 0.94)";
+      ctx.fillRect(tx, ty - 20, tw, 18);
+      ctx.strokeStyle = nd.color || "#fbbf24";
+      ctx.lineWidth = 1.35;
+      ctx.strokeRect(tx, ty - 20, tw, 18);
+      ctx.fillStyle = nd.isPrincipal ? "#fbbf24" : (nd.color || "#38bdf8");
+      if (nd.principalBase) {{
+        ctx.font = "bold 11px monospace";
+        const preW = ctx.measureText("Nodal ").width;
+        ctx.fillText("Nodal ", tx + 6, ty - 7);
+        const symW = drawPrincipalStarSymbol(ctx, nd.principalBase, tx + 6 + preW, ty - 7, 11, 8.5);
+        ctx.font = "bold 11px monospace";
+        ctx.fillText(tail, tx + 6 + preW + symW, ty - 7);
+      }} else {{
+        ctx.font = "bold 11px monospace";
+        ctx.fillText(`Nodal${{tail}}`, tx + 6, ty - 7);
+      }}
+      ctx.restore();
+    }});
+
+    // Render floating [uvw] zone-arc badge when hovering over an active ZOLZ or HOLZ curve
+    if (state.hoveredZoneId !== null && state.hoveredZonePos && pendingTooltips.length === 0 && pendingNodalTooltips.length === 0) {{
+      const hz = ZONES.find(z => z.zone_id === state.hoveredZoneId);
+      if (hz) {{
+        const holzN = state.hoveredZoneHolzN || 0;
+        let eqTag = `${{hz.n_peaks || 0}} spots`;
+        if (holzN) {{
+          const hm = getZoneHolzLayerCountMap(hz.zone_id);
+          const nLayerSpots = hm ? (hm[String(holzN)] || 0) : 0;
+          eqTag = `HOLZ N=${{holzN > 0 ? "+" : ""}}${{holzN}} • ${{nLayerSpots}} spots`;
+        }}
+        const dTag = typeof hz.d_direct === "number" && hz.d_direct > 0 ? ` • |t|=${{hz.d_direct.toFixed(2)}}Å` : "";
+        const zTag = `Zone ${{hz.label}} • ${{eqTag}}${{dTag}}`;
+        const hx = state.hoveredZonePos[0];
+        const hy = state.hoveredZonePos[1];
+        ctx.save();
+        ctx.font = "bold 11px monospace";
+        const tw = ctx.measureText(zTag).width + 12;
+        const tx = Math.min(Math.max(4, hx + 10), Math.max(4, w - tw - 4));
+        const ty = Math.max(22, hy - 6);
+        ctx.fillStyle = "rgba(11, 15, 23, 0.94)";
+        ctx.fillRect(tx, ty - 20, tw, 18);
+        ctx.strokeStyle = hz.rainbow_color || "#38bdf8";
+        ctx.lineWidth = 1.35;
+        ctx.strokeRect(tx, ty - 20, tw, 18);
+        ctx.fillStyle = hz.rainbow_color || "#38bdf8";
+        ctx.fillText(zTag, tx + 6, ty - 7);
+        ctx.restore();
+      }}
+    }}
+
+    if (detLod.isLodThinned) {{
+      ctx.save();
+      ctx.font = "bold 10px monospace";
+      const inV = typeof detLod.inViewCount === "number" ? detLod.inViewCount : detLod.totalCount;
+      const countLabel = inV < detLod.totalCount
+        ? `${{visiblePeaks.length}}/${{inV}} in view (${{detLod.totalCount}} total)`
+        : `${{visiblePeaks.length}}/${{detLod.totalCount}} spots`;
+      const lodTxt = `LOD ${{countLabel}} • d ≥ ${{detLod.activeDmin.toFixed(2)}}Å • zoom+ to resolve`;
+      const bx = 46;
+      const by = 10;
+      const bh = 18;
+      const bw = ctx.measureText(lodTxt).width + 12;
+      ctx.fillStyle = "rgba(7, 9, 19, 0.86)";
+      ctx.strokeStyle = "rgba(251, 191, 36, 0.52)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      if (typeof ctx.roundRect === "function") {{
+        ctx.roundRect(bx, by, bw, bh, 4);
+      }} else {{
+        ctx.rect(bx, by, bw, bh);
+      }}
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#fbbf24";
+      ctx.fillText(lodTxt, bx + 6, by + 12.5);
+      ctx.restore();
+    }}
   }}
 
   function getActiveGoniometerR() {{
+    if (
+      typeof state.selectedFrameIndex === "number" &&
+      typeof DATA.frame_index === "number" &&
+      state.selectedFrameIndex !== DATA.frame_index &&
+      DATA.goniometer_R_per_run &&
+      typeof DATA.goniometer_R_per_run === "object"
+    ) {{
+      const Rrun = DATA.goniometer_R_per_run[String(state.selectedFrameIndex)];
+      if (Array.isArray(Rrun) && Rrun.length === 3 && Array.isArray(Rrun[0]) && Rrun[0].length === 3) {{
+        return Rrun;
+      }}
+    }}
     const R = DATA.goniometer_R;
     if (Array.isArray(R) && R.length === 3 && Array.isArray(R[0]) && R[0].length === 3) {{
       return R;
@@ -8087,8 +20717,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
   }}
 
-  // Rotate 3D Sample-frame unit vector g=[gx, gy, gz] by lab-coupled wulffYawDeg (around lab Y) and wulffPitchDeg (around lab X),
-  // coupled through the active goniometer rotation matrix R, and project onto a convex 3D perspective Wulff sphere.
+  // Rotate 3D Sample-frame unit vector g=[gx, gy, gz] by right-handed lab camera azimuth wulffYawDeg (around lab +Y)
+  // and wulffPitchDeg (around camera +X), coupled through the active goniometer rotation matrix R,
+  // and project onto a convex 3D perspective Wulff sphere (det = +1, no mirror flip).
   function projectToWulff(g, cx, cy, R) {{
     if (!Array.isArray(g) || g.length < 3) return [cx, cy, 1, 0.0, 1.0];
     const yawRad = (state.wulffYawDeg || 0.0) * Math.PI / 180.0;
@@ -8102,14 +20733,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const gUnit = [g[0] / gn, g[1] / gn, g[2] / gn];
     const vBase = Rg ? mat3Vec(Rg, gUnit) : gUnit;
 
-    // Apply 360° lab-frame detector view rotation (yaw around lab Y, then screen-space pitch around camera X)
-    // Flip -z_lab -> +z_cam so the Ewald diffraction hemisphere (q_z < 0) faces the viewer (+z_cam > 0) at yaw=0
+    // Right-handed SO(3) camera looking from +zCam toward origin at lab azimuth α_0 = wulffYawDeg:
+    //   view forward (+zCam toward viewer) = (sin α_0, 0, cos α_0)
+    //   screen right (+xCam = increasing lab azimuth & increasing detector χ) = (cos α_0, 0, -sin α_0)
+    //   screen up (+yCam) = (0, 1, 0)
+    // Determinant of (x1, y1, z1) wrt (vx, vy, vz) is +cos²(α_0) + sin²(α_0) = +1 (strictly proper rotation!).
     const vx = vBase[0];
     const vy = vBase[1];
-    const vz = -vBase[2];
-    const x1 = vx * cyaw + vz * syaw;
+    const vz = vBase[2];
+    const x1 = vx * cyaw - vz * syaw;
     const y1 = vy;
-    const z1 = -vx * syaw + vz * cyaw;
+    const z1 = vx * syaw + vz * cyaw;
     const xCam = x1;
     const yCam = y1 * cp - z1 * sp;
     const zCam = y1 * sp + z1 * cp;
@@ -8126,19 +20760,588 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return [cx + xCam * persp * scale, cy - yCam * persp * scale, hemi, zCam, dotScale];
   }}
 
+  function getActiveWulffSourceArray() {{
+    return (SAMPLE_PEAKS && SAMPLE_PEAKS.length > 0) ? SAMPLE_PEAKS : PEAKS;
+  }}
+
   function getActiveWulffPeaks() {{
     const src = (state.wulffScope === "all_runs" && SAMPLE_PEAKS.length > 0) ? SAMPLE_PEAKS : PEAKS;
     return src.filter(isPeakVisible);
   }}
 
+  const _wulffPoolCache = {{
+    sig: "",
+    firstRef: null,
+    lastRef: null,
+    rawPeaks: [],
+    uniquePeaks: [],
+    observedHklSet: new Set(),
+    sortedD: [],
+  }};
+  let _lastWulffRenderSig = "";
+
+  function _peakSnrScore(p) {{
+    if (state.wulffColorMode === "residual" && typeof p.careless_residual === "number") {{
+      const av = getPeakDataAvailability();
+      const mid = Number.isFinite(av.resMedian) ? av.resMedian : (av.resMean || 0.0);
+      return Math.abs(p.careless_residual - mid);
+    }}
+    if (state.wulffColorMode === "mtz_isigi") {{
+      const mv = peakMtzIsigi(p);
+      if (Number.isFinite(mv)) return Math.abs(mv);
+    }}
+    if (typeof p.merged_i === "number" && typeof p.merged_sigi === "number" && p.merged_sigi > 0) {{
+      return Math.abs(p.merged_i) / p.merged_sigi;
+    }}
+    const sig = (typeof p.sigma === "number" && p.sigma > 0) ? p.sigma : 1.0;
+    return Math.abs(typeof p.intensity === "number" ? p.intensity : 0.0) / sig;
+  }}
+
+  function getWulffPoolCache() {{
+    const useAllRuns = state.wulffScope === "all_runs" && SAMPLE_PEAKS.length > 0;
+    const src = useAllRuns ? SAMPLE_PEAKS : PEAKS;
+    const firstRef = src.length > 0 ? src[0] : null;
+    const lastRef = src.length > 0 ? src[src.length - 1] : null;
+    const activeFrameIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const dynEp = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
+    const sig = `${{dynEp}}|${{useAllRuns ? "all" : "1f"}}|${{src.length}}|${{state.peakSource}}|${{state.dMin}}|${{state.lamMin}}|${{state.lamMax}}|${{state.wulffColorMode}}|${{activeFrameIdx}}`;
+    if (
+      _wulffPoolCache.sig === sig &&
+      _wulffPoolCache.firstRef === firstRef &&
+      _wulffPoolCache.lastRef === lastRef
+    ) {{
+      return _wulffPoolCache;
+    }}
+
+    const rawPeaks = getActiveWulffPeaks();
+    const observedHklSet = new Set();
+    let uniquePeaks = rawPeaks;
+    if (useAllRuns && rawPeaks.length > 0) {{
+      const byHkl = new Map();
+      const unindexed = [];
+      for (let i = 0; i < rawPeaks.length; i++) {{
+        const p = rawPeaks[i];
+        if (Array.isArray(p.hkl) && p.hkl.length === 3 && (p.hkl[0] || p.hkl[1] || p.hkl[2])) {{
+          const hk = `${{p.hkl[0]}},${{p.hkl[1]}},${{p.hkl[2]}}`;
+          observedHklSet.add(hk);
+          const prev = byHkl.get(hk);
+          if (!prev) {{
+            byHkl.set(hk, p);
+          }} else {{
+            const pAct = p.run_index === activeFrameIdx;
+            const prevAct = prev.run_index === activeFrameIdx;
+            if ((pAct && !prevAct) || (pAct === prevAct && _peakSnrScore(p) > _peakSnrScore(prev))) {{
+              prev._wulff_sx = undefined;
+              prev._wulff_sy = undefined;
+              prev._wulff_friedel_sx = undefined;
+              prev._wulff_friedel_sy = undefined;
+              byHkl.set(hk, p);
+            }} else {{
+              p._wulff_sx = undefined;
+              p._wulff_sy = undefined;
+              p._wulff_friedel_sx = undefined;
+              p._wulff_friedel_sy = undefined;
+            }}
+          }}
+        }} else {{
+          unindexed.push(p);
+        }}
+      }}
+      uniquePeaks = [...byHkl.values(), ...unindexed];
+    }} else {{
+      for (let i = 0; i < rawPeaks.length; i++) {{
+        const p = rawPeaks[i];
+        if (Array.isArray(p.hkl) && p.hkl.length === 3) {{
+          observedHklSet.add(`${{p.hkl[0]}},${{p.hkl[1]}},${{p.hkl[2]}}`);
+        }}
+      }}
+    }}
+
+    const sortedD = [];
+    for (let i = 0; i < uniquePeaks.length; i++) {{
+      const dv = uniquePeaks[i].d_spacing;
+      if (typeof dv === "number" && Number.isFinite(dv) && dv > 0) sortedD.push(dv);
+    }}
+    sortedD.sort((a, b) => b - a);
+
+    _wulffPoolCache.sig = sig;
+    _wulffPoolCache.firstRef = firstRef;
+    _wulffPoolCache.lastRef = lastRef;
+    _wulffPoolCache.rawPeaks = rawPeaks;
+    _wulffPoolCache.uniquePeaks = uniquePeaks;
+    _wulffPoolCache.observedHklSet = observedHklSet;
+    _wulffPoolCache.sortedD = sortedD;
+    return _wulffPoolCache;
+  }}
+
+  let _wulffPrevRenderedPeaks = [];
+
+  // Build a 3D unit-sphere cone BVH over crystal q_hat directions for perspective gameplay LOD on the Wulff sphere.
+  // Rotation- and zoom-invariant: orbiting or zooming the Wulff sphere traverses the cached tree in < 0.2 ms
+  // without rebuilding, subdividing cones smoothly as they approach the camera or zoom in.
+  function buildWulffSphericalBVH(uniquePeaks) {{
+    const n = uniquePeaks.length;
+    if (n === 0) return null;
+    const hasActiveZones = Boolean(state.showZoneArcs && state.activeZones && state.activeZones.size > 0);
+    const useSnr = (
+      state.peakSource === "integrated" ||
+      state.wulffColorMode === "isigi" ||
+      state.wulffColorMode === "mtz_isigi" ||
+      state.wulffColorMode === "residual"
+    );
+
+    const qxArr = new Float32Array(n);
+    const qyArr = new Float32Array(n);
+    const qzArr = new Float32Array(n);
+    const dArr = new Float32Array(n);
+    const priArr = new Float64Array(n);
+    const idxBuf = new Int32Array(n);
+
+    for (let i = 0; i < n; i++) {{
+      const p = uniquePeaks[i];
+      const q = Array.isArray(p.q_hat) && p.q_hat.length >= 3 ? p.q_hat : [0.0, 0.0, 1.0];
+      const qx = Number(q[0]) || 0.0;
+      const qy = Number(q[1]) || 0.0;
+      const qz = Number(q[2]) || 0.0;
+      const qn = Math.hypot(qx, qy, qz);
+      if (qn > 1e-12) {{
+        qxArr[i] = qx / qn;
+        qyArr[i] = qy / qn;
+        qzArr[i] = qz / qn;
+      }} else {{
+        qxArr[i] = 0.0;
+        qyArr[i] = 0.0;
+        qzArr[i] = 1.0;
+      }}
+      dArr[i] = (typeof p.d_spacing === "number" && p.d_spacing > 0) ? p.d_spacing : 0.0;
+      priArr[i] = _computePeakLodPriority(p, i, hasActiveZones, useSnr);
+      idxBuf[i] = i;
+    }}
+
+    const cap = Math.max(2, 2 * n);
+    const leftChild = new Int32Array(cap);
+    const rightChild = new Int32Array(cap);
+    const cxArr = new Float32Array(cap);
+    const cyArr = new Float32Array(cap);
+    const czArr = new Float32Array(cap);
+    const rChord = new Float32Array(cap);
+    const canRadius = new Float32Array(cap);
+    const maxD = new Float32Array(cap);
+    const repIdx = new Int32Array(cap);
+    const subCount = new Int32Array(cap);
+    let nodeCount = 0;
+
+    function buildNode(lo, hi, inX0, inX1, inY0, inY1, inZ0, inZ1, depth) {{
+      const u = nodeCount++;
+      let x0 = Infinity, x1 = -Infinity;
+      let y0 = Infinity, y1 = -Infinity;
+      let z0 = Infinity, z1 = -Infinity;
+      let sx = 0.0, sy = 0.0, sz = 0.0;
+      let dMax = 0.0;
+      let bestIdx = idxBuf[lo];
+      let bestPri = -Infinity;
+
+      for (let k = lo; k < hi; k++) {{
+        const idx = idxBuf[k];
+        const x = qxArr[idx], y = qyArr[idx], z = qzArr[idx];
+        const dv = dArr[idx], pr = priArr[idx];
+        if (x < x0) x0 = x; if (x > x1) x1 = x;
+        if (y < y0) y0 = y; if (y > y1) y1 = y;
+        if (z < z0) z0 = z; if (z > z1) z1 = z;
+        sx += x; sy += y; sz += z;
+        if (dv > dMax) dMax = dv;
+        if (pr > bestPri) {{
+          bestPri = pr;
+          bestIdx = idx;
+        }}
+      }}
+
+      let mx = sx / (hi - lo), my = sy / (hi - lo), mz = sz / (hi - lo);
+      const mn = Math.hypot(mx, my, mz);
+      if (mn > 1e-9) {{
+        mx /= mn; my /= mn; mz /= mn;
+      }} else {{
+        mx = qxArr[bestIdx]; my = qyArr[bestIdx]; mz = qzArr[bestIdx];
+      }}
+      let maxChord2 = 0.0;
+      for (let k = lo; k < hi; k++) {{
+        const idx = idxBuf[k];
+        const dx = qxArr[idx] - mx;
+        const dy = qyArr[idx] - my;
+        const dz = qzArr[idx] - mz;
+        const c2 = dx * dx + dy * dy + dz * dz;
+        if (c2 > maxChord2) maxChord2 = c2;
+      }}
+
+      cxArr[u] = mx; cyArr[u] = my; czArr[u] = mz;
+      rChord[u] = hi - lo <= 1 ? 0.0 : Math.sqrt(maxChord2);
+      // Canonical octree-cube half-diagonal (data-independent stopping radius!)
+      canRadius[u] = 0.5 * Math.hypot(inX1 - inX0, inY1 - inY0, inZ1 - inZ0);
+      maxD[u] = dMax;
+      repIdx[u] = bestIdx;
+      subCount[u] = hi - lo;
+
+      if (hi - lo <= 1) {{
+        leftChild[u] = -1;
+        rightChild[u] = -1;
+        return u;
+      }}
+
+      let cx0 = inX0, cx1 = inX1, cy0 = inY0, cy1 = inY1, cz0 = inZ0, cz1 = inZ1;
+      let midIdx = -1;
+      let boxL = null, boxR = null;
+      for (let step = 0; step < 24 && depth + step < 32; step++) {{
+        const spX = cx1 - cx0, spY = cy1 - cy0, spZ = cz1 - cz0;
+        if (spX < 1e-5 && spY < 1e-5 && spZ < 1e-5) break;
+        let axis = 0;
+        if (spY >= spX && spY >= spZ) axis = 1;
+        else if (spZ >= spX && spZ >= spY) axis = 2;
+        const midVal = axis === 0 ? 0.5 * (cx0 + cx1) : (axis === 1 ? 0.5 * (cy0 + cy1) : 0.5 * (cz0 + cz1));
+        if (axis === 0) {{
+          if (x1 <= midVal) {{ cx1 = midVal; continue; }}
+          if (x0 > midVal) {{ cx0 = midVal; continue; }}
+        }} else if (axis === 1) {{
+          if (y1 <= midVal) {{ cy1 = midVal; continue; }}
+          if (y0 > midVal) {{ cy0 = midVal; continue; }}
+        }} else {{
+          if (z1 <= midVal) {{ cz1 = midVal; continue; }}
+          if (z0 > midVal) {{ cz0 = midVal; continue; }}
+        }}
+        const coordArr = axis === 0 ? qxArr : (axis === 1 ? qyArr : qzArr);
+        let i = lo, j = hi - 1;
+        while (i <= j) {{
+          while (i <= j && coordArr[idxBuf[i]] <= midVal) i++;
+          while (i <= j && coordArr[idxBuf[j]] > midVal) j--;
+          if (i < j) {{
+            const tmp = idxBuf[i];
+            idxBuf[i] = idxBuf[j];
+            idxBuf[j] = tmp;
+            i++;
+            j--;
+          }}
+        }}
+        if (i > lo && i < hi) {{
+          midIdx = i;
+          if (axis === 0) {{
+            boxL = [cx0, midVal, cy0, cy1, cz0, cz1];
+            boxR = [midVal, cx1, cy0, cy1, cz0, cz1];
+          }} else if (axis === 1) {{
+            boxL = [cx0, cx1, cy0, midVal, cz0, cz1];
+            boxR = [cx0, cx1, midVal, cy1, cz0, cz1];
+          }} else {{
+            boxL = [cx0, cx1, cy0, cy1, cz0, midVal];
+            boxR = [cx0, cx1, cy0, cy1, midVal, cz1];
+          }}
+          break;
+        }}
+        if (i <= lo) {{
+          if (axis === 0) cx0 = midVal; else if (axis === 1) cy0 = midVal; else cz0 = midVal;
+        }} else {{
+          if (axis === 0) cx1 = midVal; else if (axis === 1) cy1 = midVal; else cz1 = midVal;
+        }}
+      }}
+
+      if (midIdx < 0) {{
+        midIdx = (lo + hi) >> 1;
+        boxL = [cx0, cx1, cy0, cy1, cz0, cz1];
+        boxR = [cx0, cx1, cy0, cy1, cz0, cz1];
+      }}
+
+      const c0 = buildNode(lo, midIdx, boxL[0], boxL[1], boxL[2], boxL[3], boxL[4], boxL[5], depth + 1);
+      const c1 = buildNode(midIdx, hi, boxR[0], boxR[1], boxR[2], boxR[3], boxR[4], boxR[5], depth + 1);
+      if (priArr[repIdx[c1]] > priArr[repIdx[c0]]) {{
+        leftChild[u] = c1;
+        rightChild[u] = c0;
+      }} else {{
+        leftChild[u] = c0;
+        rightChild[u] = c1;
+      }}
+      return u;
+    }}
+
+    buildNode(0, n, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 0);
+    return {{
+      uniquePeaks,
+      n,
+      nodeCount,
+      qxArr,
+      qyArr,
+      qzArr,
+      dArr,
+      priArr,
+      leftChild,
+      rightChild,
+      cxArr,
+      cyArr,
+      czArr,
+      rChord,
+      canRadius,
+      maxD,
+      repIdx,
+      subCount,
+      stack: new Int32Array(Math.min(cap, 256)),
+    }};
+  }}
+
+  function getWulffLodState(isExp) {{
+    const pool = getWulffPoolCache();
+    const uniquePeaks = pool.uniquePeaks;
+    const sortedD = pool.sortedD;
+    const minPoolD = sortedD.length > 0 ? sortedD[sortedD.length - 1] : 0.0;
+    const activeDmin = (typeof state.dMin === "number" && state.dMin > 0) ? state.dMin : minPoolD;
+
+    const rect = stereoCanvas.getBoundingClientRect();
+    const w = Math.max(120, Number(rect.width) || (isExp ? 620 : 210));
+    const h = Math.max(120, Number(rect.height) || (isExp ? 620 : 210));
+    const R = Math.min(w, h) * 0.43;
+    const wZoom = Math.max(0.5, Number(state.wulffZoom) || 1.0);
+    const yawDeg = Number(state.wulffYawDeg) || 0.0;
+    const pitchDeg = Number(state.wulffPitchDeg) || 0.0;
+    const withFriedel = Boolean(state.showWulffFriedel);
+    const holzWulffKey = (state.holzOrders instanceof Set && state.holzOrders.size > 0)
+      ? Array.from(state.holzOrders).sort((a, b) => a - b).join(",")
+      : "";
+    const zonesKey = state.showZoneArcs ? `${{Array.from(state.activeZones).join(",")}}:${{holzWulffKey}}` : "off";
+    const Rg = getActiveGoniometerR();
+    const hovId = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
+    const selId = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
+    const firstRef = uniquePeaks.length > 0 ? uniquePeaks[0] : null;
+    const lodSig = [
+      pool.sig, zonesKey, isExp ? "exp" : "ins",
+      Math.round(R), wZoom.toFixed(4), yawDeg.toFixed(3), pitchDeg.toFixed(3),
+      withFriedel ? 1 : 0, hovId, selId, state.activeOrbitId || "",
+      Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[2][0].toFixed(5), Rg[2][2].toFixed(5),
+    ].join("|");
+    if (_wulffLodCache.sig === lodSig && _wulffLodCache.firstRef === firstRef && _wulffLodCache.value) {{
+      return _wulffLodCache.value;
+    }}
+
+    if (uniquePeaks.length === 0) {{
+      for (let i = 0; i < _wulffPrevRenderedPeaks.length; i++) {{
+        const prev = _wulffPrevRenderedPeaks[i];
+        prev._wulff_sx = undefined;
+        prev._wulff_sy = undefined;
+        prev._wulff_friedel_sx = undefined;
+        prev._wulff_friedel_sy = undefined;
+      }}
+      _wulffPrevRenderedPeaks = [];
+      const emptyVal = {{
+        visiblePeaks: uniquePeaks,
+        observedHklSet: pool.observedHklSet,
+        lodDcut: activeDmin,
+        activeDmin,
+        isLodThinned: false,
+        totalUnique: 0,
+        inCapCount: 0,
+      }};
+      _wulffLodCache.sig = lodSig;
+      _wulffLodCache.firstRef = firstRef;
+      _wulffLodCache.value = emptyVal;
+      return emptyVal;
+    }}
+
+    const bvhSig = `${{pool.sig}}|${{zonesKey}}`;
+    if (_wulffBvhCache.sig !== bvhSig || _wulffBvhCache.firstRef !== firstRef || !_wulffBvhCache.bvh) {{
+      _wulffBvhCache.sig = bvhSig;
+      _wulffBvhCache.firstRef = firstRef;
+      _wulffBvhCache.bvh = buildWulffSphericalBVH(uniquePeaks);
+    }}
+    const bvh = _wulffBvhCache.bvh;
+
+    // Camera forward vector in crystal space (matches projectToWulff exactly: D = 2.6, kD = 2.4)
+    const yawRad = yawDeg * Math.PI / 180.0;
+    const pitchRad = pitchDeg * Math.PI / 180.0;
+    const cp = Math.cos(pitchRad), sp = Math.sin(pitchRad);
+    const fwdLab0 = Math.sin(yawRad) * cp;
+    const fwdLab1 = sp;
+    const fwdLab2 = Math.cos(yawRad) * cp;
+    const fwdCx = Rg[0][0] * fwdLab0 + Rg[1][0] * fwdLab1 + Rg[2][0] * fwdLab2;
+    const fwdCy = Rg[0][1] * fwdLab0 + Rg[1][1] * fwdLab1 + Rg[2][1] * fwdLab2;
+    const fwdCz = Rg[0][2] * fwdLab0 + Rg[1][2] * fwdLab1 + Rg[2][2] * fwdLab2;
+
+    const useCapCull = wZoom > 1.45;
+    let zCapMin = -1.0;
+    if (useCapCull) {{
+      const uCap = (1.48 / wZoom) / 2.4;
+      const u2 = uCap * uCap;
+      zCapMin = Math.max(-1.0, (2.6 * u2 + Math.sqrt(Math.max(0.0, 1.0 - 5.76 * u2))) / (1.0 + u2) - 0.04);
+    }}
+
+    const baseCellPx = isExp ? 18.0 : 21.0;
+    const cellPx = wZoom >= 14.0
+      ? 0.0
+      : (wZoom <= 5.0 ? baseCellPx : baseCellPx * ((14.0 - wZoom) / 9.0));
+
+    const {{
+      n, qxArr, qyArr, qzArr, dArr,
+      leftChild, rightChild, cxArr, cyArr, czArr, rChord, canRadius, maxD, repIdx, subCount,
+    }} = bvh;
+    let stack = bvh.stack;
+    let spIdx = 0;
+    stack[spIdx++] = 0;
+
+    const keptMask = new Uint8Array(n);
+    const outIndices = [];
+    let inCapCount = 0;
+    let stoppedAny = false;
+    let minKeptD = Infinity;
+
+    while (spIdx > 0) {{
+      const u = stack[--spIdx];
+      if (maxD[u] < activeDmin - 1e-5) continue;
+
+      const zCenter = cxArr[u] * fwdCx + cyArr[u] * fwdCy + czArr[u] * fwdCz;
+      const rc = rChord[u];
+      const zBest = (withFriedel ? Math.abs(zCenter) : zCenter) + rc;
+      if (useCapCull && zBest < zCapMin) continue;
+      const whollyInCap = !useCapCull || ((withFriedel ? Math.abs(zCenter) : zCenter) - rc >= zCapMin);
+
+      const L = leftChild[u];
+      if (L < 0) {{
+        const pIdx = repIdx[u];
+        const dv = dArr[pIdx];
+        if (dv < activeDmin - 1e-5) continue;
+        if (useCapCull) {{
+          const zp = qxArr[pIdx] * fwdCx + qyArr[pIdx] * fwdCy + qzArr[pIdx] * fwdCz;
+          if ((withFriedel ? Math.abs(zp) : zp) < zCapMin) continue;
+        }}
+        inCapCount += 1;
+        if (!keptMask[pIdx]) {{
+          keptMask[pIdx] = 1;
+          outIndices.push(pIdx);
+          if (dv < minKeptD) minKeptD = dv;
+        }}
+        continue;
+      }}
+
+      const zNear = Math.min(1.0, zBest);
+      const pxScale = (2.4 * R * wZoom) / Math.max(0.5, 2.6 - zNear);
+      const diamPx = 2.0 * Math.max(rc, canRadius[u]) * pxScale;
+      if (cellPx > 0.0 && whollyInCap && diamPx <= cellPx) {{
+        const pIdx = repIdx[u];
+        inCapCount += subCount[u];
+        if (subCount[u] > 1) stoppedAny = true;
+        if (!keptMask[pIdx]) {{
+          keptMask[pIdx] = 1;
+          outIndices.push(pIdx);
+          const dv = dArr[pIdx];
+          if (dv < minKeptD) minKeptD = dv;
+        }}
+        continue;
+      }}
+
+      if (spIdx + 2 >= stack.length) {{
+        const bigger = new Int32Array(stack.length * 2);
+        bigger.set(stack);
+        stack = bigger;
+        bvh.stack = bigger;
+      }}
+      stack[spIdx++] = rightChild[u];
+      stack[spIdx++] = L;
+    }}
+
+    const activeOrb = state.activeOrbitId;
+    if (state.hoveredPeakId !== null || state.selectedPeakId !== null || state.hoveredPeakObj || state.selectedPeakObj || activeOrb) {{
+      for (let i = 0; i < n; i++) {{
+        if (keptMask[i]) continue;
+        const p = uniquePeaks[i];
+        if (
+          isPeakHighlightedTarget(p) ||
+          Boolean(activeOrb && p.asu_orbit_id && p.asu_orbit_id === activeOrb)
+        ) {{
+          keptMask[i] = 1;
+          outIndices.push(i);
+        }}
+      }}
+    }}
+
+    for (let i = 0; i < _wulffPrevRenderedPeaks.length; i++) {{
+      const prev = _wulffPrevRenderedPeaks[i];
+      prev._wulff_sx = undefined;
+      prev._wulff_sy = undefined;
+      prev._wulff_friedel_sx = undefined;
+      prev._wulff_friedel_sy = undefined;
+    }}
+
+    const visiblePeaks = new Array(outIndices.length);
+    for (let k = 0; k < outIndices.length; k++) {{
+      visiblePeaks[k] = uniquePeaks[outIndices[k]];
+    }}
+    _wulffPrevRenderedPeaks = visiblePeaks;
+
+    const isLodThinned = Boolean(stoppedAny && visiblePeaks.length < inCapCount);
+    const resVal = {{
+      visiblePeaks,
+      observedHklSet: pool.observedHklSet,
+      lodDcut: Number.isFinite(minKeptD) ? minKeptD : activeDmin,
+      activeDmin,
+      isLodThinned,
+      totalUnique: uniquePeaks.length,
+      inCapCount,
+    }};
+    _wulffLodCache.sig = lodSig;
+    _wulffLodCache.firstRef = firstRef;
+    _wulffLodCache.value = resVal;
+    return resVal;
+  }}
+
   // Render Convex 3D Wulff Sphere (Corner Inset or Expanded Popout)
-  function renderStereoInset() {{
+  function renderStereoInset(forceRedraw) {{
     if (!state.showStereo) return;
     const rect = stereoCanvas.getBoundingClientRect();
     if (rect.width < 20 || rect.height < 20) return;
     const dpr = window.devicePixelRatio || 1;
     const targetW = Math.round(rect.width * dpr);
     const targetH = Math.round(rect.height * dpr);
+    const Rg = getActiveGoniometerR();
+    const hovRef = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
+    const selRef = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
+    const zonesKey = state.showZoneArcs ? Array.from(state.activeZones).join(",") : "off";
+    const wulffHolzKey = (state.showZoneArcs && state.holzOrders instanceof Set && state.holzOrders.size > 0)
+      ? Array.from(state.holzOrders).sort().join(",")
+      : "0";
+    const srcArr = (state.wulffScope === "all_runs" && SAMPLE_PEAKS.length > 0) ? SAMPLE_PEAKS : PEAKS;
+    const renderSig = [
+      targetW, targetH,
+      (state.wulffYawDeg || 0).toFixed(3),
+      (state.wulffPitchDeg || 0).toFixed(3),
+      (state.wulffZoom || 1).toFixed(4),
+      state.wulffExpanded ? 1 : 0,
+      state.wulffScope,
+      state.wulffColorMode,
+      getColorCrossover().toFixed(3),
+      state.showWulffFriedel ? 1 : 0,
+      state.showNodalPoints ? 1 : 0,
+      wulffHolzKey,
+      state.peakSource,
+      state.peakColorMode,
+      state.dMin,
+      state.lamMin,
+      state.lamMax,
+      state.showUncertainPeaks ? 1 : 0,
+      state.selectedZoneId,
+      state.hoveredZoneId !== null && state.hoveredZoneId !== undefined ? `${{state.hoveredZoneId}}:${{state.hoveredZoneHolzN || 0}}` : "",
+      state.hoveredNodalKey || "",
+      zonesKey,
+      hovRef,
+      selRef,
+      state.activeOrbitId || "",
+      srcArr.length,
+      ZONES.length,
+      typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0,
+      Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[2][0].toFixed(5), Rg[2][2].toFixed(5),
+    ].join("|");
+    if (
+      !forceRedraw &&
+      renderSig === _lastWulffRenderSig &&
+      stereoCanvas.width === targetW &&
+      stereoCanvas.height === targetH
+    ) {{
+      return;
+    }}
+    _lastWulffRenderSig = renderSig;
     if (stereoCanvas.width !== targetW || stereoCanvas.height !== targetH) {{
       stereoCanvas.width = targetW;
       stereoCanvas.height = targetH;
@@ -8155,7 +21358,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const zoom = state.wulffZoom || 1.0;
     const rSphere = R * Math.min(zoom, 1.35);
     const isExp = Boolean(state.wulffExpanded);
-    const Rg = getActiveGoniometerR();
     const RgT = mat3T(Rg);
 
     ctx.save();
@@ -8216,12 +21418,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
     ctx.restore();
 
-    // Draw zone great-circle conics directly from 3D Sample-frame zone axis normal
+    // Draw zone great-circle conics (+ optional HOLZ small circles) directly from 3D Sample-frame zone axis normal
     if (state.showZoneArcs) {{
       ctx.save();
+      const hasWulffHolz = state.holzOrders instanceof Set && state.holzOrders.size > 0;
+      const wHolzOrders = hasWulffHolz ? Array.from(state.holzOrders).filter(n => n > 0).sort((a, b) => a - b) : [];
+      const dCutW = Math.max(0.15, Number(state.dMin) || 0.8);
       ZONES.forEach(zone => {{
         if (!state.activeZones.has(zone.zone_id)) return;
-        const isSel = state.selectedZoneId === zone.zone_id;
+        const isSel = state.selectedZoneId === zone.zone_id || state.hoveredZoneId === zone.zone_id;
         const lw = isSel ? (isExp ? 2.5 : 2.1) : (isExp ? 1.45 : 1.15);
         const tCryst = Array.isArray(zone.axis_crystal_xyz) && zone.axis_crystal_xyz.length === 3
           ? zone.axis_crystal_xyz
@@ -8238,99 +21443,301 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }},
             96, isSel ? 0.92 : 0.72, isSel ? 0.35 : 0.20, zone.rainbow_color, lw, true
           );
+          if (hasWulffHolz && typeof zone.d_direct === "number" && zone.d_direct > 1e-3) {{
+            for (let oi = 0; oi < wHolzOrders.length; oi++) {{
+              const absN = wHolzOrders[oi];
+              const cHolz = (absN * dCutW) / zone.d_direct;
+              if (cHolz >= 0.98) continue;
+              const sHolz = Math.sqrt(Math.max(0.0, 1.0 - cHolz * cHolz));
+              [1, -1].forEach(sgn => {{
+                const cz = sgn * cHolz;
+                strokeSphereCircle(
+                  ang => {{
+                    const ca = Math.cos(ang), sa = Math.sin(ang);
+                    return [
+                      cz * tAxis[0] + sHolz * (ca * e1[0] + sa * e2[0]),
+                      cz * tAxis[1] + sHolz * (ca * e1[1] + sa * e2[1]),
+                      cz * tAxis[2] + sHolz * (ca * e1[2] + sa * e2[2]),
+                    ];
+                  }},
+                  72, isSel ? 0.65 : 0.42, 0.12, zone.rainbow_color, Math.max(0.85, lw * 0.72), true
+                );
+              }});
+            }}
+          }}
         }}
       }});
       ctx.restore();
     }}
 
-    const wPeaks = getActiveWulffPeaks();
+    // Draw principal {{a*, b*, c*}} nodal poles on the 3D Wulff Sphere when showNodalPoints is enabled
+    if (Boolean(state.showNodalPoints) && typeof getVisibleNodalPoints === "function") {{
+      const wNodals = getVisibleNodalPoints();
+      ctx.save();
+      for (let ni = 0; ni < wNodals.length; ni++) {{
+        const nd = wNodals[ni];
+        if (!nd.isPrincipal || !Array.isArray(nd.gCrystUnit)) continue;
+        const [nsx, nsy, nhemi] = projectToWulff(nd.gCrystUnit, cx, cy, R);
+        const dxN = nsx - cx, dyN = nsy - cy;
+        if (dxN * dxN + dyN * dyN > (rSphere + 6.0) * (rSphere + 6.0)) continue;
+        const isHovN = state.hoveredNodalKey !== null && state.hoveredNodalKey === nd.key;
+        const nr = isExp ? (isHovN ? 7.5 : 6.2) : (isHovN ? 5.8 : 4.8);
+        ctx.globalAlpha = nhemi >= 0 ? 0.96 : 0.36;
+        ctx.beginPath();
+        ctx.arc(nsx, nsy, nr, 0, Math.PI * 2);
+        ctx.strokeStyle = isHovN ? "#ffffff" : "#fbbf24";
+        ctx.lineWidth = isExp ? 1.8 : 1.4;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(nsx, nsy, isExp ? 2.1 : 1.6, 0, Math.PI * 2);
+        ctx.fillStyle = "#fbbf24";
+        ctx.fill();
+        if ((isExp || nhemi >= 0) && nd.principalBase) {{
+          const bPx = isExp ? 9.5 : 8.0;
+          const sPx = isExp ? 7.5 : 6.4;
+          ctx.fillStyle = "#070913";
+          drawPrincipalStarSymbol(ctx, nd.principalBase, nsx + nr + 3, nsy + 3, bPx, sPx);
+          ctx.fillStyle = "#fbbf24";
+          drawPrincipalStarSymbol(ctx, nd.principalBase, nsx + nr + 2, nsy + 2, bPx, sPx);
+        }}
+      }}
+      ctx.restore();
+    }}
+
+    const lodState = getWulffLodState(isExp);
+    const wPeaks = lodState.visiblePeaks;
+    const observedHklSet = lodState.observedHklSet;
     const orbitMates = [];
     const hoveredTargets = [];
+    const clipR2 = (rSphere + 10.0) * (rSphere + 10.0);
+    for (let i = 0; i < wPeaks.length; i++) {{
+      const p = wPeaks[i];
+      p._wulff_friedel_sx = undefined;
+      p._wulff_friedel_sy = undefined;
+      p._wulff_friedel_hemi = undefined;
+    }}
 
-    // Project all peaks in Sample frame and sort back-to-front by camera depth zCam so closer peaks render on top
-    const projectedPeaks = wPeaks.map(p => {{
+    // Project direct peaks (+g) AND optional antipodal Friedel mates (-g for (-h,-k,-l) when not already observed),
+    // sorting back-to-front by camera depth zCam so closer peaks render cleanly on top.
+    const projectedPeaks = [];
+    for (let i = 0; i < wPeaks.length; i++) {{
+      const p = wPeaks[i];
       const gVec = Array.isArray(p.q_hat) ? p.q_hat : mat3Vec(RgT, p.q_hat_lab || [0, 0, 1]);
       const [sx, sy, hemi, zCam, dotScale] = projectToWulff(gVec, cx, cy, R);
       p._wulff_sx = sx;
       p._wulff_sy = sy;
       p._wulff_hemi = hemi;
-      return {{ p, sx, sy, hemi, zCam, dotScale }};
-    }});
+      const baseParity = p.asu_friedel ? 1 : 0;
+      const dispHkl = Array.isArray(p.hkl) && p.hkl.length === 3 ? p.hkl : [0, 0, 0];
+      const isSpecial = isPeakHighlightedTarget(p) || Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
+      const dx0 = sx - cx, dy0 = sy - cy;
+      if (dx0 * dx0 + dy0 * dy0 <= clipR2 || isSpecial) {{
+        projectedPeaks.push({{
+          p,
+          sx,
+          sy,
+          hemi,
+          zCam,
+          dotScale,
+          isFriedelGhost: false,
+          friedelParity: baseParity,
+          displayHkl: dispHkl,
+        }});
+      }}
+      if (state.showWulffFriedel && Array.isArray(p.hkl) && p.hkl.length === 3 && (p.hkl[0] || p.hkl[1] || p.hkl[2])) {{
+        const fh = -p.hkl[0], fk = -p.hkl[1], fl = -p.hkl[2];
+        if (!observedHklSet.has(`${{fh}},${{fk}},${{fl}}`)) {{
+          const [fsx, fsy, fhemi, fzCam, fdotScale] = projectToWulff([-gVec[0], -gVec[1], -gVec[2]], cx, cy, R);
+          p._wulff_friedel_sx = fsx;
+          p._wulff_friedel_sy = fsy;
+          p._wulff_friedel_hemi = fhemi;
+          const fdx = fsx - cx, fdy = fsy - cy;
+          if (fdx * fdx + fdy * fdy <= clipR2 || isSpecial) {{
+            projectedPeaks.push({{
+              p,
+              sx: fsx,
+              sy: fsy,
+              hemi: fhemi,
+              zCam: fzCam,
+              dotScale: fdotScale,
+              isFriedelGhost: true,
+              friedelParity: 1 - baseParity,
+              displayHkl: [fh, fk, fl],
+            }});
+          }}
+        }}
+      }}
+    }}
     projectedPeaks.sort((a, b) => a.zCam - b.zCam);
 
-    projectedPeaks.forEach(({{ p, sx, sy, hemi, dotScale }}) => {{
+    ctx.save();
+    for (let i = 0; i < projectedPeaks.length; i++) {{
+      const {{ p, sx, sy, hemi, dotScale, isFriedelGhost, friedelParity, displayHkl }} = projectedPeaks[i];
       const captured = isPeakCapturedByActiveZone(p) || state.wulffScope === "all_runs";
       const isHovered = isPeakHighlightedTarget(p);
       const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
-      if (isOrbitMate) orbitMates.push([sx, sy, p, dotScale]);
-      if (isHovered) hoveredTargets.push([sx, sy, p, dotScale, hemi]);
+      if (isOrbitMate) orbitMates.push({{ sx, sy, p, dotScale, isFriedelGhost, friedelParity, displayHkl }});
+      if (isHovered && !isFriedelGhost) hoveredTargets.push([sx, sy, p, dotScale, hemi]);
 
       const baseDot = (isExp ? (captured ? 3.8 : 2.6) : (captured ? 2.5 : 1.75)) * dotScale;
-      const rDot = isHovered ? baseDot + 2.8 : (isOrbitMate ? baseDot + 1.6 : baseDot);
-      const alphaBase = hemi >= 0 ? (captured ? 0.94 : 0.52) : (captured ? 0.55 : 0.28);
-      const col = isHovered ? "#f43f85" : peakStrokeColor(p, alphaBase);
+      const rDot = isHovered ? baseDot + (isFriedelGhost ? 2.2 : 2.8) : (isOrbitMate ? baseDot + 1.5 : baseDot);
+      const isIsigiModeW = state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi";
+      const alphaBase = isFriedelGhost
+        ? (hemi >= 0 ? (captured ? 0.78 : 0.42) : (captured ? 0.38 : 0.20))
+        : (hemi >= 0 ? (captured ? (isIsigiModeW ? 1.0 : 0.94) : 0.52) : (captured ? 0.58 : 0.28));
+      const col = isHovered
+        ? (isFriedelGhost ? "#e879f9" : "#f43f85")
+        : peakStrokeColor(p, alphaBase);
+      if (!isHovered && !isOrbitMate && col.endsWith(", 0.000)")) {{
+        continue;
+      }}
 
-      ctx.save();
-      ctx.beginPath();
-      ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
-      if (hemi < 0) {{
-        // Back hemisphere (further from viewer): smaller open hollow circle
+      if (isFriedelGhost) {{
+        // Antipodal Friedel mate (-h,-k,-l) at -g: diamond marker ◇ populating the q_z > 0 hemisphere
+        const dRad = rDot * 1.18;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy - dRad);
+        ctx.lineTo(sx + dRad, sy);
+        ctx.lineTo(sx, sy + dRad);
+        ctx.lineTo(sx - dRad, sy);
+        ctx.closePath();
+        if (hemi >= 0) {{
+          ctx.fillStyle = peakStrokeColor(p, alphaBase * 0.36);
+          ctx.fill();
+        }}
         ctx.strokeStyle = col;
         ctx.lineWidth = (isExp ? 1.45 : 1.1) * Math.max(0.75, dotScale);
         ctx.stroke();
       }} else {{
-        // Front hemisphere (closer to viewer): larger filled circle
-        ctx.fillStyle = col;
-        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
+        if (hemi < 0) {{
+          // Back hemisphere (further from viewer): smaller open hollow circle
+          ctx.strokeStyle = col;
+          ctx.lineWidth = (isExp ? 1.45 : 1.1) * Math.max(0.75, dotScale);
+          ctx.stroke();
+        }} else {{
+          // Front hemisphere (closer to viewer): larger filled circle
+          ctx.fillStyle = col;
+          ctx.fill();
+        }}
       }}
 
-      // Harmonic Overlap Bullseye: concentric outer ring when harmonic_multiplicity > 1 or harmonic_order > 1
-      const harmMult = p.harmonic_multiplicity || p.harmonic_order || 1;
-      if (harmMult > 1) {{
+      // Harmonic Overlap Bullseye: concentric outer ring when harmonic_multiplicity > 1
+      const harmMult = p.harmonic_multiplicity || 1;
+      if (harmMult > 1 && !isFriedelGhost) {{
         ctx.beginPath();
         ctx.arc(sx, sy, rDot + (isExp ? 3.0 : 2.1) * dotScale, 0, Math.PI * 2);
         ctx.strokeStyle = isOrbitMate ? "#fbbf24" : col;
         ctx.lineWidth = (isExp ? 1.25 : 0.9) * Math.max(0.75, dotScale);
         ctx.stroke();
       }}
-      ctx.restore();
-    }});
+    }}
+    ctx.restore();
 
-    // Symmetry Starburst: connect all symmetry-equivalent observations sharing activeOrbitId
+    // Symmetry Starburst: connect all symmetry-equivalent mates sharing activeOrbitId,
+    // distinguishing point-group mates (Gold/Cyan), observed acentric Bijvoet mates (Pink #ff4db8),
+    // and virtual antipodal -g Friedel ghosts (Violet #e879f9)!
     if (orbitMates.length > 0) {{
+      const refPeak = getActiveOrbitReferencePeak();
+      const refParity = (refPeak && refPeak.asu_orbit_id === state.activeOrbitId)
+        ? (refPeak.asu_friedel ? 1 : 0)
+        : orbitMates[0].friedelParity;
+      let nProper = 0;
+      let nBijvoet = 0;
+      let nFriedel = 0;
       ctx.save();
-      orbitMates.forEach(([mx, my, mp]) => {{
+      if (
+        refPeak &&
+        typeof refPeak._wulff_sx === "number" &&
+        typeof refPeak._wulff_friedel_sx === "number"
+      ) {{
+        // Subtle direct antipodal chord linking (+h,+k,+l) <-> (-h,-k,-l) across the sphere
+        ctx.beginPath();
+        ctx.moveTo(refPeak._wulff_sx, refPeak._wulff_sy);
+        ctx.lineTo(refPeak._wulff_friedel_sx, refPeak._wulff_friedel_sy);
+        ctx.strokeStyle = "rgba(232, 121, 249, 0.55)";
+        ctx.lineWidth = isExp ? 1.35 : 1.0;
+        ctx.setLineDash([2, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }}
+      orbitMates.forEach((mate) => {{
+        const {{ sx: mx, sy: my, p: mp, isFriedelGhost, friedelParity, displayHkl }} = mate;
+        const isObservedBijvoet = !isFriedelGhost && (!refPeak || !isSameReflection(mp, refPeak)) && isBijvoetMatePair(refPeak, mp);
+        const isGhostOrImproper = !isObservedBijvoet && (isFriedelGhost || (friedelParity !== refParity));
+        if (isObservedBijvoet) nBijvoet += 1;
+        else if (isFriedelGhost) nFriedel += 1;
+        else nProper += 1;
+        const linkStroke = isObservedBijvoet
+          ? "rgba(255, 77, 184, 0.90)"
+          : (isGhostOrImproper ? "rgba(232, 121, 249, 0.72)" : "rgba(251, 191, 36, 0.65)");
+        const ringStroke = isObservedBijvoet
+          ? "#ff4db8"
+          : (isFriedelGhost ? "#e879f9" : "#00e5ff");
+        const lblFill = isObservedBijvoet
+          ? "#ff7ad9"
+          : (isFriedelGhost ? "#e879f9" : "#fbbf24");
+
         ctx.beginPath();
         ctx.moveTo(cx, cy);
         ctx.lineTo(mx, my);
-        ctx.strokeStyle = "rgba(251, 191, 36, 0.58)";
-        ctx.lineWidth = isExp ? 1.5 : 1.1;
-        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = linkStroke;
+        ctx.lineWidth = isObservedBijvoet ? (isExp ? 1.85 : 1.35) : (isExp ? 1.55 : 1.15);
+        ctx.setLineDash(isObservedBijvoet ? [] : (isGhostOrImproper ? [5, 3] : [3, 3]));
         ctx.stroke();
         ctx.setLineDash([]);
 
+        const rRing = isObservedBijvoet ? (isExp ? 7.2 : 5.2) : (isExp ? 6.5 : 4.5);
         ctx.beginPath();
-        ctx.arc(mx, my, isExp ? 6.5 : 4.5, 0, Math.PI * 2);
-        ctx.strokeStyle = "#00e5ff";
-        ctx.lineWidth = 1.6;
+        if (isFriedelGhost) {{
+          ctx.moveTo(mx, my - rRing * 1.15);
+          ctx.lineTo(mx + rRing * 1.15, my);
+          ctx.lineTo(mx, my + rRing * 1.15);
+          ctx.lineTo(mx - rRing * 1.15, my);
+          ctx.closePath();
+        }} else {{
+          ctx.arc(mx, my, rRing, 0, Math.PI * 2);
+        }}
+        ctx.strokeStyle = ringStroke;
+        ctx.lineWidth = isObservedBijvoet ? 2.0 : 1.6;
         ctx.stroke();
 
         if (isExp) {{
-          const resTxt = typeof mp.careless_residual === "number"
+          const resTxt = (!isFriedelGhost && typeof mp.careless_residual === "number")
             ? ` ${{mp.careless_residual >= 0 ? "+" : ""}}${{mp.careless_residual.toFixed(1)}}σ`
-            : "";
-          const lbl = `(${{mp.hkl.join(",")}})${{resTxt}}`;
+            : (isFriedelGhost ? " [-g]" : "");
+          const bijTxt = isObservedBijvoet ? " [Bijvoet]" : "";
+          const lbl = `(${{displayHkl.join(",")}})${{bijTxt}}${{resTxt}}`;
           ctx.font = "bold 10px monospace";
           ctx.fillStyle = "#070913";
           ctx.fillText(lbl, mx + 8, my - 4);
-          ctx.fillStyle = "#fbbf24";
+          ctx.fillStyle = lblFill;
           ctx.fillText(lbl, mx + 7, my - 5);
         }}
       }});
       if (isExp && state.activeOrbitId) {{
         ctx.font = "bold 11px monospace";
         ctx.fillStyle = "#00e5ff";
-        ctx.fillText(`ASU Orbit [${{state.activeOrbitId}}] • ${{orbitMates.length}} symmetry mates`, 14, h - 12);
+        const legendX = 14;
+        const legendY = h - 12;
+        const prefix = `ASU [${{state.activeOrbitId}}] • `;
+        ctx.fillText(prefix, legendX, legendY);
+        let curX = legendX + ctx.measureText(prefix).width;
+        const propTxt = `${{nProper}} point-group (gold/cyan)`;
+        ctx.fillStyle = "#fbbf24";
+        ctx.fillText(propTxt, curX, legendY);
+        curX += ctx.measureText(propTxt).width;
+        if (nBijvoet > 0) {{
+          const bijLegend = ` • ${{nBijvoet}} Bijvoet (pink)`;
+          ctx.fillStyle = "#ff7ad9";
+          ctx.fillText(bijLegend, curX, legendY);
+          curX += ctx.measureText(bijLegend).width;
+        }}
+        if (nFriedel > 0) {{
+          ctx.fillStyle = "#e879f9";
+          ctx.fillText(` • ${{nFriedel}} -g Friedel (violet)`, curX, legendY);
+        }}
       }}
       ctx.restore();
     }}
@@ -8342,8 +21749,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const rRet = isExp ? 10.0 : 7.5;
         ctx.beginPath();
         ctx.arc(tx, ty, rRet, 0, Math.PI * 2);
-        ctx.strokeStyle = "#f43f85";
-        ctx.lineWidth = 2.2;
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 2.1;
         ctx.stroke();
 
         ctx.beginPath();
@@ -8368,18 +21775,68 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     ctx.restore();
+
+    const cornerBadges = [];
+    if (isWulffSnrCutActive()) {{
+      cornerBadges.push({{
+        txt: `I/σ ≥ ${{WULFF_ALL_RUNS_MIN_ISIGI}}`,
+        stroke: "rgba(56, 189, 248, 0.48)",
+        fill: "#38bdf8",
+      }});
+    }}
+    if (lodState.isLodThinned) {{
+      const inC = typeof lodState.inCapCount === "number" ? lodState.inCapCount : lodState.totalUnique;
+      const dLbl = typeof lodState.activeDmin === "number" ? lodState.activeDmin.toFixed(2) : "1.00";
+      cornerBadges.push({{
+        txt: isExp
+          ? `LOD ${{lodState.visiblePeaks.length}}/${{inC}} spots (d ≥ ${{dLbl}}Å • zoom+)`
+          : `LOD ${{lodState.visiblePeaks.length}}/${{inC}} (zoom+)`,
+        stroke: "rgba(251, 191, 36, 0.48)",
+        fill: "#fbbf24",
+      }});
+    }}
+    if (cornerBadges.length > 0) {{
+      ctx.save();
+      ctx.font = isExp ? "bold 10px monospace" : "bold 8.5px monospace";
+      const bh = isExp ? 17 : 14;
+      let by = 8;
+      for (let bi = 0; bi < cornerBadges.length; bi++) {{
+        const b = cornerBadges[bi];
+        const tw = ctx.measureText(b.txt).width;
+        const bx = 8;
+        const bw = tw + 10;
+        ctx.fillStyle = "rgba(7, 9, 19, 0.84)";
+        ctx.strokeStyle = b.stroke;
+        ctx.lineWidth = 1.0;
+        ctx.beginPath();
+        if (typeof ctx.roundRect === "function") {{
+          ctx.roundRect(bx, by, bw, bh, 4);
+        }} else {{
+          ctx.rect(bx, by, bw, bh);
+        }}
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = b.fill;
+        ctx.fillText(b.txt, bx + 5, by + (isExp ? 12 : 10));
+        by += bh + 3;
+      }}
+      ctx.restore();
+    }}
   }}
 
   function findNearestPeakDetector(mx, my) {{
     const rect = detCanvas.getBoundingClientRect();
+    const detLod = getDetectorLodState(rect.width, rect.height);
+    const activePeaks = detLod.visiblePeaks;
     let best = null;
     let bestDist = 14.0;
     const fgLayer = 0.45;
     const azShifts = [-360.0, 0.0, 360.0];
-    PEAKS.forEach(p => {{
-      if (!isPeakVisible(p)) return;
+    for (let i = 0; i < activePeaks.length; i++) {{
+      const p = activePeaks[i];
       const py = getPeakVert(p);
-      azShifts.forEach(shiftAz => {{
+      for (let s = 0; s < azShifts.length; s++) {{
+        const shiftAz = azShifts[s];
         const [x, y] = detToScreen(p.det_x + shiftAz, py, rect.width, rect.height, fgLayer);
         const [bx, by] = detToScreen(p.det_x + shiftAz, py, rect.width, rect.height, -0.35);
         const d = Math.min(Math.hypot(mx - x, my - y), Math.hypot(mx - bx, my - by));
@@ -8387,41 +21844,155 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           bestDist = d;
           best = p;
         }}
-      }});
-    }});
+      }}
+    }}
+    return best;
+  }}
+
+  function findNearestNodalDetector(mx, my) {{
+    if (!state.showNodalPoints || !Array.isArray(_detNodalScreenHits) || _detNodalScreenHits.length === 0) {{
+      return null;
+    }}
+    let best = null;
+    let bestNormDist = 1e9;
+    for (let i = 0; i < _detNodalScreenHits.length; i++) {{
+      const item = _detNodalScreenHits[i];
+      const d = Math.hypot(mx - item.x, my - item.y);
+      if (d <= item.r + 3.0) {{
+        const score = d - (item.nodal.isPrincipal ? 1.5 : 0.0);
+        if (score < bestNormDist) {{
+          bestNormDist = score;
+          best = {{ nodal: item.nodal, x: item.x, y: item.y, r: item.r, dist: d }};
+        }}
+      }}
+    }}
+    return best;
+  }}
+
+  function findNearestZoneArcDetector(mx, my) {{
+    if (!state.showZoneArcs || !Array.isArray(_detZoneArcScreenSegs) || _detZoneArcScreenSegs.length === 0) {{
+      return null;
+    }}
+    let best = null;
+    let bestDist = 7.5;
+    for (let i = 0; i < _detZoneArcScreenSegs.length; i++) {{
+      const item = _detZoneArcScreenSegs[i];
+      const pts = item.pts;
+      for (let j = 0; j + 1 < pts.length; j++) {{
+        const x1 = pts[j][0], y1 = pts[j][1];
+        const x2 = pts[j + 1][0], y2 = pts[j + 1][1];
+        const minX = Math.min(x1, x2) - bestDist;
+        const maxX = Math.max(x1, x2) + bestDist;
+        if (mx < minX || mx > maxX) continue;
+        const minY = Math.min(y1, y2) - bestDist;
+        const maxY = Math.max(y1, y2) + bestDist;
+        if (my < minY || my > maxY) continue;
+        const vx = x2 - x1, vy = y2 - y1;
+        const len2 = vx * vx + vy * vy;
+        let t = len2 > 1e-6 ? ((mx - x1) * vx + (my - y1) * vy) / len2 : 0.0;
+        if (t < 0.0) t = 0.0;
+        else if (t > 1.0) t = 1.0;
+        const px = x1 + t * vx;
+        const py = y1 + t * vy;
+        const d = Math.hypot(mx - px, my - py);
+        if (d < bestDist) {{
+          bestDist = d;
+          best = {{ zone: item.zone, holzN: item.holzN || 0, lam: item.lam || null, x: px, y: py, dist: d }};
+        }}
+      }}
+    }}
     return best;
   }}
 
   function findNearestPeakWulff(mx, my) {{
     let best = null;
     let bestDist = state.wulffExpanded ? 14.0 : 10.0;
-    const wPeaks = getActiveWulffPeaks();
-    wPeaks.forEach(p => {{
-      if (typeof p._wulff_sx !== "number" || typeof p._wulff_sy !== "number") return;
-      const d = Math.hypot(mx - p._wulff_sx, my - p._wulff_sy);
-      if (d < bestDist) {{
-        bestDist = d;
-        best = p;
+    const wPeaks = getWulffLodState(Boolean(state.wulffExpanded)).visiblePeaks;
+    for (let i = 0; i < wPeaks.length; i++) {{
+      const p = wPeaks[i];
+      if (typeof p._wulff_sx === "number" && typeof p._wulff_sy === "number") {{
+        const d = Math.hypot(mx - p._wulff_sx, my - p._wulff_sy);
+        if (d < bestDist) {{
+          bestDist = d;
+          best = p;
+        }}
       }}
-    }});
+      if (
+        state.showWulffFriedel &&
+        typeof p._wulff_friedel_sx === "number" &&
+        typeof p._wulff_friedel_sy === "number"
+      ) {{
+        const df = Math.hypot(mx - p._wulff_friedel_sx, my - p._wulff_friedel_sy);
+        if (df < bestDist) {{
+          bestDist = df;
+          best = p;
+        }}
+      }}
+    }}
     return best;
   }}
 
   // Mouse & Wheel interactions on Detector Canvas (with Google-Earth 360° periodic coupling)
   let isPanningDet = false;
   let panStart = [0, 0];
+  let lastPointerNorm = null;
+
+  // Parallax activates ONLY while holding a keyboard modifier key (never on mouse-button pan/drag)
+  function isParallaxTriggerActive(ev) {{
+    if (isPanningDet || isDraggingWulff || !ev || (ev.buttons && ev.buttons !== 0)) {{
+      return false;
+    }}
+    return Boolean(ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey);
+  }}
+
   detCanvas.addEventListener("mousedown", (ev) => {{
     isPanningDet = true;
     panStart = [ev.clientX - state.detPanX, ev.clientY - state.detPanY];
+    state.targetParallaxX = 0.0;
+    state.targetParallaxY = 0.0;
   }});
-  window.addEventListener("mouseup", () => {{ isPanningDet = false; isDraggingWulff = false; }});
+  window.addEventListener("mouseup", (ev) => {{
+    isPanningDet = false;
+    isDraggingWulff = false;
+    if (!isParallaxTriggerActive(ev)) {{
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
+    }}
+  }});
+  window.addEventListener("keydown", (ev) => {{
+    if (lastPointerNorm && isParallaxTriggerActive(ev)) {{
+      state.targetParallaxX = lastPointerNorm[0];
+      state.targetParallaxY = lastPointerNorm[1];
+    }}
+  }});
+  window.addEventListener("keyup", (ev) => {{
+    if (!isParallaxTriggerActive(ev)) {{
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
+    }}
+  }});
+  window.addEventListener("blur", () => {{
+    isPanningDet = false;
+    isDraggingWulff = false;
+    lastPointerNorm = null;
+    state.targetParallaxX = 0.0;
+    state.targetParallaxY = 0.0;
+  }});
 
   detCanvas.addEventListener("mousemove", (ev) => {{
     const rect = detCanvas.getBoundingClientRect();
     const mx = ev.clientX - rect.left;
     const my = ev.clientY - rect.top;
-    state.targetParallaxX = ((mx / rect.width) - 0.5) * 2.0;
-    state.targetParallaxY = ((my / rect.height) - 0.5) * 2.0;
+    const nx = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
+    const ny = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
+    lastPointerNorm = [nx, ny];
+    if (isParallaxTriggerActive(ev)) {{
+      state.targetParallaxX = nx;
+      state.targetParallaxY = ny;
+    }} else {{
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
+    }}
 
     if (isPanningDet) {{
       let nextPanX = ev.clientX - panStart[0];
@@ -8430,54 +22001,157 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (span360 > 10) {{
         while (nextPanX > 0.5 * span360) {{ nextPanX -= span360; panStart[0] += span360; }}
         while (nextPanX < -0.5 * span360) {{ nextPanX += span360; panStart[0] -= span360; }}
-        state.wulffYawDeg = -(nextPanX / span360) * 360.0;
       }}
       state.detPanX = nextPanX;
       state.detPanY = ev.clientY - panStart[1];
+      syncWulffYawFromDetector();
       return;
     }}
-    const hit = findNearestPeakDetector(mx, my);
+    const nodalHit = findNearestNodalDetector(mx, my);
+    let hit = findNearestPeakDetector(mx, my);
+    // When hovering the outer ring of a big nodal circle (away from its center dot), prioritize the nodal badge cleanly
+    if (nodalHit && hit && nodalHit.dist > 6.5) {{
+      hit = null;
+    }}
+    const nextNodalKey = nodalHit ? nodalHit.nodal.key : null;
+    const nodalChanged = nextNodalKey !== state.hoveredNodalKey;
+    state.hoveredNodalKey = nextNodalKey;
+    state.hoveredNodalObj = nodalHit ? nodalHit.nodal : null;
+
     const nextHoverId = hit ? hit.id : null;
     const hoverChanged = hit !== state.hoveredPeakObj;
     state.hoveredPeakId = nextHoverId;
     state.hoveredPeakObj = hit || null;
+
+    if (!hit && !nodalHit) {{
+      const arcHit = findNearestZoneArcDetector(mx, my);
+      const nextZoneId = arcHit ? arcHit.zone.zone_id : null;
+      const nextHolzN = arcHit ? (arcHit.holzN || 0) : 0;
+      const zoneChanged = nextZoneId !== state.hoveredZoneId || nextHolzN !== state.hoveredZoneHolzN;
+      state.hoveredZoneId = nextZoneId;
+      state.hoveredZoneHolzN = nextHolzN;
+      state.hoveredZonePos = arcHit ? [arcHit.x, arcHit.y] : null;
+      if (arcHit && zoneChanged) {{
+        updateZoneInspector(arcHit.zone, nextHolzN);
+      }}
+    }} else {{
+      state.hoveredZoneId = null;
+      state.hoveredZoneHolzN = 0;
+      state.hoveredZonePos = null;
+    }}
+
     if (hit) {{
       state.activeOrbitId = hit.asu_orbit_id || null;
       if (hoverChanged) updatePeakInspector(hit);
-    }} else if (state.selectedPeakId === null) {{
-      state.activeOrbitId = null;
+    }} else {{
+      if (state.selectedPeakId === null) {{
+        state.activeOrbitId = null;
+      }}
+      if (nodalHit && nodalChanged) {{
+        updateNodalInspector(nodalHit.nodal);
+      }}
     }}
   }});
 
   detCanvas.addEventListener("mouseleave", () => {{
+    lastPointerNorm = null;
     state.targetParallaxX = 0.0;
     state.targetParallaxY = 0.0;
     state.hoveredPeakId = null;
     state.hoveredPeakObj = null;
+    state.hoveredNodalKey = null;
+    state.hoveredNodalObj = null;
+    state.hoveredZoneId = null;
+    state.hoveredZoneHolzN = 0;
+    state.hoveredZonePos = null;
     if (state.selectedPeakId === null) state.activeOrbitId = null;
   }});
 
   detCanvas.addEventListener("wheel", (ev) => {{
     ev.preventDefault();
+    const rect = detCanvas.getBoundingClientRect();
+    const w = rect.width || 800;
+    const h = rect.height || 500;
+    const box = getDetectorPlotBox(w, h);
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const viewCenterX = box.originX + 0.5 * box.plotW;
+    const viewCenterY = box.originY + 0.5 * box.plotH;
+
     const rawDy = ev.deltaMode === 1 ? ev.deltaY * 16 : (ev.deltaMode === 2 ? ev.deltaY * 100 : ev.deltaY);
     const clampedDy = Math.max(-50, Math.min(50, rawDy));
     const sensitivity = ev.ctrlKey ? 0.0035 : 0.0016;
     const factor = Math.exp(-clampedDy * sensitivity);
-    state.detZoom = Math.max(0.7, Math.min(10.0, state.detZoom * factor));
+    const oldZoom = Math.max(0.7, Number(state.detZoom) || 1.0);
+    const newZoom = Math.max(0.7, Math.min(48.0, oldZoom * factor));
+    if (Math.abs(newZoom - oldZoom) < 1e-9) return;
+    const r = newZoom / oldZoom;
+
+    let nextPanX = Number(state.detPanX) || 0.0;
+    let nextPanY = Number(state.detPanY) || 0.0;
+    if (r > 1.0) {{
+      // Zooming in: keep the detector point under the cursor stationary
+      const mx = Math.max(0.0, Math.min(w, ev.clientX - rect.left));
+      const my = Math.max(0.0, Math.min(h, ev.clientY - rect.top));
+      nextPanX = (mx - cx) + (nextPanX - (mx - cx)) * r;
+      nextPanY = (my - cy) + (nextPanY - (my - cy)) * r;
+    }} else {{
+      // Zooming out: anchor horizontally at viewCenterX so centered detector azimuth never drifts sideways,
+      // and smoothly relax vertical pan back toward the centered detector strip as zoom approaches 1x.
+      nextPanX = (viewCenterX - cx) + (nextPanX - (viewCenterX - cx)) * r;
+      nextPanY = (viewCenterY - cy) + (nextPanY - (viewCenterY - cy)) * r;
+      const maxPanY = newZoom > 1.0
+        ? 0.5 * box.plotH * (newZoom - 1.0) + 24.0
+        : Math.abs(nextPanY) * 0.82;
+      const homeY = (viewCenterY - cy) * (1.0 - newZoom);
+      if (newZoom <= 1.0) {{
+        nextPanY = homeY + (nextPanY - homeY) * 0.75;
+        if (Math.abs(nextPanY - homeY) < 0.75) nextPanY = homeY;
+      }} else if (Math.abs(nextPanY - homeY) > maxPanY) {{
+        nextPanY = homeY + Math.sign(nextPanY - homeY) * maxPanY;
+      }}
+    }}
+
+    const span360 = box.plotW * newZoom;
+    if (span360 > 10.0) {{
+      while (nextPanX > 0.5 * span360) nextPanX -= span360;
+      while (nextPanX < -0.5 * span360) nextPanX += span360;
+    }}
+    state.detZoom = newZoom;
+    state.detPanX = nextPanX;
+    state.detPanY = nextPanY;
+    syncWulffYawFromDetector();
   }}, {{ passive: false }});
 
   detCanvas.addEventListener("click", (ev) => {{
     const rect = detCanvas.getBoundingClientRect();
-    const hit = findNearestPeakDetector(ev.clientX - rect.left, ev.clientY - rect.top);
+    const mx = ev.clientX - rect.left;
+    const my = ev.clientY - rect.top;
+    const nodalHit = findNearestNodalDetector(mx, my);
+    let hit = findNearestPeakDetector(mx, my);
+    if (nodalHit && hit && nodalHit.dist > 6.5) {{
+      hit = null;
+    }}
     if (hit) {{
       state.selectedPeakId = hit.id;
       state.selectedPeakObj = hit;
       state.activeOrbitId = hit.asu_orbit_id || null;
       updatePeakInspector(hit);
+    }} else if (nodalHit) {{
+      state.selectedPeakId = null;
+      state.selectedPeakObj = null;
+      state.activeOrbitId = null;
+      updateNodalInspector(nodalHit.nodal);
     }} else {{
       state.selectedPeakId = null;
       state.selectedPeakObj = null;
       state.activeOrbitId = null;
+      const arcHit = findNearestZoneArcDetector(mx, my);
+      if (arcHit) {{
+        state.selectedZoneId = arcHit.zone.zone_id;
+        renderZoneList();
+        updateZoneInspector(arcHit.zone, arcHit.holzN || 0);
+      }}
     }}
   }});
 
@@ -8488,21 +22162,29 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     stereoCanvas.addEventListener("mousedown", (ev) => {{
       isDraggingWulff = true;
       wulffDragStart = [ev.clientX, ev.clientY, state.wulffYawDeg, state.wulffPitchDeg];
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
     }});
     stereoCanvas.addEventListener("mousemove", (ev) => {{
       const rect = stereoCanvas.getBoundingClientRect();
       const mx = ev.clientX - rect.left;
       const my = ev.clientY - rect.top;
-      state.targetParallaxX = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
-      state.targetParallaxY = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
+      const nx = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
+      const ny = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
+      lastPointerNorm = [nx, ny];
+      if (isParallaxTriggerActive(ev)) {{
+        state.targetParallaxX = nx;
+        state.targetParallaxY = ny;
+      }} else {{
+        state.targetParallaxX = 0.0;
+        state.targetParallaxY = 0.0;
+      }}
       if (isDraggingWulff) {{
         const dx = ev.clientX - wulffDragStart[0];
         const dy = ev.clientY - wulffDragStart[1];
-        state.wulffYawDeg = ((wulffDragStart[2] + dx * 0.55 + 540) % 360) - 180;
+        state.wulffYawDeg = ((wulffDragStart[2] - dx * 0.55 + 540) % 360) - 180;
         state.wulffPitchDeg = Math.max(-85, Math.min(85, wulffDragStart[3] + dy * 0.45));
-        const detRect = detCanvas.getBoundingClientRect();
-        const span360 = getDetectorPlotBox(detRect.width, detRect.height).plotW * state.detZoom;
-        state.detPanX = -(state.wulffYawDeg / 360.0) * span360;
+        setDetectorCenterAzimuthDeg(wulffAzimuthToDetectorChiDeg(state.wulffYawDeg));
         return;
       }}
       const hit = findNearestPeakWulff(mx, my);
@@ -8517,6 +22199,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
     }});
     stereoCanvas.addEventListener("mouseleave", () => {{
+      lastPointerNorm = null;
       state.targetParallaxX = 0.0;
       state.targetParallaxY = 0.0;
       state.hoveredPeakId = null;
@@ -8529,7 +22212,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const clampedDy = Math.max(-50, Math.min(50, rawDy));
       const sensitivity = ev.ctrlKey ? 0.0035 : 0.0016;
       const factor = Math.exp(-clampedDy * sensitivity);
-      state.wulffZoom = Math.max(0.6, Math.min(5.0, (state.wulffZoom || 1.0) * factor));
+      state.wulffZoom = Math.max(0.6, Math.min(14.0, (state.wulffZoom || 1.0) * factor));
     }}, {{ passive: false }});
     stereoCanvas.addEventListener("click", (ev) => {{
       const rect = stereoCanvas.getBoundingClientRect();
@@ -8549,58 +22232,376 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     document.getElementById("lbl-det-alpha").textContent = Math.round(state.detAlpha * 100) + "%";
   }});
 
-  slParallax.addEventListener("input", () => {{
-    state.parallaxStrength = parseFloat(slParallax.value);
-    document.getElementById("lbl-parallax").textContent = state.parallaxStrength.toFixed(2) + "×";
-  }});
+  if (slColorEmphasis) {{
+    slColorEmphasis.addEventListener("input", () => {{
+      const v = parseFloat(slColorEmphasis.value);
+      state.colorCrossover = Number.isFinite(v) ? Math.max(0.05, Math.min(0.95, v)) : DEFAULT_COLOR_CROSSOVER;
+      updateColorscaleSliderGradient();
+    }});
+    slColorEmphasis.addEventListener("dblclick", () => {{
+      slColorEmphasis.value = DEFAULT_COLOR_CROSSOVER.toFixed(2);
+      state.colorCrossover = DEFAULT_COLOR_CROSSOVER;
+      updateColorscaleSliderGradient();
+    }});
+    updateColorscaleSliderGradient();
+  }}
 
-  if (slDmin) {{
-    slDmin.addEventListener("input", () => {{
-      const v = parseFloat(slDmin.value);
-      if (Number.isFinite(v) && v > 0) {{
-        syncDminControls(v, slDmin);
-        updateHUD();
+  function handleDynamicPredictionControlChange() {{
+    const didRepredict = repredictPeaksDynamic({{ userAdjusted: true }});
+    if (didRepredict) {{
+      renderZoneList();
+      syncWulffUI();
+    }}
+    updateColorscaleSliderGradient();
+    updateHUD();
+    renderDetector();
+    renderStereoInset(true);
+  }}
+
+  function applyDirectWavelengthInput(whichEnd, rawText) {{
+    const nums = String(rawText ?? "").match(/[+-]?(?:\\d+\\.?\\d*|\\.\\d+)/g);
+    if (!nums || nums.length === 0) {{
+      updateWavelengthLabels();
+      return false;
+    }}
+    const prevLo = state.lamMin;
+    const prevHi = state.lamMax;
+    let lo = prevLo;
+    let hi = prevHi;
+    if (nums.length >= 2) {{
+      const a = parseFloat(nums[0]);
+      const b = parseFloat(nums[1]);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || (a <= 0 && b <= 0)) {{
+        updateWavelengthLabels();
+        return false;
+      }}
+      const rawLo = Math.min(a, b);
+      const rawHi = Math.max(a, b);
+      lo = Math.max(0.05, Math.min(50.0 - MIN_WL_SPAN, rawLo));
+      hi = Math.max(lo + MIN_WL_SPAN, Math.min(50.0, rawHi));
+    }} else {{
+      const v = parseFloat(nums[0]);
+      if (!Number.isFinite(v) || v <= 0) {{
+        updateWavelengthLabels();
+        return false;
+      }}
+      if (whichEnd === "max") {{
+        hi = Math.max(0.05 + MIN_WL_SPAN, Math.min(50.0, v));
+        lo = Math.max(0.05, Math.min(hi - MIN_WL_SPAN, Number.isFinite(prevLo) ? prevLo : 0.20));
+      }} else {{
+        lo = Math.max(0.05, Math.min(50.0 - MIN_WL_SPAN, v));
+        hi = Math.max(lo + MIN_WL_SPAN, Math.min(50.0, Number.isFinite(prevHi) ? prevHi : lo + 1.0));
+      }}
+    }}
+    syncWavelengthControls(lo, hi, null);
+    if (Math.abs(state.lamMin - prevLo) > 1e-4 || Math.abs(state.lamMax - prevHi) > 1e-4) {{
+      handleDynamicPredictionControlChange();
+    }}
+    return true;
+  }}
+
+  function applyDirectDminInput(rawText) {{
+    const nums = String(rawText ?? "").match(/[+-]?(?:\\d+\\.?\\d*|\\.\\d+)/g);
+    const v = nums && nums.length > 0 ? parseFloat(nums[0]) : NaN;
+    const lblD = document.getElementById("lbl-dmin-val");
+    if (!Number.isFinite(v) || v <= 0) {{
+      syncDminControls(state.dMin);
+      return false;
+    }}
+    const prevD = state.dMin;
+    syncDminControls(v, lblD || slDmin || true);
+    if (Math.abs(state.dMin - prevD) > 1e-4) {{
+      handleDynamicPredictionControlChange();
+    }}
+    return true;
+  }}
+
+  function openWavelengthDirectInput(whichEnd = "min") {{
+    const end = whichEnd === "max" ? "max" : "min";
+    const spanEl = document.getElementById(end === "max" ? "wl-val-max" : "wl-val-min");
+    if (!spanEl || typeof document.createElement !== "function") return;
+    if (typeof spanEl.querySelector === "function" && spanEl.querySelector("input.inline-slider-input")) return;
+    const curVal = end === "max" ? state.lamMax : state.lamMin;
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.inputMode = "decimal";
+    inp.className = "inline-slider-input";
+    inp.setAttribute("aria-label", end === "max" ? "Direct λ_max [Å]" : "Direct λ_min [Å]");
+    inp.value = Number(curVal).toFixed(2);
+    spanEl.textContent = "";
+    spanEl.appendChild(inp);
+    if (typeof inp.focus === "function") inp.focus();
+    if (typeof inp.select === "function") inp.select();
+    let done = false;
+    const finish = (commit, nextEnd = null) => {{
+      if (done) return;
+      done = true;
+      const raw = inp.value;
+      spanEl.textContent = Number(end === "max" ? state.lamMax : state.lamMin).toFixed(2);
+      if (commit) {{
+        applyDirectWavelengthInput(end, raw);
+      }} else {{
+        updateWavelengthLabels();
+      }}
+      if (nextEnd) {{
+        openWavelengthDirectInput(nextEnd);
+      }}
+    }};
+    inp.addEventListener("click", (ev) => ev.stopPropagation());
+    inp.addEventListener("keydown", (ev) => {{
+      ev.stopPropagation();
+      if (ev.key === "Enter") {{
+        ev.preventDefault();
+        finish(true, null);
+      }} else if (ev.key === "Escape") {{
+        ev.preventDefault();
+        finish(false, null);
+      }} else if (ev.key === "Tab") {{
+        if (end === "min" && !ev.shiftKey) {{
+          ev.preventDefault();
+          finish(true, "max");
+        }} else if (end === "max" && ev.shiftKey) {{
+          ev.preventDefault();
+          finish(true, "min");
+        }}
+      }} else if (ev.key === "ArrowUp" || ev.key === "ArrowDown") {{
+        ev.preventDefault();
+        const step = ev.shiftKey ? 0.10 : 0.01;
+        const base = parseFloat(inp.value);
+        const cur = Number.isFinite(base) ? base : (end === "max" ? state.lamMax : state.lamMin);
+        const next = Math.max(0.05, Math.min(50.0, cur + (ev.key === "ArrowUp" ? step : -step)));
+        inp.value = next.toFixed(2);
+        applyDirectWavelengthInput(end, inp.value);
+      }}
+    }});
+    inp.addEventListener("blur", () => finish(true, null));
+  }}
+
+  function openDminDirectInput() {{
+    const lblD = document.getElementById("lbl-dmin-val");
+    if (!lblD || typeof document.createElement !== "function") return;
+    if (typeof lblD.querySelector === "function" && lblD.querySelector("input.inline-slider-input")) return;
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.inputMode = "decimal";
+    inp.className = "inline-slider-input";
+    inp.setAttribute("aria-label", "Direct resolution cutoff d_min [Å]");
+    inp.value = Number(state.dMin).toFixed(2);
+    lblD.textContent = "";
+    lblD.appendChild(inp);
+    lblD.appendChild(document.createTextNode(" Å"));
+    if (typeof inp.focus === "function") inp.focus();
+    if (typeof inp.select === "function") inp.select();
+    let done = false;
+    const finish = (commit) => {{
+      if (done) return;
+      done = true;
+      const raw = inp.value;
+      lblD.textContent = `${{Number(state.dMin).toFixed(2)}} Å`;
+      if (commit) {{
+        applyDirectDminInput(raw);
+      }} else {{
+        syncDminControls(state.dMin);
+      }}
+    }};
+    inp.addEventListener("click", (ev) => ev.stopPropagation());
+    inp.addEventListener("keydown", (ev) => {{
+      ev.stopPropagation();
+      if (ev.key === "Enter") {{
+        ev.preventDefault();
+        finish(true);
+      }} else if (ev.key === "Escape") {{
+        ev.preventDefault();
+        finish(false);
+      }} else if (ev.key === "ArrowUp" || ev.key === "ArrowDown") {{
+        ev.preventDefault();
+        const dFloor = getDynamicDminFloor();
+        const step = ev.shiftKey ? 0.10 : 0.01;
+        const base = parseFloat(inp.value);
+        const cur = Number.isFinite(base) ? base : state.dMin;
+        const next = Math.max(dFloor, Math.min(25.0, cur + (ev.key === "ArrowUp" ? step : -step)));
+        inp.value = next.toFixed(2);
+        applyDirectDminInput(inp.value);
+      }}
+    }});
+    inp.addEventListener("blur", () => finish(true));
+  }}
+
+  const wlValMinEl = document.getElementById("wl-val-min");
+  const wlValMaxEl = document.getElementById("wl-val-max");
+  const wlReadoutClickEl = document.getElementById("wl-readout");
+  const lblDminClickEl = document.getElementById("lbl-dmin-val");
+  if (wlValMinEl && typeof wlValMinEl.addEventListener === "function") {{
+    wlValMinEl.addEventListener("click", (ev) => {{
+      ev.stopPropagation();
+      openWavelengthDirectInput("min");
+    }});
+    wlValMinEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Enter" || ev.key === " ") {{
+        ev.preventDefault();
+        openWavelengthDirectInput("min");
+      }}
+    }});
+  }}
+  if (wlValMaxEl && typeof wlValMaxEl.addEventListener === "function") {{
+    wlValMaxEl.addEventListener("click", (ev) => {{
+      ev.stopPropagation();
+      openWavelengthDirectInput("max");
+    }});
+    wlValMaxEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Enter" || ev.key === " ") {{
+        ev.preventDefault();
+        openWavelengthDirectInput("max");
+      }}
+    }});
+  }}
+  if (wlReadoutClickEl && typeof wlReadoutClickEl.addEventListener === "function") {{
+    wlReadoutClickEl.addEventListener("click", (ev) => {{
+      if (ev.target && ev.target.tagName === "INPUT") return;
+      if (ev.target === wlValMinEl) {{
+        openWavelengthDirectInput("min");
+      }} else if (ev.target === wlValMaxEl) {{
+        openWavelengthDirectInput("max");
+      }} else if (typeof wlReadoutClickEl.getBoundingClientRect === "function" && Number.isFinite(ev.clientX)) {{
+        const r = wlReadoutClickEl.getBoundingClientRect();
+        openWavelengthDirectInput(ev.clientX - r.left <= r.width * 0.5 ? "min" : "max");
+      }} else {{
+        openWavelengthDirectInput("min");
+      }}
+    }});
+  }}
+  if (lblDminClickEl && typeof lblDminClickEl.addEventListener === "function") {{
+    lblDminClickEl.addEventListener("click", () => openDminDirectInput());
+    lblDminClickEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Enter" || ev.key === " ") {{
+        ev.preventDefault();
+        openDminDirectInput();
       }}
     }});
   }}
 
-  if (inpDminEl) {{
-    const onInpDmin = () => {{
-      const v = parseFloat(inpDminEl.value);
+  if (slDmin) {{
+    const onSlDmin = () => {{
+      const v = parseFloat(slDmin.value);
       if (Number.isFinite(v) && v > 0) {{
-        syncDminControls(v, inpDminEl);
-        updateHUD();
+        syncDminControls(v, slDmin);
+        handleDynamicPredictionControlChange();
       }}
     }};
-    inpDminEl.addEventListener("input", onInpDmin);
-    inpDminEl.addEventListener("change", onInpDmin);
+    slDmin.addEventListener("input", onSlDmin);
+    slDmin.addEventListener("change", onSlDmin);
   }}
 
-  if (inpLminEl) {{
-    const onInpLmin = () => {{
-      const v = parseFloat(inpLminEl.value);
+  if (slWlMin) {{
+    const onSlWlMin = () => {{
+      const v = parseFloat(slWlMin.value);
       if (Number.isFinite(v) && v > 0) {{
-        state.lamMin = Math.min(v, state.lamMax - 0.05);
-        updateWavelengthLabels();
-        updateHUD();
+        syncWavelengthControls(v, state.lamMax, "min");
+        handleDynamicPredictionControlChange();
       }}
     }};
-    inpLminEl.addEventListener("input", onInpLmin);
-    inpLminEl.addEventListener("change", onInpLmin);
+    slWlMin.addEventListener("input", onSlWlMin);
+    slWlMin.addEventListener("change", onSlWlMin);
   }}
 
-  if (inpLmaxEl) {{
-    const onInpLmax = () => {{
-      const v = parseFloat(inpLmaxEl.value);
+  if (slWlMax) {{
+    const onSlWlMax = () => {{
+      const v = parseFloat(slWlMax.value);
       if (Number.isFinite(v) && v > 0) {{
-        state.lamMax = Math.max(v, state.lamMin + 0.05);
-        updateWavelengthLabels();
-        updateHUD();
+        syncWavelengthControls(state.lamMin, v, "max");
+        handleDynamicPredictionControlChange();
       }}
     }};
-    inpLmaxEl.addEventListener("input", onInpLmax);
-    inpLmaxEl.addEventListener("change", onInpLmax);
+    slWlMax.addEventListener("input", onSlWlMax);
+    slWlMax.addEventListener("change", onSlWlMax);
   }}
+
+  if (wlSliderWrap) {{
+    let activeWlDragEnd = null;
+    const clientXToSnappedWl = (clientX) => {{
+      const rect = wlSliderWrap.getBoundingClientRect();
+      const width = Math.max(1, rect.width);
+      const frac = Math.max(0, Math.min(1, (clientX - rect.left) / width));
+      const [domMin, domMax] = getWavelengthSliderBounds();
+      const raw = domMin + frac * (domMax - domMin);
+      return Math.round(raw * 20) / 20;
+    }};
+    const applyDraggedWl = (clientX) => {{
+      if (!activeWlDragEnd) return;
+      const snapped = clientXToSnappedWl(clientX);
+      const prevLo = state.lamMin;
+      const prevHi = state.lamMax;
+      if (activeWlDragEnd === "min") {{
+        syncWavelengthControls(snapped, state.lamMax, "min");
+      }} else {{
+        syncWavelengthControls(state.lamMin, snapped, "max");
+      }}
+      if (Math.abs(state.lamMin - prevLo) > 1e-4 || Math.abs(state.lamMax - prevHi) > 1e-4) {{
+        handleDynamicPredictionControlChange();
+      }}
+    }};
+    wlSliderWrap.addEventListener("pointerdown", (ev) => {{
+      if (ev.button !== undefined && ev.button !== 0) return;
+      if (ev.target === wlKnobMin || (wlKnobMin && wlKnobMin.contains(ev.target))) {{
+        activeWlDragEnd = "min";
+      }} else if (ev.target === wlKnobMax || (wlKnobMax && wlKnobMax.contains(ev.target))) {{
+        activeWlDragEnd = "max";
+      }} else {{
+        const clickWl = clientXToSnappedWl(ev.clientX);
+        const dLo = Math.abs(clickWl - state.lamMin);
+        const dHi = Math.abs(clickWl - state.lamMax);
+        activeWlDragEnd = (dLo < dHi || (dLo === dHi && clickWl < state.lamMin)) ? "min" : "max";
+        applyDraggedWl(ev.clientX);
+      }}
+      if (wlKnobMin) wlKnobMin.classList.toggle("dragging", activeWlDragEnd === "min");
+      if (wlKnobMax) wlKnobMax.classList.toggle("dragging", activeWlDragEnd === "max");
+      if (typeof wlSliderWrap.setPointerCapture === "function" && ev.pointerId !== undefined) {{
+        try {{ wlSliderWrap.setPointerCapture(ev.pointerId); }} catch (_e) {{}}
+      }}
+      ev.preventDefault();
+    }});
+    wlSliderWrap.addEventListener("pointermove", (ev) => {{
+      if (!activeWlDragEnd) return;
+      applyDraggedWl(ev.clientX);
+    }});
+    const stopWlDrag = (ev) => {{
+      if (!activeWlDragEnd) return;
+      activeWlDragEnd = null;
+      if (wlKnobMin) wlKnobMin.classList.remove("dragging");
+      if (wlKnobMax) wlKnobMax.classList.remove("dragging");
+      if (ev && typeof wlSliderWrap.releasePointerCapture === "function" && ev.pointerId !== undefined) {{
+        try {{ wlSliderWrap.releasePointerCapture(ev.pointerId); }} catch (_e) {{}}
+      }}
+    }};
+    wlSliderWrap.addEventListener("pointerup", stopWlDrag);
+    wlSliderWrap.addEventListener("pointercancel", stopWlDrag);
+    wlSliderWrap.addEventListener("dblclick", () => {{
+      const defWl = getDefaultWavelengthForInstrument(DATA.instrument);
+      const resetLo = (Number.isFinite(_payloadBaseParams.lamMin) && _payloadBaseParams.lamMin > 0) ? _payloadBaseParams.lamMin : defWl[0];
+      const resetHi = (Number.isFinite(_payloadBaseParams.lamMax) && _payloadBaseParams.lamMax > resetLo) ? _payloadBaseParams.lamMax : defWl[1];
+      syncWavelengthControls(resetLo, resetHi, null);
+      handleDynamicPredictionControlChange();
+    }});
+  }}
+
+  [
+    [wlKnobMin, "min"],
+    [wlKnobMax, "max"],
+  ].forEach(([knobEl, endKey]) => {{
+    if (!knobEl) return;
+    knobEl.addEventListener("keydown", (ev) => {{
+      const step = ev.shiftKey ? 0.25 : 0.05;
+      let delta = 0;
+      if (ev.key === "ArrowLeft" || ev.key === "ArrowDown") delta = -step;
+      else if (ev.key === "ArrowRight" || ev.key === "ArrowUp") delta = step;
+      if (delta !== 0) {{
+        ev.preventDefault();
+        if (endKey === "min") syncWavelengthControls(state.lamMin + delta, state.lamMax, "min");
+        else syncWavelengthControls(state.lamMin, state.lamMax + delta, "max");
+        handleDynamicPredictionControlChange();
+      }}
+    }});
+  }});
 
   document.getElementById("btn-proj-toggle").addEventListener("click", () => {{
     state.projection = state.projection === "cylindrical" ? "spherical" : "cylindrical";
@@ -8612,10 +22613,69 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (b) b.addEventListener("click", () => setMaxZoneOrder(ordLevel));
   }});
 
+  function syncNodalAndHolzButtons() {{
+    const btnNodal = document.getElementById("btn-nodal-points");
+    if (btnNodal) {{
+      btnNodal.classList.toggle("active-btn", Boolean(state.showNodalPoints));
+    }}
+    [1, 2].forEach(nOrd => {{
+      const bh = document.getElementById(`btn-holz-${{nOrd}}`);
+      if (bh) {{
+        bh.classList.toggle("active-btn", Boolean(state.holzOrders instanceof Set && state.holzOrders.has(nOrd)));
+      }}
+    }});
+  }}
+
+  const btnNodalPoints = document.getElementById("btn-nodal-points");
+  if (btnNodalPoints) {{
+    btnNodalPoints.addEventListener("click", () => {{
+      state.showNodalPoints = !state.showNodalPoints;
+      if (!state.showNodalPoints) {{
+        state.hoveredNodalKey = null;
+        state.hoveredNodalObj = null;
+      }}
+      syncNodalAndHolzButtons();
+      renderDetector();
+      renderStereoInset(true);
+    }});
+  }}
+
+  [1, 2].forEach(nOrd => {{
+    const btnHolz = document.getElementById(`btn-holz-${{nOrd}}`);
+    if (btnHolz) {{
+      btnHolz.addEventListener("click", () => {{
+        if (!(state.holzOrders instanceof Set)) state.holzOrders = new Set();
+        if (state.holzOrders.has(nOrd)) {{
+          state.holzOrders.delete(nOrd);
+        }} else {{
+          state.holzOrders.add(nOrd);
+          if (!state.showZoneArcs) {{
+            state.showZoneArcs = true;
+            const bArc = document.getElementById("btn-zone-arcs");
+            if (bArc) bArc.classList.add("active-btn");
+          }}
+        }}
+        syncNodalAndHolzButtons();
+        renderZoneList();
+        updateHUD();
+        renderDetector();
+        renderStereoInset(true);
+      }});
+    }}
+  }});
+
   document.getElementById("btn-zone-arcs").addEventListener("click", (ev) => {{
     state.showZoneArcs = !state.showZoneArcs;
+    if (!state.showZoneArcs) {{
+      state.hoveredZoneId = null;
+      state.hoveredZoneHolzN = 0;
+      state.hoveredZonePos = null;
+    }}
     ev.currentTarget.classList.toggle("active-btn", state.showZoneArcs);
     ev.currentTarget.textContent = "Arcs";
+    syncTopBarTooltips(null);
+    renderDetector();
+    renderStereoInset(true);
   }});
 
   const btnPixelMask = document.getElementById("btn-pixel-mask");
@@ -8627,39 +22687,253 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
+  const inpBorderEl = document.getElementById("inp-border");
+  if (inpBorderEl) {{
+    let _borderRepredictTimer = null;
+    const runBorderRepredict = () => {{
+      _borderRepredictTimer = null;
+      if (canRepredictDynamic() && repredictPeaksDynamic({{ preserveSource: true }})) {{
+        renderDetector();
+        renderStereoInset(true);
+        updateHUD();
+      }} else if (state.showPixelMask) {{
+        renderDetector();
+      }}
+    }};
+    inpBorderEl.addEventListener("input", () => {{
+      _userTouchedBorder = true;
+      invalidatePanelRenderCaches();
+      syncPixelMaskUI();
+      if (_borderRepredictTimer) clearTimeout(_borderRepredictTimer);
+      _borderRepredictTimer = setTimeout(runBorderRepredict, 60);
+    }});
+    inpBorderEl.addEventListener("change", () => {{
+      _userTouchedBorder = true;
+      invalidatePanelRenderCaches();
+      syncPixelMaskUI();
+      if (_borderRepredictTimer) clearTimeout(_borderRepredictTimer);
+      runBorderRepredict();
+    }});
+  }}
+
+  function buildClientGrayscaleCanvas(sub, H, W, bStep) {{
+    const step = Math.max(1, bStep | 0);
+    const Hb = Math.max(1, Math.floor(H / step));
+    const Wb = Math.max(1, Math.floor(W / step));
+    const logBuf = new Float32Array(Hb * Wb);
+    for (let rb = 0; rb < Hb; rb++) {{
+      for (let cb = 0; cb < Wb; cb++) {{
+        let sum = 0;
+        for (let dr = 0; dr < step; dr++) {{
+          const rowOff = (rb * step + dr) * W + cb * step;
+          for (let dc = 0; dc < step; dc++) sum += Number(sub[rowOff + dc]);
+        }}
+        logBuf[rb * Wb + cb] = Math.log1p(Math.max(0, sum / (step * step)));
+      }}
+    }}
+    const sorted = Float32Array.from(logBuf).sort();
+    const vmax = Math.max(sorted[Math.floor(sorted.length * 0.995)] || 1.0, 1e-6);
+    const gc = document.createElement("canvas");
+    gc.width = Wb;
+    gc.height = Hb;
+    const gctx = gc.getContext("2d");
+    const idata = gctx.createImageData(Wb, Hb);
+    for (let rb = 0; rb < Hb; rb++) {{
+      for (let cb = 0; cb < Wb; cb++) {{
+        const v = Math.min(255, Math.round((logBuf[rb * Wb + cb] / vmax) * 255));
+        const pIdx = (rb * Wb + cb) * 4;
+        idata.data[pIdx] = v;
+        idata.data[pIdx + 1] = v;
+        idata.data[pIdx + 2] = v;
+        idata.data[pIdx + 3] = 255;
+      }}
+    }}
+    gctx.putImageData(idata, 0, 0);
+    return gc;
+  }}
+
+  function buildClientMaskCanvas(clsArr, Hm, Wm, bStepM) {{
+    const step = Math.max(1, bStepM | 0);
+    const Hbm = Math.max(1, Math.floor(Hm / step));
+    const Wbm = Math.max(1, Math.floor(Wm / step));
+    const mc = document.createElement("canvas");
+    mc.width = Wbm;
+    mc.height = Hbm;
+    const mctx = mc.getContext("2d");
+    const midata = mctx.createImageData(Wbm, Hbm);
+    let anyMasked = false;
+    for (let rb = 0; rb < Hbm; rb++) {{
+      for (let cb = 0; cb < Wbm; cb++) {{
+        let mx = 0;
+        for (let dr = 0; dr < step; dr++) {{
+          const rOff = (rb * step + dr) * Wm + cb * step;
+          for (let dc = 0; dc < step; dc++) {{
+            if (clsArr[rOff + dc] > mx) mx = clsArr[rOff + dc];
+          }}
+        }}
+        const pIdx = (rb * Wbm + cb) * 4;
+        if (mx >= 2) {{
+          anyMasked = true;
+          midata.data[pIdx] = 180; midata.data[pIdx + 1] = 255; midata.data[pIdx + 2] = 20; midata.data[pIdx + 3] = 224;
+        }} else if (mx === 1) {{
+          anyMasked = true;
+          midata.data[pIdx] = 56; midata.data[pIdx + 1] = 189; midata.data[pIdx + 2] = 248; midata.data[pIdx + 3] = 132;
+        }}
+      }}
+    }}
+    if (!anyMasked) return null;
+    mctx.putImageData(midata, 0, 0);
+    return mc;
+  }}
+
+  async function toggleHiResTextures() {{
+    state.hiResTextures = !state.hiResTextures;
+    const reqSeq = (state.hiresReqSeq || 0) + 1;
+    state.hiresReqSeq = reqSeq;
+    invalidatePanelRenderCaches();
+    syncHiResButtonUI();
+    renderDetector();
+
+    if (lastClientBankImgs && lastClientBankImgs.size > 0) {{
+      const step = state.hiResTextures ? 1 : 4;
+      PANELS.forEach(p => {{
+        const imEntry = lastClientBankImgs.get(p.bank);
+        if (imEntry) {{
+          const gc = buildClientGrayscaleCanvas(imEntry.data, imEntry.H, imEntry.W, step);
+          p._grayCanvas = gc;
+          rawBankImages.set(p.bank, gc);
+          cacheBankGrayscaleMap(p.bank, gc);
+          bankCanvases.set(p.bank, colorizeGrayscaleImage(gc, state.heatmapStyle));
+        }}
+        if (lastClientBankMaskRaw && lastClientBankMaskRaw.has(p.bank)) {{
+          const mEntry = lastClientBankMaskRaw.get(p.bank);
+          const mc = buildClientMaskCanvas(mEntry.data, mEntry.H, mEntry.W, step);
+          p._maskCanvas = mc;
+          if (mc) maskBankCanvases.set(p.bank, mc);
+        }}
+      }});
+      invalidatePanelRenderCaches();
+      renderDetector();
+      setStatusLine(
+        "[DETECTOR TEXTURE]",
+        state.hiResTextures
+          ? "Switched to <strong>native 1× Hi-Res</strong> detector pixel textures."
+          : "Switched to <strong>fast 4× binned</strong> detector preview textures."
+      );
+      return;
+    }}
+
+    state.hiresLoading = true;
+    syncHiResButtonUI();
+    try {{
+      const curFrame = typeof state.selectedFrameIndex === "number"
+        ? state.selectedFrameIndex
+        : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+      const resp = await fetch(
+        `api/payload?frame=${{curFrame}}&textures_only=1${{getRenderBinningQuery()}}`,
+        {{ cache: "no-store" }}
+      );
+      if (reqSeq !== state.hiresReqSeq) return;
+      if (resp.ok) {{
+        const doc = await resp.json();
+        if (reqSeq !== state.hiresReqSeq) return;
+        if (doc && Array.isArray(doc.panels) && doc.panels.length > 0) {{
+          const panelMap = new Map(doc.panels.map(np => [np.bank, np]));
+          PANELS.forEach(p => {{
+            const np = panelMap.get(p.bank);
+            if (np) {{
+              if (np.texture_b64) p.texture_b64 = np.texture_b64;
+              if (np.mask_b64) p.mask_b64 = np.mask_b64;
+            }}
+          }});
+          DATA.render_binning = doc.render_binning || (state.hiResTextures ? 1 : 4);
+          invalidatePanelRenderCaches();
+          decodeAllBankTextures();
+          setStatusLine(
+            "[DETECTOR TEXTURE]",
+            state.hiResTextures
+              ? "Loaded <strong>native 1× Hi-Res</strong> detector bank textures (zoom in for crisp pixels)."
+              : "Restored <strong>fast 4× binned</strong> detector preview textures."
+          );
+        }}
+      }}
+    }} catch (_e) {{
+      // Client-only static HTML: warp resolution & nearest-neighbor zoom still upgraded cleanly
+    }} finally {{
+      if (reqSeq === state.hiresReqSeq) {{
+        state.hiresLoading = false;
+        syncHiResButtonUI();
+        renderDetector();
+      }}
+    }}
+  }}
+
+  const btnHiResTex = document.getElementById("btn-hires-tex");
+  if (btnHiResTex) {{
+    syncHiResButtonUI();
+    btnHiResTex.addEventListener("click", () => {{
+      toggleHiResTextures();
+    }});
+  }}
+
   document.getElementById("btn-heatmap-cmap").addEventListener("click", (ev) => {{
     const order = ["magma", "cyan", "gray"];
     const labels = {{ magma: "Magma", cyan: "Cyan", gray: "Film" }};
     state.heatmapStyle = order[(order.indexOf(state.heatmapStyle) + 1) % order.length];
     ev.currentTarget.textContent = labels[state.heatmapStyle];
+    syncTopBarTooltips(null);
     rebuildBankColorMaps();
   }});
 
   document.getElementById("btn-stereo-toggle").addEventListener("click", () => {{
     state.showStereo = !state.showStereo;
     syncWulffUI();
+    syncTopBarTooltips(null);
   }});
 
   const btnWulffScope = document.getElementById("btn-wulff-scope");
   if (btnWulffScope) {{
     btnWulffScope.addEventListener("click", () => {{
       state.wulffScope = state.wulffScope === "all_runs" ? "single_frame" : "all_runs";
-      const detRect = detCanvas.getBoundingClientRect();
-      const span360 = getDetectorPlotBox(detRect.width, detRect.height).plotW * state.detZoom;
-      state.wulffYawDeg = -(state.detPanX / Math.max(1, span360)) * 360.0;
+      if (state.wulffScope === "all_runs" && typeof _dynPendingMultiRunFn === "function") {{
+        _dynPendingMultiRunFn();
+      }}
+      syncWulffYawFromDetector();
+      syncWulffUI();
+      renderDetector();
+    }});
+  }}
+
+  const btnWulffFriedel = document.getElementById("btn-wulff-friedel");
+  if (btnWulffFriedel) {{
+    btnWulffFriedel.addEventListener("click", () => {{
+      state.showWulffFriedel = !state.showWulffFriedel;
       syncWulffUI();
     }});
   }}
 
+  ["btn-peaks-pred", "btn-peaks-integ"].forEach((btnId) => {{
+    const el = document.getElementById(btnId);
+    if (!el) return;
+    el.addEventListener("click", () => {{
+      const src = el.getAttribute("data-peak-src") || "predicted";
+      applyPeakSource(src, true);
+    }});
+  }});
+
   function applySpotColorMode(nextMode) {{
     if ((nextMode === "residual" || nextMode === "scale") && !hasMergedCarelessData()) {{
+      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
+    }} else if (nextMode === "mtz_isigi" && !hasMtzIsigi()) {{
       state.wulffColorMode = "wavelength";
     }} else if (nextMode === "isigi" && !hasIntegratedIsigi()) {{
-      state.wulffColorMode = "wavelength";
+      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
     }} else {{
       state.wulffColorMode = nextMode || "wavelength";
     }}
     syncWulffUI();
+    updateHUD();
+    renderDetector();
   }}
 
   const selWulffColor = document.getElementById("sel-wulff-color");
@@ -8696,31 +22970,296 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.detZoom = 1.0;
     state.detPanX = 0.0;
     state.detPanY = 0.0;
-    state.wulffYawDeg = 0.0;
+    syncWulffYawFromDetector();
     state.wulffPitchDeg = 0.0;
     state.wulffZoom = 1.0;
     state.selectedPeakId = null;
     state.selectedPeakObj = null;
     state.hoveredPeakId = null;
     state.hoveredPeakObj = null;
+    state.hoveredNodalKey = null;
+    state.hoveredNodalObj = null;
+    state.hoveredZoneId = null;
+    state.hoveredZoneHolzN = 0;
+    state.hoveredZonePos = null;
     state.activeOrbitId = null;
+    state.showNodalPoints = true;
+    state.holzOrders = new Set();
+    syncNodalAndHolzButtons();
     setMaxZoneOrder(1);
   }});
 
-  syncWulffUI();
+  // --- Minimalist 80s Pixel-Font Exit & Cleanup Controller ---
+  (function initArcadeExitController() {{
+    const btnExitApp = document.getElementById("btn-exit-app");
+    const modalExit = document.getElementById("modal-arcade-exit");
+    if (!btnExitApp || !modalExit) return;
 
-  document.getElementById("btn-zones-all").addEventListener("click", () => {{
-    state.activeZones = new Set(
-      ZONES.filter(z => (z.order || 1) <= state.maxZoneOrder).map(z => z.zone_id)
-    );
-    renderZoneList();
-    updateHUD();
-  }});
+    const hostTabWin = (() => {{
+      try {{
+        const href = String((window.location && window.location.href) || "");
+        if (href.startsWith("about:srcdoc") && window.parent) return window.parent;
+      }} catch (_e) {{}}
+      return window;
+    }})();
+
+    const exitEndpointUrl = (() => {{
+      try {{
+        const baseHref = (document.baseURI && /^https?:/i.test(document.baseURI))
+          ? document.baseURI
+          : ((hostTabWin.location && /^https?:/i.test(hostTabWin.location.href))
+            ? hostTabWin.location.href
+            : window.location.href);
+        return new URL("api/pipeline/exit", baseHref).href;
+      }} catch (_e) {{
+        return "api/pipeline/exit";
+      }}
+    }})();
+
+    const quipsList = (Array.isArray(window.ARCADE_EXIT_QUIPS) && window.ARCADE_EXIT_QUIPS.length > 0)
+      ? window.ARCADE_EXIT_QUIPS
+      : ["GAME OVER. Just kidding—you crushed it. Insert coffee to continue."];
+
+    let shuffledDeck = [];
+    let deckCursor = 0;
+    let exitModalOpen = false;
+    let exitConfirmed = false;
+    let preparePromise = null;
+    let lastRestorePlan = null;
+
+    if (UI_MODE === "pro") {{
+      modalExit.classList.add("pro-exit-mode");
+    }}
+
+    function refillQuipDeck() {{
+      shuffledDeck = Array.from({{ length: quipsList.length }}, (_, i) => i);
+      for (let i = shuffledDeck.length - 1; i > 0; i--) {{
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = shuffledDeck[i];
+        shuffledDeck[i] = shuffledDeck[j];
+        shuffledDeck[j] = tmp;
+      }}
+      deckCursor = 0;
+    }}
+
+    function drawNextQuip() {{
+      if (deckCursor >= shuffledDeck.length || shuffledDeck.length === 0) {{
+        refillQuipDeck();
+      }}
+      const quipIdx = shuffledDeck[deckCursor++];
+      const qTextEl = modalExit.querySelector("#arcade-exit-quip-text");
+      if (qTextEl) qTextEl.textContent = quipsList[quipIdx];
+    }}
+
+    function sendFinalExitShutdown() {{
+      if (exitConfirmed) return;
+      exitConfirmed = true;
+      const bodyStr = JSON.stringify({{ phase: "confirm" }});
+      let sent = false;
+      try {{
+        if (navigator.sendBeacon) {{
+          sent = navigator.sendBeacon(
+            exitEndpointUrl,
+            new Blob([bodyStr], {{ type: "text/plain;charset=UTF-8" }})
+          );
+        }}
+      }} catch (_e) {{}}
+      if (!sent) {{
+        try {{
+          fetch(exitEndpointUrl, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: bodyStr,
+            keepalive: true,
+          }}).catch(() => {{}});
+        }} catch (_e2) {{}}
+      }}
+    }}
+
+    // If the user opened the Exit screen and closes the browser tab manually (Ctrl+W / tab X),
+    // finalize any deferred local cleanup and stop the container cleanly.
+    const onUnloadWhileExiting = () => {{
+      if (exitModalOpen && !exitConfirmed) {{
+        sendFinalExitShutdown();
+      }}
+    }};
+    try {{ hostTabWin.addEventListener("pagehide", onUnloadWhileExiting); }} catch (_e) {{}}
+    window.addEventListener("pagehide", onUnloadWhileExiting);
+
+    function closeHostBrowserTab() {{
+      sendFinalExitShutdown();
+
+      let inOuterFrame = false;
+      try {{
+        inOuterFrame = Boolean(hostTabWin !== hostTabWin.top);
+      }} catch (_e) {{
+        inOuterFrame = true;
+      }}
+
+      // Invoke window.close() synchronously within the user's click activation
+      if (!inOuterFrame) {{
+        try {{ hostTabWin.close(); }} catch (_e) {{}}
+        try {{
+          if (!hostTabWin.closed) {{
+            const wSelf = hostTabWin.open("", "_self");
+            if (wSelf) wSelf.close();
+          }}
+        }} catch (_e) {{}}
+      }} else {{
+        try {{
+          if (hostTabWin.top) hostTabWin.top.close();
+        }} catch (_e) {{}}
+      }}
+      try {{ window.close(); }} catch (_e) {{}}
+
+      // If the browser's tab-security policy blocked closing a manually-opened tab,
+      // wait long enough not to race ClosePage() IPC and then show a clean confirmation.
+      setTimeout(() => {{
+        try {{
+          if (hostTabWin.closed) return;
+        }} catch (_e) {{
+          return;
+        }}
+        const qTextEl = modalExit.querySelector("#arcade-exit-quip-text");
+        const actionsEl = modalExit.querySelector("#arcade-exit-actions");
+        if (actionsEl) actionsEl.style.display = "none";
+        if (qTextEl) {{
+          qTextEl.textContent =
+            "SESSION CLOSED. Temporary files are clean — press Ctrl+W (or Cmd+W) to close this tab.";
+        }}
+      }}, 550);
+    }}
+
+    async function restorePreviousStepAfterCancel(plan) {{
+      if (!plan || plan.mode === "local_deferred" || plan.mode === "empty") {{
+        probeGalaxyConnection();
+        return;
+      }}
+      if (plan.mode === "galaxy_dataset" && plan.dataset_id) {{
+        await probeGalaxyConnection();
+        await loadFromGalaxyDatasetId(plan.dataset_id, {{
+          preserveFrameIndex: typeof plan.frame_index === "number" ? plan.frame_index : 0,
+        }});
+        if (plan.mtz_dataset_id && plan.mtz_dataset_id !== plan.dataset_id) {{
+          await loadFromGalaxyDatasetId(plan.mtz_dataset_id);
+        }}
+        return;
+      }}
+      if (plan.mode === "reduce_recipe" && plan.params) {{
+        setStatusLine(
+          "[AUTO-REDUCE]",
+          "Restoring session — regenerating reduced detector frames on the fly via <strong>Step 1 (Reduce)</strong>…"
+        );
+        selectPipelineStage(0, true);
+        await executeWorkflowStage(0, plan.params);
+        return;
+      }}
+      probeGalaxyConnection();
+    }}
+
+    const btnCancelExit = modalExit.querySelector("#btn-arcade-exit-cancel");
+    const btnCloseTab = modalExit.querySelector("#btn-arcade-exit-close-tab");
+    const actionsWrap = modalExit.querySelector("#arcade-exit-actions");
+
+    if (btnCancelExit) {{
+      btnCancelExit.addEventListener("click", async () => {{
+        if (exitConfirmed) return;
+        exitModalOpen = false;
+        modalExit.classList.remove("arcade-exit-card-open");
+        const pendingPrep = preparePromise;
+        if (pendingPrep) {{
+          setStatusLine(
+            "[RESTORING SESSION]",
+            "Finishing cleanup sync and restoring previous step from Galaxy History…"
+          );
+          try {{
+            await pendingPrep;
+          }} catch (_e) {{}}
+        }}
+        if (exitModalOpen || exitConfirmed) return;
+        const plan = lastRestorePlan;
+        lastRestorePlan = null;
+        await restorePreviousStepAfterCancel(plan);
+      }});
+    }}
+
+    if (btnCloseTab) {{
+      btnCloseTab.addEventListener("click", () => {{
+        if (btnCloseTab.disabled) return;
+        btnCloseTab.disabled = true;
+        if (btnCancelExit) btnCancelExit.disabled = true;
+        closeHostBrowserTab();
+      }});
+    }}
+
+    btnExitApp.addEventListener("click", async () => {{
+      if (exitModalOpen) {{
+        modalExit.classList.add("arcade-exit-card-open");
+        return;
+      }}
+      if (typeof state.runningStageIdx === "number" && state.runningStageIdx >= 0) {{
+        const okAbort = window.confirm(
+          "A SubHKL pipeline job is currently running. Cancel active job, clean up temporary/shared files, and exit?"
+        );
+        if (!okAbort) return;
+      }}
+      exitModalOpen = true;
+      exitConfirmed = false;
+      lastRestorePlan = null;
+      if (typeof galaxyBridge !== "undefined" && galaxyBridge.pollTimer) {{
+        clearInterval(galaxyBridge.pollTimer);
+        galaxyBridge.pollTimer = null;
+      }}
+
+      if (actionsWrap) actionsWrap.style.display = "";
+      if (btnCancelExit) btnCancelExit.disabled = false;
+      if (btnCloseTab) btnCloseTab.disabled = true;
+      drawNextQuip();
+      modalExit.classList.add("arcade-exit-card-open");
+
+      const curPrep = (async () => {{
+        try {{
+          const r = await fetch(exitEndpointUrl, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ phase: "prepare" }}),
+          }});
+          if (r.ok) {{
+            const doc = await r.json();
+            if (doc && doc.restore_plan) {{
+              lastRestorePlan = doc.restore_plan;
+            }}
+          }}
+        }} catch (_err) {{
+          // Static HTML export without backend server
+        }} finally {{
+          if (preparePromise === curPrep) {{
+            preparePromise = null;
+          }}
+          if (exitModalOpen && !exitConfirmed && btnCloseTab) {{
+            btnCloseTab.disabled = false;
+          }}
+        }}
+      }})();
+      preparePromise = curPrep;
+      await curPrep;
+    }});
+  }})();
+
+  applyPeakSource(state.peakSource, false);
+  syncWulffYawFromDetector();
+  syncWulffUI();
+  syncNodalAndHolzButtons();
 
   document.getElementById("btn-zones-none").addEventListener("click", () => {{
     state.activeZones = new Set();
+    state.hoveredZoneId = null;
+    state.hoveredZoneHolzN = 0;
+    state.hoveredZonePos = null;
     renderZoneList();
     updateHUD();
+    renderDetector();
+    renderStereoInset(true);
   }});
 
   document.getElementById("btn-ladder-prev").addEventListener("click", () => {{
@@ -8775,27 +23314,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
   }});
 
-  document.getElementById("btn-ladder-play").addEventListener("click", (ev) => {{
-    if (state.ladderTimer) {{
-      clearInterval(state.ladderTimer);
-      state.ladderTimer = null;
-      ev.currentTarget.textContent = "WALK SOLVE STEPS";
-      return;
-    }}
-    selectPipelineStage(1, false);
-    selectLadderRung(0, false);
-    ev.currentTarget.textContent = "STOP";
-    state.ladderTimer = setInterval(() => {{
-      if (state.currentRungIdx + 1 < LADDER.length) {{
-        selectLadderRung(state.currentRungIdx + 1, false);
-      }} else {{
-        clearInterval(state.ladderTimer);
-        state.ladderTimer = null;
-        document.getElementById("btn-ladder-play").textContent = "WALK SOLVE STEPS";
-      }}
-    }}, 1800);
-  }});
-
   // Open in its own full-screen browser tab when embedded inside an outer host iframe (e.g. Galaxy).
   // Inside Trame/NOVA, the widget runs inside an internal full-bleed `<iframe srcdoc>` (`about:srcdoc`)
   // whose `window.parent` is the real HTTP document; hide the button when already in a top-level tab.
@@ -8824,7 +23342,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function openInOwnTab() {{
     const targetUrl = resolveStandaloneTabUrl();
     if (targetUrl) {{
-      return window.open(targetUrl, "_blank", "noopener");
+      return window.open(targetUrl, "_blank");
     }}
     const blob = new Blob([document.documentElement.outerHTML], {{ type: "text/html" }});
     return window.open(URL.createObjectURL(blob), "_blank");
@@ -8892,6 +23410,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.projection = nextProj;
       syncProjectionUI();
     }}
+    if (!isFrameSwitch && !_userTouchedBorder && DATA.instrument && DATA.instrument !== prevInst) {{
+      const bEl = document.getElementById("inp-border");
+      if (bEl) bEl.value = String(defaultRelBorderForInstrument(DATA.instrument));
+    }}
     DATA.space_group = newPayload.space_group || DATA.space_group;
     const defInstWl = getDefaultWavelengthForInstrument(DATA.instrument);
     const nextArtKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
@@ -8917,17 +23439,53 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const nextF = typeof newPayload.frame_index === "number" ? newPayload.frame_index : 0;
       state.selectedFrameIndex = nextF;
       DATA.frame_index = nextF;
+    }} else if (!isFrameSwitch && !preserveParams && typeof newPayload.frame_index === "number") {{
+      state.selectedFrameIndex = newPayload.frame_index;
+      DATA.frame_index = newPayload.frame_index;
+    }} else if (typeof newPayload.frame_index === "number") {{
+      DATA.frame_index = newPayload.frame_index;
+      if (
+        typeof state.selectedFrameIndex !== "number" ||
+        (nFrames > 0 && (state.selectedFrameIndex < 0 || state.selectedFrameIndex >= nFrames))
+      ) {{
+        state.selectedFrameIndex = newPayload.frame_index;
+      }}
     }} else if (
       typeof state.selectedFrameIndex === "number" &&
       (nFrames === 0 || (state.selectedFrameIndex >= 0 && state.selectedFrameIndex < nFrames))
     ) {{
       DATA.frame_index = state.selectedFrameIndex;
-    }} else if (typeof newPayload.frame_index === "number") {{
-      state.selectedFrameIndex = newPayload.frame_index;
-      DATA.frame_index = newPayload.frame_index;
     }}
     if (newPayload.goniometer_summary) DATA.goniometer_summary = newPayload.goniometer_summary;
     if (Array.isArray(newPayload.goniometer_R)) DATA.goniometer_R = newPayload.goniometer_R;
+    if (newPayload.goniometer_R_per_run && typeof newPayload.goniometer_R_per_run === "object") DATA.goniometer_R_per_run = newPayload.goniometer_R_per_run;
+    if (Array.isArray(newPayload.sample_offset_lab)) DATA.sample_offset_lab = newPayload.sample_offset_lab;
+    if (newPayload.sample_offset_lab_per_run && typeof newPayload.sample_offset_lab_per_run === "object") DATA.sample_offset_lab_per_run = newPayload.sample_offset_lab_per_run;
+    if (newPayload.u_matrix) DATA.u_matrix = newPayload.u_matrix;
+    if (newPayload.b_matrix) DATA.b_matrix = newPayload.b_matrix;
+    if (newPayload.ub_matrix) DATA.ub_matrix = newPayload.ub_matrix;
+    if (newPayload.detector_configs) DATA.detector_configs = newPayload.detector_configs;
+    _fullFacePanelsCacheKey = "";
+    _nodalPointsCacheSig = "";
+    _holzCacheSig = "";
+    _zoneHolzCountsCacheSig = "";
+    if (newPayload.space_group_ops) DATA.space_group_ops = newPayload.space_group_ops;
+    if (Array.isArray(newPayload.ki)) DATA.ki = newPayload.ki;
+    if (typeof newPayload.has_tof_data === "boolean") DATA.has_tof_data = newPayload.has_tof_data;
+    if (typeof newPayload.has_tof_events === "boolean") DATA.has_tof_events = newPayload.has_tof_events;
+    if (newPayload.angular_error_mode) DATA.angular_error_mode = newPayload.angular_error_mode;
+    if (typeof newPayload.tof_l1 === "number") DATA.tof_l1 = newPayload.tof_l1;
+    if (newPayload.tof_gate !== undefined) DATA.tof_gate = newPayload.tof_gate;
+    _lastTofDeltaThetaSig = "";
+    DATA.mtz_overlay_name = newPayload.mtz_overlay_name || null;
+    DATA.mtz_overlay_reflections = newPayload.mtz_overlay_reflections || 0;
+    DATA.mtz_overlay_matched = newPayload.mtz_overlay_matched || 0;
+    DATA.mtz_overlay_space_group = newPayload.mtz_overlay_space_group || null;
+    DATA.mtz_overlay_cell = newPayload.mtz_overlay_cell || null;
+    DATA.mtz_overlay_warning = newPayload.mtz_overlay_warning || null;
+    DATA.mtz_asu_lookup = newPayload.mtz_asu_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_asu_lookup : null);
+    DATA.mtz_exact_lookup = newPayload.mtz_exact_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_exact_lookup : null);
+    DATA.default_peak_source = newPayload.default_peak_source || null;
     renderFrameSelector();
 
     if (DATA.wavelength_range && DATA.wavelength_range.length >= 2) {{
@@ -8939,8 +23497,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       syncDminControls(Number(DATA.d_min));
     }}
 
-    let nextPeaks = Array.isArray(newPayload.peaks) ? [...newPayload.peaks] : [];
-    let nextSamplePeaks = Array.isArray(newPayload.sample_peaks) ? [...newPayload.sample_peaks] : nextPeaks;
+    const nextBuckets = extractPeakBucketsFromPayload(newPayload);
+    captureBaselineMeasurements(nextBuckets, newPayload, isFrameSwitch && Boolean(DATA.mtz_overlay_name));
     let nextZones = Array.isArray(newPayload.zones) ? [...newPayload.zones] : [];
     const nextPanels = Array.isArray(newPayload.panels) ? [...newPayload.panels] : [];
     let nextLadder = Array.isArray(newPayload.ladder_steps) && newPayload.ladder_steps.length > 0 ? [...newPayload.ladder_steps] : [...LADDER];
@@ -8951,18 +23509,39 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         nextZones = prevZones;
         nextLadder = prevLadder;
       }}
-      if (nextPeaks.length === 0 && prevPeaks.length > 0) {{
-        nextPeaks = prevPeaks;
-        nextSamplePeaks = prevSamplePeaks;
+      if (nextBuckets.predPeaks.length === 0 && nextBuckets.integPeaks.length === 0 && prevPeaks.length > 0) {{
+        nextBuckets.predPeaks = prevPeaks;
+        nextBuckets.predSample = prevSamplePeaks;
       }}
     }}
 
-    PEAKS.length = 0;
-    nextPeaks.forEach(p => PEAKS.push(p));
-    SAMPLE_PEAKS.length = 0;
-    nextSamplePeaks.forEach(p => SAMPLE_PEAKS.push(p));
-    DATA.merge_metrics = newPayload.merge_metrics || null;
-    DATA.em_mask_summary = newPayload.em_mask_summary || {{ available: false }};
+    PREDICTED_PEAKS = nextBuckets.predPeaks;
+    PREDICTED_SAMPLE_PEAKS = nextBuckets.predSample;
+    _dynEwaldTruncated = false;
+    _dynEwaldRawTotal = 0;
+    _dynViewportPatchCache.sig = "";
+    INTEGRATED_PEAKS = nextBuckets.integPeaks;
+    INTEGRATED_SAMPLE_PEAKS = nextBuckets.integSample;
+    if (newPayload.merge_metrics !== undefined) {{
+      DATA.merge_metrics = newPayload.merge_metrics || null;
+    }} else if (!isFrameSwitch) {{
+      DATA.merge_metrics = null;
+    }}
+    state.hoveredHistBin = null;
+    hideHistBinTooltip();
+    if (newPayload.em_mask_summary !== undefined) {{
+      DATA.em_mask_summary = newPayload.em_mask_summary || {{ available: false }};
+    }} else if (!isFrameSwitch) {{
+      DATA.em_mask_summary = {{ available: false }};
+    }}
+    DATA.default_color_mode = newPayload.default_color_mode || null;
+    const preferredSrc = isFrameSwitch
+      ? state.peakSource
+      : (newPayload.default_peak_source || state.peakSource);
+    applyPeakSource(preferredSrc, false);
+    if (!isFrameSwitch && hasMtzIsigi() && (newPayload.mtz_fresh_overlay || state.wulffColorMode === "mtz_isigi" || newPayload.default_color_mode === "mtz_isigi")) {{
+      state.wulffColorMode = "mtz_isigi";
+    }}
     ZONES.length = 0;
     nextZones.forEach(z => ZONES.push(z));
     PANELS.length = 0;
@@ -8971,6 +23550,24 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     nextLadder.forEach(s => LADDER.push(s));
     PIPELINE.length = 0;
     nextPipeline.forEach(s => PIPELINE.push(s));
+
+    const shellDiffersFromBase = Boolean(
+      Math.abs(state.dMin - _payloadBaseParams.dMin) > 0.01 ||
+      Math.abs(state.lamMin - _payloadBaseParams.lamMin) > 0.01 ||
+      Math.abs(state.lamMax - _payloadBaseParams.lamMax) > 0.01
+    );
+    if (DATA.angular_error_mode === "tof_3d" && !shellDiffersFromBase) {{
+      _lastTofDeltaThetaSig = _buildTofDeltaThetaSig();
+    }}
+    if (
+      keepUserParams &&
+      (
+        shellDiffersFromBase ||
+        (state.peakSource === "predicted" && PREDICTED_PEAKS.length === 0 && canRepredictDynamic())
+      )
+    ) {{
+      repredictPeaksDynamic({{ preserveSource: true }});
+    }}
 
     if (PANELS.length > 0) {{
       const allY = [], allEl = [];
@@ -8991,20 +23588,45 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     rawBankImages.clear();
+    rawBankGrayMaps.clear();
     bankCanvases.clear();
     maskBankCanvases.clear();
+    if (newPayload.pixel_mask_bits && typeof newPayload.pixel_mask_bits === "object") {{
+      DATA.pixel_mask_bits = newPayload.pixel_mask_bits;
+      serverBankPixelMaskCache.clear();
+    }} else if (!isFrameSwitch && Array.isArray(newPayload.panels)) {{
+      DATA.pixel_mask_bits = null;
+      serverBankPixelMaskCache.clear();
+    }}
+    if (typeof newPayload.rel_border_width === "number") {{
+      DATA.rel_border_width = newPayload.rel_border_width;
+    }}
+    if (!PANELS.some(p => Boolean(p._grayCanvas))) {{
+      lastClientBankImgs = null;
+      lastClientBankMaskRaw = null;
+    }}
+    if (typeof newPayload.render_binning === "number") {{
+      DATA.render_binning = newPayload.render_binning;
+    }}
+    syncHiResButtonUI();
     invalidateDetectorGeometryCache();
     decodeAllBankTextures();
     // Support direct canvas textures generated by client-side h5wasm
     PANELS.forEach(p => {{
       if (p._grayCanvas) {{
         rawBankImages.set(p.bank, p._grayCanvas);
+        cacheBankGrayscaleMap(p.bank, p._grayCanvas);
         bankCanvases.set(p.bank, colorizeGrayscaleImage(p._grayCanvas, state.heatmapStyle));
       }}
       if (p._maskCanvas) {{
         maskBankCanvases.set(p.bank, p._maskCanvas);
       }}
     }});
+    if (rawBankGrayMaps.size > 0 && estimateActiveFrameAngularErrorsJS(PEAKS) > 0) {{
+      refreshZonesAngularStatsJS(PEAKS);
+      _peakDataAvailabilitySig = "";
+    }}
+    invalidatePanelRenderCaches();
     syncPixelMaskUI();
 
     const subEl = document.querySelector(".subtitle-tag");
@@ -9038,6 +23660,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       artBadge = "RAW NEXUS • PENDING: 1. REDUCE";
     }} else if (newPayload.intensity_source === "raw_h5") {{
       artBadge = "RAW DETECTOR COUNTS";
+    }}
+    if (newPayload.mtz_overlay_name) {{
+      artBadge = newPayload.mtz_fresh_overlay
+        ? `MTZ • ${{newPayload.mtz_overlay_name}}`
+        : `${{artBadge}} • MTZ: ${{newPayload.mtz_overlay_name}}`;
     }}
     if (subEl) {{
       subEl.textContent = `${{DATA.instrument || "CG4D"}} • ${{DATA.space_group || "P 1"}} • ${{artBadge}}`;
@@ -9108,14 +23735,29 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (LADDER.length > 0) selectLadderRung(state.currentRungIdx, false);
     else {{ renderZoneList(); updateHUD(); }}
     renderFilesDrawer();
-    probeGalaxyConnection();
+    if (newPayload.hydration_job && newPayload.hydration_job.job_id) {{
+      startHydrationJobPoll(newPayload.hydration_job);
+    }} else {{
+      probeGalaxyConnection();
+    }}
     if (isFrameSwitch) {{
       return;
     }}
-    if (newPayload.mtz_overlay_name) {{
+    if (newPayload.hydration_job && newPayload.hydration_job.job_id) {{
+      const nHydRuns = Number(newPayload.hydration_job.n_runs || 1);
+      setStatusLine(
+        `[HYDRATING FRAMES]`,
+        `Loaded derived dataset — regenerating detector image frames on the fly via <strong>1. Reduce</strong> (${{nHydRuns}} run${{nHydRuns === 1 ? "" : "s"}}) while keeping current stage active…`
+      );
+      return;
+    }}
+    if (newPayload.mtz_overlay_name && newPayload.mtz_fresh_overlay !== false) {{
+      const warnHtml = newPayload.mtz_overlay_warning
+        ? ` • <span style="color:var(--accent-gold);">⚠ ${{escTxt(newPayload.mtz_overlay_warning)}}</span>`
+        : "";
       setStatusLine(
         `[MTZ REFERENCE SPOTS]`,
-        `Overlaid <strong>${{Number(newPayload.mtz_overlay_reflections || 0).toLocaleString()}}</strong> ASU reflections from <strong>${{newPayload.mtz_overlay_name}}</strong> (<strong>${{Number(newPayload.mtz_overlay_matched || 0).toLocaleString()}}</strong> spots matched on active detector geometry).`
+        `Overlaid <strong>${{Number(newPayload.mtz_overlay_reflections || 0).toLocaleString()}}</strong> ASU reflections from <strong>${{escTxt(newPayload.mtz_overlay_name)}}</strong> (<strong>${{Number(newPayload.mtz_overlay_matched || 0).toLocaleString()}}</strong> spots matched on active detector geometry)${{warnHtml}}.`
       );
       return;
     }}
@@ -9125,9 +23767,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const isig = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
       const comp = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
       const mult = typeof m.multiplicity === "number" ? `${{m.multiplicity.toFixed(2)}}×` : "—";
+      const hostInfo = m.runner_host ? ` (Host=<strong>${{escTxt(String(m.runner_host))}}</strong>)` : "";
       setStatusLine(
         `[4. MERGE COMPLETE]`,
-        `<strong style="color:var(--accent-gold);">Careless Variational Merge</strong> • CC½=<strong style="color:var(--accent-cyan);">${{cc}}</strong> • ⟨I/σ⟩=<strong>${{isig}}</strong> • Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{m.n_merged_asu || 0}} ASU, mult=${{mult}}) — Click any reflection to inspect its ASU symmetry starburst &amp; ΔI/σ residual.`
+        `<strong style="color:var(--accent-gold);">Careless Variational Merge</strong>${{hostInfo}} • CC½=<strong style="color:var(--accent-cyan);">${{cc}}</strong> • ⟨I/σ⟩=<strong>${{isig}}</strong> • Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{m.n_merged_asu || 0}} ASU, mult=${{mult}}) — Click any reflection to inspect its ASU symmetry starburst &amp; ΔI/σ residual.`
       );
     }} else if (artKind === "merged") {{
       const cStr = (DATA.cell && DATA.cell.length === 6)
@@ -9340,8 +23983,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const mBankIds = dKeys.includes("mask_bank_ids")
             ? Array.from(dGrp.get("mask_bank_ids").value).map(Number)
             : Array.from({{ length: nBanksM }}, (_, idx) => idx + 1);
-          const bStepM = 4;
-          const Hbm = Math.max(1, Math.floor(Hm / bStepM)), Wbm = Math.max(1, Math.floor(Wm / bStepM));
+          const bStepM = state.hiResTextures ? 1 : 4;
           let nTotM = 0, nDarkM = 0, nBrightM = 0;
           for (let bi = 0; bi < Math.min(nBanksM, mBankIds.length); bi++) {{
             const bidM = Number(mBankIds[bi]);
@@ -9357,29 +23999,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
             bankMaskRaw.set(bidM, {{ data: clsArr, H: Hm, W: Wm }});
             if (hasMasked) {{
-              const mc = document.createElement("canvas");
-              mc.width = Wbm; mc.height = Hbm;
-              const mctx = mc.getContext("2d");
-              const midata = mctx.createImageData(Wbm, Hbm);
-              for (let rb = 0; rb < Hbm; rb++) {{
-                for (let cb = 0; cb < Wbm; cb++) {{
-                  let mx = 0;
-                  for (let dr = 0; dr < bStepM; dr++) {{
-                    const rOff = (rb * bStepM + dr) * Wm + cb * bStepM;
-                    for (let dc = 0; dc < bStepM; dc++) {{
-                      if (clsArr[rOff + dc] > mx) mx = clsArr[rOff + dc];
-                    }}
-                  }}
-                  const pIdx = (rb * Wbm + cb) * 4;
-                  if (mx >= 2) {{
-                    midata.data[pIdx] = 180; midata.data[pIdx+1] = 255; midata.data[pIdx+2] = 20; midata.data[pIdx+3] = 224;
-                  }} else if (mx === 1) {{
-                    midata.data[pIdx] = 56; midata.data[pIdx+1] = 189; midata.data[pIdx+2] = 248; midata.data[pIdx+3] = 132;
-                  }}
-                }}
-              }}
-              mctx.putImageData(midata, 0, 0);
-              bankMaskCanvases.set(bidM, mc);
+              const mc = buildClientMaskCanvas(clsArr, Hm, Wm, bStepM);
+              if (mc) bankMaskCanvases.set(bidM, mc);
             }}
           }}
           if (nTotM > 0) {{
@@ -9398,42 +24019,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const imDs = mf.get("images");
       const shape = Array.from(imDs.shape || []).map(Number); // [N, H, W]
       const H = shape[1] || 512, W = shape[2] || 512;
-      const bStep = 4;
-      const Hb = Math.floor(H / bStep), Wb = Math.floor(W / bStep);
+      const bStep = state.hiResTextures ? 1 : 4;
       for (let i = 0; i < bankIdsRun.length; i++) {{
         const bid = Number(bankIdsRun[i]);
         const sub = imDs.slice([[f0 + i, f0 + i + 1], [0, H], [0, W]]);
         bankImgs.set(bid, {{ data: sub, H, W }});
-
-        // Downsample and log1p-scale into offscreen canvas (canonical r, c order matching C0..C3)
-        const logBuf = new Float32Array(Hb * Wb);
-        for (let rb = 0; rb < Hb; rb++) {{
-          for (let cb = 0; cb < Wb; cb++) {{
-            let sum = 0;
-            for (let dr = 0; dr < bStep; dr++) {{
-              const rowOff = (rb * bStep + dr) * W + cb * bStep;
-              for (let dc = 0; dc < bStep; dc++) sum += Number(sub[rowOff + dc]);
-            }}
-            logBuf[rb * Wb + cb] = Math.log1p(Math.max(0, sum / (bStep * bStep)));
-          }}
-        }}
-        const sorted = Float32Array.from(logBuf).sort();
-        const vmax = Math.max(sorted[Math.floor(sorted.length * 0.995)] || 1.0, 1e-6);
-        const gc = document.createElement("canvas");
-        gc.width = Wb; gc.height = Hb;
-        const gctx = gc.getContext("2d");
-        const idata = gctx.createImageData(Wb, Hb);
-        for (let rb = 0; rb < Hb; rb++) {{
-          for (let cb = 0; cb < Wb; cb++) {{
-            const v = Math.min(255, Math.round((logBuf[rb * Wb + cb] / vmax) * 255));
-            const pIdx = (rb * Wb + cb) * 4;
-            idata.data[pIdx] = v; idata.data[pIdx+1] = v; idata.data[pIdx+2] = v; idata.data[pIdx+3] = 255;
-          }}
-        }}
-        gctx.putImageData(idata, 0, 0);
-        bankGrayCanvases.set(bid, gc);
+        bankGrayCanvases.set(bid, buildClientGrayscaleCanvas(sub, H, W, bStep));
       }}
     }}
+    lastClientBankImgs = bankImgs.size > 0 ? bankImgs : null;
+    lastClientBankMaskRaw = bankMaskRaw.size > 0 ? bankMaskRaw : null;
 
     // Build panel outlines and 4 corners from detMap (det.center is the (0,0) corner in subhkl Detector.pixel_to_lab)
     const panelsOut = [];
@@ -9602,9 +24197,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
           for (let i = 0; i < prArr.length; i++) {{
             if (runArr && runArr[i] !== 0) continue;
-            const inten = intArr ? intArr[i] : 120.0;
-            const sig = sigArr ? sigArr[i] : 3.0;
-            if (intArr && sigArr && (sig <= 0 || inten / Math.max(sig, 1e-9) < 2.5)) continue;
+            const inten = intArr ? intArr[i] : null;
+            const sig = sigArr && sigArr[i] > 0 ? sigArr[i] : null;
+            if (intArr && sigArr && (!sig || inten / Math.max(sig, 1e-9) < 2.5)) continue;
             const bid = bkArr[i];
             const det = detMap.get(bid);
             if (!det) continue;
@@ -9693,7 +24288,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             candPeaks.push({{
               bank: bid, row: Number(rPix.toFixed(1)), col: Number(cPix.toFixed(1)),
               det_x: az, det_y: dy, det_el: el, q_hat: gCryst, q_hat_lab: qLab,
-              stereographic: [sx, sy], hemisphere: hemi, intensity: 150.0, sigma: 3.0,
+              stereographic: [sx, sy], hemisphere: hemi, intensity: null, sigma: null,
               wavelength: lam, d_spacing: dVal, harmonic_order: Math.max(1, gcd3(h, k, l)),
               parallax_depth: Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * dVal))),
               hkl: [h, k, l], zone_ids: [], indexed: true, angular_error_deg: 0.02,
@@ -9779,13 +24374,49 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         candPeaks.push({{
           bank: gh.bid, row: Number(gh.rPix.toFixed(1)), col: Number(gh.cPix.toFixed(1)),
           det_x: az, det_y: dy, det_el: el, q_hat: gCryst, q_hat_lab: qLab,
-          stereographic: [sx, sy], hemisphere: hemi, intensity: gh.inten, sigma: 3.0,
+          stereographic: [sx, sy], hemisphere: hemi, intensity: null, sigma: null,
           wavelength: gh.lam, d_spacing: dVal, harmonic_order: Math.max(1, gcd3(gh.h, gh.k, gh.l)),
           parallax_depth: Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * dVal))),
           hkl: [gh.h, gh.k, gh.l], zone_ids: [], indexed: true, angular_error_deg: 0.02,
         }});
       }}
       }}
+      const sgU = String(sg || "").trim().toUpperCase();
+      const isClientAbsent = (hv, kv, lv) => {{
+        if (hv === 0 && kv === 0 && lv === 0) return true;
+        if (sgU.startsWith("I")) return (((hv + kv + lv) & 1) !== 0);
+        if (sgU.startsWith("F")) return ((((hv + kv) & 1) !== 0) || (((kv + lv) & 1) !== 0) || (((hv + lv) & 1) !== 0));
+        if (sgU.startsWith("C")) return (((hv + kv) & 1) !== 0);
+        if (sgU.startsWith("A")) return (((kv + lv) & 1) !== 0);
+        if (sgU.startsWith("B")) return (((hv + lv) & 1) !== 0);
+        if (sgU.startsWith("R")) return (((((-hv + kv + lv) % 3) + 3) % 3) !== 0);
+        return false;
+      }};
+      const clientWlMin = Number(wlRangeNew[0] || 2.0);
+      const clientWlMax = Number(wlRangeNew[1] || 4.5);
+      const clientDMin = Number(dMinNew || 1.0);
+      candPeaks.forEach(p => {{
+        if (!Array.isArray(p.hkl)) return;
+        const [hv, kv, lv] = p.hkl;
+        const g = Math.max(1, gcd3(hv, kv, lv));
+        const h0 = Math.trunc(hv / g), k0 = Math.trunc(kv / g), l0 = Math.trunc(lv / g);
+        let ordAllowed = 0;
+        for (let m = 1; m <= Math.min(g, 64); m++) {{
+          if (!isClientAbsent(m * h0, m * k0, m * l0)) ordAllowed++;
+        }}
+        p.harmonic_order = Math.max(1, ordAllowed);
+        const lamProd = g * Number(p.wavelength || 2.5);
+        const mLo = Math.max(1, Math.ceil(lamProd / Math.max(clientWlMax, 1e-6) - 1e-5));
+        const mHiWl = lamProd / Math.max(clientWlMin, 1e-6);
+        const dEff = Math.min(Math.max(clientDMin, 1e-3), Math.max(Number(p.d_spacing || 1.0), 1e-3));
+        const mHiD = (g * Number(p.d_spacing || 1.0)) / Math.max(dEff, 1e-6);
+        const mHi = Math.floor(Math.min(mHiWl, mHiD) + 1e-5);
+        let multAllowed = 0;
+        for (let m = mLo; m <= Math.min(mHi, mLo + 64); m++) {{
+          if (!isClientAbsent(m * h0, m * k0, m * l0)) multAllowed++;
+        }}
+        p.harmonic_multiplicity = Math.max(1, multAllowed);
+      }});
       candPeaks.sort((a, b) => b.intensity - a.intensity);
       candPeaks.slice(0, 1200).forEach((p, idx) => {{
         p.id = idx;
@@ -9852,6 +24483,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (curCyl.length > 1) {{ detSegs.push(curCyl); detSegsSph.push(curSph); }}
         zonesOut.push({{
           zone_id: zi, uvw: z.uvw, order: z.order, label: `[${{z.uvw[0]}} ${{z.uvw[1]}} ${{z.uvw[2]}}]`,
+          d_direct: Number(vecNorm(mat3Vec(mat3T(A_real), z.uvw)).toFixed(4)),
           axis_xyz: z.tLab, axis_crystal_xyz: mat3Vec(R_T, z.tLab),
           n_peaks: z.n_peaks, angular_rms_deg: 0.02, rainbow_color: ZONE_COLORS[zi % ZONE_COLORS.length],
           detector_segments: detSegs, detector_segments_sph: detSegsSph, stereo_segments: stereoSegs,
@@ -9867,7 +24499,33 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       {{ rung: 4, stage: "4. 120→400 Zone + Cell", subtitle: "Higher-order zones + cell ratios", active_zones: zonesOut.slice(0, 12).map(z => z.zone_id), n_captured: Math.round(peaksOut.length * 0.92), description: "Staged 120→400 zone-band refinement co-refines axial stretch, ω drift, and unit-cell ratios." }},
       {{ rung: 5, stage: "5. Converged Solve UB", subtitle: `${{sg}} • a=${{cell[0].toFixed(1)}}, b=${{cell[1].toFixed(1)}}, c=${{cell[2].toFixed(1)}} Å`, active_zones: ord1Ids.length ? ord1Ids : zonesOut.map(z => z.zone_id), n_captured: peaksOut.length, description: `Converged 3D UB orientation (${{peaksOut.length}} forward-projected spots with SNR ≥ 3.0).` }},
     ];
+    const _clientH5HasTof = (hf) => {{
+      if (!hf) return false;
+      try {{
+        if (hf.attrs && hf.attrs.has_tof_events && hf.attrs.has_tof_events.value) return true;
+        const ks = hf.keys();
+        if (ks.includes("tof_gate")) return true;
+        if (ks.includes("peaks") && hf.get("peaks").keys().includes("tof")) return true;
+        if (ks.includes("events") && hf.get("events").keys().includes("tof")) return true;
+      }} catch (_te) {{}}
+      return false;
+    }};
+    const hasTofData = _clientH5HasTof(f) || _clientH5HasTof(mf);
     try {{ f.close(); if (mf && mf !== f) mf.close(); }} catch (_e) {{}}
+    const clientDetConfigs = {{}};
+    detMap.forEach((dCfg, bid) => {{
+      clientDetConfigs[String(bid)] = {{
+        panel: "flat",
+        panel_type: "flat",
+        m: dCfg.m,
+        n: dCfg.n,
+        center: dCfg.center,
+        uhat: dCfg.uhat,
+        vhat: dCfg.vhat,
+        width: dCfg.width,
+        height: dCfg.height,
+      }};
+    }});
     return {{
       instrument: inst,
       default_projection: (inst === "MANDI" || inst === "TOPAZ") ? "spherical" : "cylindrical",
@@ -9875,10 +24533,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       intensity_source: bankImgs.size > 0 ? "raw_h5" : "reconstructed",
       artifact_kind: artifactKind,
       peak_shape_mode: peakShapeMode,
+      has_tof_data: hasTofData,
+      has_tof_events: false,
+      angular_error_mode: "image_2d",
+      tof_gate: null,
       wavelength_range: wlRangeNew,
       d_min: dMinNew,
       goniometer_R: Rrun,
       cell,
+      u_matrix: U,
+      b_matrix: B,
+      ub_matrix: UB,
+      detector_configs: clientDetConfigs,
       em_mask_summary: emMaskSummary,
       peaks: peaksOut,
       sample_peaks: peaksOut,
@@ -9902,7 +24568,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function classifyArtifactStageClient(filename) {{
     const low = String(filename || "").split("/").pop().toLowerCase();
     if (!low) return null;
-    if (["merged.mtz", "predictions.mtz", "xval.mtz", "careless_metrics.json", "careless_0.mtz", "careless_predictions_0.mtz", "careless_xval_0.mtz"].some(k => low === k || low.endsWith(k))) {{
+    if (["merged.mtz", "predictions.mtz", "xval.mtz", "careless_metrics.json", "merge_table.csv", "careless_0.mtz", "careless_predictions_0.mtz", "careless_xval_0.mtz"].some(k => low === k || low.endsWith(k))) {{
       return "merge";
     }}
     if (["predictor.h5", "integrated.h5", "reflections.mtz"].some(k => low === k || low.endsWith(k))) {{
@@ -9995,8 +24661,454 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         a.title = `Download ${{item.name}} (${{grp.sTitle}}) to local computer`;
         filesDrawer.appendChild(a);
       }});
+
+      if (grp.sId === "merge" && getMergeResolutionBins().length > 0) {{
+        const existingNames = new Set(grp.items.map(it => String(it.name || "").toLowerCase()));
+        if (!existingNames.has("merge_table.csv")) {{
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "file-dl-pill";
+          b.style.cursor = "pointer";
+          b.textContent = "↓ merge_table.csv";
+          b.title = "Download merge_table.csv to local computer";
+          b.addEventListener("click", () => downloadMergeArtifact("csv"));
+          filesDrawer.appendChild(b);
+        }}
+      }}
     }});
   }}
+
+  function escapeHtmlText(val) {{
+    return String(val === null || val === undefined ? "" : val)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }}
+
+  function ordinalShellRank(num) {{
+    const mod100 = num % 100;
+    if (mod100 >= 10 && mod100 <= 20) return `${{num}}TH`;
+    const mod10 = num % 10;
+    if (mod10 === 1) return `${{num}}ST`;
+    if (mod10 === 2) return `${{num}}ND`;
+    if (mod10 === 3) return `${{num}}RD`;
+    return `${{num}}TH`;
+  }}
+
+  function computeCcStarClient(cc) {{
+    if (cc === null || cc === undefined || !Number.isFinite(cc) || cc < 0) return null;
+    if (cc === 0) return 0;
+    const d = 1 + cc;
+    return d > 1e-12 ? Math.sqrt(Math.max(0, (2 * cc) / d)) : null;
+  }}
+
+  function ccHalfTierClient(cc) {{
+    if (cc === null || cc === undefined || !Number.isFinite(cc)) return "na";
+    if (cc >= 0.8) return "green";
+    if (cc >= 0.3) return "yellow";
+    return "red";
+  }}
+
+  function buildClientMergeTableData() {{
+    const m = DATA.merge_metrics || {{}};
+    const bins = getMergeResolutionBins();
+    const numOrNull = (v) => (v !== null && v !== undefined && typeof v !== "boolean" && Number.isFinite(Number(v))) ? Number(v) : null;
+    const intOrNull = (v) => {{
+      const f = numOrNull(v);
+      return f !== null ? Math.round(f) : null;
+    }};
+
+    let sumObs = 0;
+    let allHaveObs = bins.length > 0;
+    let sumUnique = 0;
+    let sumTheo = 0;
+    let anyHaveTheo = false;
+    const rows = bins.map((b, idx) => {{
+      const shell = idx + 1;
+      const dMax = numOrNull(b && b.d_max);
+      const dMin = numOrNull(b && b.d_min);
+      const nObs = intOrNull(b && b.n_obs);
+      const nUnique = intOrNull(b && b.n_refl) !== null ? intOrNull(b && b.n_refl) : 0;
+      const nTheoRaw = intOrNull(b && b.n_theo);
+      const nTheo = (nTheoRaw !== null && nTheoRaw > 0) ? nTheoRaw : null;
+      let mult = numOrNull(b && b.multiplicity);
+      if (mult === null && nObs !== null && nUnique > 0) mult = nObs / nUnique;
+      let comp = numOrNull(b && b.completeness_pct);
+      if (comp === null && nTheo !== null && nTheo > 0) comp = (100 * nUnique) / nTheo;
+      const isigi = numOrNull(b && b.mean_isigi);
+      const ccHalf = numOrNull(b && b.cc_half);
+      const ccStar = computeCcStarClient(ccHalf);
+      if (nObs !== null) sumObs += nObs;
+      else allHaveObs = false;
+      sumUnique += nUnique;
+      if (nTheo !== null) {{
+        sumTheo += nTheo;
+        anyHaveTheo = true;
+      }}
+      return {{
+        shell,
+        rankBadge: ordinalShellRank(shell),
+        dMax,
+        dMin,
+        rangeDisplay: (dMax !== null && dMin !== null) ? `${{dMax.toFixed(2)}} – ${{dMin.toFixed(2)}}` : `Bin ${{shell}}`,
+        rangeAscii: (dMax !== null && dMin !== null) ? `${{dMax.toFixed(2)}} - ${{dMin.toFixed(2)}}` : `Bin ${{shell}}`,
+        nObs,
+        nUnique,
+        nTheo,
+        multiplicity: mult,
+        completenessPct: comp,
+        meanIsigi: isigi,
+        ccHalf,
+        ccStar,
+        ccTier: ccHalfTierClient(ccHalf),
+      }};
+    }});
+
+    const ovDMax = numOrNull(m.d_max) !== null ? numOrNull(m.d_max) : (rows.length && rows[0].dMax !== null ? rows[0].dMax : null);
+    const ovDMin = numOrNull(m.d_min) !== null ? numOrNull(m.d_min) : (rows.length && rows[rows.length - 1].dMin !== null ? rows[rows.length - 1].dMin : null);
+    const ovObs = intOrNull(m.n_observations) !== null ? intOrNull(m.n_observations) : (allHaveObs && sumObs > 0 ? sumObs : null);
+    const ovUnique = intOrNull(m.n_merged_asu) || sumUnique;
+    const ovTheo = intOrNull(m.n_theoretical_asu) !== null ? intOrNull(m.n_theoretical_asu) : (anyHaveTheo && sumTheo > 0 ? sumTheo : null);
+    let ovMult = numOrNull(m.multiplicity) !== null ? numOrNull(m.multiplicity) : numOrNull(m.mean_multiplicity);
+    if (ovMult === null && ovObs !== null && ovUnique > 0) ovMult = ovObs / ovUnique;
+    let ovComp = numOrNull(m.completeness_pct);
+    if (ovComp === null && ovTheo !== null && ovTheo > 0) ovComp = (100 * ovUnique) / ovTheo;
+    const ovIsigi = numOrNull(m.mean_i_over_sigi) !== null ? numOrNull(m.mean_i_over_sigi) : numOrNull(m.mean_isigi);
+    const ovCc = numOrNull(m.cc_half_overall) !== null ? numOrNull(m.cc_half_overall) : numOrNull(m.cc_half);
+    const overall = {{
+      shell: "Overall",
+      rankBadge: "ALL",
+      dMax: ovDMax,
+      dMin: ovDMin,
+      rangeDisplay: (ovDMax !== null && ovDMin !== null) ? `${{ovDMax.toFixed(2)}} – ${{ovDMin.toFixed(2)}}` : "Overall",
+      rangeAscii: (ovDMax !== null && ovDMin !== null) ? `${{ovDMax.toFixed(2)}} - ${{ovDMin.toFixed(2)}}` : "Overall",
+      nObs: ovObs,
+      nUnique: ovUnique,
+      nTheo: ovTheo,
+      multiplicity: ovMult,
+      completenessPct: ovComp,
+      meanIsigi: ovIsigi,
+      ccHalf: ovCc,
+      ccStar: computeCcStarClient(ovCc),
+      ccTier: ccHalfTierClient(ovCc),
+    }};
+
+    let dCc30 = null;
+    rows.forEach(r => {{
+      if (r.ccHalf !== null && r.ccHalf >= 0.3 && r.dMin !== null) {{
+        if (dCc30 === null || r.dMin < dCc30) dCc30 = r.dMin;
+      }}
+    }});
+
+    const sg = String(m.space_group || DATA.space_group || "").trim();
+    const cellArr = Array.isArray(m.cell) && m.cell.length >= 6 ? m.cell : (Array.isArray(DATA.cell) && DATA.cell.length >= 6 ? DATA.cell : null);
+    const wlArr = Array.isArray(m.wavelength_range) && m.wavelength_range.length >= 2 ? m.wavelength_range : (Array.isArray(DATA.wavelength_range) && DATA.wavelength_range.length >= 2 ? DATA.wavelength_range : null);
+    const metaParts = [];
+    if (sg) metaParts.push(`Space group: ${{sg}}`);
+    if (cellArr) {{
+      metaParts.push(`Cell: ${{Number(cellArr[0]).toFixed(2)}}, ${{Number(cellArr[1]).toFixed(2)}}, ${{Number(cellArr[2]).toFixed(2)}} Å; ${{Number(cellArr[3]).toFixed(1)}}°, ${{Number(cellArr[4]).toFixed(1)}}°, ${{Number(cellArr[5]).toFixed(1)}}°`);
+    }}
+    if (wlArr) metaParts.push(`λ: ${{Number(wlArr[0]).toFixed(2)}}–${{Number(wlArr[1]).toFixed(2)}} Å`);
+    if (dCc30 !== null) metaParts.push(`d(CC½ ≥ 0.30): ${{dCc30.toFixed(2)}} Å`);
+
+    return {{
+      title: "Merging and Scaling Statistics by Resolution Shell",
+      metaLine: metaParts.join(" • "),
+      dCc30,
+      rows,
+      overall,
+    }};
+  }}
+
+  function buildMergeTableClipboardPayloads(tData) {{
+    const fmtF = (v, nd) => (v !== null && v !== undefined && Number.isFinite(v)) ? v.toFixed(nd) : "";
+    const tsvLines = [
+      ["Shell", "Resolution (Å)", "N_obs", "N_unique", "N_theo", "Multiplicity", "Completeness (%)", "<I/sigma(I)>", "CC1/2", "CC*"].join("\\t")
+    ];
+    const cleanRows = tData.rows.map(r => {{
+      tsvLines.push([
+        String(r.shell),
+        r.rangeDisplay,
+        r.nObs !== null ? String(r.nObs) : "",
+        String(r.nUnique),
+        r.nTheo !== null ? String(r.nTheo) : "",
+        fmtF(r.multiplicity, 2),
+        fmtF(r.completenessPct, 1),
+        fmtF(r.meanIsigi, 2),
+        fmtF(r.ccHalf, 3),
+        fmtF(r.ccStar, 3),
+      ].join("\\t"));
+      return `<tr>` +
+        `<td style="padding:4px 8px;text-align:center;">${{r.shell}}</td>` +
+        `<td style="padding:4px 8px;text-align:center;">${{escapeHtmlText(r.rangeDisplay)}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{r.nObs !== null ? r.nObs : ""}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{r.nUnique}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{r.nTheo !== null ? r.nTheo : ""}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{fmtF(r.multiplicity, 2)}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{fmtF(r.completenessPct, 1)}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{fmtF(r.meanIsigi, 2)}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{fmtF(r.ccHalf, 3)}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{fmtF(r.ccStar, 3)}}</td>` +
+      `</tr>`;
+    }});
+    const ov = tData.overall;
+    tsvLines.push([
+      "Overall",
+      ov.rangeDisplay,
+      ov.nObs !== null ? String(ov.nObs) : "",
+      String(ov.nUnique),
+      ov.nTheo !== null ? String(ov.nTheo) : "",
+      fmtF(ov.multiplicity, 2),
+      fmtF(ov.completenessPct, 1),
+      fmtF(ov.meanIsigi, 2),
+      fmtF(ov.ccHalf, 3),
+      fmtF(ov.ccStar, 3),
+    ].join("\\t"));
+    const cleanFoot =
+      `<tr style="border-top:1px solid #000;border-bottom:2px solid #000;font-weight:bold;">` +
+        `<td style="padding:5px 8px;text-align:center;">Overall</td>` +
+        `<td style="padding:5px 8px;text-align:center;">${{escapeHtmlText(ov.rangeDisplay)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{ov.nObs !== null ? ov.nObs : ""}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{ov.nUnique}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{ov.nTheo !== null ? ov.nTheo : ""}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtF(ov.multiplicity, 2)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtF(ov.completenessPct, 1)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtF(ov.meanIsigi, 2)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtF(ov.ccHalf, 3)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtF(ov.ccStar, 3)}}</td>` +
+      `</tr>`;
+    const cleanHtml =
+      `<div style="background:#ffffff;color:#000000;font-family:Calibri,Arial,sans-serif;font-size:11pt;">` +
+      `<p style="margin:0 0 6px 0;font-weight:bold;">${{escapeHtmlText(tData.title)}}${{tData.metaLine ? ` (${{escapeHtmlText(tData.metaLine)}})` : ""}}</p>` +
+      `<table style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:10.5pt;color:#000000;background:#ffffff;">` +
+      `<thead><tr style="border-top:2px solid #000;border-bottom:1px solid #000;font-weight:bold;">` +
+        `<th style="padding:5px 8px;text-align:center;">Shell</th>` +
+        `<th style="padding:5px 8px;text-align:center;">Resolution (Å)</th>` +
+        `<th style="padding:5px 8px;text-align:right;">N<sub>obs</sub></th>` +
+        `<th style="padding:5px 8px;text-align:right;">N<sub>unique</sub></th>` +
+        `<th style="padding:5px 8px;text-align:right;">N<sub>theo</sub></th>` +
+        `<th style="padding:5px 8px;text-align:right;">Multiplicity</th>` +
+        `<th style="padding:5px 8px;text-align:right;">Completeness (%)</th>` +
+        `<th style="padding:5px 8px;text-align:right;">⟨I/σ(I)⟩</th>` +
+        `<th style="padding:5px 8px;text-align:right;">CC<sub>1/2</sub></th>` +
+        `<th style="padding:5px 8px;text-align:right;">CC*</th>` +
+      `</tr></thead><tbody>${{cleanRows.join("")}}</tbody><tfoot>${{cleanFoot}}</tfoot></table></div>`;
+
+    const csvEscape = (s) => {{
+      const str = String(s === null || s === undefined ? "" : s);
+      return /[",\\n]/.test(str) ? `"${{str.replace(/"/g, '""')}}"` : str;
+    }};
+    const csvRows = [
+      ["shell", "d_max_A", "d_min_A", "resolution_range_A", "n_obs", "n_unique", "n_theo", "multiplicity", "completeness_pct", "mean_isigi", "cc_half", "cc_star"].join(",")
+    ];
+    [...tData.rows, ov].forEach(r => {{
+      csvRows.push([
+        csvEscape(r.shell),
+        fmtF(r.dMax, 2),
+        fmtF(r.dMin, 2),
+        csvEscape(r.rangeAscii),
+        r.nObs !== null ? String(r.nObs) : "",
+        String(r.nUnique),
+        r.nTheo !== null ? String(r.nTheo) : "",
+        fmtF(r.multiplicity, 2),
+        fmtF(r.completenessPct, 1),
+        fmtF(r.meanIsigi, 2),
+        fmtF(r.ccHalf, 4),
+        fmtF(r.ccStar, 4),
+      ].join(","));
+    }});
+    return {{ cleanHtml, tsv: tsvLines.join("\\n"), csv: csvRows.join("\\n") + "\\n" }};
+  }}
+
+  function renderMergeTableModalContent() {{
+    const card = document.getElementById("merge-tbl-card");
+    const titleEl = document.getElementById("merge-tbl-modal-title");
+    const metaEl = document.getElementById("merge-tbl-meta");
+    const wrap = document.getElementById("merge-tbl-body-wrap");
+    if (!card || !wrap) return;
+
+    const tData = buildClientMergeTableData();
+    card.style.background = "#0a1020";
+    card.style.color = "#bae6fd";
+    card.style.borderColor = "rgba(56, 189, 248, 0.38)";
+    if (titleEl) {{
+      titleEl.textContent = tData.title;
+      titleEl.style.color = "#e0f2fe";
+      titleEl.style.fontFamily = "Georgia, 'Times New Roman', Times, serif";
+    }}
+    if (metaEl) {{
+      metaEl.style.color = "rgba(147, 197, 253, 0.78)";
+      metaEl.textContent = tData.metaLine;
+    }}
+
+    const fmtDisp = (v, nd) => (v !== null && v !== undefined && Number.isFinite(v)) ? v.toFixed(nd) : "—";
+    const fmtIntDisp = (v) => (v !== null && v !== undefined && Number.isFinite(v)) ? Math.round(v).toLocaleString() : "—";
+    const thStyle = "padding:6px 8px;text-align:right;border-top:2px solid rgba(125,211,252,0.72);border-bottom:1px solid rgba(125,211,252,0.40);color:#7dd3fc;font-weight:700;white-space:nowrap;";
+
+    const bodyHtml = tData.rows.map(r =>
+      `<tr>` +
+        `<td style="padding:5px 8px;text-align:center;">${{r.shell}}</td>` +
+        `<td style="padding:5px 8px;text-align:center;white-space:nowrap;">${{escapeHtmlText(r.rangeDisplay)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtIntDisp(r.nObs)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtIntDisp(r.nUnique)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtIntDisp(r.nTheo)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtDisp(r.multiplicity, 2)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtDisp(r.completenessPct, 1)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtDisp(r.meanIsigi, 2)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;font-weight:600;color:#e0f2fe;">${{fmtDisp(r.ccHalf, 3)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtDisp(r.ccStar, 3)}}</td>` +
+      `</tr>`
+    ).join("");
+
+    const ov = tData.overall;
+    const ovRowStyle = "border-top:1px solid rgba(125,211,252,0.40);border-bottom:2px solid rgba(125,211,252,0.72);font-weight:700;color:#e0f2fe;";
+    const footHtml =
+      `<tr style="${{ovRowStyle}}">` +
+        `<td style="padding:6px 8px;text-align:center;">Overall</td>` +
+        `<td style="padding:6px 8px;text-align:center;white-space:nowrap;">${{escapeHtmlText(ov.rangeDisplay)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtIntDisp(ov.nObs)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtIntDisp(ov.nUnique)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtIntDisp(ov.nTheo)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.multiplicity, 2)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.completenessPct, 1)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.meanIsigi, 2)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;color:#e0f2fe;">${{fmtDisp(ov.ccHalf, 3)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.ccStar, 3)}}</td>` +
+      `</tr>`;
+
+    wrap.innerHTML =
+      `<table style="width:100%;border-collapse:collapse;font-family:Georgia,'Times New Roman',Times,serif;font-variant-numeric:tabular-nums;font-size:0.81rem;color:#bae6fd;">` +
+        `<thead><tr>` +
+          `<th style="${{thStyle}}text-align:center;">Shell</th>` +
+          `<th style="${{thStyle}}text-align:center;">Resolution (Å)</th>` +
+          `<th style="${{thStyle}}">N<sub>obs</sub></th>` +
+          `<th style="${{thStyle}}">N<sub>unique</sub></th>` +
+          `<th style="${{thStyle}}">N<sub>theo</sub></th>` +
+          `<th style="${{thStyle}}">Multiplicity</th>` +
+          `<th style="${{thStyle}}">Completeness (%)</th>` +
+          `<th style="${{thStyle}}">⟨I/σ(I)⟩</th>` +
+          `<th style="${{thStyle}}">CC<sub>1/2</sub></th>` +
+          `<th style="${{thStyle}}">CC*</th>` +
+        `</tr></thead>` +
+        `<tbody>${{bodyHtml}}</tbody>` +
+        `<tfoot>${{footHtml}}</tfoot>` +
+      `</table>` +
+      `<div style="margin-top:9px;font-family:Georgia,'Times New Roman',Times,serif;font-size:0.69rem;color:rgba(147,197,253,0.72);">` +
+        `<span>CC* = [2 CC<sub>1/2</sub> / (1 + CC<sub>1/2</sub>)]<sup>1/2</sup> (Karplus &amp; Diederichs, 2012).</span>` +
+      `</div>`;
+  }}
+
+  function openMergeTableModal() {{
+    const modal = document.getElementById("modal-merge-table");
+    if (!modal || !DATA.merge_metrics) return;
+    renderMergeTableModalContent();
+    modal.style.display = "flex";
+  }}
+
+  function closeMergeTableModal() {{
+    const modal = document.getElementById("modal-merge-table");
+    if (modal) modal.style.display = "none";
+  }}
+
+  async function copyMergeTableForPublication() {{
+    const btn = document.getElementById("btn-merge-tbl-copy");
+    const tData = buildClientMergeTableData();
+    const payloads = buildMergeTableClipboardPayloads(tData);
+    let ok = false;
+    try {{
+      if (navigator.clipboard && window.ClipboardItem) {{
+        await navigator.clipboard.write([
+          new ClipboardItem({{
+            "text/html": new Blob([payloads.cleanHtml], {{ type: "text/html" }}),
+            "text/plain": new Blob([payloads.tsv], {{ type: "text/plain" }}),
+          }})
+        ]);
+        ok = true;
+      }}
+    }} catch (_e) {{}}
+    if (!ok) {{
+      const holder = document.createElement("div");
+      holder.style.cssText = "position:fixed;left:-9999px;top:0;background:#ffffff;color:#000000;user-select:text;";
+      holder.innerHTML = payloads.cleanHtml;
+      document.body.appendChild(holder);
+      const sel = window.getSelection();
+      const rng = document.createRange();
+      rng.selectNodeContents(holder);
+      sel.removeAllRanges();
+      sel.addRange(rng);
+      try {{ ok = document.execCommand("copy"); }} catch (_e2) {{}}
+      sel.removeAllRanges();
+      document.body.removeChild(holder);
+    }}
+    if (!ok && navigator.clipboard && navigator.clipboard.writeText) {{
+      try {{ await navigator.clipboard.writeText(payloads.tsv); ok = true; }} catch (_e3) {{}}
+    }}
+    if (btn) {{
+      btn.textContent = ok ? "✓ Copied" : "Copy failed";
+      setTimeout(() => {{ btn.textContent = "Copy"; }}, 1600);
+    }}
+  }}
+
+  async function downloadMergeArtifact(ext) {{
+    const cleanExt = ext === "csv" ? "csv" : "html";
+    const fname = `merge_table.${{cleanExt}}`;
+    if (window.location && /^https?:$/i.test(window.location.protocol || "")) {{
+      try {{
+        const mergeList = (galaxyBridge.stepArtifacts && galaxyBridge.stepArtifacts.merge) || [];
+        const matchItem = mergeList.find(it => it && String(it.name || "").toLowerCase() === fname);
+        const qs = new URLSearchParams({{ name: fname }});
+        if (matchItem && matchItem.dataset_id) qs.set("dataset_id", matchItem.dataset_id);
+        const resp = await fetch(`api/artifacts/download?${{qs.toString()}}`, {{ credentials: "same-origin" }});
+        if (resp.ok) {{
+          const blob = await resp.blob();
+          if (blob && blob.size > 0) {{
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = fname;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 1500);
+            return;
+          }}
+        }}
+      }} catch (_e) {{}}
+    }}
+    const tData = buildClientMergeTableData();
+    const payloads = buildMergeTableClipboardPayloads(tData);
+    const blob = new Blob([payloads.csv], {{ type: "text/csv;charset=utf-8" }});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "merge_table.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }}
+
+  (function bindMergeTableControls() {{
+    const btnHistOpen = document.getElementById("btn-hist-open-table");
+    const btnCopy = document.getElementById("btn-merge-tbl-copy");
+    const btnClose = document.getElementById("btn-merge-tbl-close");
+    const modal = document.getElementById("modal-merge-table");
+
+    if (btnHistOpen) btnHistOpen.addEventListener("click", () => openMergeTableModal());
+    if (btnCopy) btnCopy.addEventListener("click", () => copyMergeTableForPublication());
+    if (btnClose) btnClose.addEventListener("click", () => closeMergeTableModal());
+    if (modal) {{
+      modal.addEventListener("click", (ev) => {{
+        if (ev.target === modal) closeMergeTableModal();
+      }});
+    }}
+    document.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Escape" && modal && modal.style.display !== "none") {{
+        closeMergeTableModal();
+      }}
+    }});
+  }})();
 
   const elGalaxyBadge = document.getElementById("galaxy-status-badge");
   const btnGalaxyDispatch = document.getElementById("btn-galaxy-dispatch");
@@ -10066,6 +25178,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     if (ext === "h5" || ext === "hdf5" || ext === "nxs.h5" || ext === "nxs") {{
       return {{ canLoad: true, ext, hint: "" }};
+    }}
+    const rawNameLow = String((d && d.name) || "").toLowerCase();
+    if (ext === "json" && (rawNameLow.endsWith(".ref.json") || rawNameLow.endsWith("_ref.json"))) {{
+      return {{ canLoad: true, ext: "json", hint: "shared ref" }};
     }}
     if (ext === "mtz") {{
       if (hasActiveDetectorGeometryForMtz()) {{
@@ -11471,6 +26587,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return idx;
   }}
 
+  function syncDataCellFromParamsInputs() {{
+    const sgIn = (document.getElementById("inp-sg")?.value || "").trim();
+    if (sgIn && sgIn !== DATA.space_group) {{
+      DATA.space_group = sgIn;
+      DATA.space_group_ops = null;
+    }}
+    const vals = ["inp-a", "inp-b", "inp-c", "inp-alpha", "inp-beta", "inp-gamma"].map(
+      id => parseFloat(document.getElementById(id)?.value || "")
+    );
+    if (vals.every(v => Number.isFinite(v) && v > 0) && vals[3] < 180 && vals[4] < 180 && vals[5] < 180) {{
+      DATA.cell = vals;
+      syncDminControls(state.dMin);
+    }}
+  }}
+
   function handleUnitCellPasteEvent(ev, prefix = "nd") {{
     const clip = (ev.clipboardData || window.clipboardData);
     if (!clip) return;
@@ -11494,6 +26625,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         badgeEl.textContent = `PASTED • ${{sym.summary}}`;
       }}
     }} else {{
+      syncDataCellFromParamsInputs();
       setStatusLine(
         "[UNIT CELL PASTED]",
         `Filled unit cell <strong>${{parsed.cell.map(v => Number(v).toFixed(2)).join(", ")}}</strong>${{parsed.space_group ? ` (SG: <strong>${{parsed.space_group}}</strong>)` : ""}} from clipboard.`
@@ -11605,6 +26737,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const maybeFull = parseUnitCellClipboardText(inpEl.value);
           if (maybeFull) {{
             applyUnitCellEntryToDialog(maybeFull, "inp");
+            syncDataCellFromParamsInputs();
             return;
           }}
           applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: false, resetManualOverrides: true }});
@@ -11616,6 +26749,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           }}
           mirrorLinkedUnitCellFields("inp", fieldKey);
         }}
+        syncDataCellFromParamsInputs();
       }});
       inpEl.addEventListener("change", () => {{
         if (fieldKey === "sg") {{
@@ -11623,6 +26757,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }} else {{
           mirrorLinkedUnitCellFields("inp", fieldKey);
         }}
+        syncDataCellFromParamsInputs();
       }});
     }}
   }});
@@ -11747,6 +26882,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (s && d && s.value.trim() !== "") d.value = s.value;
       }});
       applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: true }});
+      syncDataCellFromParamsInputs();
       const iptsForHist = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
       const runsForHist = (document.getElementById("nd-runs")?.value || "").trim();
       const histLbl = iptsForHist ? `IPTS-${{iptsForHist}}${{runsForHist ? " #" + runsForHist : ""}}` : "Load Neutron Data";
@@ -11801,7 +26937,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       // If a single already-merged .h5 was specified, load it directly and set pending stage to 2. Solve
       if (paths.length === 1 && !/\\.nxs(\\.h5)?$/i.test(paths[0]) && /merged|scan|solve|integrat|predict/i.test(paths[0])) {{
         try {{
-          const r = await fetch(`api/payload?file_path=${{encodeURIComponent(paths[0])}}`, {{ cache: "no-store" }});
+          const r = await fetch(`api/payload?file_path=${{encodeURIComponent(paths[0])}}${{getRenderBinningQuery()}}`, {{ cache: "no-store" }});
           if (r.ok) {{
             const p = await r.json();
             recomputeBoundsAndReload(p);
@@ -11825,13 +26961,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   async function uploadLocalFilesToServer(files, forceReduce = false) {{
     const params = collectWorkflowParams();
-    const isRawNexus = forceReduce || files.some(f => /\\.nxs(\\.h5)?$/i.test(f.name));
+    const isMtzFile = files.length === 1 && /\\.mtz$/i.test(files[0].name);
+    const isRawNexus = !isMtzFile && (forceReduce || files.some(f => /\\.nxs(\\.h5)?$/i.test(f.name)));
+    const statusTag = isMtzFile ? "[LOCAL MTZ]" : "[LOCAL HDF5]";
     try {{
       setStatusLine(
-        "[LOCAL HDF5]",
+        statusTag,
         isRawNexus
           ? `Opening ${{files.length}} raw NeXus file(s) and triggering <strong>1. Reduce + Merge Images</strong>...`
-          : `Loading <strong>${{files.map(f => f.name).join(", ")}}</strong>...`
+          : (isMtzFile
+              ? `Projecting custom reflections from <strong>${{files[0].name}}</strong> into active UB geometry...`
+              : `Loading <strong>${{files.map(f => f.name).join(", ")}}</strong>...`)
       );
       // Fast path: check if the selected local file(s) already exist on the server filesystem by (name, size)
       try {{
@@ -11854,13 +26994,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               }});
               return;
             }}
-            const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(matchedPaths[0])}}`, {{ cache: "no-store" }});
-            if (pr.ok) {{
-              const srvPayload = await pr.json();
-              if (srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
-                recomputeBoundsAndReload(srvPayload);
-                return;
-              }}
+            const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(matchedPaths[0])}}${{getRenderBinningQuery()}}`, {{ cache: "no-store" }});
+            const srvPayload = await pr.json().catch(() => null);
+            if (pr.ok && srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
+              recomputeBoundsAndReload(srvPayload);
+              return;
+            }}
+            if (isMtzFile && srvPayload && srvPayload.error) {{
+              setStatusLine(statusTag, `<span style="color:#f87171;">${{srvPayload.error}}</span>`);
+              return;
             }}
           }}
         }}
@@ -11885,18 +27027,30 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           return;
         }}
         if (savedPaths.length === 1) {{
-          const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(savedPaths[0])}}`, {{ cache: "no-store" }});
-          if (pr.ok) {{
-            const srvPayload = await pr.json();
-            if (srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
-              recomputeBoundsAndReload(srvPayload);
-              return;
-            }}
+          const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(savedPaths[0])}}${{getRenderBinningQuery()}}`, {{ cache: "no-store" }});
+          const srvPayload = await pr.json().catch(() => null);
+          if (pr.ok && srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
+            recomputeBoundsAndReload(srvPayload);
+            return;
+          }}
+          if (isMtzFile) {{
+            const errMsg = (srvPayload && srvPayload.error) || `HTTP ${{pr.status}} loading ${{files[0].name}}`;
+            setStatusLine(statusTag, `<span style="color:#f87171;">${{errMsg}}</span>`);
+            return;
           }}
         }}
+      }} else if (isMtzFile) {{
+        const errDoc = await r.json().catch(() => null);
+        const errMsg = (errDoc && errDoc.error) || `HTTP ${{r.status}} uploading ${{files[0].name}}`;
+        setStatusLine(statusTag, `<span style="color:#f87171;">${{errMsg}}</span>`);
+        return;
       }}
     }} catch (_uploadErr) {{
       // Fall through to client-side h5wasm parsing when running as standalone static file
+    }}
+    if (isMtzFile) {{
+      setStatusLine(statusTag, `<span style="color:#f87171;">Loading local .mtz files requires an active SubHKL backend server and determined U matrix.</span>`);
+      return;
     }}
     try {{
       while (!window.h5wasm) await new Promise(r => setTimeout(r, 120));
@@ -12133,11 +27287,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       let serverResponded = false;
       try {{
         if (dsExt !== "mtz") {{
-          state.selectedFrameIndex = 0;
-          DATA.frame_index = 0;
+          const targetFrame = (opts && typeof opts.preserveFrameIndex === "number" && opts.preserveFrameIndex >= 0)
+            ? opts.preserveFrameIndex
+            : 0;
+          state.selectedFrameIndex = targetFrame;
+          DATA.frame_index = targetFrame;
         }}
         const hasGeomFlag = hasActiveDetectorGeometryForMtz() ? "1" : "0";
-        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{state.selectedFrameIndex || 0}}&has_active_geometry=${{hasGeomFlag}}`, {{
+        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{state.selectedFrameIndex || 0}}&has_active_geometry=${{hasGeomFlag}}${{getRenderBinningQuery()}}`, {{
           cache: "no-store",
           credentials: "same-origin",
         }});
@@ -12253,6 +27410,175 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
+  function startHydrationJobPoll(hJob) {{
+    if (!hJob || !hJob.job_id) return;
+    const hydClientId = String(hJob.client_job_id || hJob.job_id);
+    if (
+      (galaxyBridge.hydratingClientId === hydClientId || galaxyBridge.hydratingJobId === String(hJob.job_id)) &&
+      galaxyBridge.hydratingPromise
+    ) {{
+      return galaxyBridge.hydratingPromise;
+    }}
+    if (galaxyBridge.pollTimer) {{
+      clearInterval(galaxyBridge.pollTimer);
+      galaxyBridge.pollTimer = null;
+    }}
+    let hydJobId = String(hJob.job_id);
+    galaxyBridge.hydratingJobId = hydJobId;
+    galaxyBridge.hydratingClientId = hydClientId;
+    const cellSummary = document.getElementById("cell-summary");
+    state.runningStageIdx = 0;
+    startStepStopwatch(
+      "reduce",
+      typeof hJob.elapsed_ms === "number" && hJob.elapsed_ms > 0 ? hJob.elapsed_ms : 0
+    );
+    const syncHydrationHostDisplay = (rec) => {{
+      const rHost = (rec && rec.runner_host && String(rec.runner_host).trim())
+        ? String(rec.runner_host).trim().toUpperCase()
+        : ((String(`${{(rec && rec.stdout) || ""}}\n${{(rec && rec.stderr) || ""}}`).match(/\\[(?:pulsar|subhkl|careless)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
+      const hostTag = rHost || ((rec && rec.mode === "galaxy") ? "PULSAR" : "SUBHKL");
+      const stateTag = String((rec && rec.state) || "running").toUpperCase();
+      if (cellSummary) {{
+        cellSummary.textContent = `[${{hostTag}}] ${{stateTag}}`;
+      }}
+    }};
+    syncHydrationHostDisplay(hJob);
+    renderPipeline();
+    if (hJob.stdout || hJob.stderr) {{
+      appendTerminalLog(
+        (hJob.stdout || "") + (hJob.stderr ? `\\n[stderr]\\n${{hJob.stderr}}` : ""),
+        true
+      );
+    }}
+    galaxyBridge.hydratingPromise = new Promise((resolveHyd) => {{
+      galaxyBridge.resolveHydrating = resolveHyd;
+      let pollBusy = false;
+      galaxyBridge.pollTimer = setInterval(async () => {{
+        if (galaxyBridge.hydratingClientId !== hydClientId) {{
+          clearInterval(galaxyBridge.pollTimer);
+          galaxyBridge.pollTimer = null;
+          resolveHyd(false);
+          return;
+        }}
+        if (pollBusy) return;
+        pollBusy = true;
+        try {{
+          const curFrame = typeof state.selectedFrameIndex === "number"
+            ? state.selectedFrameIndex
+            : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+          const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}&poll=1`, {{ cache: "no-store" }});
+          if (!sr.ok) return;
+          const sdoc = await sr.json();
+          if (sdoc.history_datasets) {{
+            galaxyBridge.datasets = sdoc.history_datasets;
+            populateGalaxyH5Selector();
+          }}
+          if (sdoc.step_artifacts) {{
+            galaxyBridge.stepArtifacts = sdoc.step_artifacts;
+            renderFilesDrawer();
+          }}
+          const aj = sdoc.active_job;
+          const sameHydJob = Boolean(
+            aj &&
+            aj.hydrate_only &&
+            (
+              (aj.client_job_id && String(aj.client_job_id) === hydClientId) ||
+              String(aj.job_id || "") === hydJobId ||
+              hydJobId.startsWith("nova-")
+            )
+          );
+          if (!sameHydJob) {{
+            clearInterval(galaxyBridge.pollTimer);
+            galaxyBridge.pollTimer = null;
+            galaxyBridge.hydratingJobId = null;
+            galaxyBridge.hydratingClientId = null;
+            galaxyBridge.hydratingPromise = null;
+            if (
+              state.stepTimings &&
+              state.stepTimings.reduce &&
+              state.stepTimings.reduce.status === "running" &&
+              (!aj || aj.stage_id !== "reduce")
+            ) {{
+              finishStepStopwatch("reduce", "stopped");
+            }}
+            if (state.runningStageIdx === 0 && (!aj || aj.stage_id !== "reduce")) {{
+              state.runningStageIdx = -1;
+              renderPipeline();
+            }}
+            resolveHyd(true);
+            return;
+          }}
+          if (aj.job_id) {{
+            hydJobId = String(aj.job_id);
+            galaxyBridge.hydratingJobId = hydJobId;
+          }}
+          syncHydrationHostDisplay(aj);
+          const outText = (aj.stdout || "") + (aj.stderr ? `\\n[stderr]\\n${{aj.stderr}}` : "");
+          if (outText) appendTerminalLog(outText, true);
+          const isCancelled = aj.state === "deleted" || Boolean(aj.cancel_requested);
+          const finishedOk = aj.state === "ok";
+          const finishedErr = isCancelled || aj.state === "error" || aj.state === "paused" || (!finishedOk && !!aj.error);
+          if (finishedOk || finishedErr) {{
+            clearInterval(galaxyBridge.pollTimer);
+            galaxyBridge.pollTimer = null;
+            galaxyBridge.hydratingJobId = null;
+            galaxyBridge.hydratingClientId = null;
+            galaxyBridge.hydratingPromise = null;
+            if (state.runningStageIdx === 0) {{
+              state.runningStageIdx = -1;
+            }}
+            finishStepStopwatch(
+              "reduce",
+              finishedOk ? "done" : (isCancelled ? "stopped" : "error"),
+              typeof aj.elapsed_ms === "number" ? aj.elapsed_ms : null
+            );
+            if (cellSummary) {{
+              cellSummary.textContent = finishedOk ? "DONE" : (isCancelled ? "STOPPED" : "ERROR");
+            }}
+            renderPipeline();
+            if (finishedOk) {{
+              let reloadedHydrated = false;
+              try {{
+                const pr = await fetch(
+                  `api/payload?frame=${{curFrame}}&preserve_params=1${{getRenderBinningQuery()}}`,
+                  {{ cache: "no-store" }}
+                );
+                if (pr.ok) {{
+                  const hydratedPayload = await pr.json();
+                  if (hydratedPayload && typeof hydratedPayload === "object") {{
+                    delete hydratedPayload.hydration_job;
+                  }}
+                  if (hydratedPayload && (Array.isArray(hydratedPayload.panels) || Array.isArray(hydratedPayload.peaks))) {{
+                    recomputeBoundsAndReload(hydratedPayload, {{ preserveParams: true }});
+                    reloadedHydrated = true;
+                  }}
+                }}
+              }} catch (_he) {{}}
+              if (reloadedHydrated) {{
+                setStatusLine(
+                  "[FRAMES HYDRATED]",
+                  "Detector image frames hydrated from raw NeXus — full 2D detector intensity view ready."
+                );
+              }}
+              probeGalaxyConnection();
+            }} else {{
+              const errDetail = escTxt(String(aj.error || (isCancelled ? "Hydration job stopped." : "Failed to hydrate detector frames.")));
+              setStatusLine(
+                isCancelled ? "[HYDRATION STOPPED]" : "[HYDRATION ERROR]",
+                `<span style="color:${{isCancelled ? "var(--accent-gold)" : "#f87171"}};">${{errDetail}}</span>`
+              );
+            }}
+            resolveHyd(finishedOk);
+          }}
+        }} catch (_pe) {{
+        }} finally {{
+          pollBusy = false;
+        }}
+      }}, 1200);
+    }});
+    return galaxyBridge.hydratingPromise;
+  }}
+
   async function probeGalaxyConnection() {{
     // 1. Check NOVA server endpoint (api/pipeline/status)
     try {{
@@ -12267,6 +27593,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           galaxyBridge.stepArtifacts = doc.step_artifacts || {{}};
           hydrateStepTimingsFromServer(doc);
           if (
+            doc.active_job &&
+            doc.active_job.hydrate_only &&
+            (doc.active_job.state === "running" || doc.active_job.state === "queued")
+          ) {{
+            startHydrationJobPoll(doc.active_job);
+          }} else if (
             state.runningStageIdx < 0 &&
             doc.active_job &&
             (doc.active_job.state === "running" || doc.active_job.state === "queued")
@@ -12346,6 +27678,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const st = PIPELINE[idx] || PIPELINE[state.currentPipelineIdx] || {{ stage_id: "solve", name: "STAGE" }};
     const stageId = st.stage_id || "solve";
     state.workflowRunSeq = (state.workflowRunSeq || 0) + 1;
+    galaxyBridge.hydratingJobId = null;
+    galaxyBridge.hydratingClientId = null;
+    galaxyBridge.hydratingPromise = null;
+    if (typeof galaxyBridge.resolveHydrating === "function") {{
+      const resFn = galaxyBridge.resolveHydrating;
+      galaxyBridge.resolveHydrating = null;
+      resFn(false);
+    }}
     if (galaxyBridge.pollTimer) {{
       clearInterval(galaxyBridge.pollTimer);
       galaxyBridge.pollTimer = null;
@@ -12409,6 +27749,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       openNeutronDataModal(null);
       return;
     }}
+    if (galaxyBridge.hydratingPromise && stageIdx > 0) {{
+      setStatusLine(
+        `[WAITING FOR HYDRATE]`,
+        `Waiting for background <strong>1. Reduce</strong> frame hydration to finish before launching <strong>${{st.name}}</strong>…`
+      );
+      const hydOk = await galaxyBridge.hydratingPromise;
+      if (!hydOk && (stageId === "solve" || stageId === "integrate")) {{
+        return;
+      }}
+    }}
     if (state.runningStageIdx >= 0 && state.runningStageIdx !== stageIdx) {{
       await cancelWorkflowStage(state.runningStageIdx);
     }}
@@ -12449,6 +27799,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
         const jobObj = res.job || {{}};
         const jobId = jobObj.job_id || "local";
+        let lastMergeHostBanner = "";
+        const syncRunningHostDisplay = (rec) => {{
+          const rHost = (rec && rec.runner_host && String(rec.runner_host).trim())
+            ? String(rec.runner_host).trim().toUpperCase()
+            : ((String(`${{(rec && rec.stdout) || ""}}\n${{(rec && rec.stderr) || ""}}`).match(/\\[(?:pulsar|subhkl|careless)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
+          const hostTag = rHost || ((rec && rec.mode === "galaxy") ? "PULSAR" : "SUBHKL");
+          const stateTag = String((rec && rec.state) || "running").toUpperCase();
+          if (cellSummary) {{
+            cellSummary.textContent = `[${{hostTag}}] ${{stateTag}}`;
+          }}
+          if (stageId === "merge" && stateTag !== "OK" && stateTag !== "ERROR" && stateTag !== "DELETED") {{
+            const sig = `${{hostTag}}:${{stateTag}}`;
+            if (sig !== lastMergeHostBanner) {{
+              lastMergeHostBanner = sig;
+              setStatusLine(
+                `[4. MERGE • ${{hostTag}}]`,
+                `Running <strong style="color:var(--accent-pink);">Careless Variational Merge</strong> on host <strong style="color:var(--accent-cyan);">${{escTxt(hostTag)}}</strong> (${{stateTag.toLowerCase()}})…`
+              );
+            }}
+          }}
+        }};
+        syncRunningHostDisplay(jobObj);
         if (jobObj.stdout || jobObj.stderr) {{
           appendTerminalLog((jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : ""), true);
         }}
@@ -12480,7 +27852,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const curFrame = typeof state.selectedFrameIndex === "number"
               ? state.selectedFrameIndex
               : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
-            const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}&poll=1`, {{ cache: "no-store" }});
+            const ovSeqParam = (lastPartialFrame === curFrame && lastPartialSeq > 0)
+              ? `&overlay_seq=${{lastPartialSeq}}`
+              : "";
+            const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}${{ovSeqParam}}&poll=1`, {{ cache: "no-store" }});
             if (!sr.ok) return;
             const sdoc = await sr.json();
             if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) return;
@@ -12499,6 +27874,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               stageId === "solve" &&
               aj.state !== "ok" &&
               aj.partial_overlay &&
+              !aj.partial_overlay.unchanged &&
               ovFrame === curFrame &&
               ((aj.partial_overlay.seq || 0) > lastPartialSeq || lastPartialFrame !== curFrame)
             ) {{
@@ -12511,14 +27887,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               if (Array.isArray(aj.partial_overlay.peaks)) {{
                 PEAKS.length = 0;
                 aj.partial_overlay.peaks.forEach(p => PEAKS.push(p));
+                PREDICTED_PEAKS = [...PEAKS];
               }}
               if (Array.isArray(aj.partial_overlay.sample_peaks) && aj.partial_overlay.sample_peaks.length > 0) {{
                 SAMPLE_PEAKS.length = 0;
                 aj.partial_overlay.sample_peaks.forEach(p => SAMPLE_PEAKS.push(p));
+                PREDICTED_SAMPLE_PEAKS = [...SAMPLE_PEAKS];
               }} else if (Array.isArray(aj.partial_overlay.peaks) && aj.partial_overlay.peaks.length > 0) {{
                 SAMPLE_PEAKS.length = 0;
                 aj.partial_overlay.peaks.forEach(p => SAMPLE_PEAKS.push(p));
+                PREDICTED_SAMPLE_PEAKS = [...SAMPLE_PEAKS];
               }}
+              captureBaselineMeasurements(
+                {{ integPeaks: [], predPeaks: PEAKS, integSample: [], predSample: SAMPLE_PEAKS }},
+                aj.partial_overlay,
+                true
+              );
+              _visDetPeaksSig = "";
+              _peakDataAvailabilitySig = "";
+              _lastWulffRenderSig = "";
               if (Array.isArray(aj.partial_overlay.panels) && aj.partial_overlay.panels.length > 0) {{
                 const pByBank = new Map(aj.partial_overlay.panels.map(p => [Number(p.bank), p]));
                 PANELS.forEach(curP => {{
@@ -12552,13 +27939,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               selectLadderRung(aj.ladder_rung_idx, false);
             }}
             const isCancelled = aj.state === "deleted" || Boolean(aj.cancel_requested);
-            if (cellSummary) {{
-              const rHost = (aj.runner_host && String(aj.runner_host).trim())
-                ? String(aj.runner_host).trim().toUpperCase()
-                : ((String(`${{aj.stdout || ""}}\n${{aj.stderr || ""}}`).match(/\\[(?:pulsar|subhkl)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
-              const hostTag = rHost || (aj.mode === "galaxy" ? "PULSAR" : "SUBHKL");
-              cellSummary.textContent = `[${{hostTag}}] ${{(aj.state || "running").toUpperCase()}}`;
-            }}
+            syncRunningHostDisplay(aj);
             const finishedOk = aj.state === "ok";
             const finishedErr = isCancelled || aj.state === "error" || aj.state === "paused" || (!finishedOk && !!aj.error);
             if (finishedOk || finishedErr) {{
@@ -12573,8 +27954,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 );
               }}
               if (finishedOk) {{
-                const h5Outs = Array.isArray(aj.outputs)
-                  ? aj.outputs.filter(o => o && o.id && (!o.extension || o.extension === "h5" || o.extension === "hdf5"))
+                const h5Outs = stageId !== "merge" && Array.isArray(aj.outputs)
+                  ? aj.outputs.filter(o => {{
+                      if (!o || !o.id) return false;
+                      const ext = String(o.extension || "").toLowerCase();
+                      const nm = String(o.name || o.output_name || "").toLowerCase();
+                      if (
+                        nm.endsWith(".mtz") || nm.endsWith(".json") || nm.endsWith(".csv") || nm.endsWith(".html")
+                        || nm.includes("mtz") || nm.includes("metrics") || nm.includes("merge_table")
+                      ) {{
+                        return false;
+                      }}
+                      return !ext || ext === "h5" || ext === "hdf5";
+                    }})
                   : [];
                 if (selGalaxyH5 && h5Outs.length > 0) {{
                   selGalaxyH5.value = h5Outs[0].id;
@@ -12584,51 +27976,56 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 const targetDmin = userChangedDmin
                   ? Number(state.dMin)
                   : (Number.isFinite(params.d_min) && params.d_min > 0 ? Number(params.d_min) : Number(state.dMin));
-                try {{
-                  const targetFrame = stageId === "reduce"
-                    ? 0
-                    : (typeof state.selectedFrameIndex === "number"
-                      ? state.selectedFrameIndex
-                      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0));
-                  const dminParam = (stageId !== "reduce" && Number.isFinite(targetDmin) && targetDmin > 0)
-                    ? `&preserve_params=1&d_min=${{encodeURIComponent(targetDmin)}}`
-                    : "";
-                  const payloadUrl = (!aj.updated_payload_ready && aj.output_h5_path)
-                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}${{dminParam}}`
-                    : `api/payload?frame=${{targetFrame}}${{dminParam}}`;
-                  const pr = await fetch(payloadUrl, {{ cache: "no-store" }});
-                  if (runSeq !== state.workflowRunSeq) return;
-                  if (pr.ok) {{
-                    const newPayload = await pr.json();
+                const canReloadWarmPayload = Boolean(
+                  aj.updated_payload_ready || aj.output_h5_path || h5Outs.length === 0
+                );
+                if (canReloadWarmPayload) {{
+                  try {{
+                    const targetFrame = stageId === "reduce"
+                      ? 0
+                      : (typeof state.selectedFrameIndex === "number"
+                        ? state.selectedFrameIndex
+                        : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0));
+                    const dminParam = stageId !== "reduce"
+                      ? `&preserve_params=1${{Number.isFinite(targetDmin) && targetDmin > 0 ? `&d_min=${{encodeURIComponent(targetDmin)}}` : ""}}`
+                      : "";
+                    const payloadUrl = (!aj.updated_payload_ready && aj.output_h5_path)
+                      ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}${{dminParam}}${{getRenderBinningQuery()}}`
+                      : `api/payload?frame=${{targetFrame}}${{dminParam}}${{getRenderBinningQuery()}}`;
+                    const pr = await fetch(payloadUrl, {{ cache: "no-store" }});
                     if (runSeq !== state.workflowRunSeq) return;
-                    if (newPayload && (Array.isArray(newPayload.panels) || Array.isArray(newPayload.peaks))) {{
-                      recomputeBoundsAndReload(newPayload, {{
-                        resetSelectedFrame: stageId === "reduce",
-                        preserveParams: stageId !== "reduce",
-                      }});
-                      if (stageId !== "reduce") {{
-                        if (Number.isFinite(params.wavelength_min) && Number.isFinite(params.wavelength_max) && params.wavelength_max > params.wavelength_min) {{
-                          state.lamMin = Number(params.wavelength_min);
-                          state.lamMax = Number(params.wavelength_max);
-                          updateWavelengthLabels();
+                    if (pr.ok) {{
+                      const newPayload = await pr.json();
+                      if (runSeq !== state.workflowRunSeq) return;
+                      if (newPayload && (Array.isArray(newPayload.panels) || Array.isArray(newPayload.peaks))) {{
+                        recomputeBoundsAndReload(newPayload, {{
+                          resetSelectedFrame: stageId === "reduce",
+                          preserveParams: stageId !== "reduce",
+                        }});
+                        if (stageId !== "reduce") {{
+                          if (Number.isFinite(params.wavelength_min) && Number.isFinite(params.wavelength_max) && Number.isFinite(params.wavelength_max) > Number(params.wavelength_min)) {{
+                            state.lamMin = Number(params.wavelength_min);
+                            state.lamMax = Number(params.wavelength_max);
+                            updateWavelengthLabels();
+                          }}
+                          const finalDmin = (state.dMinUserSeq || 0) !== dMinSeqAtStart
+                            ? Number(state.dMin)
+                            : targetDmin;
+                          if (Number.isFinite(finalDmin) && finalDmin > 0) {{
+                            syncDminControls(finalDmin);
+                          }}
+                          updateHUD();
                         }}
-                        const finalDmin = (state.dMinUserSeq || 0) !== dMinSeqAtStart
-                          ? Number(state.dMin)
-                          : targetDmin;
-                        if (Number.isFinite(finalDmin) && finalDmin > 0) {{
-                          syncDminControls(finalDmin);
-                        }}
-                        updateHUD();
+                        loadedOk = true;
+                        appendTerminalLog(
+                          stageId === "reduce"
+                            ? "\\nLoaded merged.h5 into viewport — Pending step: 2. Solve (Lattice Ladder)."
+                            : "\\nReloaded updated orientation, Laue zones, and Bragg reflections into viewport."
+                        );
                       }}
-                      loadedOk = true;
-                      appendTerminalLog(
-                        stageId === "reduce"
-                          ? "\\nLoaded merged.h5 into viewport — Pending step: 2. Solve (Lattice Ladder)."
-                          : "\\nReloaded updated orientation, Laue zones, and Bragg reflections into viewport."
-                      );
                     }}
-                  }}
-                }} catch (_re) {{}}
+                  }} catch (_re) {{}}
+                }}
                 if (!loadedOk && h5Outs.length > 0 && runSeq === state.workflowRunSeq) {{
                   await loadFromGalaxyDatasetId(h5Outs[0].id);
                   if (runSeq !== state.workflowRunSeq) return;
@@ -12713,6 +28110,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             wavelength_min: params.wavelength_min,
             wavelength_max: params.wavelength_max,
           }};
+        }} else if (stageId === "merge") {{
+          const mtzDs = [...galaxyBridge.datasets].reverse().find(
+            d => d.state === "ok" && (
+              (d.extension || "").toLowerCase() === "mtz" ||
+              /reflections\\.mtz|unmerged.*\\.mtz$/i.test(d.name || "")
+            ) && !/^(merged|predictions|xval|careless_0|careless_predictions_0|careless_xval_0)\\.mtz$/i.test(d.name || "")
+          );
+          if (!mtzDs) throw new Error("Need unmerged reflections.mtz in Galaxy History");
+          toolId = "imaginex_subhkl_merge";
+          inputs = {{
+            reflections: {{ src: "hda", id: mtzDs.id }},
+            mode: params.merge_mode || (DATA.has_tof_data ? "mono" : "poly"),
+            iterations: 10000,
+            studenttDof: 4.0,
+            mergeHalfDatasets: true,
+            anomalous: false,
+          }};
         }} else {{
           if (!mergedDs) throw new Error("No HDF5 dataset in Galaxy History");
           toolId = (st.tool_ids && st.tool_ids[0]) || "imaginex_subhkl_solve";
@@ -12764,8 +28178,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               );
             }}
             if (cellSummary) {{
-              const rHost = ((String(`${{stdOut}}\n${{stdErr}}`).match(/\\[(?:pulsar|subhkl)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "GALAXY").toUpperCase();
+              const rHost = ((String(`${{stdOut}}\n${{stdErr}}`).match(/\\[(?:pulsar|subhkl|careless)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "GALAXY").toUpperCase();
               cellSummary.textContent = `[${{rHost}}] ${{jstate.toUpperCase()}}`;
+              if (stageId === "merge" && jstate !== "ok" && jstate !== "error" && jstate !== "deleted") {{
+                setStatusLine(
+                  `[4. MERGE • ${{rHost}}]`,
+                  `Running <strong style="color:var(--accent-pink);">Careless Variational Merge</strong> on host <strong style="color:var(--accent-cyan);">${{escTxt(rHost)}}</strong> (${{jstate.toLowerCase()}})…`
+                );
+              }}
             }}
             if (stageId === "solve" && (jstate === "queued" || jstate === "running")) {{
               rungStep = Math.min(3, rungStep + 1);
@@ -12840,8 +28260,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function animate() {{
-    state.parallaxX += (state.targetParallaxX - state.parallaxX) * 0.14;
-    state.parallaxY += (state.targetParallaxY - state.parallaxY) * 0.14;
+    const dxP = state.targetParallaxX - state.parallaxX;
+    const dyP = state.targetParallaxY - state.parallaxY;
+    state.parallaxX = Math.abs(dxP) < 1e-4 ? state.targetParallaxX : (state.parallaxX + dxP * 0.11);
+    state.parallaxY = Math.abs(dyP) < 1e-4 ? state.targetParallaxY : (state.parallaxY + dyP * 0.11);
     renderDetectorCanvas();
     renderStereoInset();
     if (activeRunningStageId() || (stopwatchFlash.demoUntilPerf && performance.now() < stopwatchFlash.demoUntilPerf)) {{
@@ -12864,10 +28286,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.frameAbortController = abortCtrl;
     renderFrameSelector();
     updateHUD();
+    const ctrlPill = document.getElementById("hud-frame-ctrl");
+    if (ctrlPill) ctrlPill.style.opacity = "0.68";
     const curF = frames[clamped];
     if (curF) {{
       setStatusLine(
-        `[FRAME ${{clamped + 1}}/${{frames.length}}]`,
+        `[LOADING FRAME ${{clamped + 1}}/${{frames.length}}…]`,
         `<strong style="color:var(--accent-pink);">${{curF.file || "Frame"}}</strong> • Goniometer: <strong style="color:var(--accent-cyan);">${{curF.motor_summary || "—"}}</strong>`
       );
     }}
@@ -12875,14 +28299,26 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const fetchOpts = {{ cache: "no-store" }};
       if (abortCtrl) fetchOpts.signal = abortCtrl.signal;
       const dminQ = (Number.isFinite(state.dMin) && state.dMin > 0) ? `&d_min=${{encodeURIComponent(state.dMin)}}` : "";
-      const resp = await fetch(`api/payload?frame=${{clamped}}${{dminQ}}`, fetchOpts);
+      const resp = await fetch(`api/payload?frame=${{clamped}}&frame_only=1${{dminQ}}${{getRenderBinningQuery()}}`, fetchOpts);
       if (reqSeq !== state.frameRequestSeq || clamped !== state.selectedFrameIndex) return;
       if (resp.ok) {{
         const newPayload = await resp.json();
         if (reqSeq !== state.frameRequestSeq || clamped !== state.selectedFrameIndex) return;
+        if (newPayload && newPayload.status === "superseded") return;
         recomputeBoundsAndReload(newPayload, {{ isFrameSwitch: true }});
+        if (curF) {{
+          setStatusLine(
+            `[FRAME ${{clamped + 1}}/${{frames.length}}]`,
+            `<strong style="color:var(--accent-pink);">${{curF.file || "Frame"}}</strong> • Goniometer: <strong style="color:var(--accent-cyan);">${{curF.motor_summary || "—"}}</strong>`
+          );
+        }}
       }}
-    }} catch (_e) {{}}
+    }} catch (_e) {{
+    }} finally {{
+      if (reqSeq === state.frameRequestSeq && ctrlPill) {{
+        ctrlPill.style.opacity = "1";
+      }}
+    }}
   }}
 
   const selFrameEl = document.getElementById("sel-frame");
@@ -12917,6 +28353,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     barResizeObserver.observe(document.body);
   }}
 
+  if (DATA.angular_error_mode === "tof_3d") {{
+    _lastTofDeltaThetaSig = _buildTofDeltaThetaSig();
+  }}
   renderFrameSelector();
   renderZoneList();
   renderPipeline();

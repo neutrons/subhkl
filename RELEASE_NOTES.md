@@ -4,6 +4,551 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.3]
+
+### Fixed
+
+- **Galaxy History derived-HDF5 (`...integrated.h5` / `...solve.h5`) background frame hydration completion (`rainbow_zones`, `nova_rainbow_view`, `nova_app`)**:
+  - Preserved a stable `client_job_id` across `submit_galaxy_stage`'s
+    placeholder `nova-<timestamp>` ID -> Galaxy/Pulsar `job_id` transition so
+    `startHydrationJobPoll` no longer aborts polling early while leaving the
+    Step 1 stopwatch running indefinitely.
+  - Kept hydration `work_dir` aligned with staged derived datasets (including
+    dot-suffixed `.integrated.h5` / `.solve.h5` names), surfaced live runner
+    host status during hydration, and cleared completed `hydration_job`
+    descriptors from cached `/api/payload` responses.
+
+## [1.7.2]
+
+### Fixed
+
+- **NDIP/Galaxy Stage 4 (`imaginex_subhkl_merge`) Careless output handling and UI completion (`nova_rainbow_view`, `rainbow_zones`, `nova_app`)**:
+  - Fixed a post-job `h5py.File` failure (`Unable to synchronously open file
+    (file signature not found)`) when `imaginex_subhkl_merge` completed on
+    Galaxy/Pulsar: `h5_outs` is now skipped completely on `stage_id == "merge"`,
+    and Galaxy output descriptors are normalized and reconciled against
+    `/api/jobs/{id}` without mislabeling non-HDF5 datasets (`metrics_json`,
+    `merge_table_csv`, `merge_table_html`, `*_mtz`) as `h5`.
+  - Materialized a local writable `integrated.h5` before stamping Careless
+    merge metrics and per-observation residuals so read-only shared `/scratch`
+    symlinks are never modified in place, supported both separate
+    `peaks/{h,k,l}` and packed `peaks/hkl` arrays during residual stamping, and
+    added state rollback guards if payload reload fails.
+
+## [1.7.1]
+
+### Added
+
+- **Reversible two-phase session Exit (`⏻`) with deterministic shared/staging cleanup and 80s pixel-font exit modal (`rainbow_zones`, `arcade_exit_quips`, `nova_rainbow_view`, `nova_app`)**:
+  - Added a compact top-bar `⏻` exit button that opens a minimalist gold-on-dark
+    `8×8` pixel-font (`SubhklArcade`, offline embedded TrueType) modal with 230
+    cheerful arcade/beamline sign-off messages, paired with reversible **`GO
+    BACK`** and crimson **`CLOSE TAB`** actions (and clean sans-serif typography
+    in Pro mode).
+  - Implemented a two-phase `/api/pipeline/exit` lifecycle (`prepare` on modal
+    open, `confirm` on **`CLOSE TAB`** / tab unload):
+    - In **Galaxy/NDIP** mode, `prepare` immediately sweeps Tier 1 staging and
+      Tier 2 shared intermediates (locally or via `imaginex_subhkl_cleanup_shared`)
+      while keeping the Trame/HTTP server alive so **`GO BACK`** restores the
+      previous step and hydrates reduced detector frames on the fly from Galaxy
+      History.
+    - In **Local** mode, intermediate file deletion is deferred until `confirm`
+      or process finalization so **`GO BACK`** preserves local state intact.
+- **Execution host reporting for Careless variational merge (`nova_rainbow_view`, `rainbow_zones`)**:
+  - Surfaced the active execution host (`runner_host`, resolved from local
+    container headers, `[pulsar] Runner host:` console output, or Galaxy
+    `job_metrics`) in `#cell-summary`, the live `[4. MERGE • <HOST>]` HUD status
+    bar, terminal logs, and `careless_metrics.json`.
+
+### Fixed
+
+- **Post-integration Wulff $d_{\min}$ filtering in `Integ` / `All-Runs` mode and Careless `--dmin` cutoff forwarding (`rainbow_zones`, `nova_rainbow_view`, `nova_app`)**:
+  - Preserved the selected peak source (`Integ` vs. `Pred`) and multi-run
+    `All-Runs` peak pools when adjusting $d_{\min}$ or $[\lambda_{\min},
+    \lambda_{\max}]$ after integration: `Integ` mode filters integrated
+    reflections in place by $d \ge d_{\min}$ without switching to predicted
+    peaks, starving runs `1..N-1`, or dropping multi-run `frame_only` pools.
+  - Forwarded the active UI $d_{\min}$ as `--dmin` to both local Careless
+    containers (with pre-flight empty-cutoff validation) and Galaxy
+    `imaginex_subhkl_merge`, and stamped full `/careless/{asu_hkl,merged_i,merged_sigi}`
+    datasets so Bayesian-extrapolated harmonics ($d_{\min} <
+    d_{\min,\text{integrated}}$) retain merged structure factors.
+- **Read-only UI `SUBHKL_SHARED_DIR` mounts, worker-delegated shared cleanup, and non-ORNL Galaxy hydration (`shared_storage`, `nova_rainbow_view`)**:
+  - Relaxed UI `require_shared_dir_for_galaxy_mode()` to require read-only
+    `R_OK | X_OK` permissions (retaining `W_OK | X_OK` on worker writers),
+    dispatching `imaginex_subhkl_cleanup_shared` on a read-write worker whenever
+    the UI container mounts `SUBHKL_SHARED_DIR` read-only.
+  - Allowed canonical `/SNS` and `/HFIR` NeXus `source_files` paths to trigger
+    remote Galaxy Reduce hydration even when `/SNS` and `/HFIR` are not mounted
+    on the UI or CI host.
+
+## [1.7.0]
+
+### Added
+
+- **Three-tier shared storage orchestration for Galaxy/Pulsar runner mode with NFS race-free UUID sideband publication (`shared_storage`, `parser`, `nova_rainbow_view`, `galaxy`)**:
+  - Separated intermediate and persistent data across three storage tiers so
+    interactive `subhkl-nova-app` sessions release GPUs to job runners without
+    moving multi-GB HDF5 files through Galaxy/Pulsar object-storage caches:
+    - **Tier 1 (`SUBHKL_STAGING_DIR` / `TMPDIR`)**: fast node-local NVMe scratch
+      for step-local work (`reduce-batch` per-run files, local HDF5 assembly,
+      and Careless scratch).
+    - **Tier 2 (`SUBHKL_SHARED_DIR`, mandatory when `SUBHKL_EXEC_MODE=galaxy`)**:
+      network filesystem exchanging compact `subhkl_shared_pointer/v1` JSON
+      sideband pointers (`--shared-pointer-out`) for large cross-step HDF5
+      artifacts (`merged.h5`, `predictor.h5`, `integrated.h5`), with automatic
+      `/proc/self/mountinfo` canonical network-path translation across
+      heterogeneous runner mounts (e.g. `/scratch` on `imaginex-{1,2}` vs.
+      `/gpfs/neutronsfs/scratch` on `analysis.sns.gov`) and deterministic
+      cleanup (`subhkl cleanup-shared` and app exit hooks).
+    - **Tier 3 (Galaxy Object Storage / History)**: persists thin crystallography
+      artifacts (`solve.h5`, `reflections.mtz`, `merged.mtz`, `xval.mtz`,
+      `careless_metrics.json`, `merge_table.{csv,html}`), reconstructing reduced
+      detector data on the fly when restarting from a History `solve.h5`.
+  - Hardened Tier 2 sideband publication for lockless/non-atomic NFS mounts:
+    allocates fresh 128-bit UUIDv4 filenames (`subhkl_shared_<32hex>_<artifact>`)
+    opened via `O_WRONLY | O_CREAT | O_EXCL` with zero pre-creation `stat`
+    probes to guarantee cold client dcache/attribute/page-cache misses, flushes
+    and `os.fsync`s + closes the HDF5 file (and parent directory) strictly
+    **before** writing and `os.fsync`ing the JSON pointer, exports
+    `HDF5_USE_FILE_LOCKING=FALSE`, and keeps published shared files
+    write-once/read-only.
+- **Laue nodal bullseyes (`a⋆`, `b⋆`, `c⋆` & zone hubs), `[uvw]` arc hover badges, and `±1`/`±2` Higher-Order Laue Zones (`rainbow_zones`)**:
+  - Rendered uniform-radius Laue nodal bullseye markers at zone-axis
+    intersections (with superscript `a⋆`, `b⋆`, `c⋆` labels on principal
+    reciprocal axes, dimmed markers in inter-panel gaps within 25% of a panel
+    width, and intersection-count hover badges), calibrated flat-panel hub
+    raycasting on cylindrical bank assemblies (e.g. CG4D), interactive `[uvw]`
+    zone-axis hover badges, and optional `±1` / `±2` HOLZ curves with live
+    predicted reflection counts.
+- **3D ToF reciprocal-space `Δθ`, warm divergent `I/σ` colorscale, and direct numerical slider inputs (`rainbow_zones`)**:
+  - Added directional 3D ToF-gated reciprocal-space `Δθ` (`arccos` unit-vector
+    placement) with a dedicated `/api/tof_delta_theta` route and $10\times$
+    faster frame switching.
+  - Added a warm quantile-normalized divergent `I/σ` colorscale (with matching
+    gold `Integ` button styling), median/outlier-robust `ΔI/σ` colorbar bounds,
+    click-to-edit `0.01 Å` numerical inputs on the $[\lambda_{\min},
+    \lambda_{\max}]$ and $d_{\min}$ sliders (paired with `0.05 Å` slider drag
+    steps on `#slider-dmin`), fixed-width `1-Frame`/`All-Runs` toggle geometry,
+    and corner `^`/`v` magnification carets on the Wulff pane.
+- **Unlocked `0.50 Å` high-resolution $d_{\min}$ floor on large macromolecular unit cells via Ewald-shell rod slicing & viewport-frustum LOD (`rainbow_zones`, `crystallography`)**:
+  - Removed the `2,000,000` full-sphere lattice-point UI $d_{\min}$ ceiling
+    (which clamped `P 61 2 2`, $80\times 80\times 238\text{ Å}$, at `1.41 Å`),
+    allowing `#slider-dmin` to reach `0.50 Å` across all unit-cell volumes.
+  - Added closed-form Ewald-shell $(h, k)$ rod slicing in both the browser
+    (`raycastRunDirectEwaldShell`) and Python (`generate_ewald_reflections`) plus
+    slabbed quadratic rod bounds in `generate_reflections` so high-resolution
+    macromolecular shells ($40\text{M}+$ reciprocal lattice points) evaluate
+    directly inside the active $[\lambda_{\min}, \lambda_{\max}]$ Ewald band
+    without multi-GB 3D `meshgrid` allocations.
+  - Upgraded Detector and Wulff-sphere LOD thinning with two-tier
+    viewport-frustum high-resolution streaming (up to `48×` detector zoom) and
+    gameplay-style canonical dyadic Spherical BVHs (`buildDetectorSphericalBVH`,
+    `buildWulffSphericalBVH`) paired with solid-angle stratified Ewald sampling
+    (`_stratified_spherical_subsample` on server, `selectSpatiallyStratifiedOrder`
+    on client): outer resolution shells and back-scattering banks populate
+    immediately at `1×` zoom as `#slider-dmin` decreases while screen peak
+    density stays bounded (~18 px cells), and zooming in subdivides cells
+    100% pop-free down to full doublet/harmonic separation (`0.50 Å`).
+- **GPU multi-panel peak prediction & fixed-chunk $O(n)$ TOF-gated integration for large macromolecular unit cells (`physics`, `tof_gate`, `detector`)**:
+  - Replaced per-bank `ProcessPoolExecutor` peak prediction (which regenerated
+    millions of `(h, k, l)` tuples inside every worker process, taking ~3–4 min
+    on `P 61 2 2` at $d_{\min} = 1.0\text{ Å}$) with `predict_peaks_batch_gpu`:
+    generates candidate `(h, k, l)` once, filters Ewald shells and batches flat
+    or curved panel intersections on GPU using static-shape `Precision.HIGHEST`
+    kernels (~1.6–2.1 s across 41–164 banks), and finalizes surviving hits in
+    float64 for exact parity with `predict_single_bank`.
+  - Eliminated per-bank XLA JIT recompilation stalls and $O(n^2)$ host overhead
+    in `integrate_reflections_tof_gated` by evaluating `_scatter_events_impl`,
+    `_box_sums_impl`, `_tiles_impl`, `_snap_positions_impl`, and
+    `_solve_tiles` in fixed-size chunks, freeing intermediate 3D prefix cubes
+    immediately after sideband box sums, replacing dense $n \times n$ neighbor
+    broadcasts and `np.nanmedian` with `scipy.spatial.cKDTree` sparse Chebyshev
+    queries + vectorized masked row medians, and prefetching next-bank events in
+    a background thread.
+
+### Fixed
+
+- **Time-of-flight sideband background biased by the shape of the spectrum (`tof_gate`, `detector`)**:
+  - The gated integrator scaled each reflection's sideband background to its
+    gate by the length of the intervals in time, which assumes a background
+    rate flat in time. The incident spectrum is curved and falls off steeply at
+    the band edges, so weak reflections carried an additive offset of up to
+    about ±1.5σ depending on wavelength, scattering angle and bank. The offset
+    repeats between measurements and showed up as CC½ where there is no Bragg
+    signal.
+  - Intervals are now measured in each image's own cumulative time spectrum
+    (`--tof-sideband-measure spectrum`, the default, folded directly into the
+    fused on-GPU 4D slab prefix sums alongside consistent detector border/pixel
+    mask enforcement across prediction, gating, and visualization), so the
+    background is taken as proportional to what the image shows at each time;
+    images with too few events for a spectrum fall back to plain time.
+    `--tof-sideband-measure time` restores the previous behaviour.
+  - Check for this kind of bias with an off-peak control: integrate with the
+    gate moved off the reflections (e.g. `--tof-gate=0.06,0.11`) and merge; any
+    CC½ that survives is not Bragg signal.
+
+- **Unresolvable overlaps reported with meaningless intensities (`tof_gate`, `matrix_free`)**:
+  - Where reflections sit closer together than the spot width inside one time
+    window (around the direction of a long cell axis, e.g. within ~10° of c*
+    for c = 238 Å), the joint amplitude fit is singular to working precision.
+    The reported σ then saturated at the fixed regularisation constant (1000
+    photons) while the signed estimate left it by orders of magnitude, giving
+    rows with |I/σ| in the hundreds; merged, their reproducible values added
+    CC½ of 0.2–0.4 in shells without signal.
+  - A gated reflection is now censored (σ_I = 0, dropped from the export) when
+    overlapping neighbours inflate the variance of its intensity more than
+    1000-fold relative to an isolated reflection
+    (`--tof-max-variance-inflation`; 0 keeps every row). Only the sum of such a
+    group is determined, and a per-reflection table cannot carry it.
+  - `--tof-amplitude-ridge counts` sets the regularisation of the joint fit to
+    the gross counts under each reflection's own profile instead of a fixed
+    1000 photons. It gives unresolved reflections a meaningful σ, but on a
+    crowded lattice it also shrinks weak, partly overlapped reflections, so
+    `fixed` stays the default.
+
+- **Detector view sideways drift when zooming out (`rainbow_zones`)**:
+  - Anchored `detCanvas` wheel zoom-in at the cursor and zoom-out horizontally at
+    `viewCenterX` (with periodic $\pm 360^\circ$ pan wrapping and smooth vertical
+    recentering toward `1×`), eliminating unexpected sideways azimuth shifts and
+    coupled Wulff rotations when zooming out.
+- **Rhombohedral hexagonal (`:H`) vs. primitive rhombohedral (`:R`) space-group settings in cell refinement and UI**:
+  - `gemmi.SpaceGroup` reports `ext='H', centring_type()='R'` for
+    hexagonal-axes `R` space groups (`R 3`, `R 3:H`, `R -3 m`) and
+    `ext='R', centring_type()='P'` for primitive rhombohedral-axes settings
+    (`R 3:R`, `R -3 m :R`).
+  - Fixed `optimization.get_lattice_system` and
+    `scan_band._cell_symmetry_spec` to inspect `sg.ext == 'R'` rather than
+    `centering == 'R'`, preserving hexagonal cell constraints
+    ($a=b\neq c,\,90^\circ,90^\circ,120^\circ$, 3-point `R` centering) on
+    default/`:H` `R` groups and primitive rhombohedral angle/length constraints
+    ($a=b=c,\,\alpha=\beta=\gamma$, `P` centering) on `:R` groups.
+  - Prevented `trigonal_r` from overwriting bare `R` symbols (`"R 3"`,
+    `"R -3 m"`, `"R 3 2"`) in Rainbow Zones' client-side `SG_SYMMETRY_LOOKUP`.
+- **Generalized multi-run unit-cell, detector-geometry, and per-run crystal-slip refinement (`scan_band`, `scan_refine`)**:
+  - Included unwarped `search/proposal_orientations` in the bootstrap candidate
+    pool and replaced the `1.5%` radial `shared_geometry` cliff with a direct
+    Ewald + per-run zone-funnel competition against nominal detector geometry
+    (refreshing EM pixel responsibilities when nominal wins while preserving
+    genuine uncalibrated detector shifts).
+  - Kept pure nominal geometry (`s_init = 0`) as a distinct Stage 0 trial,
+    stopped re-injecting rejected `shared_geometry`, and freed unit-cell
+    ratios/angles ($\pm 3.5\%$) from Stage 0 onward on multi-setting scans so
+    anisotropic cell errors (`0.5–1.0 Å`) are not absorbed into fake detector
+    warps.
+  - Replaced the single-pass $0.15^\circ$-clamped Stage 3 post-cell orientation
+    polish with a 2-pass alternating `(cell <-> 0.6° U + zone-funnel + per-run R)`
+    polish so monoclinic/anisotropic cell updates unwind coupled shear
+    rotations.
+  - Re-anchored `(R_r, U)` to `anchor_run` (`ΔΘ_anchor = 0°`) across Ewald and
+    Stage 4 ICP polishes and regularized $\chi = 0$ gimbal-lock 3-axis
+    goniometer decomposition across both axis handedness conventions.
+
+## [1.6.6]
+
+### Added
+
+- Cell- and $d_{\min}$-aware automatic `Solve` band binning (`binning=4` on
+  $\le 256\times 256$ panels for dense long-axis cells), `b2=2` (`128×128`)
+  Ewald excess maps, and a `<option value="2">2</option>` binning option in the
+  Rainbow Zones `Params` drawer.
+- Live client-side HUD `Δθ` (`angular_rms_deg`) recomputation in Rainbow Zones
+  when switching scan frames or dragging wavelength, $d_{\min}$, or manual
+  orientation controls.
+
+### Fixed
+
+- **Long-axis joint scan refinement, per-run crystal slip, and Stage 4 ICP aliasing (`scan_refine`, `scan_band`)**:
+  - Computed exact metric-tensor unit-cell volume and Bravais centering
+    multiplicity in `_ewald_d_min`, applied the Laue kinematic lower bound
+    $q_{\min} = 2\sin\theta_{\min}/\lambda_{\max}$, and stratified large
+    Ewald reflection pools across $|G|$ shells instead of truncating to
+    overlapping inner rings.
+  - Added per-run Gaussian zone-band pre-alignment (`_zone_funnel_seed_per_run`,
+    $\pm 3.8^\circ$) plus fine-stepped `polish_per_run` to capture genuine
+    inter-batch crystal slips into `R_refined[r]` without rigid-orientation
+    overwrites, direct Stage 3 Ewald unit-cell axis-ratio polish, and
+    off-singularity `Y-Z-Y` gimbal-lock seeds in `_decompose_R_to_angles`.
+  - Adapted Stage 4 per-run ICP matching radii to median nearest-neighbor
+    predicted spot spacing with unambiguous second-neighbor filtering
+    (`d2_best < 0.55 * d2_second`) and an Ewald non-degradation guard.
+- **Missing (`"-"`) and neighbor-contaminated HUD `Δθ` on multi-frame datasets (`rainbow_zones`)**:
+  - Resolved `bank_ids` before `banks` in `_load_cached_frame_bank_images` (fixing
+    `Δθ = "-"` on frames $\ge 1$ and bank-scrambling on non-contiguous detector
+    bank lists) and enforced Voronoi nearest-predicted-reflection ownership in
+    both Python and client-side JS spot-centroid error estimation.
+
+## [1.6.5]
+
+### Added
+
+- Promoted the wavelength interval ($\lambda_{\min}$–$\lambda_{\max}$) to a
+  dedicated dual-knob (`[` and `]`) sidebar range slider above $d_{\min}$ in
+  Rainbow Zones and simplified the `Params` drawer to `Unit cell / Params`.
+
+### Fixed
+
+- Fixed `ReferenceError: getActiveWulffSourceArray is not defined` in
+  `updatePeakInspector` when hovering detector panels.
+- Wired `stage_derived_h5_in_work_dir` and background `Reduce` frame hydration
+  into the Trame `MainApp` / `SubhklGalaxyModel.refresh_payload` path (plus
+  `.reduce.h5` → `.nxs.h5` provenance recovery) so reloading `solve.h5` or
+  `integrated.h5` from NDIP Galaxy History regenerates detector images.
+
+## [1.6.4]
+
+### Added
+
+- **Cross-instance NDIP Galaxy History reuse, `integrated.h5` persistence, and on-the-fly `Reduce` frame hydration**:
+  - Unifies Galaxy History discovery across the shared `"IMAGINE-X SubHKL"`
+    datastore history and the interactive tool's launch `HISTORY_ID` (with
+    automatic cache invalidation on upload/touch and descriptive
+    `<tag>_solve.h5` / `<tag>_integrated.h5` dataset names) so analysis
+    artifacts from previous app instances are immediately visible in local
+    execution mode.
+  - Persists compact `integrated.h5` and `predictor.h5` artifacts to NDIP
+    Galaxy History during Stage 3 (`Integrate`) and re-uploads Careless-stamped
+    `integrated.h5` after Stage 4 (`Merge`), automatically reconstructing
+    `reflections.mtz` from `integrated.h5` when restarting Stage 4 in a fresh
+    instance.
+  - Embeds raw NeXus provenance (`source_files`, `files`, `file_offsets`,
+    wavelength, and cell metadata) in `solve.h5` and `integrated.h5` (with
+    `/SNS` and `/HFIR` run-range fallback for pre-existing NDIP datasets) and
+    automatically triggers a non-destructive background `Reduce` hydration job
+    whenever derived data is loaded without a hit in the instance's local
+    staging cache, hot-reloading detector images and TOF histograms on
+    completion.
+
+## [1.6.3]
+
+### Changed
+
+- **Local-staging GPU execution in `subhkl-nova-app` with Galaxy Careless merge**:
+  - When running in local-staging mode (`SUBHKL_EXEC_MODE=local`, or
+    automatically inside an NDIP interactive GPU tool session with `EP_PATH`
+    and `/SNS` / `/HFIR` mounted), `Reduce`, `Solve`, and `Integrate` execute
+    directly inside the app's local NVMe staging directory
+    (`SUBHKL_STAGING_DIR` / `TMPDIR`) instead of round-tripping multi-GB
+    `merged.h5` / `integrated.h5` datasets through NDIP Rucio/Ceph object
+    storage.
+  - Uploads only compact (`<= 50 MiB`) metadata and crystallography
+    deliverables (`solve.h5`, `reflections.mtz`, `merged.mtz`, `xval.mtz`,
+    `careless_metrics.json`, `merge_table.csv`, `merge_table.html`) to NDIP
+    Galaxy History, deduplicating `reflections.mtz` by `(size, mtime_ns)`.
+  - Routes Stage 4 (`Merge` / Careless) through NDIP Galaxy
+    (`imaginex_subhkl_merge`) whenever `careless` is not installed locally in
+    the `subhkl` container, exchanging only compact `.mtz` files.
+  - Ensures Pulsar-friendly world-writable permissions (`0777` directories,
+    `0666` files) inside `SUBHKL_STAGING_DIR` so host `pulsar` job cleanup
+    never encounters `PermissionError`.
+
+## [1.6.2]
+
+### Fixed
+
+- Fixed a ~29-minute post-upload hang on remote Galaxy instances (e.g.
+  `ndip-test.ornl.gov`) after `reduce` produces multi-GB TOF `merged.h5`
+  datasets (`6 × 240 s` silent proxy-buffering read timeouts when downloading
+  embedded `events/tof`): `subhkl-nova-app` now syncs only the 2D `images`
+  stack and metadata (`~1–2%` of file size) via chunked HTTP `Range` requests
+  (`X-Accel-Buffering: no`) while keeping the full `events/tof` dataset in
+  Galaxy for Pulsar GPU `solve` / `integrate` jobs, emits immediate connection
+  and retry status lines, and fails fast on scratch `ENOSPC`.
+
+## [1.6.1]
+
+### Added
+
+- Monochromatic (`careless mono`) vs. polychromatic (`careless poly`) merge
+  routing for time-of-flight gated data:
+  - Added an explicit `merge_mode` (`mono` / `poly`) selector to the NDIP
+    Galaxy `imaginex_subhkl_merge` tool wrapper, omitting `--wavelength-key` in
+    `mono` mode while keeping `WAVEL` in the neural-scaler metadata so
+    time-resolved Laue harmonics are scaled and merged independently.
+  - Automatically selects `careless mono` in `subhkl-nova-app` whenever
+    time-of-flight data is present (`peaks/tof`, `tof_gate`, or `events/tof`),
+    falling back to `careless poly` for steady-state quasi-Laue datasets.
+- Live `Δθ` spot-centroid angular residual diagnostic and top-bar tooltips in
+  Rainbow Zones:
+  - Measures local detector-spot centroids directly on `merged.h5` for
+    predicted/solved reflections and streams `blind_band` / `scan_band`
+    micro-step rungs so `Δθ` updates live during `Solve` and reports physical
+    angular RMS residuals immediately after finder-less `Solve` (preserved
+    across dynamic client-side re-predictions).
+  - Added descriptive static and live dynamic tooltips across all top-bar HUD
+    pills (`PEAKS`, `Δθ`, `ZONES`, `GONIO`, `FRAME`), selectors, and buttons
+    via a `1.5 s`-delay hover overlay (`#ui-hover-tooltip`).
+- Automatic `TMPDIR` cleanup in `subhkl-nova-app` and `serve_rainbow_zones`:
+  removes per-job staging files immediately upon stage completion and removes
+  tracked `subhkl_work_*`, `subhkl_gx_*`, `subhkl_upload_*`,
+  `subhkl_merge_tables`, and `subhkl_nova_*` artifacts on normal exit,
+  `KeyboardInterrupt`, or `SIGTERM`.
+
+### Changed
+
+- Calibrated the post-merge `ΔI/σ` signed-residual colormap and colorbar to
+  span the observed `[min, max]` range with its neutral white midpoint anchored
+  at the dataset mean.
+- Removed redundant UI controls: the duplicate merging-table button on the
+  Wulff bar, the `ALL` Laue-zone button (superseded by `≤1` / `≤2` / `≤3`), and
+  the `Walk` solve-step button.
+- Reverted container `/dev/shm` and `podman --tmpfs /tmp` scratch overrides so
+  large multi-run datasets use standard `TMPDIR` storage paired with exit
+  cleanup.
+
+### Fixed
+
+- Time-of-flight gated integration took the wavelength band from the images
+  file, which only records the instrument default written at reduce time. When
+  the choppers ran a different band (e.g. MANDI at 1–3 Å instead of 2–4 Å),
+  every predicted reflection outside the default band was dropped as
+  unobserved. The band now comes from the predictions (`instrument/wavelength`
+  of the predictor file) and is always widened to hold every predicted
+  wavelength; the integrator prints the band it uses.
+- Left Careless's built-in Wilson prior intact by defaulting `wilson_prior_b`
+  to `None` instead of forcing `--wilson-prior-b=40.0`, which underflowed
+  `float32` (`loss=nan`) at high resolution ($d \approx 1\,\text{\AA}$).
+- Prevented long top-bar `.subtitle-tag` labels from overlapping the `PEAKS`
+  HUD pill via flex overflow clipping and bounding-box overlap scaling.
+- Separated staging filenames in `blind_band` (`.blind.rung.tmp.h5` vs.
+  `.blind.final.tmp.h5`) so live rung updates cannot collide with the final
+  `solve.blind.h5` atomic rename.
+
+
+## [1.6.0]
+
+### Added
+
+- Time-of-flight gated integration for pulsed-source instruments (MANDI,
+  TOPAZ). `reduce` / `reduce-batch` now keep the event times of flight next to
+  the detector images (`events/tof`, sorted by pixel so the image itself is the
+  index; `--no-events` opts out), and `merge-images` carries them into the
+  merged stack. When the images file has events, `integrator` integrates every
+  predicted reflection from the events inside a time window around its
+  predicted time of flight, with the background measured in time sidebands on
+  the same pixels, using the unchanged 2D Poisson amplitude solve on a small
+  per-reflection tile. The window is measured from the data by stacking the
+  events near all predictions in `t / t_predicted - 1` (`--tof-gate auto`), or
+  set with `--tof-gate lo,hi`; `--tof-gate off` restores the whole-band 2D
+  integration. Harmonics become separate rows with their own intensities, and
+  the output records the gate (`tof_gate`), each row's gate centre
+  (`peaks/tof`) and in-gate background (`peaks/tof_background`).
+- Resolution-shell hover on the post-merge sparkline in Rainbow Zones
+  (`#canvas-hist`): the hovered bar is highlighted and its exact
+  `d_max`–`d_min` Å edges, reflection count and active statistic
+  ($\mathrm{CC}_{1/2}$, completeness or $\langle I/\sigma \rangle$) are shown
+  in the sparkline footer and a floating tooltip (`#hist-bin-tooltip`). Signed
+  $\mathrm{CC}_{1/2}$ values are preserved, including negative outer-shell
+  correlations, and the readout updates when clicking to cycle metrics.
+
+### Changed
+
+- Time-of-flight gating runs on the accelerator one image at a time: each
+  image's events are histogrammed into a (row, column, log-time) cube whose
+  cumulative sums give every gated tile and sideband count by lookup, so gate
+  and sideband edges are time-bin edges at most a thirtieth of the gate wide.
+  A 22-run MANDI job at `d_min` 1.5 (1.12M predictions) integrates in about
+  3 minutes on one GPU.
+- Vectorized the integrator's per-reflection peak geometry (projection
+  matrices, flight distances, streak directions) and shape-fit patch
+  extraction per image, with progress output; only the patches the shape fit
+  keeps are held in memory.
+
+### Fixed
+
+- Removed a quadratic loop from the app's post-Careless stamping of
+  per-observation residuals and scales into `integrated.h5`: each row
+  allocated five full-length arrays as lookup defaults (about 3 ms per row,
+  most of an hour for the ~950k observations of a `d_min` 1.5 merge).
+
+## [1.5.9]
+
+### Added
+
+- Segmented `Pred` / `Integ` peak overlay modes and direct `.mtz` reflection
+  inspection in Rainbow Zones (`subhkl-nova-app` and `rainbow-visualize`):
+  - Switch between unfiltered predicted Bragg circles (`Pred`, loaded from
+    companion `predictor.h5`, unfiltered `integrated.h5`, or live `UB`
+    raycast) and SNR-filtered integrated $2\sigma$ ellipses (`Integ`), with
+    mode-distinct intensity highlight palettes (Sky-Cyan/Aqua for `Pred` vs.
+    Solar Gold/Chartreuse-Lime for `Integ`) and a live transparency-checkerboard
+    `Colorscale` crossover slider.
+  - Load external `.mtz` files from disk or Galaxy History once `U` is solved,
+    forward-projecting `.mtz` $(h,k,l)$ reflections through the full calibrated
+    detector and goniometer geometry (keeping solved `B` and space group
+    authoritative with mismatch warnings), coloring by `.mtz I/σ`, and
+    persisting `.mtz` overlays across frame switches and `Solve` $\to$
+    `Integrate` $\to$ `Merge` transitions.
+- Dynamic client-side $d_{\min}$ and $[\lambda_{\min}, \lambda_{\max}]$ peak
+  re-prediction with zoom-coupled level-of-detail (LOD) thinning:
+  - Re-predicts reflections interactively in the browser past the initial
+    indexing/integration cutoff using exact Gemmi space-group
+    systematic-absence, ASU, and Bijvoet rules on flat and curved cylindrical
+    detectors, guarded by a unit-cell-volume-aware lower $d_{\min}$ floor.
+  - Couples zoom level to a progressive $d$-spacing LOD cutoff on both the 3D
+    Wulff stereogram and 2D Detector view with live HUD badges and LOD-aware
+    hover/click hit-testing.
+- Acentric Bijvoet and Friedel mate highlighting across Detector and Wulff
+  views, computing signed acentric Bijvoet hand ($\pm 1$ for $I^+/I^-$, $0$ for
+  centric zones and centrosymmetric space groups) with pink (`#ff4db8`) hover
+  rings, `[Bijvoet]` labels, status-bar `±Bijvoet` badges, and antipodal
+  Friedel diamond markers (`-h,-k,-l`).
+- `Hi-Res` detector microscope toggle switching between $4\times$-binned
+  preview and native $1\times$ pixel textures via a lock-free
+  `/api/payload?textures_only=1` fast path (`build_rainbow_panel_textures_only`)
+  and `h5wasm` client fallback, plus live coral-amber detector border frames in
+  the `Mask` view (`6%` default `rel_border_width` on `MANDI`/`TOPAZ`/`SNAP`,
+  `3%` elsewhere).
+- Physical vanadium spectral calibration (`--spectral-file` with
+  `--trainable-spectral-scale`) and `--lorentz-correction` support in the NOVA
+  Careless merge runner alongside `--disable-image-scales`,
+  `--wilson-prior-b=40.0`, and clean `WAVEL,THETA,PHI,RUN` metadata columns.
+
+### Changed
+
+- Improved weak-reflection integration, backscattering-shadow masking, and
+  high-resolution merging:
+  - Added cross-bank same-$2\theta$ peer-ring dark-floor normalization in
+    `PixelEMClassifier` to mask whole- and partial-panel shadows, and wired
+    `detector/pixel_mask` loading directly from `solve.h5`.
+  - Gated sub-pixel centroid snapping by matched-filter SNR, excluded detector
+    border pixels from background and Poisson likelihoods, rejected heavily
+    occluded footprints ($<65\%$ valid weight), raised default
+    `shape_fit_min_snr` to `5.0`, and added `--allow-negative` 1-step
+    Fisher-scoring signed intensities for unbiased Careless merging.
+- Accelerated multi-run visualization, NDIP staging, and detector rendering:
+  - Vectorized flat-panel `_raycast_hkl_on_detectors` across all active banks,
+    projected multi-run `All-Runs` Wulff peaks immediately after finder-less
+    `Solve`, cached HKL generation and multi-run projections across frame
+    switches, deduplicated unchanged `partial_overlay` status polls via
+    `overlay_seq`, and defaulted BLAS/OMP thread counts to `1` in
+    `subhkl-nova-app`.
+  - Streamed multi-GB Galaxy `merged.h5` downloads with live progress,
+    eliminated redundant temp copies via hardlinks, batched 3D NumPy panel
+    binning, and ran blocking HTTP payload/status handlers via
+    `asyncio.to_thread`.
+  - Gated parallax strictly on held modifier keys (`Ctrl`/`Shift`/`Alt`/`Meta`
+    without mouse buttons) with a wider rubber-band excursion, and rendered
+    detector bank textures directly from native $(u,v)$ pixel coordinates with
+    adaptive supersampling to eliminate tile aliasing.
+
+### Fixed
+
+- Preserved $\ge 32 \times 32$ bins per panel in `solve --refinement band`
+  default binning (`default_band_binning()`, capped at `8`), removing the
+  $>240$-panel switch to `binning=16` that collapsed $256 \times 256$
+  `MANDI`/`TOPAZ` panels to $16 \times 16$ bins and aliased macromolecular Laue
+  zones.
+- Fixed right-handed $SO(3)$ Wulff camera projection and centered detector
+  azimuth ($\chi$) coupling, and computed exact space-group-aware in-band Laue
+  harmonic multiplicity without forbidden centered half-indices.
+- Propagated refined `goniometer/{angles,R,harmonics}` into `integrated.h5`,
+  accepted uploaded `.mtz` datasets typed as `binary` in Galaxy Stage 4
+  Careless discovery, hoisted early colorscale constants above initial script
+  boot so `Data Sources` binds cleanly, and reclaimed JAX XLA caches and glibc
+  arenas between `test_sparse_rbf_integrator.py` runs to prevent 16 GiB CI OOM
+  kills.
+
 ## [1.5.8]
 
 ### Added

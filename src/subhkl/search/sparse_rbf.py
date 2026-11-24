@@ -712,12 +712,13 @@ def integrate_peaks_rbf_ssn(
     mosaicity_radial: bool = False,
     shape_spherical: bool = False,
     mosaicity_bound_rad: float = 0.010,
-    shape_fit_min_snr: float = 0.0,
+    shape_fit_min_snr: float = 5.0,
     shape_fit_normalized: bool = False,
     matrix_free_profile: str = "gaussian",
     matrix_free_fp_target: float | None = None,
     static_mask_file: str | None = None,
     border_width: int = 0,
+    allow_negative: bool = False,
     chunk_size: int = 1024,
     create_visualizations: bool = False,
     file_prefix: str | None = None,
@@ -727,6 +728,16 @@ def integrate_peaks_rbf_ssn(
     gonio_offsets: np.ndarray = None,
     per_run_trans: np.ndarray = None,
     frame_to_run: np.ndarray = None,
+    event_reader=None,
+    tof_l1: float | None = None,
+    tof_gate=None,
+    tof_gate_coverage: float = 0.95,
+    tof_gate_search: float = 0.05,
+    tof_sideband_factor: float = 4.0,
+    tof_sideband_measure: str = "spectrum",
+    tof_max_variance_inflation: float | None = 1000.0,
+    tof_amplitude_ridge: str = "fixed",
+    tof_band: tuple[float, float] | None = None,
 ):
     """
     Args:
@@ -734,6 +745,18 @@ def integrate_peaks_rbf_ssn(
         peaks_obj: Instrument mapping object
         sigmas: List of unstretched peak radii
         nominal_sigma: Fallback sigma for crushed peaks
+        event_reader: img_key -> (tof [microsecond], pixel offsets) of that
+            image's pixel-sorted events.  When given (with ``tof_l1``),
+            every predicted reflection is integrated on its own
+            time-of-flight gated tile (see ``subhkl.search.tof_gate``)
+            instead of on the image of the whole wavelength band, and
+            harmonics are separate measurements rather than one multiplet.
+        tof_l1: [m] moderator-to-sample distance
+        tof_gate: a ``TofGate`` with relative edges, or None to measure
+            the gate from the stacked time profile
+        tof_band: [Angstrom] (min, max) wavelength band the reflections
+            were predicted in; gates and sidebands are clipped to it.  None
+            falls back to the band stored with the images.
     Returns:
         res: RBFResult containing intensities and sigI
     """
@@ -747,6 +770,10 @@ def integrate_peaks_rbf_ssn(
             self.var_u, self.var_v, self.cov_uv = [], [], []
             self.peak_rows, self.peak_cols = [], []
             self.image_index = []
+            # Time-of-flight gating only: gate centre [microsecond] and
+            # expected background [photons/Pixel] inside the gate.
+            self.tof, self.tof_bg = [], []
+            self.tof_info = None
 
     res = RBFResult()
     if sample_offset is None:
@@ -916,8 +943,13 @@ def integrate_peaks_rbf_ssn(
         return R_val @ s_off if R_val is not None else s_off
 
     max_sigma = max(sigmas)
+    tof_mode = event_reader is not None
+    if tof_mode and tof_l1 is None:
+        raise ValueError("time-of-flight gating needs the moderator distance L1")
 
     # --- PHASE 1: GATHER AND BATCH ---
+    all_wl = []
+    frame_img_keys = []
     images_list = []
     batched_banks = []
     all_frames = []
@@ -949,7 +981,9 @@ def integrate_peaks_rbf_ssn(
                 continue
 
             g = np.gcd.reduce([abs(h), abs(k), abs(l)])
-            fund_hkl = (h // g, k // g, l // g)
+            # Gated in time, the harmonics of one ray are separate
+            # measurements at their own wavelengths, not one multiplet.
+            fund_hkl = (idx,) if tof_mode else (h // g, k // g, l // g)
 
             if fund_hkl not in unique_peaks:
                 unique_peaks[fund_hkl] = {
@@ -994,6 +1028,7 @@ def integrate_peaks_rbf_ssn(
             peaks_obj.image.ims[img_key], nan=0.0, posinf=0.0, neginf=0.0
         )
         images_list.append(image_raw)
+        frame_img_keys.append(img_key)
         batched_banks.append(peaks_obj.image.bank_mapping.get(img_key, img_key))
 
         for data in keep_data:
@@ -1001,6 +1036,7 @@ def integrate_peaks_rbf_ssn(
             all_frames.append(frame_counter)
             all_rs.append(i_arr[idx])
             all_cs.append(j_arr[idx])
+            all_wl.append(_wl_arr[idx])
 
             meta_harmonics.append(data["harmonic_indices"])  # Save the multiplet list!
             meta_keys.append(img_key)
@@ -1017,37 +1053,47 @@ def integrate_peaks_rbf_ssn(
     _B, H, W = images_batch.shape
     bw = max(border_width, 5)
 
-    all_P_mats = []
-    all_R_mats = []
-    all_distances = []
-    all_streak_dirs = []
     ki_hat = np.asarray(ki_vec, dtype=float)
     ki_hat = ki_hat / np.linalg.norm(ki_hat)
 
-    for idx, img_key in enumerate(meta_keys):
+    # Detector, rotation and sample position belong to the image, not the
+    # peak, so the geometry of all peaks of an image is one array
+    # expression.  ``frames`` is sorted: each image's peaks are contiguous.
+    n_all = len(frames)
+    rs_arr = np.asarray(all_rs, dtype=float)
+    cs_arr = np.asarray(all_cs, dtype=float)
+    all_P_mats = np.zeros((n_all, 2, 3))
+    all_R_mats = np.zeros((n_all, 3, 3))
+    all_distances = np.zeros(n_all)
+    all_streak_dirs = np.zeros((n_all, 3))
+    frame_bounds = np.searchsorted(frames, np.arange(len(frame_img_keys) + 1))
+    for seq_idx, img_key in enumerate(
+        tqdm(frame_img_keys, disable=not show_progress, desc="Peak geometry")
+    ):
+        sl = slice(frame_bounds[seq_idx], frame_bounds[seq_idx + 1])
+        if sl.start == sl.stop:
+            continue
         det = peaks_obj.get_detector_by_img(img_key)
-        seq_idx = frames[idx]  # frames stores the image sequence index
         run_id = peaks_obj.image.get_run_id(img_key)  # Get the real run_id
-
         current_R = get_safe_R(img_key, seq_idx, run_id)
         s_lab = get_s_lab_for_img(img_key, run_id, current_R)
 
-        pixel_xyz = det.pixel_to_lab(all_rs[idx], all_cs[idx])
-        k_f = pixel_xyz - s_lab
-        distance = np.linalg.norm(k_f)
-        all_distances.append(distance)
-        k_f_hat = k_f / distance
+        k_f = det.pixel_to_lab(rs_arr[sl], cs_arr[sl]) - s_lab
+        distance = np.linalg.norm(k_f, axis=1)
+        all_distances[sl] = distance
+        k_f_hat = k_f / distance[:, None]
 
         # Unit radial (2-theta gradient) direction in the lab: the axis
         # the mosaic spread streaks the spot along.  Degenerate frames
         # (near-forward peaks) get a zero vector: no streak contribution.
         t3 = np.cross(ki_hat, k_f_hat)
-        t3_norm = np.linalg.norm(t3)
-        if t3_norm > 1e-6:
-            r3 = np.cross(t3 / t3_norm, k_f_hat)
-            all_streak_dirs.append(r3 / np.linalg.norm(r3))
-        else:
-            all_streak_dirs.append(np.zeros(3))
+        t3_norm = np.linalg.norm(t3, axis=1)
+        ok = t3_norm > 1e-6
+        r3 = np.cross(t3 / np.where(ok, t3_norm, 1.0)[:, None], k_f_hat)
+        r3_norm = np.linalg.norm(r3, axis=1)
+        all_streak_dirs[sl] = np.where(
+            ok[:, None], r3 / np.where(ok, r3_norm, 1.0)[:, None], 0.0
+        )
 
         # Detector Normal & Orthogonal Projection
         n_det = np.cross(det.uhat, det.vhat)
@@ -1055,10 +1101,13 @@ def integrate_peaks_rbf_ssn(
         P_ortho = np.vstack([det.uhat, det.vhat])
 
         # The Central Projection Skew Matrix
-        cos_alpha = np.dot(k_f_hat, n_det_hat)
-        ca_sign = 1.0 if cos_alpha >= 0 else -1.0
-        cos_alpha = ca_sign * max(abs(cos_alpha), 0.01)
-        Skew = np.eye(3) - np.outer(k_f_hat, n_det_hat) / cos_alpha
+        cos_alpha = k_f_hat @ n_det_hat
+        ca_sign = np.where(cos_alpha >= 0, 1.0, -1.0)
+        cos_alpha = ca_sign * np.maximum(np.abs(cos_alpha), 0.01)
+        Skew = (
+            np.eye(3)[None]
+            - k_f_hat[:, :, None] * n_det_hat[None, None, :] / cos_alpha[:, None, None]
+        )
 
         # Pixel Pitch Scaling Matrix
         pixel_pitch_u = det.width / (det.m - 1)
@@ -1066,22 +1115,14 @@ def integrate_peaks_rbf_ssn(
         S_pix = np.diag([1.0 / pixel_pitch_u, 1.0 / pixel_pitch_v])
 
         # The Ultimate Projection Matrix
-        P_final = S_pix @ P_ortho @ Skew
-        all_P_mats.append(P_final)
-        all_R_mats.append(current_R if current_R is not None else np.eye(3))
-
-    all_P_mats = np.array(all_P_mats)
-    all_R_mats = np.array(all_R_mats)
-    all_distances = np.array(all_distances)
-    all_streak_dirs = np.array(all_streak_dirs)
+        all_P_mats[sl] = (S_pix @ P_ortho) @ Skew
+        all_R_mats[sl] = current_R if current_R is not None else np.eye(3)
 
     # ==========================================
     # 2. Extract exact patches for global optimization
     # ==========================================
     opt_P = 15
     opt_half = opt_P // 2
-    opt_patches, opt_bgs, opt_drs, opt_dcs = [], [], [], []
-    opt_Pmats, opt_dists, opt_Rmats, opt_streaks = [], [], [], []
 
     if show_progress:
         print(f"  > 3D Tensor Optimization: Using ALL {len(frames)} peaks.")
@@ -1091,42 +1132,35 @@ def integrate_peaks_rbf_ssn(
         images_batch, ((0, 0), (opt_P, opt_P), (opt_P, opt_P)), mode="reflect"
     )
 
-    for idx in range(len(frames)):
-        f, r, c = frames[idx], all_rs[idx], all_cs[idx]
+    # Boundary safety check (matches your H, W constraints)
+    ri_all = np.rint(rs_arr).astype(int)
+    ci_all = np.rint(cs_arr).astype(int)
+    opt_idx = np.flatnonzero(
+        (bw < ri_all) & (ri_all < H - bw) & (bw < ci_all) & (ci_all < W - bw)
+    )
+    win = np.arange(-opt_half, opt_half + 1)
+    # Local background estimation (edges of the 15x15 patch)
+    bg_mask = np.ones((opt_P, opt_P), dtype=bool)
+    bg_mask[2:-2, 2:-2] = False
 
-        # Boundary safety check (matches your H, W constraints)
-        if not (bw < round(r) < H - bw and bw < round(c) < W - bw):
-            continue
+    def _patches(sel):
+        return pad_images[
+            frames[sel][:, None, None],
+            (ri_all[sel] + opt_P)[:, None, None] + win[None, :, None],
+            (ci_all[sel] + opt_P)[:, None, None] + win[None, None, :],
+        ].astype(np.float32)
 
-        opt_Pmats.append(all_P_mats[idx])
-        opt_dists.append(all_distances[idx])
-        opt_Rmats.append(all_R_mats[idx])
-        opt_streaks.append(all_streak_dirs[idx])
-
-        ri, ci = round(r) + opt_P, round(c) + opt_P
-
-        # Bounding box bounds
-        r_min, r_max = ri - opt_half, ri + opt_half + 1
-        c_min, c_max = ci - opt_half, ci + opt_half + 1
-
-        patch = pad_images[f, r_min:r_max, c_min:c_max].astype(np.float32)
-
-        # Local background estimation (edges of the 15x15 patch)
-        bg_mask = np.ones_like(patch, dtype=bool)
-        bg_mask[2:-2, 2:-2] = False
-        bg = np.median(patch[bg_mask])
-
-        opt_patches.append(patch)
-        opt_bgs.append(bg)
-
-        # Sub-pixel grid shifts
-        rr, cc = np.meshgrid(
-            np.arange(r_min, r_max) - opt_P,
-            np.arange(c_min, c_max) - opt_P,
-            indexing="ij",
-        )
-        opt_drs.append(rr - r)
-        opt_dcs.append(cc - c)
+    # Background and core signal of every patch, in chunks: only the
+    # patches the shape fit keeps are held.
+    opt_bgs = np.zeros(len(opt_idx), dtype=np.float32)
+    core_sum = np.zeros(len(opt_idx), dtype=np.float32)
+    for lo in range(0, len(opt_idx), 65536):
+        chunk = _patches(opt_idx[lo : lo + 65536])
+        opt_bgs[lo : lo + 65536] = np.median(chunk[:, bg_mask], axis=1)
+        core_sum[lo : lo + 65536] = chunk[
+            :, opt_half - 2 : opt_half + 3, opt_half - 2 : opt_half + 3
+        ].sum(axis=(1, 2))
+    n_opt = len(opt_idx)
 
     # We require at least 15 valid peaks to mathematically constrain a 6-parameter 3D tensor
     MIN_PEAKS_FOR_GLOBAL_FIT = 15
@@ -1137,34 +1171,40 @@ def integrate_peaks_rbf_ssn(
     # over all peaks lets the many weak ones drag the widths to their
     # bounds.  Restrict the SHAPE fit to significant peaks; integration
     # itself still covers every prediction.
-    if shape_fit_min_snr > 0 and len(opt_patches) >= MIN_PEAKS_FOR_GLOBAL_FIT:
-        keep = []
-        for patch, bg in zip(opt_patches, opt_bgs):
-            core = patch[opt_half - 2 : opt_half + 3, opt_half - 2 : opt_half + 3]
-            signal = float(core.sum() - 25.0 * bg)
-            noise = float(np.sqrt(max(25.0 * bg, 1.0)))
-            keep.append(signal / noise >= shape_fit_min_snr)
-        keep = np.array(keep)
+    if shape_fit_min_snr > 0 and n_opt >= MIN_PEAKS_FOR_GLOBAL_FIT:
+        signal = core_sum.astype(np.float64) - 25.0 * opt_bgs
+        noise = np.sqrt(np.maximum(25.0 * opt_bgs.astype(np.float64), 1.0))
+        keep = signal / noise >= shape_fit_min_snr
         if keep.sum() >= MIN_PEAKS_FOR_GLOBAL_FIT:
             if show_progress:
                 print(
                     f"  > Shape fit restricted to {int(keep.sum())} of "
                     f"{len(keep)} peaks with core SNR >= {shape_fit_min_snr}."
                 )
-            sel = np.where(keep)[0]
-            opt_patches = [opt_patches[i] for i in sel]
-            opt_bgs = [opt_bgs[i] for i in sel]
-            opt_drs = [opt_drs[i] for i in sel]
-            opt_dcs = [opt_dcs[i] for i in sel]
-            opt_Pmats = [opt_Pmats[i] for i in sel]
-            opt_dists = [opt_dists[i] for i in sel]
-            opt_Rmats = [opt_Rmats[i] for i in sel]
-            opt_streaks = [opt_streaks[i] for i in sel]
+            opt_idx = opt_idx[keep]
+            opt_bgs = opt_bgs[keep]
         elif show_progress:
             print(
                 f"  > Only {int(keep.sum())} peaks pass SNR >= "
                 f"{shape_fit_min_snr}; shape fit keeps all peaks."
             )
+
+    opt_patches = []
+    if anisotropic and n_opt >= MIN_PEAKS_FOR_GLOBAL_FIT:
+        opt_patches = _patches(opt_idx)
+        # Sub-pixel grid shifts
+        opt_drs = np.broadcast_to(
+            (ri_all[opt_idx, None] + win[None, :] - rs_arr[opt_idx, None])[:, :, None],
+            opt_patches.shape,
+        )
+        opt_dcs = np.broadcast_to(
+            (ci_all[opt_idx, None] + win[None, :] - cs_arr[opt_idx, None])[:, None, :],
+            opt_patches.shape,
+        )
+        opt_Pmats = all_P_mats[opt_idx]
+        opt_dists = all_distances[opt_idx]
+        opt_Rmats = all_R_mats[opt_idx]
+        opt_streaks = all_streak_dirs[opt_idx]
 
     if not anisotropic or len(opt_patches) < MIN_PEAKS_FOR_GLOBAL_FIT:
         if show_progress:
@@ -1259,22 +1299,80 @@ def integrate_peaks_rbf_ssn(
             static_mask_file, batched_banks, images_batch.shape[1:]
         )
 
-    integrated_results = integrate_reflections_matrix_free(
-        images_batch,
-        frames,
-        all_rs,
-        all_cs,
-        var_us=all_var_u,
-        var_vs=all_var_v,
-        cov_uvs=all_cov_uv,
-        ref_sigma=1.0,
-        max_sigma=max_sigma,
-        static_valid=static_valid,
-        profile=matrix_free_profile,
-        fp_target=matrix_free_fp_target,
-        border_width=border_width,
-        show_progress=show_progress,
-    )
+    tof_info = None
+    if tof_mode:
+        from subhkl.search.tof_gate import (
+            integrate_reflections_tof_gated,
+            predicted_tof,
+            wavelength_band,
+        )
+
+        # Flight path of each reflection: moderator to sample, sample to
+        # its pixel (the same sample position the predictions used).
+        wl = np.asarray(all_wl, dtype=np.float64)
+        tof_pred = predicted_tof(wl, tof_l1, all_distances)
+        images_band = (peaks_obj.wavelength.min, peaks_obj.wavelength.max)
+        band_min, band_max = wavelength_band(wl, tof_band, images_band)
+        if show_progress:
+            note = (
+                ""
+                if np.allclose((band_min, band_max), images_band)
+                else f" (images file says {images_band[0]:g}-{images_band[1]:g})"
+            )
+            print(f"  > Wavelength band: {band_min:.3f}-{band_max:.3f} A{note}")
+
+        def _frame_event_reader(f):
+            return event_reader(frame_img_keys[f])
+
+        if getattr(event_reader, "event_store", None) is not None:
+            _frame_event_reader.event_store = event_reader.event_store
+            _frame_event_reader.frame_img_keys = frame_img_keys
+
+        integrated_results, tof_info = integrate_reflections_tof_gated(
+            images_batch,
+            _frame_event_reader,
+            frames,
+            all_rs,
+            all_cs,
+            tof_pred,
+            predicted_tof(band_min, tof_l1, all_distances),
+            predicted_tof(band_max, tof_l1, all_distances),
+            var_us=all_var_u,
+            var_vs=all_var_v,
+            cov_uvs=all_cov_uv,
+            gate=tof_gate,
+            gate_coverage=tof_gate_coverage,
+            gate_search=tof_gate_search,
+            sideband_factor=tof_sideband_factor,
+            sideband_measure=tof_sideband_measure,
+            max_variance_inflation=tof_max_variance_inflation,
+            amplitude_ridge=tof_amplitude_ridge,
+            static_valid=static_valid,
+            profile=matrix_free_profile,
+            fp_target=matrix_free_fp_target,
+            border_width=border_width,
+            allow_negative=allow_negative,
+            show_progress=show_progress,
+        )
+        res.tof_info = tof_info
+    else:
+        integrated_results = integrate_reflections_matrix_free(
+            images_batch,
+            frames,
+            all_rs,
+            all_cs,
+            var_us=all_var_u,
+            var_vs=all_var_v,
+            cov_uvs=all_cov_uv,
+            ref_sigma=1.0,
+            max_sigma=max_sigma,
+            static_valid=static_valid,
+            profile=matrix_free_profile,
+            fp_target=matrix_free_fp_target,
+            border_width=border_width,
+            allow_negative=allow_negative,
+            show_progress=show_progress,
+        )
 
     # --- PHASE 3: GEOMETRY AND METADATA MAPPING ---
     results_by_img = defaultdict(list)
@@ -1371,6 +1469,9 @@ def integrate_peaks_rbf_ssn(
                 res.var_u.append(var_u)
                 res.var_v.append(var_v)
                 res.cov_uv.append(cov_uv)
+                if tof_info is not None:
+                    res.tof.append(float(tof_info["tof"][global_idx]))
+                    res.tof_bg.append(float(tof_info["bg"][global_idx]))
 
     # --- PHASE 4: PARALLEL VISUALIZATION (PER RUN) ---
     if create_visualizations and runs_plot_data:

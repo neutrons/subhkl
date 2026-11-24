@@ -10,6 +10,7 @@ if any(
     for cmd in ("rainbow-visualize", "reduce", "reduce-batch", "merge-images")
 ):
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 import h5py
 import typer
@@ -142,6 +143,125 @@ def _main_callback() -> None:
     print(f"[pulsar] Runner host: {detect_runner_hostname()}", flush=True)
 
 
+def _get_local_nvme_scratch_dir() -> str:
+    """Return Tier 1 fast local NVMe scratch directory (SUBHKL_STAGING_DIR or TMPDIR)."""
+    import tempfile
+
+    raw = str(os.environ.get("SUBHKL_STAGING_DIR") or "").strip()
+    if raw and not raw.startswith("$"):
+        os.makedirs(raw, exist_ok=True)
+        return os.path.abspath(raw)
+    return os.path.abspath(tempfile.gettempdir())
+
+
+def _resolve_cli_input(
+    path: str | None, *, must_exist: bool = True
+) -> tuple[str | None, dict | None]:
+    """Resolve a CLI HDF5 input that may be a shared-storage JSON pointer or network path."""
+    if not path:
+        return path, None
+    from subhkl.io.shared_storage import resolve_input_h5_path
+
+    resolved, ptr_doc = resolve_input_h5_path(path, must_exist=must_exist)
+    if ptr_doc is not None or os.path.abspath(resolved) != os.path.abspath(path):
+        net_lbl = ptr_doc.get("network_path") if isinstance(ptr_doc, dict) else path
+        print(
+            f"[subhkl] Resolved shared input '{net_lbl}' -> '{resolved}'",
+            flush=True,
+        )
+    return resolved, ptr_doc
+
+
+def _copy_scan_provenance_to_derived_h5(
+    scan_h5_path: str | None,
+    derived_h5_path: str | None,
+    *,
+    instrument: str | None = None,
+    space_group: str | None = None,
+    pointer_meta: dict | None = None,
+) -> None:
+    """Copy raw NeXus provenance (`source_files`, `files`, `file_offsets`, wavelength) into thin derived HDF5s."""
+    import contextlib
+
+    import numpy as np
+
+    if not derived_h5_path or not os.path.isfile(derived_h5_path):
+        return
+    with contextlib.suppress(OSError, KeyError, ValueError, TypeError):
+        src_files: list[str] = []
+        files_vals: list[str] = []
+        file_offsets_arr = None
+        merged_inst = ""
+        merged_wl = None
+        if isinstance(pointer_meta, dict) and isinstance(
+            pointer_meta.get("source_files"), list
+        ):
+            src_files = [
+                str(x).strip() for x in pointer_meta["source_files"] if str(x).strip()
+            ]
+        if scan_h5_path and os.path.isfile(scan_h5_path):
+            with h5py.File(scan_h5_path, "r") as mf:
+                if "source_files" in mf:
+                    src_files = [
+                        (
+                            x.decode("utf-8", "ignore")
+                            if isinstance(x, (bytes, np.bytes_))
+                            else str(x)
+                        ).strip()
+                        for x in list(mf["source_files"][()])
+                    ]
+                if "files" in mf:
+                    files_vals = [
+                        (
+                            x.decode("utf-8", "ignore")
+                            if isinstance(x, (bytes, np.bytes_))
+                            else str(x)
+                        ).strip()
+                        for x in list(mf["files"][()])
+                    ]
+                if "file_offsets" in mf:
+                    file_offsets_arr = np.asarray(mf["file_offsets"][()])
+                raw_mi = mf.attrs.get("instrument")
+                if raw_mi is not None:
+                    merged_inst = (
+                        raw_mi.decode("utf-8", "ignore")
+                        if isinstance(raw_mi, (bytes, np.bytes_))
+                        else str(raw_mi)
+                    ).strip()
+                if "instrument/wavelength" in mf:
+                    merged_wl = np.asarray(
+                        mf["instrument/wavelength"][()], dtype=np.float64
+                    )
+
+        with h5py.File(derived_h5_path, "r+") as hf:
+            dt_str = h5py.string_dtype(encoding="utf-8")
+            if src_files and "source_files" not in hf:
+                hf.create_dataset("source_files", data=src_files, dtype=dt_str)
+            if not files_vals and src_files:
+                files_vals = [os.path.basename(p) for p in src_files]
+            if files_vals and "files" not in hf:
+                hf.create_dataset("files", data=files_vals, dtype=dt_str)
+            if file_offsets_arr is not None and "file_offsets" not in hf:
+                hf.create_dataset("file_offsets", data=file_offsets_arr)
+            inst_s = str(
+                instrument
+                or merged_inst
+                or (pointer_meta or {}).get("instrument")
+                or ""
+            ).strip()
+            if inst_s and "instrument" not in hf.attrs:
+                hf.attrs["instrument"] = inst_s
+            if merged_wl is not None and "instrument/wavelength" not in hf:
+                if "instrument" in hf and not isinstance(hf["instrument"], h5py.Group):
+                    del hf["instrument"]
+                igrp = hf.require_group("instrument")
+                igrp.create_dataset("wavelength", data=merged_wl)
+            sg_s = str(space_group or "").strip()
+            if sg_s and "sample/space_group" not in hf and "space_group" not in hf:
+                sgrp = hf.require_group("sample")
+                sgrp["space_group"] = np.bytes_(sg_s)
+
+
 @app.command()
 def solve(
     frames_filename: Annotated[
@@ -174,7 +294,7 @@ def solve(
         int | None,
         typer.Option(
             min=1,
-            help="Sum count pixels into bins (default: 8 for poisson, 16 for band)",
+            help="Sum count pixels into bins (default: auto <=8 keeping >=32x32 bins/panel)",
         ),
     ] = None,
     proposal_binning: Annotated[
@@ -315,6 +435,15 @@ def solve(
     from subhkl.solve import run_solve
 
     try:
+        frames_resolved, frames_ptr = _resolve_cli_input(frames_filename)
+        assert frames_resolved is not None
+        frames_filename = frames_resolved
+        metadata, _ = _resolve_cli_input(metadata)
+        bootstrap, _ = _resolve_cli_input(bootstrap)
+        finder_peaks, _ = _resolve_cli_input(finder_peaks)
+        static_mask_file, _ = _resolve_cli_input(static_mask_file)
+        profile_file, _ = _resolve_cli_input(profile_file)
+        background_file, _ = _resolve_cli_input(background_file)
         values = [float(v.strip()) for v in cell.split(",")] if cell else None
         if refinement not in ("poisson", "band"):
             raise ValueError("refinement must be poisson or band")
@@ -325,15 +454,6 @@ def solve(
                 raise ValueError(
                     "band uses --refine-modes to select free geometry; omit --no-refine/--fixed-geometry"
                 )
-            eff_binning = binning
-            if eff_binning is None:
-                eff_binning = 8
-                try:
-                    with h5py.File(frames_filename, "r") as _bf:
-                        if "images" in _bf and int(_bf["images"].shape[0]) > 240:
-                            eff_binning = 16
-                except OSError:
-                    pass
             band_result = run_scan_refinement(
                 frames_filename,
                 output_filename,
@@ -362,7 +482,7 @@ def solve(
                 d_min=d_min,
                 min_deviance=min_deviance,
                 pixel_polish=pixel_polish,
-                binning=eff_binning,
+                binning=binning,
                 maxiter=band_maxiter,
                 static_mask_file=static_mask_file,
                 search_samples=search_samples,
@@ -373,6 +493,13 @@ def solve(
             )
             if band_result["status"] != "converged":
                 raise typer.Exit(1)
+            _copy_scan_provenance_to_derived_h5(
+                frames_filename,
+                output_filename,
+                instrument=instrument,
+                space_group=space_group,
+                pointer_meta=frames_ptr,
+            )
             return
         if finder_peaks or refine_modes or runs or stable_runs or pixel_polish:
             raise ValueError("finder/mode/run/pixel options require --refinement band")
@@ -408,6 +535,13 @@ def solve(
         raise typer.Exit(1) from exc
     if result["status"] != "converged":
         raise typer.Exit(1)
+    _copy_scan_provenance_to_derived_h5(
+        frames_filename,
+        output_filename,
+        instrument=instrument,
+        space_group=space_group,
+        pointer_meta=frames_ptr,
+    )
 
 
 def apply_detector_calibration(hdf5_filename: str, instrument: str):
@@ -1121,7 +1255,7 @@ def integrator(
             "upward (broad templates soak background pedestals).  "
             "0 keeps every peak."
         ),
-    ] = 0.0,
+    ] = 5.0,
     shape_fit_normalized: Annotated[
         bool,
         typer.Option(
@@ -1182,6 +1316,16 @@ def integrator(
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
     ] = 0.03,
+    allow_negative: Annotated[
+        bool,
+        typer.Option(
+            "--allow-negative/--no-allow-negative",
+            help="Take one unconstrained Fisher-scoring step around the "
+            "joint nonnegative Poisson MLE so weak reflections carry "
+            "unbiased signed intensities I +- sigI for downstream "
+            "Bayesian/Careless merging instead of being censored at zero.",
+        ),
+    ] = False,
     show_progress: Annotated[bool, typer.Option("--show-progress")] = True,
     create_visualizations: bool = False,
     chunk_size: int = 256,
@@ -1194,6 +1338,65 @@ def integrator(
     ] = None,
     dials_polychromatic: _DialsPolyOpt = False,
     dials_wavelength: _DialsWavelengthOpt = None,
+    tof_gate: Annotated[
+        str,
+        typer.Option(
+            help="Time-of-flight gating, used when the images file carries "
+            "events (reduce --events): each reflection is integrated from "
+            "the events inside a time window around its predicted time of "
+            "flight, with the background taken from time sidebands on the "
+            "same pixels.  'auto' measures the window from the data, "
+            "'lo,hi' sets its edges relative to the predicted time (e.g. "
+            "'-0.01,0.015'), 'off' integrates the whole wavelength band."
+        ),
+    ] = "auto",
+    tof_gate_coverage: Annotated[
+        float,
+        typer.Option(
+            help="Fraction of the stacked Bragg excess the measured gate holds."
+        ),
+    ] = 0.95,
+    tof_gate_search: Annotated[
+        float,
+        typer.Option(help="Half-range of t / t_predicted - 1 searched for the gate."),
+    ] = 0.05,
+    tof_sideband_factor: Annotated[
+        float,
+        typer.Option(
+            help="Length of the background sideband on each side of the "
+            "gate, in units of the gate width."
+        ),
+    ] = 4.0,
+    tof_sideband_measure: Annotated[
+        str,
+        typer.Option(
+            help="How the sideband background is scaled to the gate. "
+            "'spectrum' (default) uses each image's own time spectrum, so a "
+            "spectrum that is curved or falls off at the band edges does not "
+            "bias the background; 'time' assumes a rate flat in time."
+        ),
+    ] = "spectrum",
+    tof_max_variance_inflation: Annotated[
+        float,
+        typer.Option(
+            help="Censor a gated reflection (sigI = 0, dropped from the "
+            "export) when overlapping neighbours in the same time window "
+            "inflate the variance of its intensity by more than this factor "
+            "relative to an isolated reflection. Such a reflection cannot "
+            "be told apart from its neighbours: only their sum is "
+            "determined. 0 keeps every row."
+        ),
+    ] = 1000.0,
+    tof_amplitude_ridge: Annotated[
+        str,
+        typer.Option(
+            help="Regularisation of the joint fit of overlapping gated "
+            "reflections. 'fixed' is a prior of 1000 photons on every "
+            "reflection; 'counts' sets it to the gross counts under the "
+            "reflection's own profile, which gives unresolved reflections a "
+            "meaningful sigma but also shrinks weak, partly overlapped ones."
+        ),
+    ] = "fixed",
 ):
     """
     Integrates predicted peaks using the Dense Sparse RBF network approach on GPU.
@@ -1216,10 +1419,14 @@ def integrator(
             "implementation (see the matrix-free integration notes in "
             "subhkl.search.matrix_free)"
         )
+    resolved_scan, scan_ptr = _resolve_cli_input(filename)
+    resolved_peaks, _ = _resolve_cli_input(integration_peaks_filename)
+    resolved_mask, _ = _resolve_cli_input(static_mask_file)
+    assert resolved_scan is not None and resolved_peaks is not None
     run_rbf_integrator(
-        filename=filename,
+        filename=resolved_scan,
         instrument=instrument,
-        integration_peaks_filename=integration_peaks_filename,
+        integration_peaks_filename=resolved_peaks,
         output_filename=output_filename,
         sigmas=sigmas,
         nominal_sigma=nominal_sigma,
@@ -1232,12 +1439,26 @@ def integrator(
         shape_fit_normalized=shape_fit_normalized,
         matrix_free_profile=matrix_free_profile,
         matrix_free_fp_target=matrix_free_fp_target,
-        static_mask_file=static_mask_file,
+        static_mask_file=resolved_mask,
         rel_border_width=rel_border_width,
+        allow_negative=allow_negative,
         show_progress=show_progress,
         create_visualizations=create_visualizations,
         chunk_size=chunk_size,
         max_workers=max_workers,
+        tof_gate=tof_gate,
+        tof_gate_coverage=tof_gate_coverage,
+        tof_gate_search=tof_gate_search,
+        tof_sideband_factor=tof_sideband_factor,
+        tof_sideband_measure=tof_sideband_measure,
+        tof_max_variance_inflation=tof_max_variance_inflation,
+        tof_amplitude_ridge=tof_amplitude_ridge,
+    )
+    _copy_scan_provenance_to_derived_h5(
+        resolved_scan,
+        output_filename,
+        instrument=instrument,
+        pointer_meta=scan_ptr,
     )
     _maybe_export_dials(
         dials,
@@ -1245,7 +1466,7 @@ def integrator(
         output_filename,
         instrument,
         dials_prefix,
-        image_source=filename,
+        image_source=resolved_scan,
         polychromatic=dials_polychromatic,
         wavelength=dials_wavelength,
     )
@@ -1369,9 +1590,13 @@ def metrics(
         else ("metrics_per_peak.h5" if per_peak else None)
     )
 
+    resolved_f1, _ = _resolve_cli_input(file1)
+    resolved_f2, _ = _resolve_cli_input(file2)
+    assert resolved_f1 is not None
+
     run_metrics(
-        file1=file1,
-        file2=file2,
+        file1=resolved_f1,
+        file2=resolved_f2,
         instrument=instrument,
         d_min=d_min,
         per_run=per_run,
@@ -1410,11 +1635,80 @@ def peak_predictor(
     ] = None,
     dials_polychromatic: _DialsPolyOpt = False,
     dials_wavelength: _DialsWavelengthOpt = None,
+    rel_border_width: Annotated[
+        float,
+        typer.Option(
+            "--rel-border-width",
+            help="Fractional detector-panel border margin to exclude predicted peaks near edges.",
+        ),
+    ] = 0.0,
+    static_mask_file: Annotated[
+        str | None,
+        typer.Option(
+            "--static-mask-file",
+            help="Optional static per-pixel mask HDF5 mapped by bank_ids.",
+        ),
+    ] = None,
+    shared_pointer_out: Annotated[
+        str | None,
+        typer.Option(
+            "--shared-pointer-out",
+            help="Stage predicted HDF5 into mandatory SUBHKL_SHARED_DIR (ephemeral) and write JSON pointer here.",
+        ),
+    ] = None,
 ):
+    import uuid
+
+    from subhkl.io.shared_storage import publish_shared_artifact
+
+    resolved_scan, scan_ptr = _resolve_cli_input(filename)
+    resolved_idx, _ = _resolve_cli_input(indexed_hdf5_filename)
+    resolved_mask, _ = _resolve_cli_input(static_mask_file)
+    assert resolved_scan is not None and resolved_idx is not None
+
+    if shared_pointer_out:
+        local_tmp = os.path.join(
+            _get_local_nvme_scratch_dir(),
+            f"subhkl_pred_tmp_{uuid.uuid4().hex}.h5",
+        )
+        try:
+            run_peak_predictor(
+                resolved_scan,
+                instrument,
+                resolved_idx,
+                local_tmp,
+                d_min=d_min,
+                wavel_min=wavel_min,
+                wavel_max=wavel_max,
+                space_group=space_group,
+                max_workers=max_workers,
+                create_visualizations=create_visualizations,
+                rel_border_width=rel_border_width,
+                static_mask_file=resolved_mask,
+            )
+            _shared_local, ptr_doc = publish_shared_artifact(
+                local_tmp,
+                shared_pointer_out,
+                artifact="peak_predictor.h5",
+                delete_after_use=True,
+                metadata={
+                    "instrument": instrument,
+                    "source_files": (scan_ptr or {}).get("source_files"),
+                },
+            )
+        finally:
+            if os.path.exists(local_tmp):
+                os.unlink(local_tmp)
+        print(
+            f"[subhkl] Staged ephemeral predictor -> {ptr_doc['network_path']} (pointer: {shared_pointer_out})",
+            flush=True,
+        )
+        return
+
     run_peak_predictor(
-        filename,
+        resolved_scan,
         instrument,
-        indexed_hdf5_filename,
+        resolved_idx,
         integration_peaks_filename,
         d_min=d_min,
         wavel_min=wavel_min,
@@ -1422,6 +1716,8 @@ def peak_predictor(
         space_group=space_group,
         max_workers=max_workers,
         create_visualizations=create_visualizations,
+        rel_border_width=rel_border_width,
+        static_mask_file=resolved_mask,
     )
     _maybe_export_dials(
         dials,
@@ -1429,7 +1725,7 @@ def peak_predictor(
         integration_peaks_filename,
         instrument,
         dials_prefix,
-        image_source=filename,
+        image_source=resolved_scan,
         polychromatic=dials_polychromatic,
         wavelength=dials_wavelength,
     )
@@ -1466,12 +1762,16 @@ def mtz_exporter(
     dials_polychromatic: _DialsPolyOpt = False,
     dials_wavelength: _DialsWavelengthOpt = None,
 ):
+    resolved_idx, _ = _resolve_cli_input(indexed_h5_filename)
+    resolved_pred, _ = _resolve_cli_input(predictions_file)
+    resolved_corr, _ = _resolve_cli_input(corrections_file)
+    assert resolved_idx is not None
     run_mtz_exporter(
-        indexed_h5_filename,
+        resolved_idx,
         output_mtz_filename,
         space_group,
-        predictions_file=predictions_file,
-        corrections_file=corrections_file,
+        predictions_file=resolved_pred,
+        corrections_file=resolved_corr,
     )
     # The reflection information lives in the input indexed HDF5; the DIALS
     # files are named after the MTZ output.
@@ -1503,9 +1803,26 @@ def reduce(
     ] = None,
     dials_polychromatic: _DialsPolyOpt = False,
     dials_wavelength: _DialsWavelengthOpt = None,
+    store_events: Annotated[
+        bool | None,
+        typer.Option(
+            "--events/--no-events",
+            help="Keep the event times of flight next to the images, sorted "
+            "by pixel, so the integrator can gate each reflection in time. "
+            "Default: on for instruments with a moderator distance (L1) in "
+            "their settings.",
+        ),
+    ] = None,
 ):
+    resolved_nxs, _ = _resolve_cli_input(nexus_filename)
+    assert resolved_nxs is not None
     run_reduce(
-        nexus_filename, output_filename, instrument, wavelength_min, wavelength_max
+        resolved_nxs,
+        output_filename,
+        instrument,
+        wavelength_min,
+        wavelength_max,
+        store_events=store_events,
     )
     _maybe_export_dials(
         dials,
@@ -1542,21 +1859,34 @@ def reduce_batch(
     workers: Annotated[
         int | None, typer.Option(help="Max parallel CPU worker processes")
     ] = None,
+    store_events: Annotated[
+        bool | None,
+        typer.Option(
+            "--events/--no-events",
+            help="Keep the event times of flight next to the images, sorted "
+            "by pixel, so the integrator can gate each reflection in time. "
+            "Default: on for instruments with a moderator distance (L1) in "
+            "their settings.",
+        ),
+    ] = None,
 ):
     os.makedirs(output_dir, exist_ok=True)
     tasks: list[tuple[str, str]] = []
     for idx, nxs_p in enumerate(nexus_filenames):
-        bn = os.path.basename(nxs_p).split(".")[0] or f"run_{idx:03d}"
+        resolved_nxs, _ = _resolve_cli_input(nxs_p, must_exist=False)
+        actual_nxs = resolved_nxs or nxs_p
+        bn = os.path.basename(actual_nxs).split(".")[0] or f"run_{idx:03d}"
         out_p = os.path.join(output_dir, f"{bn}.reduce.h5")
         if any(existing_out == out_p for _, existing_out in tasks):
             out_p = os.path.join(output_dir, f"{idx:03d}_{bn}.reduce.h5")
-        tasks.append((nxs_p, out_p))
+        tasks.append((actual_nxs, out_p))
     run_reduce_batch(
         tasks,
         instrument,
         wavelength_min=wavelength_min,
         wavelength_max=wavelength_max,
         max_workers=workers,
+        store_events=store_events,
     )
 
 
@@ -1582,11 +1912,121 @@ def merge_images(
     ] = None,
     dials_polychromatic: _DialsPolyOpt = False,
     dials_wavelength: _DialsWavelengthOpt = None,
+    shared_pointer_out: Annotated[
+        str | None,
+        typer.Option(
+            "--shared-pointer-out",
+            help="Stage merged HDF5 into mandatory SUBHKL_SHARED_DIR and write JSON pointer here.",
+        ),
+    ] = None,
+    source_files: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--source-file",
+            help="Raw NeXus file path(s) to record in source_files provenance.",
+        ),
+    ] = None,
+    instrument: Annotated[
+        str | None,
+        typer.Option(
+            "--instrument",
+            help="Optional instrument name to stamp into merged HDF5 metadata.",
+        ),
+    ] = None,
 ):
+    import uuid
+
+    from subhkl.io.shared_storage import (
+        get_shared_dir_local,
+        publish_shared_artifact,
+    )
+
+    clean_src_files = [str(p).strip() for p in (source_files or []) if str(p).strip()]
+    tag_hint = ""
+    if clean_src_files:
+        s0 = os.path.basename(clean_src_files[0]).split(".")[0]
+        s1 = os.path.basename(clean_src_files[-1]).split(".")[0]
+        tag_hint = s0 if s0 == s1 else f"{s0}_{s1}"
+
     try:
+        if shared_pointer_out:
+            # Fail fast before running expensive merge if SUBHKL_SHARED_DIR is unset/unwritable.
+            get_shared_dir_local(require=True, create=True)
+            local_tmp = os.path.join(
+                _get_local_nvme_scratch_dir(),
+                f"subhkl_merge_tmp_{uuid.uuid4().hex}.h5",
+            )
+            local_parent = os.path.dirname(os.path.abspath(local_tmp))
+            if local_parent:
+                os.makedirs(local_parent, exist_ok=True)
+            try:
+                run_merge_images(
+                    input_pattern,
+                    local_tmp,
+                    a,
+                    b,
+                    c,
+                    alpha,
+                    beta,
+                    gamma,
+                    space_group,
+                )
+                if os.path.isfile(local_tmp) and (clean_src_files or instrument):
+                    with h5py.File(local_tmp, "r+") as hf:
+                        dt_str = h5py.string_dtype(encoding="utf-8")
+                        if clean_src_files:
+                            if "source_files" in hf:
+                                del hf["source_files"]
+                            hf.create_dataset(
+                                "source_files", data=clean_src_files, dtype=dt_str
+                            )
+                            if "files" in hf and len(hf["files"]) == len(
+                                clean_src_files
+                            ):
+                                del hf["files"]
+                                hf.create_dataset(
+                                    "files",
+                                    data=[os.path.basename(p) for p in clean_src_files],
+                                    dtype=dt_str,
+                                )
+                        if instrument:
+                            hf.attrs["instrument"] = str(instrument)
+                        hf.flush()
+                # Copy closed local HDF5 to brand-new UUID path, os.fsync + close, THEN publish JSON pointer.
+                _shared_local, ptr_doc = publish_shared_artifact(
+                    local_tmp,
+                    shared_pointer_out,
+                    artifact="merged.h5",
+                    delete_after_use=False,
+                    metadata={
+                        "instrument": instrument,
+                        "source_files": clean_src_files or None,
+                        "tag": tag_hint or None,
+                    },
+                )
+            finally:
+                if os.path.exists(local_tmp):
+                    os.unlink(local_tmp)
+            print(
+                f"[subhkl] Staged shared scan -> {ptr_doc['network_path']} (pointer: {shared_pointer_out})",
+                flush=True,
+            )
+            return
+
         run_merge_images(
             input_pattern, output_filename, a, b, c, alpha, beta, gamma, space_group
         )
+        if os.path.isfile(output_filename) and (clean_src_files or instrument):
+            with h5py.File(output_filename, "r+") as hf:
+                dt_str = h5py.string_dtype(encoding="utf-8")
+                if clean_src_files:
+                    if "source_files" in hf:
+                        del hf["source_files"]
+                    hf.create_dataset(
+                        "source_files", data=clean_src_files, dtype=dt_str
+                    )
+                if instrument:
+                    hf.attrs["instrument"] = str(instrument)
 
     except ValueError as e:
         print(str(e))
@@ -1596,11 +2036,45 @@ def merge_images(
         dials,
         output_filename,
         output_filename,
-        None,
+        instrument,
         dials_prefix,
         polychromatic=dials_polychromatic,
         wavelength=dials_wavelength,
     )
+
+
+@app.command("cleanup-shared")
+def cleanup_shared_cmd(
+    targets: Annotated[
+        list[str],
+        typer.Argument(
+            help="Shared-storage JSON pointer file(s) or shared path(s) to delete."
+        ),
+    ],
+    if_ephemeral: Annotated[
+        bool,
+        typer.Option(
+            "--if-ephemeral",
+            help="Only delete pointer targets marked delete_after_use=true (e.g. peak_predictor.h5).",
+        ),
+    ] = False,
+) -> None:
+    """Remove shared-filesystem intermediates created by Galaxy runner steps."""
+    from subhkl.io.shared_storage import cleanup_shared_artifact
+
+    expanded_targets = [
+        part.strip()
+        for raw_tgt in targets
+        for part in str(raw_tgt or "").split(",")
+        if part.strip()
+    ]
+    for tgt in expanded_targets:
+        removed = cleanup_shared_artifact(
+            tgt,
+            only_if_delete_after_use=if_ephemeral,
+        )
+        if removed:
+            print(f"[subhkl] Deleted shared intermediate for '{tgt}'", flush=True)
 
 
 _IMAGES_HELP = "Reduced (or merged) HDF5 file holding the image stack the search ran on"
@@ -2164,6 +2638,8 @@ def rainbow_visualize(
     """Export or serve the interactive 'Rainbow Zones' Laue zone GUI (Arcade + Pro View)."""
     from subhkl.viz.rainbow_zones import export_rainbow_widget
 
+    peaks_filename, _ = _resolve_cli_input(peaks_filename, must_exist=False)
+    images, _ = _resolve_cli_input(images, must_exist=False)
     extra = {"instrument": instrument} if instrument else {}
     replay_target = peaks_filename or images
     if output_html and replay_target:

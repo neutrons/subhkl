@@ -3415,6 +3415,8 @@ def _snap_positions_impl(images, bg_maps, valid, frames, rs, cs, patch_size=15):
         (k_grid + 0.5) / nominal_sig_sq2
     ) - jax.scipy.special.erf((k_grid - 0.5) / nominal_sig_sq2)
 
+    k_norm2 = jnp.sum(k_1d**2) ** 2
+
     def snap_one(f, r, c):
         r_int = jnp.int32(jnp.round(r))
         c_int = jnp.int32(jnp.round(c))
@@ -3428,6 +3430,17 @@ def _snap_positions_impl(images, bg_maps, valid, frames, rs, cs, patch_size=15):
         temp = jax.scipy.signal.correlate2d(y_sub, k_1d[:, None], mode="same")
         smooth = jax.scipy.signal.correlate2d(temp, k_1d[None, :], mode="same")
 
+        # Gate sub-pixel centroid snapping by local matched-filter SNR so weak
+        # high-resolution reflections stay pinned at their sub-pixel predicted
+        # geometry rather than noise-hunting onto random positive spikes.
+        noise_sd = jnp.sqrt(jnp.maximum(patch_bg[half, half] * k_norm2, 1.0))
+        snr = smooth[half, half] / noise_sd
+        w = jnp.where(
+            patch_v[half, half] > 0.5,
+            jnp.clip((snr - 4.5) / 3.0, 0.0, 1.0),
+            0.0,
+        )
+
         safe = jnp.maximum(smooth, 1e-6)
         val = jnp.log(safe[half, half])
         val_up = jnp.log(safe[half - 1, half])
@@ -3440,7 +3453,9 @@ def _snap_positions_impl(images, bg_maps, valid, frames, rs, cs, patch_size=15):
         den_c = jnp.minimum(val_lf - 2.0 * val + val_rt, -1e-6)
         dc = jnp.clip(0.5 * (val_lf - val_rt) / den_c, -MAX_SNAP_SHIFT, MAX_SNAP_SHIFT)
 
-        return r_int + dr, c_int + dc
+        shift_r = jnp.clip(r_int + dr - r, -MAX_SNAP_SHIFT, MAX_SNAP_SHIFT)
+        shift_c = jnp.clip(c_int + dc - c, -MAX_SNAP_SHIFT, MAX_SNAP_SHIFT)
+        return r + w * shift_r, c + w * shift_c
 
     return vmap(snap_one)(frames, rs, cs)
 
@@ -3459,7 +3474,21 @@ def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
 
 
 def _solve_image_amplitudes_impl(
-    image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok, admission_z, profile=None
+    image,
+    bg,
+    valid,
+    rs,
+    cs,
+    var_u,
+    var_v,
+    cov_uv,
+    atom_ok,
+    admission_z,
+    profile=None,
+    use_l1_gate=False,
+    allow_negative=False,
+    max_variance_inflation=None,
+    ridge="fixed",
 ):
     """One image, all its reflections: L1-admitted, debiased Poisson solve.
 
@@ -3502,6 +3531,33 @@ def _solve_image_amplitudes_impl(
         profile: optional (u, f, norm) measured radial trunk in model
             sigmas with norm = integral of f(m) m dm, from
             _measure_whitened_profile; None keeps the analytic Gaussian
+        max_variance_inflation: [-] optional.  The variance of an atom's
+            amplitude in the joint fit, relative to what it would be with
+            no other atom present, is C_kk * I_kk (1 for an isolated
+            atom).  Atoms above this value cannot be told apart from
+            their neighbours: the information matrix is singular to
+            working precision, the reported sigma is then set by the
+            ridge that keeps the inverse finite (it saturates near
+            1 / sqrt(1e-6) = 1000 photons) and no longer bounds the
+            error, and the signed step below multiplies any misfit along
+            the unresolved directions by up to the inverse ridge.  Such
+            atoms are returned censored (flux 0, sigma 0).  None keeps
+            every atom.
+        ridge: what keeps the information matrix invertible.  A ridge
+            1/tau^2 on its diagonal is a zero-centred Gaussian prior of
+            width tau on an atom's flux.
+            "fixed" is tau = 1000 photons for every atom, whatever is on
+            the detector.  Where atoms overlap too closely to be told
+            apart, the reported sigma then saturates at that constant
+            and the signed estimate can leave it by orders of magnitude.
+            "counts" sets tau to the gross counts under the atom's own
+            profile: it cannot hold more flux than is there.  Resolved
+            atoms are unaffected (tau is many times their sigma), and an
+            unresolved atom comes back as "somewhere between none and
+            all of the counts here", with a sigma that says so.  Where
+            the counts under a profile are mostly background, tau is
+            comparable to the sigma of a weak, partly overlapped atom
+            and shrinks it too.
     Returns:
         (flux [photons], sigma [photons]) per atom
     """
@@ -3536,12 +3592,17 @@ def _solve_image_amplitudes_impl(
         return (g / norm).flatten() * ok * v_flat
 
     A = vmap(atom)(rs, cs, var_u, var_v, cov_uv, atom_ok).T  # (H*W, K)
+    # Require >=65% unmasked profile mass so shadow- or border-occluded spots
+    # are excluded cleanly rather than extrapolated from a partial tail.
+    valid_frac = jnp.sum(A, axis=0)
+    well_measured = (atom_ok > 0.5) & (valid_frac >= 0.65)
+    A = A * well_measured[None, :]
     y = image.flatten() * v_flat
     bg_flat = bg.flatten() * v_flat
 
     c_warm = jnp.zeros(A.shape[1], dtype=jnp.float32)
-    # Calibrated z on real atoms; the huge weight keeps padding inert.
-    alpha_vec = jnp.where(atom_ok > 0.5, admission_z, 1e6)
+    # Calibrated z on real atoms; the huge weight keeps padding/occluded inert.
+    alpha_vec = jnp.where(well_measured, admission_z, 1e6)
     c = solve_ssn_unified(
         A,
         y,
@@ -3551,28 +3612,80 @@ def _solve_image_amplitudes_impl(
         c_warm,
         max_iter=20,
         per_atom_var=True,
+        active_override=None if use_l1_gate else well_measured,
     )
 
     # Fisher information of the Poisson likelihood at the constrained
     # optimum, over the full dictionary: I = A^T diag(1/u) A.  Padding
-    # columns are identically zero; give them a unit diagonal so the
-    # inverse exists (their sigma is discarded on scatter-back).
+    # and occluded columns are identically zero; give them a unit diagonal
+    # so the inverse exists (their sigma is zeroed below).
     u = jnp.maximum(A @ c + bg_flat, 1e-3)
-    I_F = A.T @ (A / u[:, None])
-    I_F = I_F + jnp.diag(jnp.where(atom_ok > 0.5, 1e-6, 1.0))
+    I_data = A.T @ (A / u[:, None])
+    info_alone = jnp.diag(I_data)
+    if ridge == "counts":
+        peak = jnp.maximum(jnp.max(A, axis=0), 1e-12)
+        tau = jnp.maximum(jnp.sum(y[:, None] * A / peak[None, :], axis=0), 1.0)
+        ridge_diag = 1.0 / tau**2
+    elif ridge == "fixed":
+        ridge_diag = 1e-6
+    else:
+        raise ValueError(f"ridge must be 'fixed' or 'counts', got {ridge!r}")
+    I_F = I_data + jnp.diag(jnp.where(well_measured, ridge_diag, 1.0))
     C = jnp.linalg.inv(I_F)
-    sigma = jnp.sqrt(jnp.maximum(jnp.diag(C), 0.0))
+    sigma = jnp.where(well_measured, jnp.sqrt(jnp.maximum(jnp.diag(C), 0.0)), 0.0)
+    if allow_negative and not use_l1_gate:
+        # One unconstrained Fisher-scoring step around the joint nonnegative
+        # MLE c: positive interior peaks have zero score and stay unchanged,
+        # while boundary-pinned weak reflections receive their unbiased signed
+        # profile-fitted amplitude (with bright-neighbor overlap A @ c removed).
+        if ridge == "counts":
+            # The posterior mean under the zero-centred prior: the weighted
+            # least-squares solution with the ridge in it, so that value
+            # and sigma come from the same regularised problem.
+            c = jnp.where(well_measured, C @ (A.T @ ((y - bg_flat) / u)), 0.0)
+        else:
+            score = A.T @ ((y - bg_flat - A @ c) / u)
+            c = jnp.where(well_measured, c + C @ score, 0.0)
+    else:
+        c = jnp.where(well_measured, c, 0.0)
+    if max_variance_inflation is not None:
+        # Decide on the data's information matrix scaled to unit diagonal,
+        # with its own small ridge, so the decision does not depend on the
+        # ridge used above or on how bright the atoms are.
+        scale = jnp.sqrt(jnp.where(well_measured, info_alone, 1.0))
+        unit = I_data / (scale[:, None] * scale[None, :])
+        unit = unit + jnp.diag(jnp.where(well_measured, 1e-6, 1.0))
+        inflation = jnp.diag(jnp.linalg.inv(unit))
+        # A matrix this close to singular can invert to a negative or
+        # non-finite diagonal in single precision: unresolved as well.
+        resolved = (inflation > 0) & (inflation <= max_variance_inflation)
+        c = jnp.where(resolved, c, 0.0)
+        sigma = jnp.where(resolved, sigma, 0.0)
     return c, sigma
 
 
 def _solve_image_amplitudes(
-    image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok, admission_z, profile=None
+    image,
+    bg,
+    valid,
+    rs,
+    cs,
+    var_u,
+    var_v,
+    cov_uv,
+    atom_ok,
+    admission_z,
+    profile=None,
+    use_l1_gate=False,
+    allow_negative=False,
 ):
     global _SOLVE_IMAGE_AMPLITUDES_JIT
     if _SOLVE_IMAGE_AMPLITUDES_JIT is None:
         from jax import jit
 
-        _SOLVE_IMAGE_AMPLITUDES_JIT = jit(_solve_image_amplitudes_impl)
+        _SOLVE_IMAGE_AMPLITUDES_JIT = partial(
+            jit, static_argnames=["use_l1_gate", "allow_negative"]
+        )(_solve_image_amplitudes_impl)
     return _SOLVE_IMAGE_AMPLITUDES_JIT(
         image,
         bg,
@@ -3585,6 +3698,8 @@ def _solve_image_amplitudes(
         atom_ok,
         admission_z,
         profile=profile,
+        use_l1_gate=use_l1_gate,
+        allow_negative=allow_negative,
     )
 
 
@@ -3603,6 +3718,7 @@ def integrate_reflections_matrix_free(
     profile_min_peaks=50,
     fp_target=None,
     border_width=0,
+    allow_negative=False,
     rate_chunk_size=64,
     show_progress=False,
 ):
@@ -3684,7 +3800,17 @@ def integrate_reflections_matrix_free(
     if static_valid is None:
         static_valid = np.ones((B, H, W), dtype=np.float32)
     else:
-        static_valid = np.asarray(static_valid, dtype=np.float32)
+        static_valid = np.asarray(static_valid, dtype=np.float32).copy()
+
+    # Mask detector border pixels in both background estimation and the
+    # Poisson amplitude likelihood so dead/PMT-pileup edge rims never corrupt
+    # nearby spot tails.
+    bw_px = min(max(0, int(border_width)), H // 4, W // 4)
+    if bw_px > 0:
+        static_valid[:, :bw_px, :] = 0.0
+        static_valid[:, H - bw_px :, :] = 0.0
+        static_valid[:, :, :bw_px] = 0.0
+        static_valid[:, :, W - bw_px :] = 0.0
 
     # The rate map must not look at predicted footprints (signal) NOR at
     # static structures (not background either); the likelihood keeps the
@@ -3693,12 +3819,6 @@ def integrate_reflections_matrix_free(
     rate_valid = static_valid * _footprint_mask(
         B, H, W, frames, rs, cs, var_us, var_vs, cov_uvs
     )
-    edge_pad = min(int(border_width), 5, H // 8, W // 8)
-    if edge_pad > 0:
-        rate_valid[:, :edge_pad, :] = 0.0
-        rate_valid[:, H - edge_pad :, :] = 0.0
-        rate_valid[:, :, :edge_pad] = 0.0
-        rate_valid[:, :, W - edge_pad :] = 0.0
 
     images_jax = jnp.array(images_batch, dtype=jnp.float32)
     static_valid_jax = jnp.array(static_valid)
@@ -3818,6 +3938,7 @@ def integrate_reflections_matrix_free(
         atom_ok = jnp.array(
             np.concatenate([np.ones(k), np.zeros(k_pad - k)]).astype(np.float32)
         )
+        use_l1_gate = bool(admission_z > 0.0)
         flux, sigma = _solve_image_amplitudes(
             images_jax[f],
             rate_maps[f],
@@ -3830,12 +3951,15 @@ def integrate_reflections_matrix_free(
             atom_ok,
             admission_z_jax,
             profile=trunk_jax,
+            use_l1_gate=use_l1_gate,
+            allow_negative=bool(allow_negative),
         )
         flux = np.array(flux[:k], dtype=np.float64)
         sigma = np.array(sigma[:k], dtype=np.float64)
-        # Boundary-pinned amplitudes are censored, not measured: mark
-        # them with sigI = 0 so the exporter drops them (see docstring).
-        sigma[flux <= 0.0] = 0.0
+        if not allow_negative or use_l1_gate:
+            # Boundary-pinned amplitudes are censored, not measured: mark
+            # them with sigI = 0 so the exporter drops them (see docstring).
+            sigma[flux <= 0.0] = 0.0
 
         out[idx, 0] = flux
         out[idx, 1] = snap_r[idx]

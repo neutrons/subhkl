@@ -714,8 +714,17 @@ def load_mask_for_banks(
     anyway would mask the wrong pixels.
     """
     with h5py.File(path, "r") as f:
-        masks = np.asarray(f["images"][()], dtype=np.float32)
-        file_banks = np.asarray(f["bank_ids"][()]).astype(int)
+        if "images" in f and "bank_ids" in f:
+            masks = np.asarray(f["images"][()], dtype=np.float32)
+            file_banks = np.asarray(f["bank_ids"][()]).astype(int)
+        elif "detector/pixel_mask" in f and "detector/mask_bank_ids" in f:
+            masks = np.asarray(f["detector/pixel_mask"][()], dtype=np.float32)
+            file_banks = np.asarray(f["detector/mask_bank_ids"][()]).astype(int)
+        else:
+            raise KeyError(
+                f"{path} contains neither ('images', 'bank_ids') nor "
+                "('detector/pixel_mask', 'detector/mask_bank_ids')"
+            )
     if masks.shape[1:] != tuple(shape):
         raise ValueError(
             f"mask frames are {masks.shape[1:]}, input images are {tuple(shape)}; "

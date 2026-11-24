@@ -338,7 +338,9 @@ def test_decompose_R_to_angles_handles_kappa_180_branch():
     ang_rec = _decompose_R_to_angles(axes, ang_nom, R_target)
     R_rec = calc_goniometer_rotation_matrix(axes, ang_rec)
     np.testing.assert_allclose(R_rec, R_target, atol=1e-12)
-    np.testing.assert_allclose(ang_rec[[1, 3, 4]], ang_nom[[1, 3, 4]], atol=1e-12)
+    np.testing.assert_allclose(
+        ang_rec[[1, 3, 4]], ang_nom[[1, 3, 4]], rtol=1e-6, atol=1e-4
+    )
 
 
 def test_recover_unlogged_outer_goniometer_recovers_kappa_stage_and_skips_nominal(

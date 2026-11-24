@@ -193,6 +193,9 @@ class SubhklGalaxyModel:
         )
         self.payload: dict[str, Any] | None = None
         self.frame_index: int | None = None
+        self.render_binning: int = 4
+        self.mtz_overlay_path: str | None = None
+        self.mtz_overlay_info: dict[str, Any] | None = None
         self.last_job_result: dict[str, Any] = {}
         self.refresh_payload()
 
@@ -200,15 +203,24 @@ class SubhklGalaxyModel:
         self,
         frame_index: int | None = None,
         preserve_params: bool = False,
+        include_all_runs_peaks: bool = True,
     ) -> dict[str, Any] | None:
         """Rebuild the Diffraction Parallax & Lattice Ladder payload from current HDF5 files."""
         if frame_index is not None:
             self.frame_index = int(frame_index)
+        prev_payload = (
+            self.payload
+            if (not include_all_runs_peaks and isinstance(self.payload, dict))
+            else None
+        )
         saved_wl_min = float(self.data.wavelength_min)
         saved_wl_max = float(self.data.wavelength_max)
         saved_d_min = float(self.data.d_min)
         has_peaks = bool(self.data.peaks_file and os.path.isfile(self.data.peaks_file))
-        from subhkl.viz.rainbow_zones import _discover_images_h5
+        from subhkl.viz.rainbow_zones import (
+            _discover_images_h5,
+            merge_frame_only_payload,
+        )
 
         img_path = _discover_images_h5(self.data.peaks_file) if has_peaks else None
         if (
@@ -225,9 +237,20 @@ class SubhklGalaxyModel:
                     self.data.images_file
                 ) == os.path.abspath(self.data.peaks_file):
                     img_path = self.data.images_file
+                else:
+                    try:
+                        import h5py
+
+                        with h5py.File(self.data.images_file, "r") as hf_img:
+                            if "images" in hf_img:
+                                img_path = self.data.images_file
+                    except OSError:
+                        pass
         self.payload = build_rainbow_zone_payload(
             replay_h5=(self.data.peaks_file if has_peaks else None),
-            instrument=self.data.instrument.value,
+            instrument=str(
+                getattr(self.data.instrument, "value", self.data.instrument)
+            ),
             space_group=self.data.space_group,
             cell=(
                 None
@@ -248,6 +271,8 @@ class SubhklGalaxyModel:
             max_zone_index=self.data.max_zone_index,
             images_h5=img_path,
             frame_index=self.frame_index,
+            render_binning=int(self.render_binning),
+            include_all_runs_peaks=bool(include_all_runs_peaks),
         )
         if self.payload.get("images_h5") and os.path.isfile(
             str(self.payload["images_h5"])
@@ -289,6 +314,24 @@ class SubhklGalaxyModel:
                 self.data.d_min = round(0.5 * float(wl_range[0]), 2)
             elif self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
                 self.data.d_min = round(float(self.payload["d_min"]), 2)
+        if (
+            self.mtz_overlay_path
+            and os.path.isfile(self.mtz_overlay_path)
+            and (
+                self.payload.get("u_matrix") is not None
+                or self.payload.get("ub_matrix") is not None
+            )
+        ):
+            from subhkl.viz.rainbow_zones import apply_mtz_to_payload
+
+            self.payload = apply_mtz_to_payload(
+                self.payload,
+                self.mtz_overlay_path,
+                self.mtz_overlay_info,
+                select_mtz_color=False,
+            )
+        if prev_payload is not None:
+            self.payload = merge_frame_only_payload(prev_payload, self.payload)
         return self.payload
 
     def render_html(self) -> str:
@@ -321,6 +364,20 @@ class SubhklGalaxyModel:
                 "d_min": self.data.d_min,
                 "n_zones": self.data.n_zones,
             }
+        if stage == "merge":
+            from subhkl.viz.rainbow_zones import _h5_has_tof_data
+
+            has_tof = _h5_has_tof_data(self.data.peaks_file, self.data.images_file)
+            merge_params: dict[str, Any] = {
+                "mode": "mono" if has_tof else "poly",
+                "iterations": 10000,
+                "studenttDof": 4.0,
+                "mergeHalfDatasets": True,
+                "anomalous": False,
+            }
+            if self.data.d_min and float(self.data.d_min) > 0.0:
+                merge_params["dmin"] = round(float(self.data.d_min), 4)
+            return merge_params
         return {
             "instrument": self.data.instrument.value,
             "space_group": self.data.space_group,
@@ -387,11 +444,14 @@ class SubhklGalaxyModel:
                         KeyError,
                         AttributeError,
                     ):
+                        from subhkl.viz.nova_rainbow_view import register_temp_artifact
+
                         ds = outputs.get_dataset(out_name)
                         target = os.path.join(
                             tempfile.gettempdir(),
                             f"subhkl_nova_{stage}_{int(time.time())}.h5",
                         )
+                        register_temp_artifact(target)
                         ds.download(target)
                         downloaded_path = target
                         break

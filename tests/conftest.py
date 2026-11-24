@@ -78,6 +78,34 @@ def fixture__test_data_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> None:
+    """Reclaim JAX XLA CPU compilation caches and glibc arenas so 16 GiB CI runners do not OOM.
+
+    ``MatrixFreeSparseRBFPeakFinder`` jits bound methods per instance, so each test in
+    ``test_sparse_rbf_integrator.py`` otherwise pins un-reusable XLA executables and
+    multi-GB LLVM/Eigen buffers in process RSS until ``test_large_sensor_*`` triggers a
+    silent Linux OOM SIGKILL right after ``test_real_neutron_structured_background``.
+    """
+    import contextlib
+    import ctypes
+    import gc
+    import sys
+
+    boundary = nextitem is None or item.path != nextitem.path
+    rbf_suite = item.path.name == "test_sparse_rbf_integrator.py"
+    heavy_sensor = "large_sensor" in item.name or (
+        nextitem is not None and "large_sensor" in nextitem.name
+    )
+    if boundary or rbf_suite or heavy_sensor:
+        jax_mod = sys.modules.get("jax")
+        if jax_mod is not None and hasattr(jax_mod, "clear_caches"):
+            jax_mod.clear_caches()
+        gc.collect()
+        if sys.platform.startswith("linux"):
+            with contextlib.suppress(OSError, AttributeError):
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+
+
 @pytest.fixture(name="meso_tiff")
 def fixture__meso_tiff(test_data_dir) -> str:
     return os.path.join(test_data_dir, "meso_2_15min_2-0_4-5_050.tif")

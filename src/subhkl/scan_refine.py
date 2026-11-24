@@ -2,6 +2,7 @@
 
 import json
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,6 +138,45 @@ def _parse_rot_axis(axis):
     return tuple(float(v) for v in unit)
 
 
+def default_band_binning(
+    n_rows: int,
+    n_cols: int,
+    min_bins: int = 32,
+    max_binning: int = 8,
+    *,
+    cell: Sequence[float] | np.ndarray | None = None,
+    d_min: float | None = None,
+) -> int:
+    """Choose spatial binning from panel dimensions and cell/d_min rung density."""
+    import math
+
+    r_dim, c_dim = int(n_rows), int(n_cols)
+    min_dim = min(r_dim, c_dim)
+    eff_min_bins = int(min_bins)
+    if cell is not None and len(cell) >= 3 and d_min is not None and float(d_min) > 0:
+        max_axis = max(float(cell[0]), float(cell[1]), float(cell[2]))
+        axis_ratio = max_axis / float(d_min)
+        # Keep >= ~2 spatial bins per adjacent zone layer on long-axis unit cells
+        # while capping automatic 256-px detector binning at >=4 (64x64 bins/panel)
+        # so initial SO(3) blind search remains fast.
+        scaled_bins = round(0.5 * axis_ratio)
+        if min_dim <= 256 and eff_min_bins <= 64:
+            scaled_bins = min(scaled_bins, 64)
+        else:
+            scaled_bins = min(scaled_bins, 128)
+        eff_min_bins = max(eff_min_bins, scaled_bins)
+
+    g = math.gcd(r_dim, c_dim)
+    cap = min(
+        int(max_binning),
+        max(1, min_dim // max(1, eff_min_bins)),
+    )
+    for b in range(cap, 0, -1):
+        if g % b == 0:
+            return b
+    return 1
+
+
 def run_scan_refinement(
     frames,
     output,
@@ -155,7 +195,7 @@ def run_scan_refinement(
     d_min=2.0,
     min_deviance=100.0,
     pixel_polish=False,
-    binning=16,
+    binning=None,
     maxiter=600,
     static_mask_file=None,
     search_samples=16384,
@@ -268,10 +308,6 @@ def run_scan_refinement(
             int(img_shape[1]),
             int(img_shape[2]),
         )
-        if binning < 1 or n_rows % binning or n_cols % binning:
-            raise ValueError(
-                f"band binning ({binning}) must divide the detector size ({n_rows}x{n_cols})"
-            )
         offsets = _frame_offsets(f, n_frames)
         _frame_rotations_and_scan_axes(f, n_frames)
         if cell is None:
@@ -283,6 +319,12 @@ def run_scan_refinement(
             space_group = f["sample/space_group"][()]
             if isinstance(space_group, bytes):
                 space_group = space_group.decode()
+        if binning is None:
+            binning = default_band_binning(n_rows, n_cols, cell=cell, d_min=d_min)
+        if binning < 1 or n_rows % binning or n_cols % binning:
+            raise ValueError(
+                f"band binning ({binning}) must divide the detector size ({n_rows}x{n_cols})"
+            )
     if (
         not np.isfinite(cell).all()
         or len(cell) != 6
@@ -631,10 +673,30 @@ def _decompose_R_to_angles(axes, ang_nom, R_target):
     """Decompose a 3D rotation matrix R_target into motor angles on `axes` near `ang_nom`."""
     from scipy.optimize import least_squares
 
+    ang_nom = np.asarray(ang_nom, dtype=float)
+    if (
+        np.max(np.abs(calc_goniometer_rotation_matrix(axes, ang_nom) - R_target))
+        < 1e-12
+    ):
+        return ang_nom.copy()
+
     K = len(axes)
     if K == 3:
         free_cols = [0, 1, 2]
-        inits = [np.zeros(3)]
+        v0 = np.asarray(axes[0, :3], float) * float(axes[0, 3])
+        v2 = np.asarray(axes[2, :3], float) * float(axes[2, 3])
+        s_rel = -1.0 if float(np.dot(v0, v2)) < 0.0 else 1.0
+        inits = [
+            np.zeros(3),
+            np.array([0.0, 2.0, 0.0]),
+            np.array([0.0, -2.0, 0.0]),
+            np.array([90.0, 2.0, -s_rel * 90.0]),
+            np.array([-90.0, 2.0, s_rel * 90.0]),
+            np.array([90.0, -2.0, -s_rel * 90.0]),
+            np.array([-90.0, -2.0, s_rel * 90.0]),
+            np.array([45.0, 2.0, -s_rel * 45.0]),
+            np.array([-45.0, 2.0, s_rel * 45.0]),
+        ]
     elif K == 5:
         free_cols = [0, 2, 4]
         inits = [
@@ -652,27 +714,42 @@ def _decompose_R_to_angles(axes, ang_nom, R_target):
     else:
         free_cols = list(range(min(K, 3)))
         inits = [np.zeros(len(free_cols))]
-    best_a, best_err = ang_nom.copy(), 1e9
-    for x0 in inits:
 
-        def fn(x):
-            a = ang_nom.copy()
-            for idx, c in enumerate(free_cols):
-                a[c] += x[idx]
-            return Rotation.from_matrix(
-                calc_goniometer_rotation_matrix(axes, a) @ R_target.T
-            ).as_rotvec()
-
-        res = least_squares(fn, x0, ftol=1e-15, xtol=1e-15, gtol=1e-15, max_nfev=200)
+    def fn(x):
         a = ang_nom.copy()
         for idx, c in enumerate(free_cols):
-            a[c] += res.x[idx]
-        err = float(np.max(np.abs(calc_goniometer_rotation_matrix(axes, a) - R_target)))
-        if err < best_err:
-            best_err, best_a = err, a
-        if best_err < 1e-13:
-            break
-    return best_a
+            a[c] += x[idx]
+        return Rotation.from_matrix(
+            calc_goniometer_rotation_matrix(axes, a) @ R_target.T
+        ).as_rotvec()
+
+    def fn_reg(x):
+        return np.concatenate([fn(x), 1e-7 * x])
+
+    best_any_a, best_any_err = ang_nom.copy(), 1e9
+    best_exact_a, best_exact_norm = None, 1e9
+    for x0 in inits:
+        res_reg = least_squares(
+            fn_reg, x0, ftol=1e-14, xtol=1e-14, gtol=1e-14, max_nfev=200
+        )
+        res_pol = least_squares(
+            fn, res_reg.x, ftol=1e-15, xtol=1e-15, gtol=1e-15, max_nfev=200
+        )
+        for x_cand in (res_reg.x, res_pol.x):
+            x_wrap = (x_cand + 180.0) % 360.0 - 180.0
+            a = ang_nom.copy()
+            for idx, c in enumerate(free_cols):
+                a[c] += x_wrap[idx]
+            err = float(
+                np.max(np.abs(calc_goniometer_rotation_matrix(axes, a) - R_target))
+            )
+            if err < best_any_err:
+                best_any_err, best_any_a = err, a
+            if err < 1e-11:
+                disp = float(np.linalg.norm(x_wrap))
+                if disp < best_exact_norm:
+                    best_exact_norm, best_exact_a = disp, a
+    return best_exact_a if best_exact_a is not None else best_any_a
 
 
 def write_result(

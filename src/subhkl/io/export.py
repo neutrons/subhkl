@@ -413,3 +413,20 @@ class ImageStackMerger(BaseConcatenateMerger):
             "instrument/name",
         ]
         super().__init__(h5_files, copy_keys, merge_keys)
+
+    def merge(self, output_filename):
+        """Merge the image stacks and, when every input has them, the events."""
+        super().merge(output_filename)
+        from subhkl.io.events import has_events, merge_events
+
+        n_with = sum(has_events(name) for name in self.h5_files)
+        if n_with == 0:
+            return
+        if n_with < len(self.h5_files):
+            print(
+                f"Warning: only {n_with} of {len(self.h5_files)} inputs carry "
+                "events; the merged file keeps images only."
+            )
+            return
+        with h5py.File(output_filename, "a") as f_out:
+            merge_events(self.h5_files, f_out)

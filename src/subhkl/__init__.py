@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import os
 import re
 import subprocess
@@ -10,19 +11,17 @@ _REPO_DIR = Path(__file__).resolve().parents[2]
 _SEMVER_RE = re.compile(r"^[vV]?\d+\.\d+")
 
 
-def _git_exact_tag_or_branch() -> str | None:
-    """Return the exact git tag at HEAD, or the current git branch name when inside a checkout."""
-    env_ver = os.environ.get("SUBHKL_VERSION", "").strip()
-    if env_ver:
-        return env_ver
-    if not (_REPO_DIR / ".git").exists():
+@functools.lru_cache(maxsize=1)
+def _cached_git_ref(repo_dir_str: str) -> str | None:
+    repo_dir = Path(repo_dir_str)
+    if not (repo_dir / ".git").exists():
         return None
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         tag_res = subprocess.run(
             [
                 "git",
                 "-C",
-                str(_REPO_DIR),
+                str(repo_dir),
                 "describe",
                 "--tags",
                 "--exact-match",
@@ -38,7 +37,7 @@ def _git_exact_tag_or_branch() -> str | None:
             if tag:
                 return tag.lstrip("vV") if _SEMVER_RE.match(tag) else tag
         branch_res = subprocess.run(
-            ["git", "-C", str(_REPO_DIR), "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
             timeout=2,
@@ -49,6 +48,14 @@ def _git_exact_tag_or_branch() -> str | None:
             if branch and branch != "HEAD":
                 return branch
     return None
+
+
+def _git_exact_tag_or_branch() -> str | None:
+    """Return the exact git tag at HEAD, or the current git branch name when inside a checkout."""
+    env_ver = os.environ.get("SUBHKL_VERSION", "").strip()
+    if env_ver:
+        return env_ver
+    return _cached_git_ref(str(_REPO_DIR))
 
 
 def get_version() -> str:

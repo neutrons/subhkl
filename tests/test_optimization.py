@@ -13,6 +13,32 @@ def test_get_lattice_system_simple_cubic():
     assert centering == "P"
 
 
+def test_get_lattice_system_rhombohedral_h_vs_r_settings():
+    import warnings
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        # Default / :H setting uses centered hexagonal cell (a=b, 90, 90, 120) with R centering
+        for sg_h in ("R 3", "R 3:H", "R -3 m", "R -3 m :H"):
+            final_h, num_h, cent_h = optimization.get_lattice_system(
+                12.0, 12.0, 28.0, 90.0, 90.0, 120.0, sg_h
+            )
+            assert final_h == "Hexagonal"
+            assert num_h == 2
+            assert cent_h == "R"
+
+        # Primitive :R setting uses rhombohedral cell (a=b=c, alpha=beta=gamma) with P centering
+        for sg_r in ("R 3:R", "R 3 :R", "R -3 m:R", "R -3 m :R"):
+            final_r, num_r, cent_r = optimization.get_lattice_system(
+                8.5, 8.5, 8.5, 55.2, 55.2, 55.2, sg_r
+            )
+            assert final_r == "Rhombohedral"
+            assert num_r == 2
+            assert cent_r == "P"
+
+        assert len(rec) == 0
+
+
 def test_findub_load_from_dict_and_reciprocal_B():
     data = {}
     data["sample/a"] = 10.0

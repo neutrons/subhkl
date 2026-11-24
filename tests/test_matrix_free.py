@@ -452,3 +452,43 @@ def test_multi_image_scatter_back():
     )
     assert abs(out[0, 0] - 1200.0) < 5.0 * out[0, 4]
     assert abs(out[1, 0] - 3000.0) < 5.0 * out[1, 4]
+
+
+def test_allow_negative_unbiased_weak_and_border_occlusion():
+    """Signed Fisher-scoring mode keeps zero-flux/weak reflections unbiased
+    (including negative draws) with valid sigma > 0, pins weak sub-pixel
+    centroids against noise-hunting, and drops border-occluded spots."""
+    # Place atom 0 on pure background at sub-pixel (30.35, 29.65), atom 1 bright,
+    # and atom 2 right inside a 10-px masked border where >35% of its profile is cut.
+    positions = [(30.35, 29.65), (18.0, 46.0), (6.0, 32.0)]
+    truth = np.array([0.0, 3000.0, 800.0])
+    weak_signed = []
+    snapped_dr = []
+    for seed in range(16):
+        rng = np.random.default_rng(1200 + seed)
+        image = _render(positions, truth, rng)
+        # Corrupt border with huge PMT-pileup spike; border_width=10 must mask it out.
+        image[:8, :] += 200.0
+        out = integrate_reflections_matrix_free(
+            image[None],
+            np.zeros(3, dtype=int),
+            np.array([p[0] for p in positions]),
+            np.array([p[1] for p in positions]),
+            np.full(3, VAR),
+            np.full(3, VAR),
+            np.zeros(3),
+            ref_sigma=1.0,
+            max_sigma=3.0,
+            border_width=10,
+            allow_negative=True,
+        )
+        assert out[0, 4] > 0.0  # weak reflection retained with valid Fisher sigma
+        assert out[1, 4] > 0.0
+        assert out[2, 4] == 0.0  # border-occluded reflection cleanly excluded
+        weak_signed.append(out[0, 0] / out[0, 4])
+        snapped_dr.append(np.hypot(out[0, 1] - 30.35, out[0, 2] - 29.65))
+
+    weak_signed = np.asarray(weak_signed)
+    assert np.any(weak_signed < 0.0)  # negative fluctuations preserved, not censored
+    assert abs(np.mean(weak_signed)) * np.sqrt(len(weak_signed)) < 2.5
+    assert np.median(snapped_dr) < 0.05  # weak sub-pixel prediction does not noise-hunt

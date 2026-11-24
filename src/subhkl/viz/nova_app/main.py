@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# Prevent OpenBLAS/OMP from spawning 60+ worker threads inside the interactive UI
+# server, which otherwise contend on small NumPy projections and starve pipeline jobs.
+for _thr_var in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thr_var, "1")
 
 from subhkl.viz.nova_app.views.main_view import MainApp
 
@@ -54,12 +65,27 @@ def main(
         kwargs.setdefault("timeout", 0)
         kwargs.setdefault("open_browser", False)
 
+    import contextlib
+
+    from subhkl.viz.nova_rainbow_view import (
+        cleanup_registered_temp_artifacts,
+        install_exit_cleanup_signal_handlers,
+    )
+
     app = MainApp(
         peaks_h5=peaks_h5,
         images_h5=images_h5,
         instrument=instrument,
     )
-    app.server.start(**kwargs)
+    install_exit_cleanup_signal_handlers(app.pipeline_runner.shutdown_cleanup)
+    try:
+        app.server.start(**kwargs)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            app.pipeline_runner.shutdown_cleanup()
+        cleanup_registered_temp_artifacts()
 
 
 if __name__ == "__main__":
