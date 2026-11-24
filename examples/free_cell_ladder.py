@@ -14,26 +14,32 @@ Observations: spot directions d_m (sample frame), sin(theta_m), weights.
    least squares on all indexed vectors; reduction.
 
 Status (prototype, first step towards estimating the cell inside the
-ladder so that Laue and time-of-flight data share one path).  Blind cell
-against the known one:
+ladder so that Laue and time-of-flight data share one path).  The length
+of each ladder comes from a two-level model of the spot density away from
+the zone (low up to lam_min / L, high in the first order); the lattice is
+then the shape that the directions of the poles with a clear ladder give,
+with one scale from the median ladder length.  Blind cell against the
+known one, all runs of each dataset:
 
-- IMAGINE-X T4 lysozyme, five runs: 62.1 62.5 99.6, 89.4 90.8 118.9
-  against 62.2 62.2 97.1, 90 90 120 (the true primitive lattice).
-- IMAGINE-X L1 MBL, fourteen runs: 72.8 95.5 101.5, 89.4 90.3 105.8
-  against 69.0 90.9 97.9, 89.9 90.0 106.1.  This needed the spots that stay
-  on one detector pixel across runs to be removed: they gave a family of
-  Funk peaks on a cone about the rotation axis, as strong as the true ones.
-- MANDI with the time of flight ignored: Mpro complex 54.3 63.0 64.7,
-  80.5 106.9 112.7 against the primitive cell 55.1 63.1 64.2, 78.0 110.7
-  111.8; T4 lysozyme 54.3 59.5 92.8, 86.8 92.3 115.4 against 61.0 61.0
-  97.2, 90 90 120 (the right lattice, lengths 5-11% short).
-- Single runs: roughly right for IMAGINE-X T4 lysozyme and MANDI Mpro,
-  wrong for MANDI T4 lysozyme.
+- IMAGINE-X T4 lysozyme: 63.1 63.7 99.6, 89.7 90.0 119.2 against
+  62.2 62.2 97.1, 90 90 120.
+- IMAGINE-X L1 MBL: 71.7 94.4 101.2, 89.7 90.3 105.9 against
+  69.0 90.9 97.9, 89.9 90.0 106.1.  This needed the spots that stay on one
+  detector pixel across runs to be removed: they gave Funk peaks on a cone
+  about the rotation axis, as strong as the true ones.
+- MANDI Mpro complex with the time of flight ignored: 55.0 63.9 64.1,
+  78.8 110.6 110.4 against the primitive cell 55.1 63.1 64.2,
+  78.0 110.7 111.8.
+- MANDI T4 lysozyme with the time of flight ignored: wrong (the c axis is
+  not among the Funk peaks, and only 12 poles have a clear ladder).
+- Single runs: not enough poles with a clear ladder; wrong.
 
-The IMAGINE-X cases used detector geometry and rotations from an earlier
-solve, the MANDI cases nominal detectors and rotations from align_runs.
-Lengths carry a bias of a few percent that follows the assumed lower band
-edge, and ladders longer than about 180 A are not resolved.
+The script prints how much the individual scales scatter: 2-3% in the
+cases that work, 11% and more in those that do not.  On IMAGINE-X the
+scale comes out 2-4% high with lam_min = 3.0, which a lower edge near
+3.1 A would remove.  The IMAGINE-X cases used detector geometry and
+rotations from an earlier solve, the MANDI cases nominal detectors and
+rotations from align_runs.
 
 Usage:
     python free_cell_ladder.py merged.h5 INSTRUMENT lam_min lam_max [--geometry solve.h5]
@@ -45,7 +51,7 @@ import itertools
 
 import h5py
 import numpy as np
-from quasi_laue_cell_shape import zone_poles
+from quasi_laue_cell_shape import shape_from_poles, zone_poles
 from scipy.ndimage import gaussian_filter, maximum_filter
 
 from subhkl.commands import apply_detector_calibration
@@ -141,6 +147,102 @@ def ladder_length(pole, dirs, sth, wts, lam_lo, lam_hi, lengths, zone_tol_deg=0.
     return best, scores
 
 
+def ladder_edge(pole, dirs, sth, wts, lam_lo, zone_tol_deg=0.35, width=1.2, min_z=3.0):
+    """Length of the lattice vector along a pole from the lower edge of the
+    first Laue order.
+
+    Moving away from the zone (y = 0), nothing is allowed until the first
+    order begins at y = lam_min / L.  The edge is the first place where the
+    spot weight just above (a factor ``width`` in y) clearly exceeds the
+    weight just below.  Unlike asking for an empty gap and a full band, this
+    does not need the stretch above the band to be empty, which it is not
+    when the band spans a factor of two in wavelength.
+
+    Returns:
+        (L [Angstrom], z of the step, weight below the edge / weight above)
+    """
+    c = dirs @ pole
+    y = np.abs(2.0 * sth * c)
+    tol = 2.0 * sth * np.sin(np.radians(zone_tol_deg))
+    off = np.abs(c) > np.sin(np.radians(zone_tol_deg))
+    y, w = y[off], wts[off]
+    floor = 2.0 * np.median(tol)  # below this, y is not resolved from the zone
+    if len(y) < 20:
+        return np.nan, 0.0, np.nan
+    order = np.argsort(y)
+    y, w = y[order], w[order]
+    cw = np.concatenate([[0.0], np.cumsum(w)])
+    cn = np.arange(len(y) + 1, dtype=float)
+    edges = np.exp(np.arange(np.log(floor * width), np.log(y[-1] / width), 0.01))
+    if len(edges) == 0:
+        return np.nan, 0.0, np.nan
+    i0 = np.searchsorted(y, edges / width)
+    i1 = np.searchsorted(y, edges)
+    i2 = np.searchsorted(y, edges * width)
+    above, below = cw[i2] - cw[i1], cw[i1] - cw[i0]
+    n = (cn[i2] - cn[i0]) + 1.0
+    # Uniformly scattered spots put ``width`` times more weight above an edge
+    # than below it (the window above is that much wider in y).
+    z = (above - width * below) / (w.mean() * np.sqrt(n) * width)
+    if not np.any(z > min_z):
+        return np.nan, float(z.max()), np.nan
+    first = int(np.argmax(z > max(min_z, 0.6 * z.max())))  # the first clear step
+    last = first
+    while last + 1 < len(z) and z[last + 1] >= z[last]:
+        last += 1
+    return (
+        float(lam_lo / edges[last]),
+        float(z[last]),
+        float(below[last] / max(above[last], 1e-9)),
+    )
+
+
+def ladder_step(pole, dirs, sth, wts, lam_lo, lam_hi, zone_tol_deg=0.35, min_llr=8.0):
+    """Length of the lattice vector along a pole from a two-level model.
+
+    Away from the zone (y = 0) the spot density is low up to y = lam_min / L
+    and high in the first Laue order, up to lam_max / L.  For every
+    candidate edge the two stretches get their own rate, and the gain in
+    Poisson log-likelihood over one common rate is the score.  A floor of
+    spurious spots in the gap lowers the score without breaking it, and what
+    lies beyond the first order does not enter.
+
+    Returns:
+        (L [Angstrom], log-likelihood gain, rate below / rate above)
+    """
+    c = dirs @ pole
+    y = np.abs(2.0 * sth * c)
+    tol = 2.0 * sth * np.sin(np.radians(zone_tol_deg))
+    off = np.abs(c) > np.sin(np.radians(zone_tol_deg))
+    y, w = y[off], wts[off] / wts[off].mean()  # weights as effective counts
+    floor = 2.0 * np.median(tol)
+    if len(y) < 20:
+        return np.nan, 0.0, np.nan
+    order = np.argsort(y)
+    y, w = y[order], w[order]
+    cw = np.concatenate([[0.0], np.cumsum(w)])
+    ratio = lam_hi / lam_lo
+    edges = np.exp(np.arange(np.log(1.5 * floor), np.log(y[-1] / ratio), 0.005))
+    if len(edges) == 0:
+        return np.nan, 0.0, np.nan
+    i_f = np.searchsorted(y, floor)
+    i_e = np.searchsorted(y, edges)
+    i_t = np.searchsorted(y, edges * ratio)
+    n_b, n_a = cw[i_e] - cw[i_f], cw[i_t] - cw[i_e]
+    l_b, l_a = edges - floor, edges * (ratio - 1.0)
+    r_b, r_a = n_b / l_b, n_a / l_a
+    r = (n_b + n_a) / (l_b + l_a)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        llr = np.where(n_b > 0, n_b * np.log(r_b / r), 0.0) + np.where(
+            n_a > 0, n_a * np.log(r_a / r), 0.0
+        )
+    llr = np.where(r_a > r_b, llr, 0.0)
+    k = int(np.argmax(llr))
+    if llr[k] < min_llr:
+        return np.nan, float(llr[k]), np.nan
+    return float(lam_lo / edges[k]), float(llr[k]), float(r_b[k] / max(r_a[k], 1e-12))
+
+
 def assemble(vecs, weight, tol=0.2):
     """Lattice basis from a set of lattice vectors with a few percent of error."""
     order = np.argsort(np.linalg.norm(vecs, axis=1))
@@ -170,6 +272,44 @@ def assemble(vecs, weight, tol=0.2):
     return reduce_basis(A), int(hit.sum())
 
 
+def assemble_by_shape(poles, lengths, max_index=3, tol_deg=0.6):
+    """Lattice from poles with a clear ladder: the shape from the directions,
+    which are good to a few tenths of a degree, and one scale from the
+    ladder lengths, which are not.
+
+    The directions fix axial ratios and angles (``shape_from_poles``).  Each
+    pole that the shape indexes then says how long its lattice vector should
+    be in units of the shape; the median of ladder length over that is the
+    scale.  A single wrong ladder length no longer distorts the cell.
+
+    Returns:
+        (basis, poles indexed, spread of the individual scales)
+    """
+    shape, _n_hit = shape_from_poles(poles[:16], n_axes=min(8, len(poles)))
+    r = range(-max_index, max_index + 1)
+    small = np.array(
+        [
+            (a, b, c)
+            for a in r
+            for b in r
+            for c in r
+            if (a, b, c) != (0, 0, 0) and np.gcd.reduce([abs(a), abs(b), abs(c)]) == 1
+        ]
+    )
+    vec = small @ shape.T
+    norm = np.linalg.norm(vec, axis=1)
+    cosang = np.abs(poles @ (vec / norm[:, None]).T)
+    which = np.argmax(cosang - 1e-3 * norm[None, :] / norm.max(), axis=1)
+    ang = np.degrees(np.arccos(np.clip(cosang[np.arange(len(poles)), which], -1, 1)))
+    hit = ang < tol_deg
+    if hit.sum() < 3:
+        return None
+    scales = lengths[hit] / norm[which][hit]
+    scale = float(np.median(scales))
+    spread = float(1.4826 * np.median(np.abs(scales / scale - 1.0)))
+    return reduce_basis(shape * scale), int(hit.sum()), spread
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("merged")
@@ -182,6 +322,12 @@ def main():
     ap.add_argument("--images", type=int, nargs=2, action="append")
     ap.add_argument("--poles", type=int, default=30)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument(
+        "--criterion",
+        choices=("step", "edge", "gap"),
+        default="step",
+        help="how the ladder length is read",
+    )
     ap.add_argument(
         "--max-length",
         type=float,
@@ -244,9 +390,18 @@ def main():
     vecs, score = [], []
     ratios = []
     for n, (p, h) in enumerate(zip(poles, heights)):
-        (_s, L, band, gap), _ = ladder_length(
-            p, dirs, sth, wts, args.lam_min, args.lam_max, lengths
-        )
+        if args.criterion == "edge":
+            L, band, gap = ladder_edge(p, dirs, sth, wts, args.lam_min)
+            if not np.isfinite(L):
+                band, gap = 0.0, 9.0
+        elif args.criterion == "step":
+            L, band, gap = ladder_step(p, dirs, sth, wts, args.lam_min, args.lam_max)
+            if not np.isfinite(L):
+                band, gap = 0.0, 9.0
+        else:
+            (_s, L, band, gap), _ = ladder_length(
+                p, dirs, sth, wts, args.lam_min, args.lam_max, lengths
+            )
         line = f" {n:3d}  {h:6.1f}   {L:10.2f}        {band:6.2f}      {gap:6.2f}"
         if true is not None:
             cosang = np.abs(Xd @ p)
@@ -268,12 +423,20 @@ def main():
     if len(vecs) < 3:
         print("fewer than three clear ladders")
         return
-    out = assemble(np.array(vecs), np.array(score))
+    vecs = np.array(vecs)
+    lens = np.linalg.norm(vecs, axis=1)
+    try:
+        out = assemble_by_shape(vecs / lens[:, None], lens)
+    except ValueError:
+        out = None
     if out is None:
         print("no basis")
         return
-    A, n_hit = out
-    print(f"{len(vecs)} vectors with a clear ladder; {n_hit} indexed by the basis")
+    A, n_hit, spread = out
+    print(
+        f"{len(vecs)} poles with a clear ladder; {n_hit} indexed by the shape; "
+        f"their individual scales scatter by {100 * spread:.0f}%"
+    )
     print("blind cell:     " + " ".join(f"{v:.2f}" for v in cell_of(A)))
     if true is not None:
         print("reference cell: " + " ".join(f"{v:.2f}" for v in cell_of(true)))
