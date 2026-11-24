@@ -9,8 +9,10 @@ needs no cell, orientation or space group:
 2. detector geometry and per-run orientation from the existing refinement,
    seeded by step 1                      (solve --refinement band --bootstrap)
 3. one prediction and integration in P 1 (peak-predictor, integrator)
-4. which lattice rotations are symmetries of the intensities
-                                         (subhkl.search.space_group.laue_class)
+4. which lattice rotations are symmetries of the intensities: a strong
+   reflection's mate must be present (laue_class_presence, no scaling and
+   no wavelength matching), cross-checked by comparing mates at matched
+   wavelength                           (subhkl.search.space_group.laue_class)
 5. which space groups of that point symmetry fit the raw events
                                          (space_group_candidates)
 
@@ -44,6 +46,7 @@ from subhkl.search.space_group import (
     best_candidates,
     event_node_counts,
     laue_class,
+    laue_class_presence,
     space_group_candidates,
 )
 
@@ -181,30 +184,42 @@ def main():
             refined,
         )
 
-    print(
-        "4. point group: lattice rotations tested on intensities at matched wavelength"
+    print("4. point group: is the mate of a strong reflection present?")
+    n_ops = len(found.setting_operations)
+    laue = laue_class_presence(
+        Observations.from_file(integrated, d_min=args.test_d_min, match=None),
+        found.setting_operations,
     )
-    obs = Observations.from_file(integrated, d_min=args.test_d_min)
-    laue = laue_class(obs, found.setting_operations)
     print(
-        f"  same reflection twice {laue.same:.2f}, unrelated reflections {laue.unrelated:.2f}, accept below {laue.cut:.2f}"
+        f"  mate absent: same reflection twice {laue.same:.1%}, unrelated reflections {laue.unrelated:.1%}, accept below {laue.cut:.1%}"
     )
     for row in laue.rows:
         print(
-            f"  {row['name']:28s} {row['strong']:6d} strong pairs  spread {row['spread']:6.2f}  {row['verdict']}"
+            f"  {row['name']:28s} {row['pairs']:6d} usable pairs  mate absent {row['spread']:6.1%}  {row['verdict']}"
         )
     print(
-        f"  point group {laue.point_group}, Laue class {laue.laue} ({len(laue.rotations)} of {len(found.setting_operations)} lattice rotations)"
+        f"  point group {laue.point_group}, Laue class {laue.laue} ({len(laue.rotations)} of {n_ops} lattice rotations)"
     )
     if laue.conflicts:
         print(
             "  WARNING: rejected operations that the accepted ones imply: "
             + ", ".join(laue.conflicts)
         )
-    if laue.friedel is not None:
-        print(
-            f"  check: Friedel mates {laue.friedel:.2f} (expected near {laue.same:.2f})"
+    try:
+        check = laue_class(
+            Observations.from_file(integrated, d_min=args.test_d_min),
+            found.setting_operations,
         )
+        same_group = {tuple(m.ravel()) for m in check.rotations} == {
+            tuple(m.ravel()) for m in laue.rotations
+        }
+        print(
+            f"  cross-check at matched wavelength (same {check.same:.2f}, unrelated {check.unrelated:.2f}): "
+            f"point group {check.point_group}"
+            + ("" if same_group else "  <- DISAGREES with the presence test")
+        )
+    except ValueError as exc:
+        print(f"  cross-check at matched wavelength: no verdict ({exc})")
 
     print("5. space group: absences tested on raw events")
     with h5py.File(refined, "r") as f:
@@ -252,6 +267,7 @@ def main():
             }
             for row in laue.rows
         ],
+        "test": "presence",
         "yardsticks": {
             "same": laue.same,
             "unrelated": laue.unrelated,

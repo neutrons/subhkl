@@ -26,6 +26,7 @@ from subhkl.search.space_group import (
     close_group,
     laue_class,
     laue_class_merged,
+    laue_class_presence,
     merged_node_counts,
     space_group_candidates,
 )
@@ -474,3 +475,57 @@ def test_symmetry_tests_refuse_data_that_cannot_decide():
     obs.I = obs.I * np.random.default_rng(43).lognormal(0.0, 1.5, len(obs.I))
     with pytest.raises(ValueError, match="cannot decide"):
         laue_class(obs, mats)
+
+
+def _unscaled(point_group, cell, rng, n_meas=3):
+    """Measurements of every reflection with an arbitrary scale each (up to
+    a factor of three either way), as unnormalised Laue data have."""
+    obs = _observations(point_group, cell, rng)
+    half = len(obs.I) // 2
+    hkl, truth, d = obs.hkl[:half], obs.I[:half], obs.d[:half]
+    truth = np.abs(truth) + 1.0
+    rows, inten, sig, dd, group = [], [], [], [], []
+    for g in range(n_meas):
+        k = np.exp(rng.uniform(-1.1, 1.1, len(hkl)))
+        s = 0.05 * k * truth + 2.0
+        rows.append(hkl)
+        inten.append(k * truth + s * rng.normal(size=len(hkl)))
+        sig.append(s)
+        dd.append(d)
+        group.append(np.full(len(hkl), g))
+    return Observations(
+        np.concatenate(rows),
+        np.concatenate(inten),
+        np.concatenate(sig),
+        np.full(n_meas * len(hkl), 2.5),
+        np.concatenate(dd),
+        np.concatenate(group),
+        match=None,
+    )
+
+
+def test_presence_test_needs_no_scaling():
+    """With every measurement on its own scale, comparing intensities fails
+    but asking whether the mate of a strong reflection is present works."""
+    cell = (60.0, 60.0, 95.0, 90.0, 90.0, 120.0)
+    mats, _name = lattice_operations(cell)
+    obs = _unscaled("P 3 2 1", cell, np.random.default_rng(51))
+    res = laue_class_presence(obs, mats)
+    assert res.point_group == "32" and res.symmorphic == "P 3 2 1"
+    assert len(res.rotations) == 6 and not res.conflicts
+    assert res.same < 0.05
+    assert res.unrelated > 0.2
+    assert res.friedel is not None and res.friedel < res.cut
+    with pytest.raises(ValueError, match="cannot decide"):
+        laue_class(obs, mats)
+
+
+def test_presence_test_refuses_unbounded_scales():
+    """If repeats of one reflection differ a hundredfold, absence proves nothing."""
+    cell = (60.0, 60.0, 95.0, 90.0, 90.0, 120.0)
+    mats, _name = lattice_operations(cell)
+    obs = _unscaled("P 3 2 1", cell, np.random.default_rng(52))
+    scale = np.exp(np.random.default_rng(53).uniform(-4.0, 4.0, len(obs.I)))
+    obs.I, obs.sig = obs.I * scale, obs.sig * scale
+    with pytest.raises(ValueError, match="not bounded"):
+        laue_class_presence(obs, mats)

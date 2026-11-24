@@ -218,7 +218,11 @@ class Observations:
 
     @classmethod
     def scaled(cls, hkl, intensity, sigma, scale, d, group, d_min=3.0, **kwargs):
-        """Observations divided by a learned scale function.
+        """Experimental.  Observations divided by a learned scale function.
+
+        Only as good as the scale: a scale model with many inputs and few
+        observations per reflection can follow the observations themselves,
+        and the comparison is then not independent of the merge.
 
         For data without matched-wavelength repeats: a merge without point
         symmetry learns the scale of every observation (incident spectrum,
@@ -354,6 +358,126 @@ def laue_class(obs, operations, min_strong=100, level=0.5, min_contrast=2.0):
         symmorphic=sg.hm if sg else "unknown",
         conflicts=conflicts,
         friedel=friedel if s_f >= min_strong else None,
+    )
+
+
+def laue_class_presence(
+    obs,
+    operations,
+    ratio=0.1,
+    min_isigi=10.0,
+    min_pairs=100,
+    level=0.5,
+    min_contrast=3.0,
+):
+    """Which lattice rotations are symmetries, by presence and absence alone.
+
+    Null hypothesis: M is a symmetry.  Then the mate of a strong reflection
+    is present too, whatever positive factors (incident spectrum, Lorentz
+    factor, exposure, absorption) separate the two measurements, as long as
+    those factors stay well within 1 / ``ratio``.  The only evidence counted
+    against a rotation is a strong reflection whose mate is absent: below
+    ``ratio`` of it, although it was measured well enough to see that much.
+
+    The test needs no wavelength matching and no normalisation, and it does
+    not rely on the standard errors being right, only on their telling
+    detectable from undetectable.  It is the counterpart, for the point
+    group, of testing systematic absences for the space group.
+
+    Two yardsticks come from the same data: the same reflection measured
+    twice (what a symmetry looks like) and unrelated reflections of the
+    same d (what a non-symmetry looks like).  If repeats of one reflection
+    are themselves often "absent", the scale factors are not bounded as
+    assumed (a quasi-Laue band whose spectrum varies tenfold, a decaying
+    crystal) and no verdict is given.
+
+    Args:
+        obs: Observations of an integration without point symmetry; pass
+            ``match=None`` when building them so that pairs at any
+            wavelength are used
+        operations: integer matrices M on Miller indices, the lattice rotations
+        ratio: [-] a mate below this fraction of the strong member is absent
+        min_isigi: [-] significance of the strong member
+        min_pairs: [-] fewest usable pairs for a verdict on a rotation
+        level: [-] acceptance level between the two yardsticks
+        min_contrast: [-] smallest ratio of the yardsticks for any verdict
+    Returns:
+        LaueResult; ``spread`` in its rows, ``same``, ``unrelated`` and
+        ``cut`` are shares of absent mates here (lower = more alike), and
+        ``friedel`` is that share for inversion mates
+    """
+
+    def share(i, j):
+        z_i, z_j = obs.I[i] / obs.sig[i], obs.I[j] / obs.sig[j]
+        first = z_i >= z_j
+        s = np.where(first, i, j)
+        w = np.where(first, j, i)
+        usable = (obs.I[s] / obs.sig[s] > min_isigi) & (
+            obs.sig[w] < ratio * obs.I[s] / 3.0
+        )
+        s, w = s[usable], w[usable]
+        if len(s) == 0:
+            return 0, float("nan")
+        return len(s), float(np.mean(obs.I[w] < ratio * obs.I[s]))
+
+    n_same, same = share(*obs.mate_pairs(IDENTITY))
+    n_unrel, unrelated = share(*obs.random_pairs())
+    if n_same < min_pairs or n_unrel < min_pairs:
+        raise ValueError(
+            "Too few repeated strong reflections to set the scale of the "
+            "presence test (need redundancy across runs or banks)."
+        )
+    if unrelated < min_contrast * max(same, 0.01):
+        raise ValueError(
+            f"Repeated measurements of one reflection are absent almost as often "
+            f"as unrelated reflections ({100 * same:.0f}% against {100 * unrelated:.0f}%): "
+            f"the scale between measurements is not bounded, and presence cannot "
+            f"decide the symmetry."
+        )
+    cut = same + level * (unrelated - same)
+    rows, accepted, rejected = [], [], []
+    for M in operations:
+        M = np.asarray(M, dtype=int)
+        if np.array_equal(M, IDENTITY):
+            continue
+        n, val = share(*obs.mate_pairs(M))
+        if n < min_pairs:
+            verdict = "too few pairs"
+        elif val < cut:
+            verdict = "symmetry"
+            accepted.append(M)
+        else:
+            verdict = "not a symmetry"
+            rejected.append(M)
+        rows.append(
+            {
+                "name": describe_operation(M),
+                "matrix": M,
+                "pairs": n,
+                "strong": n,
+                "spread": val,
+                "verdict": verdict,
+            }
+        )
+    rotations = close_group(accepted)
+    have = {tuple(m.ravel()) for m in rotations}
+    conflicts = [describe_operation(M) for M in rejected if tuple(M.ravel()) in have]
+    for row in rows:
+        if row["verdict"] == "too few pairs" and tuple(row["matrix"].ravel()) in have:
+            row["verdict"] = "symmetry (implied)"
+    n_f, friedel = share(*obs.mate_pairs(-IDENTITY))
+    sg = _group_ops(rotations)
+    return LaueResult(
+        rows=rows,
+        same=same,
+        unrelated=unrelated,
+        cut=cut,
+        rotations=rotations,
+        point_group=sg.point_group_hm() if sg else "unknown",
+        laue=sg.laue_str() if sg else "unknown",
+        symmorphic=sg.hm if sg else "unknown",
+        conflicts=conflicts,
+        friedel=friedel if n_f >= min_pairs else None,
     )
 
 
@@ -752,7 +876,11 @@ def laue_class_merged(
     level=0.5,
     min_reference=0.15,
 ):
-    """Which lattice rotations are symmetries, from a merge in P 1.
+    """Experimental.  Which lattice rotations are symmetries, from a merge in P 1.
+
+    On the quasi-Laue data tried so far the outcome depended on how the
+    merge was set up (see examples/blind_symmetry_quasi_laue.py); treat a
+    result as a hypothesis.
 
     For data without matched-wavelength repeats (a quasi-Laue rotation
     scan), merge once without point symmetry so that the merge does the

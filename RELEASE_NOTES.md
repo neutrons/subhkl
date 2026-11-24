@@ -18,6 +18,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     on intensities integrated once in P 1, comparing symmetry mates at matched
     wavelength, so no wavelength normalisation is needed. It returns the point
     group and its setting.
+  - `laue_class_presence` decides the point group without any scaling or
+    wavelength matching: under a symmetry the mate of a strong reflection must
+    be present, so only a strong reflection with an absent mate counts against
+    a rotation. It is the default in the time-of-flight example, with the
+    matched-wavelength comparison as a cross-check. On the four MANDI crystals
+    true symmetries leave 1–9% of mates absent and other rotations 36–49%.
   - `space_group_candidates` scores every space group of that point symmetry
     by its systematic absences on raw event counts at the reciprocal-lattice
     nodes (`event_node_counts`), and returns all hypotheses with their
