@@ -6,14 +6,19 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from subhkl.search.blind_cell import (
+    candidate_lattices,
     cell_of,
     centring_of,
     conventional_basis,
     describe_lattice,
     direct_space_map,
     find_peaks,
+    indexed_share,
+    ladder_scores,
     lattice_basis,
     lattice_operations,
+    laue_scale,
+    merge_radial_peaks,
     operations_in_basis,
     reduce_basis,
     refine_basis,
@@ -190,3 +195,158 @@ def test_conventional_cell_of_centred_lattices(
     assert info["lattice_group"] == group
     assert info["p1_symbol"] == p1
     assert centring_of(info["to_conventional"])[0] == want_centring
+
+
+def test_merge_radial_peaks_keeps_one_peak_per_lattice_vector():
+    a, b = np.array([60.0, 0.0, 0.0]), np.array([0.0, 0.0, 97.0])
+    pos = np.array([0.96 * a, 1.05 * a, b, 2.0 * a, 1.04 * b])
+    height = np.array([1.0, 0.9, 0.5, 0.4, 0.3])
+    merged, h = merge_radial_peaks(pos, height)
+    assert len(merged) == 3  # a (two fringes), c (two fringes), 2a
+    assert np.allclose(h, [1.0, 0.5, 0.4])
+    assert np.linalg.norm(merged[0] - a) < 1.0  # weighted mean of the fringes
+    assert np.linalg.norm(merged[2] - 2.0 * a) < 1e-9
+
+
+def test_laue_streaks_transform_to_the_direct_lattice():
+    """Without wavelengths a reflection is a radial streak over the band;
+    the Fourier transform of the streaks still peaks on the direct lattice,
+    and the basis read off it has the right shape."""
+    rng = np.random.default_rng(5)
+    cell = (40.0, 52.0, 66.0, 90.0, 104.0, 90.0)
+    A_true = Rotation.from_euler(
+        "xyz", [12, -28, 47], degrees=True
+    ).as_matrix() @ _basis(cell)
+    recip = np.linalg.inv(A_true).T
+    r = np.arange(-14, 15)
+    hkl = np.array(
+        [(h, k, l) for h in r for k in r for l in r if (h, k, l) != (0, 0, 0)]
+    )
+    q = hkl @ recip.T
+    q = q[(np.linalg.norm(q, axis=1) < 0.30) & (rng.random(len(q)) < 0.5)]
+    # each reflection is seen at some wavelength of the band; only its
+    # direction and 2 sin(theta) = |q| lambda are known afterwards
+    lam_lo, lam_hi = 3.0, 4.3
+    lam_obs = rng.uniform(lam_lo, lam_hi, len(q))
+    two_sin = np.linalg.norm(q, axis=1) * lam_obs
+    unit = q / np.linalg.norm(q, axis=1)[:, None]
+    n, q_max = 160, 1.0 / 3.0
+    voxel = 1.0 / (2.0 * q_max)
+    lam = lam_lo + (np.arange(48) + 0.5) * (lam_hi - lam_lo) / 48
+    shape = np.sin(np.pi * (np.arange(48) + 0.5) / 48) ** 2
+    pts = (unit[:, None, :] * (two_sin[:, None] / lam[None, :])[:, :, None]).reshape(
+        -1, 3
+    )
+    w = np.tile(shape / shape.sum(), len(q))
+    pts, w = np.concatenate([pts, -pts]), np.concatenate([w, w])
+    idx = np.floor((pts + q_max) * (n / (2.0 * q_max))).astype(int)
+    ok = np.all((idx >= 0) & (idx < n), axis=1)
+    grid = np.zeros((n, n, n), dtype=np.float32)
+    np.add.at(grid, tuple(idx[ok].T), w[ok])
+
+    g = direct_space_map(grid, voxel, half_extent=0.5 * n * voxel - 2 * voxel)
+    pos, height = merge_radial_peaks(*find_peaks(g, voxel, x_min=25.0, n_keep=200))
+    A, _good, _diag = lattice_basis(pos, height, g, voxel)
+    found = np.array(cell_of(reduce_basis(A)))
+    want = np.array(cell_of(reduce_basis(A_true)))
+    # the shape is right; the scale follows the assumed spectrum
+    assert np.allclose(found[:3] / found[0], want[:3] / want[0], atol=0.04)
+    assert np.allclose(found[3:], want[3:], atol=2.0)
+    assert abs(found[0] / want[0] - 1.0) < 0.08
+
+
+def _laue_bins(A_true, rng, lam=(3.0, 4.3), q_cut=0.30, n_stray=0):
+    """Count bins of a Laue pattern: directions, |q| intervals, weights."""
+    recip = np.linalg.inv(A_true).T
+    r = np.arange(-14, 15)
+    hkl = np.array(
+        [(h, k, l) for h in r for k in r for l in r if (h, k, l) != (0, 0, 0)]
+    )
+    q = hkl @ recip.T
+    q = q[(np.linalg.norm(q, axis=1) < q_cut) & (rng.random(len(q)) < 0.5)]
+    two_sin = np.linalg.norm(q, axis=1) * rng.uniform(lam[0], lam[1], len(q))
+    dirs = q / np.linalg.norm(q, axis=1)[:, None]
+    if n_stray:
+        stray = rng.normal(size=(n_stray, 3))
+        dirs = np.concatenate([dirs, stray / np.linalg.norm(stray, axis=1)[:, None]])
+        two_sin = np.concatenate([two_sin, rng.uniform(0.2, 1.2, n_stray)])
+    w = np.ones(len(dirs))
+    return {
+        "dirs": dirs,
+        "q_lo": two_sin / lam[1],
+        "q_hi": two_sin / lam[0],
+        "weights": w / w.sum(),
+    }
+
+
+def test_ladder_score_prefers_the_lattice_over_its_relatives():
+    """With as many stray bins as reflections, the true lattice outscores a
+    lattice with one axis halved, one with an axis doubled, and itself at
+    the wrong scale."""
+    rng = np.random.default_rng(13)
+    A = Rotation.from_euler("xyz", [12, -28, 47], degrees=True).as_matrix() @ _basis(
+        (40.0, 52.0, 66.0, 90.0, 104.0, 90.0)
+    )
+    obs = _laue_bins(A, rng, n_stray=3000)
+    halved, doubled = A.copy(), A.copy()
+    halved[:, 0] *= 0.5
+    doubled[:, 2] *= 2.0
+    bases = [halved, doubled, 0.88 * A, A, 1.12 * A]
+    scores, best, _A, _top, z = ladder_scores(bases, obs, n_zones=40, polish=False)
+    assert best == 3
+    assert scores[3] > 1.1 * max(scores[0], scores[1], scores[2], scores[4])
+    assert z > 8
+
+
+def test_candidate_lattices_contain_the_lattice():
+    rng = np.random.default_rng(17)
+    A = _basis((40.0, 52.0, 66.0, 90.0, 104.0, 90.0))
+    r = range(-2, 3)
+    n = np.array([(a, b, c) for a in r for b in r for c in r if (a, b, c) != (0, 0, 0)])
+    pos = n @ A.T + rng.normal(0.0, 0.3, (len(n), 3))
+    height = 1.0 / np.linalg.norm(pos, axis=1) + rng.uniform(0.0, 0.002, len(n))
+    order = np.argsort(-height)
+    cands = candidate_lattices(pos[order], height[order], n_peaks=12)
+    assert len(cands) >= 1
+    want = np.array(cell_of(reduce_basis(A)))
+    hit = [
+        np.allclose(np.array(cell_of(B))[:3], want[:3], rtol=0.03)
+        and np.allclose(np.array(cell_of(B))[3:], want[3:], atol=2.0)
+        for B, _share in cands
+    ]
+    assert any(hit)
+
+
+def test_indexed_share_tells_the_orientation_from_a_wrong_one():
+    """The full lattice indexes the bins at the true orientation and falls
+    to the chance level a few degrees away."""
+    rng = np.random.default_rng(19)
+    A = Rotation.from_euler("xyz", [12, -28, 47], degrees=True).as_matrix() @ _basis(
+        (40.0, 52.0, 66.0, 90.0, 104.0, 90.0)
+    )
+    obs = _laue_bins(A, rng)
+    true = indexed_share(A, obs)
+    turned = indexed_share(
+        A, obs, turn=Rotation.from_rotvec(np.radians([4.0, -3.0, 5.0])).as_matrix()
+    )
+    chance = indexed_share(A, obs, turn=Rotation.random(random_state=5).as_matrix())
+    assert true > 0.95
+    assert turned < chance + 0.1
+    assert true > 2 * turned
+
+
+def test_laue_scale_reads_the_scale_off_a_narrow_band_only():
+    """With a band of 3.0 to 4.3 A the share of indexed bins peaks at the
+    right scale; with an octave it does not, and the scale is left alone."""
+    A = Rotation.from_euler("xyz", [12, -28, 47], degrees=True).as_matrix() @ _basis(
+        (40.0, 52.0, 66.0, 90.0, 104.0, 90.0)
+    )
+    narrow = _laue_bins(A, np.random.default_rng(23), lam=(3.0, 4.3))
+    factor, contrast, found = laue_scale(0.95 * A, narrow)
+    assert found
+    assert abs(0.95 * factor - 1.0) < 0.02
+    wide = _laue_bins(A, np.random.default_rng(23), lam=(2.0, 4.0))
+    factor, wide_contrast, found = laue_scale(0.95 * A, wide)
+    assert wide_contrast < contrast
+    assert not found
+    assert factor == 1.0

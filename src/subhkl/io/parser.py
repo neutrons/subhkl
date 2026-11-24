@@ -203,9 +203,35 @@ def solve(
         str | None, typer.Option(help="Instrument name; defaults to metadata")
     ] = None,
     cell: Annotated[
-        str | None, typer.Option(help="a,b,c,alpha,beta,gamma in Angstrom/degrees")
+        str | None,
+        typer.Option(
+            help="a,b,c,alpha,beta,gamma in Angstrom/degrees. With --refinement band "
+            "and no cell here or in the frames file, the cell is determined from the images."
+        ),
+    ] = None,
+    cell_volume: Annotated[
+        float | None,
+        typer.Option(
+            help="Conventional cell volume in Angstrom^3, to set the scale of a cell "
+            "determined from the images"
+        ),
+    ] = None,
+    cell_length: Annotated[
+        float | None,
+        typer.Option(
+            help="One conventional cell edge in Angstrom, to set the scale of a cell "
+            "determined from the images"
+        ),
     ] = None,
     space_group: Annotated[str | None, typer.Option(help="Space group symbol")] = None,
+    geometry_from_h5: Annotated[
+        str | None,
+        typer.Option(
+            "--geometry-from-h5",
+            help="Solve file of the same instrument whose refined detector geometry "
+            "is the starting geometry (band refinement; it carries over between crystals)",
+        ),
+    ] = None,
     wavelength_min: Annotated[
         float | None, typer.Option(help="Lower wavelength in Angstrom")
     ] = None,
@@ -386,6 +412,9 @@ def solve(
                 finder=finder_peaks,
                 instrument=instrument,
                 cell=values,
+                blind_cell_volume=cell_volume,
+                blind_cell_length=cell_length,
+                geometry_from=geometry_from_h5,
                 space_group=space_group,
                 wavelength=(wavelength_min, wavelength_max),
                 assignment_wavelength=(

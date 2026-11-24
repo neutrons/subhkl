@@ -14,6 +14,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     transform of the raw events, with no cell, peaks or space group given.
     `write_seed` stores the result as a P 1 solve file for
     `solve --refinement band --bootstrap`.
+  - `find_cell(wavelength=(lam_min, lam_max))` finds the cell from Laue images
+    without event times, on the same code path: each reflection is spread
+    along its radial streak over the band before the Fourier transform. The
+    map proposes candidate lattices and the orientation search's band
+    objective, evaluated on the count bins (`ladder_scores`), decides among
+    them. On IMAGINE-X T4 lysozyme and L1 MBL and on MANDI T4 lysozyme and
+    Mpro with the time of flight ignored it returns the right lattice, with
+    centring. Where the band limits hold the scale (`laue_scale`: IMAGINE-X's
+    3.0 to 4.3 Angstrom) the edges are within about 1%; with a band spanning
+    an octave the data hold no scale and it is reported as undetermined
+    (about 10%) unless given: `find_cell(volume=...)` or `length=...`, for
+    example from the events of one time-of-flight run.
+  - `refine_run_rotations` finds each run's orientation against the shared
+    lattice from Laue images: the band objective proposes a turn, the share
+    of count bins the full lattice indexes (`indexed_share`) accepts it.
+    Alternated with `find_cell` (`examples/blind_cell_laue.py`) and started
+    from the logged angles, it brings the per-run orientation error from
+    1.0 to 0.17 degrees (IMAGINE-X L1 MBL) and from 1.8 to 0.12 degrees
+    (MANDI Mpro as Laue), measured against full refinements.
+  - `solve --refinement band` no longer needs a cell: with none on the command
+    line or in the frames file it is determined from the images
+    (`blind_cell.determine_cell`), together with the lattice group that
+    constrains the refinement. On an uncalibrated detector the translation
+    of the detector against the sample is searched first
+    (`search_detector_shift`). On IMAGINE-X from nominal geometry the
+    refined cell has the shape of the one refined from the known cell
+    (T4 lysozyme c/a 1.562 both; L1 MBL all edges 1.3% short) and the same
+    fit (median 3.9 px both for T4 lysozyme). The overall scale is tied to
+    the wavelength band; `--cell-volume` or `--cell-length` set it.
+  - `solve --refinement band --geometry-from-h5 other_solve.h5` starts from the
+    refined detector geometry of another solve on the same instrument
+    instead of the instrument metrology. It carries over between crystals:
+    IMAGINE-X L1 MBL with the geometry of a T4 lysozyme solve and no cell
+    given converges with the radial and axial corrections at -0.1% and
+    -0.5% (+6.3% and +5.1% from nominal) and skips the translation search.
+    `--runs` now also restricts the cell determination.
   - `align_runs` measures the goniometer's rotation errors from the data,
     with no cell and no model of the goniometer: each run on its own gives
     the lattice in its nominal frame, and the rotation between the per-run

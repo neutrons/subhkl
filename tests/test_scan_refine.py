@@ -1,5 +1,6 @@
 """Staged refinement modes, count observations, and rotation metadata."""
 
+import copy
 import json
 from types import SimpleNamespace
 
@@ -9,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from subhkl.config import reduction_settings
+from subhkl.config import beamlines, reduction_settings
 from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
 from subhkl.scan_refine import load_observations, run_scan_refinement
 from subhkl.search.scan_band import band_sum, ewald_directions
@@ -1075,3 +1076,179 @@ def test_genuine_uncalibrated_shared_geom_preserved(tmp_path):
         np.degrees(Rot.from_matrix(U_sol @ S @ U_true.T).magnitude()) for S in sym_ops
     )
     assert u_err < 0.20
+
+
+def _blind_stubs(monkeypatch, calls):
+    """Replace the cell chain, the orientation search and the refinement."""
+    from subhkl.search import blind_cell
+
+    lattice = np.diag([40.0, 52.0, 66.0])
+
+    def shift_search(merged, instrument, wavelength, radial=0.0, axial=None, **kw):
+        calls.append(("shift", radial, axial, kw.get("frames")))
+        return np.array([0.005, 0.0, -0.01]), 0.05, {}
+
+    def chain(
+        frames, instrument, wavelength=None, volume=None, length=None, runs=None, **kw
+    ):
+        centre = beamlines[instrument]["62"]["center"]
+        calls.append(("cell", wavelength, volume, length, runs, list(centre)))
+        diag = {"scale_determined": True, "scale_source": "band limits"}
+        return (
+            blind_cell.BlindCell(
+                diagnostics=diag, **blind_cell.describe_lattice(lattice)
+            ),
+            None,
+        )
+
+    def discover(args, *budgets):
+        calls.append(("search", list(args.cell), args.space_group))
+        return "seed.h5"
+
+    def refine(args):
+        calls.append(("refine", list(args.cell), args.space_group))
+        return {"status": "converged"}
+
+    monkeypatch.setattr(blind_cell, "search_detector_shift", shift_search)
+    monkeypatch.setattr(blind_cell, "determine_cell", chain)
+    monkeypatch.setattr("subhkl.search.blind_band.discover", discover)
+    monkeypatch.setattr("subhkl.search.scan_band.refine_scan", refine)
+
+
+@pytest.fixture
+def frames_without_cell(inputs):
+    frames, _ = inputs
+    with h5py.File(frames, "a") as f:
+        del f["sample"]
+    return frames
+
+
+def test_no_cell_runs_the_cell_chain_before_search_and_refinement(
+    frames_without_cell, tmp_path, monkeypatch
+):
+    """With no cell anywhere the cell and its lattice group come from the
+    images; the detector translation is searched first, with the
+    instrument's panel scales, and applied for the cell search only."""
+    calls = []
+    _blind_stubs(monkeypatch, calls)
+    nominal = list(beamlines["CG4D"]["62"]["center"])
+    result = run_scan_refinement(
+        frames_without_cell,
+        tmp_path / "out.h5",
+        instrument="CG4D",
+        wavelength=(3.0, 4.3),
+        runs=[1],
+        blind_cell_volume=137000.0,
+    )
+    assert result["status"] == "converged"
+    assert [c[0] for c in calls] == ["shift", "cell", "search", "refine"]
+    assert calls[0][1:3] == (0.065, 0.05)
+    assert calls[0][3] == [1]  # the frame of run 1
+    _name, wavelength, volume, length, runs, centre = calls[1]
+    assert wavelength == (3.0, 4.3) and volume == 137000.0 and length is None
+    assert runs == [1]
+    assert not np.allclose(centre, nominal)  # scales and shift in force
+    assert beamlines["CG4D"]["62"]["center"] == nominal  # and gone afterwards
+    assert calls[3][1] == pytest.approx([40.0, 52.0, 66.0, 90.0, 90.0, 90.0])
+    assert calls[3][2] == "P 2 2 2"
+
+
+def test_given_cell_or_fixed_geometry_skip_the_blind_steps(
+    frames_without_cell, tmp_path, monkeypatch
+):
+    calls = []
+    _blind_stubs(monkeypatch, calls)
+    # a cell on the command line: nothing blind
+    run_scan_refinement(
+        frames_without_cell,
+        tmp_path / "given.h5",
+        instrument="CG4D",
+        cell=[12, 13, 14, 90, 105, 90],
+        space_group="P 1 21 1",
+    )
+    assert [c[0] for c in calls] == ["search", "refine"]
+    # detector geometry not free: the cell chain without a translation search
+    calls.clear()
+    run_scan_refinement(
+        frames_without_cell, tmp_path / "fixed.h5", instrument="CG4D", modes=["per_run"]
+    )
+    assert [c[0] for c in calls] == ["cell", "search", "refine"]
+    assert calls[0][5] == pytest.approx(beamlines["CG4D"]["62"]["center"])
+
+
+def test_geometry_from_h5_starts_from_another_solves_detectors(
+    frames_without_cell, tmp_path, monkeypatch
+):
+    """The lifted geometry replaces the instrument metrology for the whole
+    solve, and the cell search then needs no translation search."""
+    monkeypatch.setitem(beamlines, "CG4D", copy.deepcopy(beamlines["CG4D"]))
+    nominal = beamlines["CG4D"]["62"]
+    lifted_centre = (
+        np.array(nominal["center"]) * 1.06 + [0.004, 0.005, -0.006]
+    ).tolist()
+    other = tmp_path / "other_solve.h5"
+    with h5py.File(other, "w") as f:
+        g = f.create_group("detector_calibration/bank_62")
+        g["center"], g["uhat"], g["vhat"] = (
+            lifted_centre,
+            nominal["uhat"],
+            nominal["vhat"],
+        )
+        g["width"], g["height"] = nominal["width"], nominal["height"]
+    calls = []
+    _blind_stubs(monkeypatch, calls)
+    run_scan_refinement(
+        frames_without_cell,
+        tmp_path / "lifted.h5",
+        instrument="CG4D",
+        geometry_from=other,
+    )
+    assert [c[0] for c in calls] == ["cell", "search", "refine"]
+    assert calls[0][5] == pytest.approx(lifted_centre)
+    assert beamlines["CG4D"]["62"]["center"] == pytest.approx(lifted_centre)
+
+    empty = tmp_path / "no_calibration.h5"
+    with h5py.File(empty, "w") as f:
+        f["sample/U"] = np.eye(3)
+    with pytest.raises(ValueError, match="no detector calibration"):
+        run_scan_refinement(
+            frames_without_cell,
+            tmp_path / "bad.h5",
+            instrument="CG4D",
+            geometry_from=empty,
+        )
+
+
+def test_solve_cli_routes_the_blind_cell_and_geometry_options(monkeypatch):
+    from typer.testing import CliRunner
+
+    from subhkl.io.parser import app
+
+    captured = {}
+
+    def run(*args, **kwargs):
+        captured.update(kwargs)
+        return {"status": "converged"}
+
+    monkeypatch.setattr("subhkl.scan_refine.run_scan_refinement", run)
+    result = CliRunner().invoke(
+        app,
+        [
+            "solve",
+            "frames.h5",
+            "out.h5",
+            "--refinement",
+            "band",
+            "--geometry-from-h5",
+            "other.h5",
+            "--cell-volume",
+            "312000",
+            "--cell-length",
+            "97.1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["cell"] is None
+    assert captured["geometry_from"] == "other.h5"
+    assert captured["blind_cell_volume"] == 312000.0
+    assert captured["blind_cell_length"] == 97.1
