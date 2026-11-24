@@ -216,6 +216,45 @@ class Observations:
             keep &= np.abs(np.log(self.lam[i] / self.lam[j])) < self.match
         return i[keep], j[keep]
 
+    @classmethod
+    def scaled(cls, hkl, intensity, sigma, scale, d, group, d_min=3.0, **kwargs):
+        """Experimental.  Observations divided by a learned scale function.
+
+        Only as good as the scale: a scale model with many inputs and few
+        observations per reflection can follow the observations themselves,
+        and the comparison is then not independent of the merge.
+
+        For data without matched-wavelength repeats: a merge without point
+        symmetry learns the scale of every observation (incident spectrum,
+        Lorentz factor, absorption, exposure) as a function of its
+        metadata.  Dividing each observed intensity by its scale makes
+        observations at different wavelengths comparable while keeping
+        them independent measurements; no merged amplitude enters, so the
+        prior of the merge does not bias the comparison.
+
+        Args:
+            hkl: (N, 3) Miller indices, Friedel mates not distinguished
+            intensity, sigma: (N,) observed intensity and standard error
+            scale: (N,) scale of each observation (intensity = scale x F^2)
+            d: [Angstrom] (N,) d-spacings
+            group: (N,) label of the image the observation is from
+            d_min: [Angstrom] observations beyond this resolution are left out
+        """
+        scale = np.asarray(scale, dtype=float)
+        ok = np.isfinite(scale) & (scale > 0.05 * np.nanmedian(scale[scale > 0]))
+        ok &= (np.asarray(sigma) > 0) & (np.asarray(d) > d_min)
+        return cls(
+            np.asarray(hkl)[ok],
+            np.asarray(intensity, dtype=float)[ok] / scale[ok],
+            np.asarray(sigma, dtype=float)[ok] / scale[ok],
+            np.ones(int(ok.sum())),
+            np.asarray(d)[ok],
+            np.asarray(group)[ok],
+            match=None,
+            friedel_merged=True,
+            **kwargs,
+        )
+
     def statistic(self, i, j):
         """(pairs, strong pairs, spread of (I1 - I2) / sigma over the strong pairs)."""
         strong = (self.I[i] / self.sig[i] > self.min_isigi) | (
@@ -812,6 +851,11 @@ def best_candidates(results):
     return [r for r in good if r["tested_nodes"] == top]
 
 
+# ---------------------------------------------------------------------------
+# The same two tests on intensities merged without point symmetry
+# ---------------------------------------------------------------------------
+
+
 def _friedel_unique(hkl):
     hkl = np.asarray(hkl, dtype=np.int64)
     flip = (
@@ -820,3 +864,154 @@ def _friedel_unique(hkl):
         | ((hkl[:, 2] == 0) & (hkl[:, 1] == 0) & (hkl[:, 0] < 0))
     )
     return np.where(flip[:, None], -hkl, hkl)
+
+
+def laue_class_merged(
+    hkl,
+    amplitude,
+    d,
+    operations,
+    cc_half=None,
+    d_min=3.0,
+    level=0.5,
+    min_reference=0.15,
+):
+    """Experimental.  Which lattice rotations are symmetries, from a merge in P 1.
+
+    On the quasi-Laue data tried so far the outcome depended on how the
+    merge was set up (see examples/blind_symmetry_quasi_laue.py); treat a
+    result as a hypothesis.
+
+    For data without matched-wavelength repeats (a quasi-Laue rotation
+    scan), merge once without point symmetry so that the merge does the
+    wavelength normalisation, then correlate every reflection with its
+    mate under each rotation.  A symmetry correlates as well as two
+    independent measurements of one reflection; a non-symmetry correlates
+    like unrelated reflections of the same d, that is, not at all.
+
+    Args:
+        hkl: (N, 3) Miller indices of the merged reflections (Friedel mates
+            merged, either hemisphere)
+        amplitude: (N,) merged structure-factor amplitudes or intensities
+        d: [Angstrom] (N,) d-spacings
+        operations: integer matrices M on Miller indices, the lattice rotations
+        cc_half: [-] half-dataset correlation of the merge in the same
+            resolution range, if known; it sets what a true symmetry should
+            reach.  Without it the best rotation takes that role, provided
+            it stands clearly above unrelated reflections.
+        d_min: [Angstrom] reflections beyond this resolution are left out
+        level: [-] acceptance level between unrelated (0) and the reference (1)
+        min_reference: [-] smallest correlation a true symmetry must be
+            expected to reach, above the unrelated level, for a verdict
+    Returns:
+        LaueResult; ``spread`` in its rows, ``same``, ``unrelated`` and
+        ``cut`` are correlation coefficients here (higher = more alike)
+    """
+    keep = np.isfinite(amplitude) & (np.asarray(d) > d_min)
+    hkl = _friedel_unique(np.asarray(hkl)[keep])
+    f = np.asarray(amplitude, dtype=float)[keep]
+    d = np.asarray(d, dtype=float)[keep]
+    if len(f) < 100:
+        raise ValueError("Too few merged reflections for the symmetry test.")
+    keys = _key(hkl)
+    order = np.argsort(keys)
+    ks = keys[order]
+    rng = np.random.default_rng(0)
+    shell = np.argsort(d)
+    pos = np.searchsorted(d[shell], d)
+    other = shell[np.clip(pos + rng.integers(5, 40, len(d)), 0, len(d) - 1)]
+    unrelated = float(np.corrcoef(f, f[other])[0, 1])
+    rows = []
+    for M in operations:
+        M = np.asarray(M, dtype=int)
+        if np.array_equal(M, IDENTITY):
+            continue
+        want = _key(_friedel_unique(hkl @ M.T))
+        p = np.clip(np.searchsorted(ks, want), 0, len(ks) - 1)
+        hit = (ks[p] == want) & (order[p] != np.arange(len(f)))
+        n = int(hit.sum())
+        cc = (
+            float(np.corrcoef(f[hit], f[order[p[hit]]])[0, 1])
+            if n > 30
+            else float("nan")
+        )
+        rows.append(
+            {
+                "name": describe_operation(M),
+                "matrix": M,
+                "pairs": n,
+                "strong": n,
+                "spread": cc,
+            }
+        )
+    tested = [r for r in rows if np.isfinite(r["spread"])]
+    if cc_half is not None:
+        reference = 2.0 * cc_half / (1.0 + cc_half)
+    else:
+        best = max(tested, key=lambda r: r["spread"], default=None)
+        clear = (
+            best is not None
+            and (best["spread"] - unrelated) * np.sqrt(best["pairs"]) > 8.0
+        )
+        reference = best["spread"] if clear else float("inf")
+    if cc_half is not None and reference - unrelated < min_reference:
+        raise ValueError(
+            f"The merge carries too little signal for the symmetry test "
+            f"(half-dataset correlation {cc_half:.3f})."
+        )
+    cut = unrelated + level * (reference - unrelated)
+    accepted, rejected = [], []
+    for r in rows:
+        if not np.isfinite(r["spread"]):
+            r["verdict"] = "too few pairs"
+        elif r["spread"] > cut:
+            r["verdict"] = "symmetry"
+            accepted.append(r["matrix"])
+        else:
+            r["verdict"] = "not a symmetry"
+            rejected.append(r["matrix"])
+    rotations = close_group(accepted)
+    have = {tuple(m.ravel()) for m in rotations}
+    conflicts = [describe_operation(M) for M in rejected if tuple(M.ravel()) in have]
+    for r in rows:
+        if r["verdict"] == "too few pairs" and tuple(r["matrix"].ravel()) in have:
+            r["verdict"] = "symmetry (implied)"
+    sg = _group_ops(rotations)
+    return LaueResult(
+        rows=rows,
+        same=float(reference),
+        unrelated=unrelated,
+        cut=float(cut),
+        rotations=rotations,
+        point_group=sg.point_group_hm() if sg else "unknown",
+        laue=sg.laue_str() if sg else "unknown",
+        symmorphic=sg.hm if sg else "unknown",
+        conflicts=conflicts,
+    )
+
+
+def merged_node_counts(hkl, intensity, sigma, basis, d_min):
+    """``NodeCounts`` from intensities merged in P 1, for
+    ``space_group_candidates`` (use ``rel_res=0``: the reflections are
+    already separated).  Friedel mates are filled in.
+
+    Args:
+        hkl: (N, 3) Miller indices
+        intensity, sigma: (N,) merged intensity and its standard error
+        basis: (3, 3) direct basis the indices refer to, columns [Angstrom]
+        d_min: [Angstrom] resolution limit of the test
+    """
+    hkl = np.asarray(hkl, dtype=np.int64)
+    ok = np.isfinite(intensity) & np.isfinite(sigma) & (np.asarray(sigma) > 0)
+    hkl = np.concatenate([hkl[ok], -hkl[ok]])
+    val = np.tile(np.asarray(intensity, dtype=float)[ok], 2)
+    err = np.tile(np.asarray(sigma, dtype=float)[ok], 2)
+    hmax = np.abs(hkl).max(axis=0)
+    shape = tuple(2 * hmax + 1)
+    net, errs, cov = np.zeros(shape), np.ones(shape), np.zeros(shape, dtype=bool)
+    idx = tuple((hkl + hmax).T)
+    net[idx], errs[idx], cov[idx] = val, err, True
+    cov[tuple(hmax)] = False
+    return NodeCounts(
+        hmax, net, errs, cov, np.asarray(basis, dtype=float), float(d_min), 0
+    )
