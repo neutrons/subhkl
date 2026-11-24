@@ -43,6 +43,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (T4 lysozyme c/a 1.562 both; L1 MBL all edges 1.3% short) and the same
     fit (median 3.9 px both for T4 lysozyme). The overall scale is tied to
     the wavelength band; `--cell-volume` or `--cell-length` set it.
+  - `solve --refinement band --geometry-from-h5 other_solve.h5` starts from the
+    refined detector geometry of another solve on the same instrument
+    instead of the instrument metrology. It carries over between crystals:
+    IMAGINE-X L1 MBL with the geometry of a T4 lysozyme solve and no cell
+    given converges with the radial and axial corrections at -0.1% and
+    -0.5% (+6.3% and +5.1% from nominal) and skips the translation search.
+    `--runs` now also restricts the cell determination.
   - `align_runs` measures the goniometer's rotation errors from the data,
     with no cell and no model of the goniometer: each run on its own gives
     the lattice in its nominal frame, and the rotation between the per-run

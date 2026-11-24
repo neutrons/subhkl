@@ -224,6 +224,14 @@ def solve(
         ),
     ] = None,
     space_group: Annotated[str | None, typer.Option(help="Space group symbol")] = None,
+    geometry_from_h5: Annotated[
+        str | None,
+        typer.Option(
+            "--geometry-from-h5",
+            help="Solve file of the same instrument whose refined detector geometry "
+            "is the starting geometry (band refinement; it carries over between crystals)",
+        ),
+    ] = None,
     wavelength_min: Annotated[
         float | None, typer.Option(help="Lower wavelength in Angstrom")
     ] = None,
@@ -406,6 +414,7 @@ def solve(
                 cell=values,
                 blind_cell_volume=cell_volume,
                 blind_cell_length=cell_length,
+                geometry_from=geometry_from_h5,
                 space_group=space_group,
                 wavelength=(wavelength_min, wavelength_max),
                 assignment_wavelength=(

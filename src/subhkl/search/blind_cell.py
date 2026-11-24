@@ -1687,6 +1687,7 @@ def refine_run_rotations(
     span_deg=3.0,
     max_bins=8192,
     log=None,
+    runs=None,
 ):
     """Orientation of every run against one shared lattice, for Laue data.
 
@@ -1708,6 +1709,8 @@ def refine_run_rotations(
         span_deg: [degree] half-width of the search around each run's
             current orientation
         max_bins: count bins used per run (the most significant)
+        runs: optional run indices to refine; the others are left alone
+        runs: optional run indices to refine; the others are left alone
     Returns:
         (rotations (n_images, 3, 3), angles [degree] per run, per run the
         score before and after and the share of bins indexed before and
@@ -1752,6 +1755,10 @@ def refine_run_rotations(
     angles, gains = [], []
     for r in range(len(offsets)):
         frames = range(bounds[r], bounds[r + 1])
+        if runs is not None and r not in runs:
+            angles.append(0.0)
+            gains.append((np.nan, np.nan, np.nan, np.nan))
+            continue
         try:
             obs = laue_observations(
                 merged,
@@ -1888,8 +1895,12 @@ def determine_cell(
     volume=None,
     length=None,
     log=None,
+    runs=None,
 ):
     """Cell and per-run rotations with nothing given: the whole chain.
+
+    ``runs`` restricts the Laue chain to those run indices (one run gives a
+    cell without any goniometer, if it has enough reflections).
 
     With events (``wavelength`` None): ``align_runs`` for the rotation
     errors between runs, then ``find_cell`` on all runs.  Without
@@ -1915,9 +1926,23 @@ def determine_cell(
         "volume": volume,
         "length": length,
     }
+    frames = None
+    if runs is not None:
+        with h5py.File(merged, "r") as f:
+            n_img = f["images"].shape[0]
+            offsets = f["file_offsets"][()].tolist() if "file_offsets" in f else [0]
+        bounds = [*offsets, n_img]
+        frames = [i for r in runs for i in range(bounds[r], bounds[r + 1])]
+    frames = None
+    if runs is not None:
+        with h5py.File(merged, "r") as f:
+            n_img = f["images"].shape[0]
+            offsets = f["file_offsets"][()].tolist() if "file_offsets" in f else [0]
+        bounds = [*offsets, n_img]
+        frames = [i for r in runs for i in range(bounds[r], bounds[r + 1])]
     rotations, found, volumes = None, None, []
     for k in range(rounds + 1):
-        found = find_cell(merged, instrument, rotations=rotations, **kw)
+        found = find_cell(merged, instrument, rotations=rotations, frames=frames, **kw)
         d = found.diagnostics
         volumes.append(abs(np.linalg.det(found.basis)))
         say(
@@ -1926,8 +1951,8 @@ def determine_cell(
             + f"  {found.centring}, {found.lattice_group}; score {1e3 * d['ladder_score']:.1f}"
             f" (z {d['ladder_z']:.0f}); scale from the {d['scale_source']}"
         )
-        if k == rounds:
-            break
+        if k == rounds or (runs is not None and len(runs) == 1):
+            break  # one run has nothing to align
         rotations, angles, stats = refine_run_rotations(
             merged,
             instrument,
@@ -1935,6 +1960,7 @@ def determine_cell(
             wavelength,
             rotations=rotations,
             d_min=d_min,
+            runs=runs,
         )
         say(
             "   runs turned by [deg]: "

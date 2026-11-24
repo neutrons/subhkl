@@ -177,7 +177,16 @@ def default_band_binning(
     return 1
 
 
-def _blind_cell(frames, instrument, wavelength, modes, volume=None, length=None):
+def _blind_cell(
+    frames,
+    instrument,
+    wavelength,
+    modes,
+    volume=None,
+    length=None,
+    runs=None,
+    calibrated=False,
+):
     """Cell and lattice group from the images when none is given.
 
     Laue chain of ``subhkl.search.blind_cell``: one lattice for all runs,
@@ -201,9 +210,19 @@ def _blind_cell(frames, instrument, wavelength, modes, volume=None, length=None)
     say = lambda line: print(f"[blind cell] {line}", flush=True)
     radial, axial = BLIND_DETECTOR_SCALE.get(instrument, (0.0, 0.0))
     shift = (0.0, 0.0, 0.0)
-    if modes & {"cylindrical", "global_trans"}:
+    kw = {}
+    if runs is not None:
+        with h5py.File(frames) as f:
+            bounds = [*_frame_offsets(f, f["images"].shape[0]), f["images"].shape[0]]
+        kw["frames"] = [
+            i for r in runs for i in range(int(bounds[r]), int(bounds[r + 1]))
+        ]
+    if calibrated:
+        # geometry lifted from another solve: nothing to search
+        radial = axial = 0.0
+    elif modes & {"cylindrical", "global_trans"}:
         shift, top, _tried = search_detector_shift(
-            frames, instrument, wavelength, radial=radial, axial=axial, log=say
+            frames, instrument, wavelength, radial=radial, axial=axial, log=say, **kw
         )
         say(
             f"detector shift [mm] {np.round(1e3 * shift, 1).tolist()} (score {1e3 * top:.1f})"
@@ -218,6 +237,7 @@ def _blind_cell(frames, instrument, wavelength, modes, volume=None, length=None)
             volume=volume,
             length=length,
             log=say,
+            runs=runs,
         )
     say(
         "cell "
@@ -266,11 +286,17 @@ def run_scan_refinement(
     border_width=4,
     blind_cell_volume=None,
     blind_cell_length=None,
+    geometry_from=None,
 ):
     """Index from finder observations or count bins and refine with band-geometry modes.
 
     Without a cell (none passed, none in the frames file) the cell and its
     lattice group are determined from the images first (``_blind_cell``).
+
+    ``geometry_from`` names a solve file of the same instrument whose
+    refined detector positions replace the instrument metrology as the
+    starting geometry (they carry over between crystals; the selected modes
+    still refine them).
 
     The bootstrap supplies orientation only. Detector geometry starts from
     instrument metrology, matching the staged reference protocol. Counts mode
@@ -291,6 +317,13 @@ def run_scan_refinement(
         )
     if instrument not in beamlines:
         raise ValueError(f"unknown instrument: {instrument}")
+    if geometry_from is not None:
+        from subhkl.commands import apply_detector_calibration
+
+        with h5py.File(geometry_from) as f:
+            if "detector_calibration" not in f:
+                raise ValueError(f"{geometry_from} carries no detector calibration")
+        apply_detector_calibration(str(geometry_from), instrument)
     dets = {int(k): Detector(dict(cfg)) for k, cfg in beamlines[instrument].items()}
     if any(det.panel_type != DetectorShape.flat_panel for det in dets.values()):
         raise ValueError("staged band refinement requires flat-panel detectors")
@@ -353,7 +386,14 @@ def run_scan_refinement(
         cell_missing = cell is None and "sample/a" not in f
     if cell_missing:
         blind_cell_found = _blind_cell(
-            frames, instrument, wavelength, chosen, blind_cell_volume, blind_cell_length
+            frames,
+            instrument,
+            wavelength,
+            chosen,
+            blind_cell_volume,
+            blind_cell_length,
+            runs=None if runs is None else list(runs),
+            calibrated=geometry_from is not None,
         )
         cell = [float(v) for v in blind_cell_found.setting_cell]
         if space_group is None:
