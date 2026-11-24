@@ -40,6 +40,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     IMAGINE-X T4 lysozyme (IPTS-37331 runs 1808–1828, even) the right point
     group (32, 321 setting) came out with one merge setup and no verdict with
     another, so a result is a hypothesis to check.
+  - Diagnostics that need no merge: `examples/diagnose_band_and_decay.py`
+    (share of strong reflections against wavelength and per run, which shows
+    the effective band and a decaying crystal) and
+    `examples/diagnose_signal_by_resolution.py` (raw image patches stacked at
+    the predicted positions by resolution shell, against a displaced control,
+    giving the signal-to-noise of one observation).
+  - Prototype `examples/quasi_laue_cell_shape.py`: cell shape (axial ratios
+    and angles, no scale) from quasi-Laue images through the zone-axis peaks
+    of the Funk transform. It recovered the T4 lysozyme cell shape to about 1%
+    and failed on L1 MBL.
   - Tried on four MANDI datasets: IPTS-30763 runs 11324–11338 (P6₁22 or
     P6₅22 found), a garnet from IPTS-34720 (Ia-3d found), T4 lysozyme,
     IPTS-34720 runs 13239–13245, a trigonal crystal in a hexagonal lattice
