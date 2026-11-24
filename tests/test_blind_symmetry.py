@@ -460,3 +460,17 @@ def test_scaled_observations_are_compared_at_any_wavelength():
     res = laue_class(obs, mats)
     assert res.point_group == "32" and len(res.rotations) == 6 and not res.conflicts
     assert res.same < 2.0 < res.unrelated
+
+
+def test_symmetry_tests_refuse_data_that_cannot_decide():
+    cell = (62.0, 62.0, 97.0, 90.0, 90.0, 120.0)
+    mats, _name = lattice_operations(cell)
+    # a merge without signal: the half-dataset correlation says so
+    hkl, amp, d = _merged("P 3 2 1", cell, np.random.default_rng(41))
+    with pytest.raises(ValueError, match="too little signal"):
+        laue_class_merged(hkl, amp, d, mats, cc_half=0.01, d_min=3.0)
+    # repeats that disagree almost as much as unrelated reflections
+    obs = _observations("P 3 2 1", cell, np.random.default_rng(42))
+    obs.I = obs.I * np.random.default_rng(43).lognormal(0.0, 1.5, len(obs.I))
+    with pytest.raises(ValueError, match="cannot decide"):
+        laue_class(obs, mats)

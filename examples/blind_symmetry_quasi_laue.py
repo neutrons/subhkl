@@ -1,33 +1,43 @@
-"""Point group and space-group candidates for quasi-Laue data, from a merge in P 1.
+"""Experimental: point group for quasi-Laue data from a merge in P 1.
 
 Quasi-Laue images carry no event times, so the cell cannot be read off the
 events, and a rotation scan hardly ever measures symmetry mates at the same
-wavelength.  With the cell known, the symmetry can still be found without
-assuming it:
+wavelength.  With the cell known, one can still try to find the symmetry
+without assuming it:
 
 1. solve the orientation with the cell and the symmetry of the lattice only
    (solve --refinement band --space-group <lattice group>)
 2. predict and integrate once in P 1      (peak-predictor, integrator)
-3. merge in P 1, which does the wavelength normalisation
+3. merge in P 1 so that the merge does the wavelength normalisation
    (mtz-exporter, careless poly)
-4. divide every observation by the scale the merge learned for it and
-   compare symmetry mates pairwise    (Observations.scaled, laue_class);
-   as a cross-check, correlate every merged reflection with its mate
-   under each lattice rotation                    (laue_class_merged)
+4. test every lattice rotation in two ways:
+   - correlate each merged reflection with its mate  (laue_class_merged)
+   - divide each observation by the scale the merge assigned to it and
+     compare mates pairwise              (Observations.scaled, laue_class)
 5. score the space groups of that point symmetry by their absences on the
    merged intensities       (merged_node_counts, space_group_candidates)
 
-This script does steps 4 and 5 on the output of a Careless merge.  Screw
-axes can only be judged if axial reflections were measured; where they
-were not, the groups that differ only by a screw axis are reported together.
+This script does steps 4 and 5 on the output of a Careless merge and only
+names a point group when both tests give a verdict and agree.
+
+Status.  Tried on one dataset (IMAGINE-X T4 lysozyme, eleven runs).  The
+outcome depends on how the merge was set up:
+
+- With the scale model given all metadata (wavelength, angles, run), both
+  tests found the right point group.  But with fewer than two observations
+  per reflection the scale model fitted each observation individually, so
+  the "scale" was not a wavelength normalisation and the second test was
+  not independent of the first.
+- With the scale model restricted to wavelength and run, the merge had no
+  signal (half-dataset correlation near zero) and both tests are refused.
+
+So treat a result from this script as a hypothesis to check, not as a
+determination.  Screw axes can only be judged if axial reflections were
+measured.
 
 Usage:
-    python blind_symmetry_quasi_laue.py careless_0.mtz --predictions careless_predictions_0.mtz \
-        [--xval careless_xval_0.mtz] [--d-min 3.0] [--sohncke]
-
-The pairwise test on scaled observations decides (it involves no merged
-amplitudes, so the merge's prior cannot bias it); without --predictions the
-merged-amplitude test is used alone.
+    python blind_symmetry_quasi_laue.py careless_0.mtz --xval careless_xval_0.mtz \
+        [--predictions careless_predictions_0.mtz] [--d-min 3.0] [--sohncke]
 """
 
 import argparse
@@ -74,17 +84,34 @@ def half_dataset_cc(path, d_min):
     )
 
 
+def show(res, n_ops, unit):
+    for row in res.rows:
+        print(
+            f"    {row['name']:28s} {row['strong']:6d} pairs  {unit} {row['spread']:6.3f}  {row['verdict']}"
+        )
+    print(
+        f"    point group {res.point_group}, Laue class {res.laue} ({len(res.rotations)} of {n_ops} lattice rotations)"
+    )
+    if res.conflicts:
+        print(
+            "    INCONSISTENT: rejected operations that the accepted ones imply: "
+            + ", ".join(res.conflicts)
+        )
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("merged", help="P 1 merge (MTZ with H, K, L, F, SigF)")
     ap.add_argument(
-        "--predictions",
-        help="per-observation output of the same merge (MTZ with Iobs, SigIobs, Scale, image_id)",
+        "--xval",
+        required=True,
+        help="half-dataset merges of the same run (MTZ with a 'half' column)",
     )
     ap.add_argument(
-        "--xval", help="half-dataset merges of the same run (MTZ with a 'half' column)"
+        "--predictions",
+        help="per-observation output of the same merge (MTZ with Iobs, SigIobs, Scale, image_id)",
     )
     ap.add_argument(
         "--d-min", type=float, default=3.0, help="resolution used by the tests [A]"
@@ -104,60 +131,75 @@ def main():
         + " ".join(f"{v:.2f}" for v in cell)
         + f"; lattice rotations: {len(mats)} ({group})"
     )
-    cc_half = half_dataset_cc(args.xval, args.d_min) if args.xval else None
-    if cc_half is not None:
-        print(f"half-dataset CC of the P 1 merge to {args.d_min} A: {cc_half:.3f}")
+    cc_half = half_dataset_cc(args.xval, args.d_min)
+    print(
+        f"half-dataset correlation of the P 1 merge to {args.d_min} A: "
+        + ("too few common reflections" if cc_half is None else f"{cc_half:.3f}")
+    )
 
-    merged = laue_class_merged(
-        hkl, col["F"], d, mats, cc_half=cc_half, d_min=args.d_min
-    )
-    res = merged
+    verdicts = {}
+    print("test 1, merged amplitudes of symmetry mates:")
+    try:
+        if cc_half is None:
+            raise ValueError("no half-dataset correlation to set the scale of the test")
+        res = laue_class_merged(
+            hkl, col["F"], d, mats, cc_half=cc_half, d_min=args.d_min
+        )
+        print(
+            f"    unrelated reflections correlate {res.unrelated:.3f}; a symmetry should reach {res.same:.3f}; accept above {res.cut:.3f}"
+        )
+        show(res, len(mats), "CC")
+        if not res.conflicts:
+            verdicts["merged"] = res
+    except ValueError as exc:
+        print(f"    no verdict: {exc}")
+
     if args.predictions:
-        _pmtz, p, phkl, pd = columns(args.predictions)
-        obs = Observations.scaled(
-            phkl,
-            p["Iobs"],
-            p["SigIobs"],
-            p["Scale"],
-            pd,
-            p["image_id"].astype(int),
-            d_min=args.d_min,
-        )
-        res = laue_class(obs, mats)
-        print(
-            f"point group, from {len(obs.I)} observations divided by their learned scale: "
-            f"same reflection twice {res.same:.2f}, unrelated {res.unrelated:.2f}, accept below {res.cut:.2f}"
-        )
-        for row in res.rows:
+        print("test 2, observations divided by the scale the merge gave them:")
+        try:
+            _pmtz, p, phkl, pd = columns(args.predictions)
+            z = p["Iobs"] / p["SigIobs"]
+            weak, strong = np.median(p["Scale"][z < 1]), np.median(p["Scale"][z > 5])
+            note = ""
+            if strong > 5 * abs(weak):
+                note = "  <- the scale follows the observations themselves; test 2 is then not independent of test 1"
             print(
-                f"  {row['name']:28s} {row['strong']:6d} strong pairs  spread {row['spread']:6.2f}  {row['verdict']}"
+                f"    median scale of observations below 1 sigma {weak:.3g}, above 5 sigma {strong:.3g}{note}"
             )
-        print(
-            f"  point group {res.point_group}, Laue class {res.laue} ({len(res.rotations)} of {len(mats)} lattice rotations)"
-        )
-    print(
-        f"{'cross-check' if args.predictions else 'point group'}, from merged amplitudes: unrelated reflections correlate "
-        f"{merged.unrelated:.3f}; a symmetry should reach {merged.same:.3f}; accept above {merged.cut:.3f}"
-    )
-    for row in merged.rows:
-        print(
-            f"  {row['name']:28s} {row['pairs']:6d} pairs  CC {row['spread']:6.3f}  {row['verdict']}"
-        )
-    print(
-        f"  point group {merged.point_group}, Laue class {merged.laue} ({len(merged.rotations)} of {len(mats)} lattice rotations)"
-    )
-    same_group = {tuple(m.ravel()) for m in res.rotations} == {
-        tuple(m.ravel()) for m in merged.rotations
+            obs = Observations.scaled(
+                phkl,
+                p["Iobs"],
+                p["SigIobs"],
+                p["Scale"],
+                pd,
+                p["image_id"].astype(int),
+                d_min=args.d_min,
+            )
+            res = laue_class(obs, mats)
+            print(
+                f"    same reflection twice {res.same:.2f}, unrelated {res.unrelated:.2f}, accept below {res.cut:.2f}"
+            )
+            show(res, len(mats), "spread")
+            if not res.conflicts:
+                verdicts["scaled"] = res
+        except ValueError as exc:
+            print(f"    no verdict: {exc}")
+
+    groups = {
+        name: frozenset(tuple(m.ravel()) for m in r.rotations)
+        for name, r in verdicts.items()
     }
-    if not same_group:
-        print(
-            "  WARNING: the two tests disagree; the pairwise test on scaled observations is used below"
+    wanted = 2 if args.predictions else 1
+    if len(verdicts) < wanted or len(set(groups.values())) != 1:
+        why = (
+            "the tests disagree"
+            if len(verdicts) == wanted
+            else "a test gave no verdict"
         )
-    if res.conflicts:
-        print(
-            "  WARNING: rejected operations that the accepted ones imply: "
-            + ", ".join(res.conflicts)
-        )
+        print(f"point group: INCONCLUSIVE ({why})")
+        return
+    res = next(iter(verdicts.values()))
+    print(f"point group (hypothesis): {res.point_group}, {res.symmorphic} setting")
 
     basis = np.array(mtz.cell.orth.mat.tolist())
     nodes = merged_node_counts(

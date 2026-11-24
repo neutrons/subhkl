@@ -278,7 +278,7 @@ class LaueResult:
     friedel: float | None = None  # spread for inversion mates (a check, not an input)
 
 
-def laue_class(obs, operations, min_strong=100, level=0.5):
+def laue_class(obs, operations, min_strong=100, level=0.5, min_contrast=2.0):
     """Which rotations of the lattice are symmetries of the intensities.
 
     Args:
@@ -288,6 +288,10 @@ def laue_class(obs, operations, min_strong=100, level=0.5):
         min_strong: [-] fewest strong pairs for a verdict
         level: [-] acceptance level between the two yardsticks (0 = same
             reflection measured twice, 1 = unrelated reflections)
+        min_contrast: [-] smallest ratio of the two yardsticks for a
+            verdict.  If repeated measurements of one reflection disagree
+            almost as much as unrelated reflections do, the intensities
+            (or their scaling) cannot carry a symmetry test.
     Returns:
         LaueResult.  Rotations that could not be tested but follow from the
         accepted ones are included; a rejected rotation that follows from
@@ -299,6 +303,12 @@ def laue_class(obs, operations, min_strong=100, level=0.5):
         raise ValueError(
             "Too few repeated strong reflections at matched wavelength to set "
             "the scale of the symmetry test (need redundancy across runs or banks)."
+        )
+    if unrelated < min_contrast * same:
+        raise ValueError(
+            f"Repeated measurements of one reflection disagree almost as much "
+            f"as unrelated reflections do (spread {same:.2f} against "
+            f"{unrelated:.2f}): these intensities cannot decide the symmetry."
         )
     cut = same + level * (unrelated - same)
     rows, accepted, rejected = [], [], []
@@ -733,7 +743,14 @@ def _friedel_unique(hkl):
 
 
 def laue_class_merged(
-    hkl, amplitude, d, operations, cc_half=None, d_min=3.0, level=0.5
+    hkl,
+    amplitude,
+    d,
+    operations,
+    cc_half=None,
+    d_min=3.0,
+    level=0.5,
+    min_reference=0.15,
 ):
     """Which lattice rotations are symmetries, from a merge in P 1.
 
@@ -756,6 +773,8 @@ def laue_class_merged(
             it stands clearly above unrelated reflections.
         d_min: [Angstrom] reflections beyond this resolution are left out
         level: [-] acceptance level between unrelated (0) and the reference (1)
+        min_reference: [-] smallest correlation a true symmetry must be
+            expected to reach, above the unrelated level, for a verdict
     Returns:
         LaueResult; ``spread`` in its rows, ``same``, ``unrelated`` and
         ``cut`` are correlation coefficients here (higher = more alike)
@@ -807,6 +826,11 @@ def laue_class_merged(
             and (best["spread"] - unrelated) * np.sqrt(best["pairs"]) > 8.0
         )
         reference = best["spread"] if clear else float("inf")
+    if cc_half is not None and reference - unrelated < min_reference:
+        raise ValueError(
+            f"The merge carries too little signal for the symmetry test "
+            f"(half-dataset correlation {cc_half:.3f})."
+        )
     cut = unrelated + level * (reference - unrelated)
     accepted, rejected = [], []
     for r in rows:
