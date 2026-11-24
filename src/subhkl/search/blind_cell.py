@@ -147,6 +147,8 @@ def laue_histogram(
     rotations=None,
     spectrum=None,
     min_z=4.0,
+    weighting="maxima",
+    binning=None,
 ):
     """Reciprocal-space density for data without wavelengths.
 
@@ -174,9 +176,23 @@ def laue_histogram(
         spectrum: optional (wavelengths [Angstrom], relative weights) of the
             scattered intensity; default a smooth bump over the band, which
             avoids the ringing that sharp band edges cause in the map
-        min_z: [-] significance of a pixel
+        min_z: [-] significance of a pixel (``weighting="maxima"``)
+        weighting: "deviance" uses every count bin with the weight of the
+            orientation search (``blind_band.count_search_weights``): the
+            images are binned so that a reflection fills about one bin, each
+            bin's Poisson deviance D against the local background is
+            computed, and the weight grows as sqrt(D) with background
+            fluctuations suppressed.  That is a significance, not an
+            intensity, so strong reflections do not outweigh the lattice.
+            "maxima" uses one entry per significant local maximum with the
+            excess counts, capped, as weight.
+            On IMAGINE-X only "maxima" has found the lattice so far (there
+            are about six times more significant bins than reflections);
+            on MANDI both do.
+        binning: [Pixel] bin size for "deviance"; default 8 for panels of
+            512 pixels and more, else 4
     Returns:
-        (grid (n, n, n), q_max [1/Angstrom], number of pixels used)
+        (grid (n, n, n), q_max [1/Angstrom], number of bins or pixels used)
     """
     import jax
     import jax.numpy as jnp
@@ -209,6 +225,29 @@ def laue_histogram(
         seen = {}
         for i in use:
             img = f["images"][i].astype(np.float64)
+            if weighting == "deviance":
+                from scipy.ndimage import median_filter
+
+                from subhkl.search.blind_band import count_search_weights
+
+                b = binning or (8 if min(img.shape) >= 512 else 4)
+                hb, wb = img.shape[0] // b, img.shape[1] // b
+                y = img[: hb * b, : wb * b].reshape(hb, b, wb, b).sum(axis=(1, 3))
+                mu = np.maximum(median_filter(y, size=7, mode="nearest"), 0.5)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    dev = 2.0 * (np.where(y > 0, y * np.log(y / mu), 0.0) - (y - mu))
+                wbin = count_search_weights(np.where(y > mu, dev, 0.0))
+                wbin[0], wbin[-1], wbin[:, 0], wbin[:, -1] = 0.0, 0.0, 0.0, 0.0
+                br, bc = np.nonzero(wbin > 1.0)
+                rr, cc = br * b + b // 2, bc * b + b // 2
+                picked[i] = (rr, cc, wbin[br, bc], img.shape)
+                key = (int(bank_ids[i]), img.shape)
+                runs = seen.setdefault(key, {})
+                near = np.zeros(img.shape, dtype=bool)
+                near[rr, cc] = True
+                prev = runs.setdefault(int(run_of[i]), np.zeros(img.shape, dtype=bool))
+                prev |= near
+                continue
             fine, coarse = gaussian_filter(img, 1.5), gaussian_filter(img, 10.0)
             excess = fine - coarse
             z = excess / np.sqrt(np.maximum(coarse, 0.05) / (4.0 * np.pi * 1.5**2))
@@ -242,6 +281,8 @@ def laue_histogram(
     # point counts, so the weights are capped at their 95th percentile.
     every = np.concatenate([p_[2] for p_ in picked.values()] or [np.zeros(1)])
     cap = float(np.quantile(every, 0.95)) if len(every) else 0.0
+    if weighting == "deviance":
+        cap = np.inf  # already a significance
     acc = jax.jit(_streak_impl, static_argnames=["n"])
     grid = jnp.zeros(n * n * n, dtype=jnp.float32)
     pos_cache = {}
@@ -872,6 +913,7 @@ def find_cell(
     wavelength=None,
     spectrum=None,
     min_z=8.0,
+    weighting="maxima",
 ):
     """Unit cell, scale and orientation from raw data, with nothing given.
 
@@ -900,7 +942,8 @@ def find_cell(
         wavelength: [Angstrom] (lam_min, lam_max) of a Laue measurement; the
             events are then not used
         spectrum: optional (wavelengths, relative weights) for Laue data
-        min_z: [-] significance of a pixel for Laue data
+        min_z: [-] significance of a pixel for Laue data (weighting "maxima")
+        weighting: "deviance" or "maxima" for Laue data, see ``laue_histogram``
     Returns:
         BlindCell
     """
@@ -928,6 +971,7 @@ def find_cell(
             rotations=rotations,
             spectrum=spectrum,
             min_z=min_z,
+            weighting=weighting,
         )
         voxel = 1.0 / (2.0 * q_max)
         say(
