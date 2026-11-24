@@ -748,6 +748,66 @@ def test_roundtrip_image_only_export_writes_no_refl(tmp_path):
     assert len(flex.reflection_table.from_file(refl_path)) == 0
 
 
+def _write_tagged_finder(path):
+    """What the finder writes today: no intensity, peaks/sigma a tagged width."""
+    with h5py.File(path, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f["instrument/wavelength"] = [2.0, 10.0]
+        f["peaks/sigma"] = np.array([1.5, 2.0, 3.5])
+        f["peaks/sigma"].attrs["quantity"] = "gaussian_width_pixels"
+        f["peaks/pixel_r"] = np.array([5.0, 6.0, 7.0])
+        f["peaks/pixel_c"] = np.array([1.0, 2.0, 3.0])
+        f["bank"] = np.array([11, 12, 11])
+        f["peaks/run_index"] = np.array([0, 0, 1])
+        f["goniometer/axes"] = np.array([[0, 1, 0], [0, 0, 1], [0, 1, 0]], dtype=float)
+        f["goniometer/angles"] = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+
+
+def test_width_quantity_matches_the_replay_viewer():
+    from subhkl.viz import replay
+
+    assert dx._WIDTH_QUANTITY == replay.WIDTH_QUANTITY
+
+
+def test_roundtrip_finder_spots_are_strong_with_width_variance(tmp_path):
+    """Finder detections export as DIALS strong spots whose positional variance
+    is the fitted width squared (x, y) and a still's 1/12 (z)."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+
+    h5 = tmp_path / "finder.h5"
+    _write_tagged_finder(str(h5))
+    refl_path = str(tmp_path / "finder.refl")
+    dx.hdf5_to_dials(str(h5), str(tmp_path / "finder.expt"), refl_path, "CG4D")
+
+    refl = flex.reflection_table.from_file(refl_path)
+    assert refl.get_flags(refl.flags.strong).count(True) == 3
+    var = list(refl["xyzobs.px.variance"])
+    assert np.allclose(
+        var, [(2.25, 2.25, 1 / 12), (4.0, 4.0, 1 / 12), (12.25, 12.25, 1 / 12)]
+    )
+    # A width is not an intensity sigma, and nothing claims integration.
+    assert "intensity.sum.variance" not in refl
+    assert refl.get_flags(refl.flags.integrated_sum).count(True) == 0
+
+
+def test_roundtrip_untagged_sigma_stays_an_intensity_sigma(tmp_path):
+    """Without the width tag, peaks/sigma is an intensity uncertainty: no
+    positional variance or strong flag is invented from it."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+
+    h5 = tmp_path / "integrated.h5"
+    _write_integrated(str(h5))
+    refl_path = str(tmp_path / "integrated.refl")
+    dx.hdf5_to_dials(str(h5), str(tmp_path / "integrated.expt"), refl_path, "CG4D")
+
+    refl = flex.reflection_table.from_file(refl_path)
+    assert "xyzobs.px.variance" not in refl
+    assert refl.get_flags(refl.flags.strong).count(True) == 0
+    assert list(refl["intensity.sum.variance"]) == [100.0, 400.0, 900.0]
+
+
 def test_roundtrip_identifiers_persist_across_steps(tmp_path):
     """Every export backed by the same stack gives a frame the same identifier,
     as identifiers persist from dials.import through a native pipeline."""

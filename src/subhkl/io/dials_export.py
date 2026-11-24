@@ -134,6 +134,18 @@ def _mean_wavelength(f, lam):
     return 1.0
 
 
+# The ``quantity`` attribute that marks ``peaks/sigma`` as the finder's per-peak
+# Gaussian width in pixels, as opposed to the integrator's uncertainty on the
+# intensity (the two share a dataset name).  Kept equal to
+# ``subhkl.viz.replay.WIDTH_QUANTITY``, which is not imported here because that
+# module pulls in the integration stack.
+_WIDTH_QUANTITY = "gaussian_width_pixels"
+
+# Variance of a still's frame coordinate: a uniform distribution over one
+# image, which is what dials.find_spots reports for a single-image centroid.
+_STILL_Z_VARIANCE = 1.0 / 12.0
+
+
 def _collect_flat_peaks(f):
     """Read the flat ``peaks/*`` array schema (finder/indexer/integrator).
 
@@ -161,6 +173,11 @@ def _collect_flat_peaks(f):
         "lambda": col("peaks/lambda"),
         "intensity": col("peaks/intensity"),
         "sigma": col("peaks/sigma"),
+        # True when peaks/sigma is the finder's spot width, not an intensity sigma.
+        "sigma_is_width": (
+            "peaks/sigma" in f
+            and _decode(f["peaks/sigma"].attrs.get("quantity", "")) == _WIDTH_QUANTITY
+        ),
         "two_theta": col("peaks/two_theta"),
         "azimuthal": col("peaks/azimuthal"),
         "bank": col("bank") if "bank" in f else col("peaks/bank"),
@@ -877,6 +894,22 @@ def _build_reflection_table(
         key = "xyzcal.px" if peaks.get("predicted") else "xyzobs.px.value"
         table[key] = flex.vec3_double(xyz_px)
 
+    # Finder detections: peaks/sigma is each spot's fitted Gaussian width in
+    # pixels, so its square is the spot's positional variance in x and y (the
+    # same isotropic sigma^2 the replay viewer draws).  The frame coordinate of
+    # a still gets dials.find_spots' single-image value, 1/12.
+    observed_width = (
+        peaks.get("sigma_is_width")
+        and peaks["sigma"] is not None
+        and not peaks.get("predicted")
+        and "xyzobs.px.value" in table
+    )
+    if observed_width:
+        var = np.asarray(peaks["sigma"], dtype=float) ** 2
+        table["xyzobs.px.variance"] = flex.vec3_double(
+            [(float(v), float(v), _STILL_Z_VARIANCE) for v in var]
+        )
+
     # Diffracted beam wavevector s1: direction from the sample to the peak's
     # lab-frame position, scaled to |s1| = 1/wavelength (reciprocal Angstroms).
     # With the sample translated to the origin, the peak position is xyz - s_lab.
@@ -900,11 +933,15 @@ def _build_reflection_table(
         table["intensity.sum.value"] = flex.double(
             [float(x) for x in peaks["intensity"]]
         )
-        if peaks["sigma"] is not None:
+        # A spot width is not an uncertainty on the intensity.
+        if peaks["sigma"] is not None and not peaks.get("sigma_is_width"):
             variance = np.asarray(peaks["sigma"], dtype=float) ** 2
             table["intensity.sum.variance"] = flex.double([float(x) for x in variance])
 
-    # Flags describing what was computed.
+    # Flags describing what was computed.  Finder detections are DIALS' strong
+    # spots (what dials.find_spots flags them).
+    if observed_width:
+        table.set_flags(flex.bool(n, True), table.flags.strong)
     if peaks.get("predicted"):
         table.set_flags(flex.bool(n, True), table.flags.predicted)
     if peaks["h"] is not None:
