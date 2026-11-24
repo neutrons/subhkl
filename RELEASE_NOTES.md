@@ -33,6 +33,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     from the logged angles, it brings the per-run orientation error from
     1.0 to 0.17 degrees (IMAGINE-X L1 MBL) and from 1.8 to 0.12 degrees
     (MANDI Mpro as Laue), measured against full refinements.
+  - `solve --refinement band` no longer needs a cell: with none on the command
+    line or in the frames file it is determined from the images
+    (`blind_cell.determine_cell`), together with the lattice group that
+    constrains the refinement. On an uncalibrated detector the translation
+    of the detector against the sample is searched first
+    (`search_detector_shift`). On IMAGINE-X from nominal geometry the
+    refined cell has the shape of the one refined from the known cell
+    (T4 lysozyme c/a 1.562 both; L1 MBL all edges 1.3% short) and the same
+    fit (median 3.9 px both for T4 lysozyme). The overall scale is tied to
+    the wavelength band; `--cell-volume` or `--cell-length` set it.
   - `align_runs` measures the goniometer's rotation errors from the data,
     with no cell and no model of the goniometer: each run on its own gives
     the lattice in its nominal frame, and the rotation between the per-run

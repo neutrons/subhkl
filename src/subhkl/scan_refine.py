@@ -177,6 +177,67 @@ def default_band_binning(
     return 1
 
 
+def _blind_cell(frames, instrument, wavelength, modes, volume=None, length=None):
+    """Cell and lattice group from the images when none is given.
+
+    Laue chain of ``subhkl.search.blind_cell``: one lattice for all runs,
+    each run's orientation against it, alternated.  If the detector
+    geometry is free in the refinement (uncalibrated instrument), the
+    translation of the detector against the sample is searched first on the
+    lattice score, with the panels moved outwards by the instrument's
+    ``blind_detector_scale`` (radial, axial) if the beamline defines one: the
+    cell search needs pixel directions good to well under a degree, which
+    the refinement that follows does not.
+
+    Returns:
+        BlindCell (``setting_cell`` and ``setting_group`` go to the refinement)
+    """
+    from subhkl.search.blind_cell import (
+        determine_cell,
+        scaled_detectors,
+        search_detector_shift,
+    )
+
+    say = lambda line: print(f"[blind cell] {line}", flush=True)
+    radial, axial = BLIND_DETECTOR_SCALE.get(instrument, (0.0, 0.0))
+    shift = (0.0, 0.0, 0.0)
+    if modes & {"cylindrical", "global_trans"}:
+        shift, top, _tried = search_detector_shift(
+            frames, instrument, wavelength, radial=radial, axial=axial, log=say
+        )
+        say(
+            f"detector shift [mm] {np.round(1e3 * shift, 1).tolist()} (score {1e3 * top:.1f})"
+        )
+    else:
+        radial = axial = 0.0
+    with scaled_detectors(instrument, radial, axial, shift=shift):
+        found, _rotations = determine_cell(
+            frames,
+            instrument,
+            wavelength=wavelength,
+            volume=volume,
+            length=length,
+            log=say,
+        )
+    say(
+        "cell "
+        + " ".join(f"{v:.3f}" for v in found.setting_cell)
+        + f", lattice group {found.setting_group}"
+        + (
+            ""
+            if found.diagnostics["scale_determined"]
+            else "; SCALE NOT DETERMINED by the data"
+        )
+    )
+    return found
+
+
+# Panels of an uncalibrated instrument sit further out than nominal by these
+# relative amounts (radial in x and z, axial in y); found by the blind
+# orientation search on two independent crystals each.
+BLIND_DETECTOR_SCALE = {"CG4D": (0.065, 0.05)}
+
+
 def run_scan_refinement(
     frames,
     output,
@@ -203,8 +264,13 @@ def run_scan_refinement(
     search_seed=0,
     global_rot_axis=(0.0, 1.0, 0.0),
     border_width=4,
+    blind_cell_volume=None,
+    blind_cell_length=None,
 ):
     """Index from finder observations or count bins and refine with band-geometry modes.
+
+    Without a cell (none passed, none in the frames file) the cell and its
+    lattice group are determined from the images first (``_blind_cell``).
 
     The bootstrap supplies orientation only. Detector geometry starts from
     instrument metrology, matching the staged reference protocol. Counts mode
@@ -282,6 +348,16 @@ def run_scan_refinement(
     for band in (wavelength, assignment_wavelength):
         if not 0 < band[0] < band[1]:
             raise ValueError("wavelength bounds must be positive and increasing")
+    blind_cell_found = None
+    with h5py.File(frames) as f:
+        cell_missing = cell is None and "sample/a" not in f
+    if cell_missing:
+        blind_cell_found = _blind_cell(
+            frames, instrument, wavelength, chosen, blind_cell_volume, blind_cell_length
+        )
+        cell = [float(v) for v in blind_cell_found.setting_cell]
+        if space_group is None:
+            space_group = blind_cell_found.setting_group
     with h5py.File(frames) as f:
         if "goniometer/translations" in f and np.any(f["goniometer/translations"][()]):
             raise ValueError("band refinement starts from nominal sample translations")

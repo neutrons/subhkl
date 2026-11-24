@@ -1842,6 +1842,8 @@ def search_detector_shift(
         (shift [m] (3,), score, {shift: score})
     """
     say = log or (lambda *_: None)
+    kw.setdefault("grid", 384)  # the Laue settings of ``determine_cell``
+    kw.setdefault("x_min", 35.0)
 
     def score(shift):
         with scaled_detectors(instrument, radial, axial, shift=shift):
