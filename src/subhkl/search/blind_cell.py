@@ -873,6 +873,27 @@ def align_runs(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
                 f"the runs rotate about one axis, [{mean[0]:+.3f} {mean[1]:+.3f} {mean[2]:+.3f}] "
                 f"in the lab frame, {tilt:.2f} deg from the nominal one"
             )
+    if axis is not None and not all(aligned):
+        # A run that gave no lattice of its own is placed with the axis the
+        # other runs share, turned by its nominal angle from the first run.
+        from scipy.spatial.transform import Rotation
+
+        i0 = runs[first][0]
+        for r, frames in enumerate(runs):
+            if aligned[r]:
+                continue
+            rel = r_nom[frames[0]] @ r_nom[i0].T
+            v = np.array(
+                [rel[2, 1] - rel[1, 2], rel[0, 2] - rel[2, 0], rel[1, 0] - rel[0, 1]]
+            )
+            theta = np.radians(_rotation_angle(rel)) * np.sign(v @ axis_nom)
+            fixed = Rotation.from_rotvec(theta * axis).as_matrix() @ r_nom[i0]
+            corrections[r] = r_nom[frames[0]].T @ fixed
+            for i in frames:
+                rotations[i] = r_nom[i] @ corrections[r]
+            say(
+                f"run {r}: placed with the common axis ({_rotation_angle(corrections[r]):.2f} deg)"
+            )
     return RunAlignment(
         rotations=rotations,
         corrections=corrections,
