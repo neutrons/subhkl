@@ -56,7 +56,7 @@ def _accumulate_impl(grid, tof, pix, pos, rot, l1, q_max, n):
     return grid.at[flat].add(1.0, mode="drop")
 
 
-def reciprocal_histogram(merged, instrument, d_min, n):
+def reciprocal_histogram(merged, instrument, d_min, n, frames=None, rotations=None):
     """Event density on an n^3 grid over |q_i| <= 1/d_min, sample frame.
 
     Args:
@@ -64,6 +64,9 @@ def reciprocal_histogram(merged, instrument, d_min, n):
         instrument: instrument name (nominal detector geometry and L1)
         d_min: [Angstrom] the grid spans |q_i| <= 1 / d_min
         n: [-] grid points per axis
+        frames: optional image indices to use (for example one run)
+        rotations: optional (n_images, 3, 3) goniometer rotations to use
+            instead of the ones in the file
     Returns:
         (grid [counts] (n, n, n), q_max [1/Angstrom], events read)
     """
@@ -79,11 +82,13 @@ def reciprocal_histogram(merged, instrument, d_min, n):
         rot = Goniometer.from_h5_file(f).rotation
     if rot.ndim == 2:
         rot = np.broadcast_to(rot, (len(images), 3, 3))
+    if rotations is not None:
+        rot = np.asarray(rotations)
     pos_cache = {}
     grid = jnp.zeros(n * n * n, dtype=jnp.float32)
     n_events = 0
     with EventStore(merged) as store:
-        for i in range(len(images)):
+        for i in range(len(images)) if frames is None else frames:
             bank = int(bank_ids[i])
             if bank not in pos_cache:
                 pos_cache[bank] = jnp.array(
@@ -656,7 +661,16 @@ def describe_lattice(A):
     }
 
 
-def find_cell(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
+def find_cell(
+    merged,
+    instrument,
+    d_min=3.0,
+    grid=768,
+    x_min=12.0,
+    log=None,
+    frames=None,
+    rotations=None,
+):
     """Unit cell, absolute scale and orientation from raw events.
 
     Args:
@@ -668,11 +682,16 @@ def find_cell(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
             from the origin and must hold a few cell lengths
         x_min: [Angstrom] shortest lattice vector considered
         log: optional callable for progress lines
+        frames: optional image indices to use (for example one run)
+        rotations: optional (n_images, 3, 3) goniometer rotations to use
+            instead of the ones in the file
     Returns:
         BlindCell
     """
     say = log or (lambda *_: None)
-    counts, q_max, n_events = reciprocal_histogram(merged, instrument, d_min, grid)
+    counts, q_max, n_events = reciprocal_histogram(
+        merged, instrument, d_min, grid, frames=frames, rotations=rotations
+    )
     voxel = 1.0 / (2.0 * q_max)
     density = bragg_excess(counts)
     say(
@@ -709,6 +728,161 @@ def find_cell(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
         + f"; centring {info['centring']}; lattice rotations: {len(info['operations'])} ({info['lattice_group']})"
     )
     return BlindCell(**info, diagnostics=diag)
+
+
+def _nearest_rotation(M):
+    u, _s, vt = np.linalg.svd(M)
+    return u @ np.diag([1.0, 1.0, np.sign(np.linalg.det(u @ vt))]) @ vt
+
+
+def _rotation_angle(Rm):
+    return float(np.degrees(np.arccos(np.clip((np.trace(Rm) - 1.0) / 2.0, -1.0, 1.0))))
+
+
+def relate_lattices(basis, reference, tol=0.05):
+    """Rotation M with basis ~ M @ reference, for two bases of one lattice
+    that may differ by an integer change of basis and a small rotation.
+
+    Returns:
+        (M, ok): ok is False when no integer change of basis of determinant
+        +-1 relates them, or the lattices do not coincide after the rotation
+        to within ``tol`` of the shortest axis.
+    """
+    T = np.rint(np.linalg.solve(basis, reference))
+    if abs(round(float(np.linalg.det(T)))) != 1:
+        return np.eye(3), False
+    M = _nearest_rotation(basis @ T @ np.linalg.inv(reference))
+    resid = np.abs(M.T @ basis @ T - reference).max()
+    if resid > tol * np.linalg.norm(reference, axis=0).min():
+        return np.eye(3), False
+    return M, True
+
+
+@dataclass
+class RunAlignment:
+    """Result of ``align_runs``."""
+
+    rotations: np.ndarray  # (n_images, 3, 3) corrected goniometer rotations
+    corrections: list  # per run: rotation applied in the nominal sample frame
+    angles: list  # [degree] size of each correction
+    aligned: list  # per run: False where the run's lattice could not be related
+    cells: list  # per run: reduced cell found from that run alone
+    axis: (
+        np.ndarray | None
+    )  # lab-frame axis of the run-to-run rotations, if they share one
+    axis_nominal: np.ndarray | None
+    axis_tilt: float | None  # [degree] between the two
+
+
+def align_runs(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
+    """Goniometer corrections from the data, with no cell and no model of
+    the goniometer.
+
+    Combining runs needs the rotation between them, and a goniometer whose
+    axes are a few degrees off spoils that (the lattices of the runs no
+    longer coincide and the pooled cell search blurs).  But each run on its
+    own gives the lattice in its own nominal sample frame.  The same crystal
+    was measured throughout, so the rotation that carries the lattice of the
+    first run onto the lattice of run r is the error of run r's rotation
+    relative to the first.  The lattices may come out in equivalent bases;
+    the integer change of basis is found first, which works while the error
+    is small against the angles between lattice vectors.
+
+    Args:
+        merged: images file with pixel-sorted events, goniometer angles and
+            ``file_offsets`` (first image of each run)
+        instrument: instrument name
+        d_min, grid, x_min: as for ``find_cell``, applied to single runs
+        log: optional callable for progress lines
+    Returns:
+        RunAlignment.  ``rotations`` goes to ``find_cell(rotations=...)``.
+        When the run-to-run rotations share one axis, it is reported with
+        its tilt from the nominal axis: a goniometer calibration.
+    """
+    say = log or (lambda *_: None)
+    with h5py.File(merged, "r") as f:
+        n_img = f["images"].shape[0]
+        offsets = f["file_offsets"][()].tolist() if "file_offsets" in f else [0]
+        r_nom = Goniometer.from_h5_file(f).rotation
+    if r_nom.ndim == 2:
+        r_nom = np.broadcast_to(r_nom, (n_img, 3, 3))
+    r_nom = np.array(r_nom, dtype=float)
+    bounds = [*offsets, n_img]
+    runs = [range(bounds[r], bounds[r + 1]) for r in range(len(offsets))]
+
+    bases, cells = [], []
+    for r, frames in enumerate(runs):
+        try:
+            found = find_cell(
+                merged, instrument, d_min=d_min, grid=grid, x_min=x_min, frames=frames
+            )
+            bases.append(found.basis)
+            cells.append(found.cell)
+        except ValueError:
+            bases.append(None)
+            cells.append(None)
+    first = next((r for r, b in enumerate(bases) if b is not None), None)
+    if first is None:
+        raise ValueError("No run gave a lattice on its own.")
+    corrections, aligned = [], []
+    for r, basis in enumerate(bases):
+        ok, M = basis is not None, np.eye(3)
+        if ok and r != first:
+            M, ok = relate_lattices(basis, bases[first])
+        corrections.append(M)
+        aligned.append(bool(ok))
+        say(
+            f"run {r}: "
+            + (
+                f"correction {_rotation_angle(M):.2f} deg"
+                if ok
+                else "not aligned (its lattice does not match the first run's)"
+            )
+        )
+    rotations = r_nom.copy()
+    for r, frames in enumerate(runs):
+        for i in frames:
+            rotations[i] = r_nom[i] @ corrections[r]
+
+    # Do the corrected run-to-run rotations share one axis?  (lab frame)
+    def rel_axes(rot):
+        out = []
+        for r in range(len(runs)):
+            if r == first or not aligned[r]:
+                continue
+            rel = rot[runs[r][0]] @ rot[runs[first][0]].T
+            v = np.array(
+                [rel[2, 1] - rel[1, 2], rel[0, 2] - rel[2, 0], rel[1, 0] - rel[0, 1]]
+            )
+            if np.linalg.norm(v) > 0.03:  # more than about a degree apart
+                out.append(v / np.linalg.norm(v))
+        return np.array(out)
+
+    axis = axis_nom = tilt = None
+    ax, ax_n = rel_axes(rotations), rel_axes(r_nom)
+    if len(ax) >= 2 and len(ax) == len(ax_n):
+        ax = ax * np.sign(np.sum(ax * ax_n, axis=1))[:, None]  # same sense as nominal
+        mean, mean_n = ax.mean(0), ax_n.mean(0)
+        mean, mean_n = mean / np.linalg.norm(mean), mean_n / np.linalg.norm(mean_n)
+        scatter = np.degrees(np.arccos(np.clip(ax @ mean, -1, 1)))
+        scatter_n = np.degrees(np.arccos(np.clip(ax_n @ mean_n, -1, 1)))
+        if scatter.max() < 0.5 and scatter_n.max() < 0.5:
+            axis, axis_nom = mean, mean_n
+            tilt = float(np.degrees(np.arccos(np.clip(mean @ mean_n, -1, 1))))
+            say(
+                f"the runs rotate about one axis, [{mean[0]:+.3f} {mean[1]:+.3f} {mean[2]:+.3f}] "
+                f"in the lab frame, {tilt:.2f} deg from the nominal one"
+            )
+    return RunAlignment(
+        rotations=rotations,
+        corrections=corrections,
+        angles=[_rotation_angle(M) for M in corrections],
+        aligned=aligned,
+        cells=cells,
+        axis=axis,
+        axis_nominal=axis_nom,
+        axis_tilt=tilt,
+    )
 
 
 def write_seed(found, merged, instrument, out):

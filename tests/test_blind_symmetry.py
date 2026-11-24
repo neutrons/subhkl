@@ -17,6 +17,7 @@ from subhkl.search.blind_cell import (
     operations_in_basis,
     reduce_basis,
     refine_basis,
+    relate_lattices,
     symmetrized_cell,
 )
 from subhkl.search.space_group import (
@@ -529,3 +530,22 @@ def test_presence_test_refuses_unbounded_scales():
     obs.I, obs.sig = obs.I * scale, obs.sig * scale
     with pytest.raises(ValueError, match="not bounded"):
         laue_class_presence(obs, mats)
+
+
+def test_relate_lattices_recovers_a_small_rotation_between_equivalent_bases():
+    """The same lattice, turned by 2.5 degrees and written in another
+    basis: the rotation comes back; a different lattice is refused."""
+    A = Rotation.from_euler("xyz", [20, -35, 50], degrees=True).as_matrix() @ _basis(
+        (60.9, 60.9, 97.1, 90.0, 90.0, 120.0)
+    )
+    turn = Rotation.from_rotvec(
+        np.radians(2.5) * np.array([0.3, -0.5, 0.81])
+    ).as_matrix()
+    rebase = np.array(
+        [[0, -1, 0], [1, -1, 0], [0, 0, 1]]
+    )  # an equivalent hexagonal basis
+    M, ok = relate_lattices(turn @ A @ rebase, A)
+    assert ok
+    assert np.allclose(M, turn, atol=1e-6)
+    other = _basis((60.9, 60.9, 110.0, 90.0, 90.0, 120.0))
+    assert not relate_lattices(turn @ other, A)[1]

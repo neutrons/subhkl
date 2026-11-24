@@ -4,8 +4,10 @@ Starts from a merged images file with events (``reduce`` then
 ``merge-images``; the cell given to ``merge-images`` is a placeholder) and
 needs no cell, orientation or space group:
 
-1. cell, absolute scale and orientation from the 3D Fourier transform of
-   the raw events                        (subhkl.search.blind_cell.find_cell)
+1. the lattice of each run on its own, and from their differences the
+   rotation errors of the goniometer     (subhkl.search.blind_cell.align_runs);
+   then cell, absolute scale and orientation from the 3D Fourier transform
+   of the raw events of all runs                                (find_cell)
 2. detector geometry and per-run orientation from the existing refinement,
    seeded by step 1                      (solve --refinement band --bootstrap)
 3. one prediction and integration in P 1 (peak-predictor, integrator)
@@ -35,6 +37,7 @@ import h5py
 import numpy as np
 
 from subhkl.search.blind_cell import (
+    align_runs,
     cell_of,
     conventional_basis,
     find_cell,
@@ -103,13 +106,23 @@ def main():
     pred, integrated = work / "blind_pred.h5", work / "integrated_p1.h5"
 
     print("1. cell and orientation from raw events")
+    say = lambda m: print("  " + m)
+    runs = align_runs(
+        args.merged,
+        args.instrument,
+        d_min=args.cell_d_min,
+        grid=args.grid,
+        x_min=args.x_min,
+        log=say,
+    )
     found = find_cell(
         args.merged,
         args.instrument,
         d_min=args.cell_d_min,
         grid=args.grid,
         x_min=args.x_min,
-        log=lambda m: print("  " + m),
+        log=say,
+        rotations=runs.rotations,
     )
     band = write_seed(found, args.merged, args.instrument, seed)
     # The refinement keeps the metric symmetry of the lattice (not of the
@@ -258,6 +271,9 @@ def main():
         "lattice_points_per_cell": int(mult),
         "lattice_group": found.lattice_group,
         "cell_search": found.diagnostics,
+        "run_corrections_deg": runs.angles,
+        "rotation_axis_lab": None if runs.axis is None else runs.axis.tolist(),
+        "rotation_axis_tilt_deg": runs.axis_tilt,
         "point_group": laue.point_group,
         "laue_class": laue.laue,
         "operations": [
