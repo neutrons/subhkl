@@ -21,7 +21,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     objective, evaluated on the count bins (`ladder_scores`), decides among
     them. On IMAGINE-X T4 lysozyme and L1 MBL and on MANDI T4 lysozyme and
     Mpro with the time of flight ignored it returns the right lattice, with
-    centring, and the scale within 3%.
+    centring. Where the band limits hold the scale (`laue_scale`: IMAGINE-X's
+    3.0 to 4.3 Angstrom) the edges are within about 1%; with a band spanning
+    an octave the data hold no scale and it is reported as undetermined
+    (about 10%).
+  - `refine_run_rotations` finds each run's orientation against the shared
+    lattice from Laue images: the band objective proposes a turn, the share
+    of count bins the full lattice indexes (`indexed_share`) accepts it.
+    Alternated with `find_cell` (`examples/blind_cell_laue.py`) and started
+    from the logged angles, it brings the per-run orientation error from
+    1.0 to 0.17 degrees (IMAGINE-X L1 MBL) and from 1.8 to 0.12 degrees
+    (MANDI Mpro as Laue), measured against full refinements.
   - `align_runs` measures the goniometer's rotation errors from the data,
     with no cell and no model of the goniometer: each run on its own gives
     the lattice in its nominal frame, and the rotation between the per-run

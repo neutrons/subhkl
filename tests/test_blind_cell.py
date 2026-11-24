@@ -13,9 +13,11 @@ from subhkl.search.blind_cell import (
     describe_lattice,
     direct_space_map,
     find_peaks,
+    indexed_share,
     ladder_scores,
     lattice_basis,
     lattice_operations,
+    laue_scale,
     merge_radial_peaks,
     operations_in_basis,
     reduce_basis,
@@ -313,3 +315,38 @@ def test_candidate_lattices_contain_the_lattice():
         for B, _share in cands
     ]
     assert any(hit)
+
+
+def test_indexed_share_tells_the_orientation_from_a_wrong_one():
+    """The full lattice indexes the bins at the true orientation and falls
+    to the chance level a few degrees away."""
+    rng = np.random.default_rng(19)
+    A = Rotation.from_euler("xyz", [12, -28, 47], degrees=True).as_matrix() @ _basis(
+        (40.0, 52.0, 66.0, 90.0, 104.0, 90.0)
+    )
+    obs = _laue_bins(A, rng)
+    true = indexed_share(A, obs)
+    turned = indexed_share(
+        A, obs, turn=Rotation.from_rotvec(np.radians([4.0, -3.0, 5.0])).as_matrix()
+    )
+    chance = indexed_share(A, obs, turn=Rotation.random(random_state=5).as_matrix())
+    assert true > 0.95
+    assert turned < chance + 0.1
+    assert true > 2 * turned
+
+
+def test_laue_scale_reads_the_scale_off_a_narrow_band_only():
+    """With a band of 3.0 to 4.3 A the share of indexed bins peaks at the
+    right scale; with an octave it does not, and the scale is left alone."""
+    A = Rotation.from_euler("xyz", [12, -28, 47], degrees=True).as_matrix() @ _basis(
+        (40.0, 52.0, 66.0, 90.0, 104.0, 90.0)
+    )
+    narrow = _laue_bins(A, np.random.default_rng(23), lam=(3.0, 4.3))
+    factor, contrast, found = laue_scale(0.95 * A, narrow)
+    assert found
+    assert abs(0.95 * factor - 1.0) < 0.02
+    wide = _laue_bins(A, np.random.default_rng(23), lam=(2.0, 4.0))
+    factor, wide_contrast, found = laue_scale(0.95 * A, wide)
+    assert wide_contrast < contrast
+    assert not found
+    assert factor == 1.0

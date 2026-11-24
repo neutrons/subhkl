@@ -428,7 +428,9 @@ def laue_observations(
     return {"dirs": dirs, "q_lo": qlo, "q_hi": qhi, "weights": wts / wts.sum()}
 
 
-def candidate_lattices(pos, height, n_peaks=30, n_fit=80, tol=0.15, max_candidates=300):
+def candidate_lattices(
+    pos, height, n_peaks=30, n_fit=80, tol=0.15, max_candidates=300, min_length=0.0
+):
     """Lattices that triples of the strongest map peaks span.
 
     Each triple of non-coplanar peaks is taken as a basis, refined by least
@@ -437,6 +439,8 @@ def candidate_lattices(pos, height, n_peaks=30, n_fit=80, tol=0.15, max_candidat
     which of them is the lattice (a strong peak at half a lattice vector, or
     a missing short one, gives sub- and superlattices that index the peaks
     almost as well); ``ladder_scores`` decides.
+
+    ``min_length`` [Angstrom] drops lattices with a shorter basis vector.
 
     Returns:
         list of (basis, share of the peak weight it indexes), best share first
@@ -466,7 +470,14 @@ def candidate_lattices(pos, height, n_peaks=30, n_fit=80, tol=0.15, max_candidat
             A = (X * W) @ N.T @ np.linalg.inv(M)
         if good is None or good.sum() < 4:
             continue
-        found.append((reduce_basis(A), float(fit_h[good].sum() / fit_h.sum())))
+        A = reduce_basis(A)
+        # The peaks were searched beyond ``min_length`` only; a basis with a
+        # shorter vector is a combination of errors, and the score would
+        # favour it, because every bin satisfies the Laue condition of a
+        # vector that is short enough.
+        if np.linalg.norm(A, axis=0).min() < min_length:
+            continue
+        found.append((A, float(fit_h[good].sum() / fit_h.sum())))
     found.sort(key=lambda t: -t[1])
     unique = []
     for A, share in found:
@@ -1226,7 +1237,7 @@ def find_cell(
         # The map proposes, the ladder objective decides: a linear map takes
         # every structure in the data for a peak, whereas a score of a whole
         # lattice on the count bins averages out what does not belong to it.
-        cands = candidate_lattices(pos, height)
+        cands = candidate_lattices(pos, height, min_length=0.8 * x_min)
         if not cands:
             raise ValueError(
                 "No three independent peaks in the direct-space map: no lattice in the images."
@@ -1235,6 +1246,8 @@ def find_cell(
             merged, instrument, wavelength, d_min, frames=frames, rotations=rotations
         )
         scores, best, A, top, z = ladder_scores([c[0] for c in cands], obs)
+        factor, contrast, scale_found = laue_scale(A, obs)
+        A = factor * A
         order = np.argsort(-scores)
         other = next(
             (
@@ -1256,12 +1269,20 @@ def find_cell(
             "map_share_of_winner": cands[best][1],
             "map_rank_of_winner": int(best),
             "bins": len(obs["weights"]),
+            "scale_factor": factor,
+            "scale_contrast": contrast,
+            "scale_determined": scale_found,
             "events": n_events,
         }
         say(
             f"{len(cands)} candidate lattices from the map, scored on {len(obs['weights'])} count bins: "
             f"best {1e3 * top:.2f} (z {z:.0f} against random orientations), next different lattice "
             f"{1e3 * other:.2f}; the map alone ranked it {best + 1}"
+        )
+        say(
+            f"scale from the band limits: factor {factor:.3f}, contrast {contrast:.2f}"
+            if scale_found
+            else f"the band limits do not fix the scale (contrast {contrast:.2f}): the scale is the map's, good to about 10%"
         )
     else:
         A, good, diag = lattice_basis(pos, height, g, voxel)
@@ -1341,7 +1362,16 @@ class RunAlignment:
     axis_tilt: float | None  # [degree] between the two
 
 
-def align_runs(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
+def align_runs(
+    merged,
+    instrument,
+    d_min=3.0,
+    grid=768,
+    x_min=12.0,
+    log=None,
+    wavelength=None,
+    min_z=8.0,
+):
     """Goniometer corrections from the data, with no cell and no model of
     the goniometer.
 
@@ -1361,6 +1391,11 @@ def align_runs(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
         instrument: instrument name
         d_min, grid, x_min: as for ``find_cell``, applied to single runs
         log: optional callable for progress lines
+        wavelength: [Angstrom] (lam_min, lam_max) for Laue data; each run's
+            lattice then comes from ``find_cell`` in Laue mode
+        min_z: [-] for Laue data, a run's lattice is only used if its ladder
+            score stands this many standard deviations above random
+            orientations
     Returns:
         RunAlignment.  ``rotations`` goes to ``find_cell(rotations=...)``.
         When the run-to-run rotations share one axis, it is reported with
@@ -1381,8 +1416,19 @@ def align_runs(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
     for r, frames in enumerate(runs):
         try:
             found = find_cell(
-                merged, instrument, d_min=d_min, grid=grid, x_min=x_min, frames=frames
+                merged,
+                instrument,
+                d_min=d_min,
+                grid=grid,
+                x_min=x_min,
+                frames=frames,
+                wavelength=wavelength,
             )
+            if (
+                wavelength is not None
+                and found.diagnostics.get("ladder_z", 0.0) < min_z
+            ):
+                raise ValueError("no lattice stands out in this run")
             bases.append(found.basis)
             cells.append(found.cell)
         except ValueError:
@@ -1395,7 +1441,15 @@ def align_runs(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
     for r, basis in enumerate(bases):
         ok, M = basis is not None, np.eye(3)
         if ok and r != first:
-            M, ok = relate_lattices(basis, bases[first])
+            if wavelength is None:
+                M, ok = relate_lattices(basis, bases[first])
+            else:
+                # In Laue mode the scale of a single run is only good to a
+                # few percent: compare the lattices at equal volume.
+                same = basis * (
+                    abs(np.linalg.det(bases[first])) / abs(np.linalg.det(basis))
+                ) ** (1.0 / 3.0)
+                M, ok = relate_lattices(same, bases[first], tol=0.1)
         corrections.append(M)
         aligned.append(bool(ok))
         say(
@@ -1471,6 +1525,222 @@ def align_runs(merged, instrument, d_min=3.0, grid=768, x_min=12.0, log=None):
         axis_nominal=axis_nom,
         axis_tilt=tilt,
     )
+
+
+def ladder_scale(basis, obs, n_zones=60, span=0.25, steps=101):
+    """The ladder objective as a function of the lattice's overall scale.
+
+    Returns:
+        (scale factors (steps,), scores (steps,)); the lattice is
+        ``factor * basis``
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from subhkl.search.scan_band import band_sum
+
+    D, LO, HI, W = (
+        jnp.asarray(obs[k], dtype=jnp.float32)
+        for k in ("dirs", "q_lo", "q_hi", "weights")
+    )
+    X, zw, _uvw = _ladder_vectors(basis, n_zones)
+    Xj, zwj = jnp.asarray(X, jnp.float32), jnp.asarray(zw, jnp.float32)
+    factors = np.linspace(1.0 - span, 1.0 + span, steps)
+    scores = jax.jit(
+        lambda F: jax.lax.map(lambda f: band_sum(f * Xj, D, LO, HI, W, zwj), F)
+    )(jnp.asarray(factors, jnp.float32))
+    return factors, np.asarray(scores)
+
+
+def indexed_share(basis, obs, turn=None, tol=0.08, samples=81):
+    """Share of the count-bin weight that the full lattice indexes.
+
+    A bin is indexed if, for some |q| in its interval, the scattering vector
+    lies within ``tol`` of a reciprocal lattice point in every index.  The
+    ladder objective looks at low-order lattice vectors only and has false
+    maxima a few degrees from the truth; this test uses the whole lattice,
+    and a wrong orientation falls to the chance level.
+
+    Args:
+        turn: optional (3, 3) rotation applied to the lattice
+    Returns:
+        share [-] between 0 and 1
+    """
+    A = np.asarray(basis, dtype=float) if turn is None else np.asarray(turn) @ basis
+    w = obs["weights"]
+    t = np.linspace(0.0, 1.0, samples)[None, :]
+    q = obs["q_lo"][:, None] + t * (obs["q_hi"] - obs["q_lo"])[:, None]
+    h = (obs["dirs"] @ A)[:, None, :] * q[:, :, None]
+    miss = np.abs(h - np.rint(h)).max(axis=2).min(axis=1)
+    return float((w * (miss < tol)).sum() / w.sum())
+
+
+def laue_scale(
+    basis, obs, span=0.15, steps=61, tol=0.05, max_bins=6000, min_contrast=0.25
+):
+    """Overall scale of a lattice from Laue count bins, where they hold it.
+
+    Directions fix the shape of a lattice but not its size; the size is in
+    the band limits only.  A bin whose |q| interval is shorter than the
+    spacing of lattice points along its ray is indexed at some scales and
+    not at others, so the share of bins the full lattice indexes
+    (``indexed_share``) has a maximum at the right scale.  How clear that
+    maximum is depends on the band: clear for a band of 3.0 to 4.3 Angstrom,
+    absent for one spanning an octave, where every ray has a lattice point
+    inside every interval.
+
+    Returns:
+        (factor, contrast, determined): the lattice is ``factor * basis``;
+        ``contrast`` is (max - min) / max of the share over the scan;
+        ``determined`` says whether it reaches ``min_contrast`` (otherwise
+        the factor is 1)
+    """
+    top = np.argsort(-obs["weights"])[:max_bins]
+    sub = {k: v[top] for k, v in obs.items()}
+    factors = np.linspace(1.0 - span, 1.0 + span, steps)
+    share = np.array(
+        [indexed_share(f * np.asarray(basis), sub, tol=tol) for f in factors]
+    )
+    contrast = float((share.max() - share.min()) / max(share.max(), 1e-12))
+    if contrast < min_contrast:
+        return 1.0, contrast, False
+    # middle of the plateau: steadier than the highest point of a flat top
+    high = factors[share >= share.max() - 0.25 * (share.max() - share.min())]
+    return float(0.5 * (high.min() + high.max())), contrast, True
+
+
+def refine_run_rotations(
+    merged,
+    instrument,
+    basis,
+    wavelength,
+    rotations=None,
+    d_min=3.0,
+    n_zones=60,
+    span_deg=3.0,
+    max_bins=8192,
+    log=None,
+):
+    """Orientation of every run against one shared lattice, for Laue data.
+
+    The lattices of single runs (``align_runs``) give the rotation between
+    runs to about a degree.  With the cell fixed, a run has only its
+    orientation left to determine, and the ladder objective pins that down
+    much better: for every run the lattice is turned by a small rotation
+    that maximises the band objective on that run's count bins (a grid over
+    +-``span_deg`` and a gradient polish propose; the share of bins the full
+    lattice indexes, ``indexed_share``, accepts or rejects).  The result
+    is a correction of each run's rotation, in the same sense as
+    ``align_runs``, which ``goniometer_angles_for`` turns into motor angles.
+
+    Args:
+        merged: images file with goniometer angles and ``file_offsets``
+        basis: (3, 3) shared direct basis, columns [Angstrom], sample frame
+        wavelength: [Angstrom] (lam_min, lam_max)
+        rotations: (n_images, 3, 3) current rotations; default the nominal ones
+        span_deg: [degree] half-width of the search around each run's
+            current orientation
+        max_bins: count bins used per run (the most significant)
+    Returns:
+        (rotations (n_images, 3, 3), angles [degree] per run, per run the
+        score before and after and the share of bins indexed before and
+        after (n_runs, 4))
+    """
+    import jax
+    import jax.numpy as jnp
+    from scipy.optimize import minimize
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.search.scan_band import band_sum, rodrigues_jax
+
+    say = log or (lambda *_: None)
+    with h5py.File(merged, "r") as f:
+        n_img = f["images"].shape[0]
+        offsets = f["file_offsets"][()].tolist() if "file_offsets" in f else [0]
+        r_nom = Goniometer.from_h5_file(f).rotation
+    if r_nom.ndim == 2:
+        r_nom = np.broadcast_to(r_nom, (n_img, 3, 3))
+    rot = np.array(r_nom if rotations is None else rotations, dtype=float)
+    bounds = [*offsets, n_img]
+    _X, zw, uvw = _ladder_vectors(basis, n_zones)
+    uvw_j, zw_j = jnp.asarray(uvw, jnp.float32), jnp.asarray(zw, jnp.float32)
+    A0 = jnp.asarray(basis, jnp.float32)
+
+    def score(delta, D, LO, HI, W):
+        return band_sum(uvw_j @ (rodrigues_jax(delta) @ A0).T, D, LO, HI, W, zw_j)
+
+    score_j = jax.jit(score)
+    grid_j = jax.jit(
+        lambda G, D, LO, HI, W: jax.lax.map(lambda d: score(d, D, LO, HI, W), G)
+    )
+    grad_j = jax.jit(
+        jax.value_and_grad(lambda d, D, LO, HI, W: -score(d, D, LO, HI, W))
+    )
+    steps = np.arange(-span_deg, span_deg + 0.01, 1.0)
+    G = jnp.asarray(
+        np.radians([(a, b, c) for a in steps for b in steps for c in steps]),
+        jnp.float32,
+    )
+    out = rot.copy()
+    angles, gains = [], []
+    for r in range(len(offsets)):
+        frames = range(bounds[r], bounds[r + 1])
+        try:
+            obs = laue_observations(
+                merged,
+                instrument,
+                wavelength,
+                d_min,
+                frames=frames,
+                rotations=rot,
+                max_bins=max_bins,
+            )
+        except ValueError:
+            angles.append(0.0)
+            gains.append((np.nan, np.nan, np.nan, np.nan))
+            continue
+        m = len(obs["weights"])
+        pad = max_bins - m
+        data = tuple(
+            jnp.asarray(
+                np.pad(obs[k], [(0, pad)] + [(0, 0)] * (obs[k].ndim - 1)), jnp.float32
+            )
+            for k in ("dirs", "q_lo", "q_hi", "weights")
+        )
+        before = float(score_j(jnp.zeros(3, jnp.float32), *data))
+        coarse = np.asarray(grid_j(G, *data))
+
+        def f(d, data=data):
+            v, g = grad_j(jnp.asarray(d, jnp.float32), *data)
+            return float(v), np.asarray(g, dtype=np.float64)
+
+        # Two proposals, the nearest maximum and the best of the grid; the
+        # share of bins the full lattice indexes decides between them and
+        # staying put (the objective alone has false maxima).
+        delta, after = np.zeros(3), before
+        share = share0 = indexed_share(basis, obs)
+        for start in (
+            np.zeros(3),
+            np.asarray(G[int(np.argmax(coarse))], dtype=np.float64),
+        ):
+            res = minimize(
+                f, start, jac=True, method="L-BFGS-B", options={"maxiter": 60}
+            )
+            got = indexed_share(
+                basis, obs, turn=Rotation.from_rotvec(res.x).as_matrix()
+            )
+            if got > share:
+                delta, after, share = res.x, float(-res.fun), got
+        M = Rotation.from_rotvec(delta).as_matrix()
+        for i in frames:
+            out[i] = rot[i] @ M
+        angles.append(float(np.degrees(np.linalg.norm(delta))))
+        gains.append((before, after, share0, share))
+        say(
+            f"run {r}: turned by {angles[-1]:.2f} deg, score {1e3 * before:.2f} -> {1e3 * after:.2f}, "
+            f"bins indexed {100 * share0:.0f}% -> {100 * share:.0f}%"
+        )
+    return out, angles, np.array(gains)
 
 
 def goniometer_angles_for(rotations, axes, start):

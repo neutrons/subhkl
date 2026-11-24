@@ -39,6 +39,9 @@ detector geometry and rotations from an earlier solve (--geometry), the
 MANDI cases nominal detectors and rotations from ``align_runs``
 (--rotations).
 
+See ``blind_cell_laue.py`` for the chain that also refines each run's
+orientation and starts from the logged goniometer angles.
+
 Usage:
     python laue_poisson_summation.py merged.h5 INSTRUMENT lam_min lam_max [--geometry solve.h5]
         [--rotations rotations.npy] [--reference solve.h5] [--images FIRST LAST]...
