@@ -53,6 +53,7 @@ import numpy as np
 from subhkl import get_container_image
 from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
 from subhkl.viz.rainbow_zones import (
+    _get_instrument_default_wavelength,
     build_rainbow_zone_payload,
     render_rainbow_html,
 )
@@ -1061,7 +1062,7 @@ class NovaGalaxyPipelineRunner:
             return False
         inst = str(doc.get("instrument") or "CG4D")
         sg = str(doc.get("space_group") or "P 1")
-        wl = doc.get("wavelength") or [2.8, 4.5]
+        wl = doc.get("wavelength") or list(_get_instrument_default_wavelength(inst))
         cell_vals = [
             float(x) for x in (doc.get("cell") or [68.7, 69.8, 156.9, 90.0, 90.0, 90.0])
         ]
@@ -4567,11 +4568,7 @@ class NovaGalaxyPipelineRunner:
 
         inst_final = (inst_val or "CG4D").strip().upper()
         if not wl_vals or len(wl_vals) < 2:
-            wl_vals = (
-                [2.0, 4.0]
-                if inst_final == "MANDI"
-                else ([0.4, 3.5] if inst_final == "TOPAZ" else [2.8, 4.5])
-            )
+            wl_vals = list(_get_instrument_default_wavelength(inst_final))
         if not raw_cell or len(raw_cell) < 6:
             raw_cell = [68.7, 69.8, 156.9, 90.0, 90.0, 90.0]
         return {
@@ -5883,14 +5880,15 @@ class NovaGalaxyPipelineRunner:
                     params.get("beta", 90.0),
                     params.get("gamma", 90.0),
                 ]
+            inst = str(params.get("instrument", "CG4D"))
+            def_wl_inst = _get_instrument_default_wavelength(inst)
             if "wavelength_min" in params or "wavelength_max" in params:
                 wl = [
-                    float(params.get("wavelength_min", 2.8)),
-                    float(params.get("wavelength_max", 4.5)),
+                    float(params.get("wavelength_min", def_wl_inst[0])),
+                    float(params.get("wavelength_max", def_wl_inst[1])),
                 ]
             else:
-                wl = params.get("wavelength_range") or [2.8, 4.5]
-            inst = str(params.get("instrument", "CG4D"))
+                wl = params.get("wavelength_range") or list(def_wl_inst)
             sg = str(params.get("space_group", "P 21 21 21"))
             merged_path = params.get("images_file") or ""
             merged_has_images = False
@@ -8189,14 +8187,15 @@ class NovaGalaxyPipelineRunner:
                 params.get("gamma", 90.0),
             ]
         cell_str = ",".join(str(float(x)) for x in raw_cell[:6])
+        inst = params.get("instrument", "CG4D")
+        def_wl_inst = _get_instrument_default_wavelength(inst)
         if "wavelength_min" in params or "wavelength_max" in params:
             wl = [
-                float(params.get("wavelength_min", 2.8)),
-                float(params.get("wavelength_max", 4.5)),
+                float(params.get("wavelength_min", def_wl_inst[0])),
+                float(params.get("wavelength_max", def_wl_inst[1])),
             ]
         else:
-            wl = params.get("wavelength_range") or [2.8, 4.5]
-        inst = params.get("instrument", "CG4D")
+            wl = params.get("wavelength_range") or list(def_wl_inst)
         sg = params.get("space_group", "P 21 21 21")
         raw_img = params.get("images_file") or ""
         if (

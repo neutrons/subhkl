@@ -12638,3 +12638,476 @@ def test_careless_merge_respects_dmin_and_stamps_extrapolated_asu_lookup(
     ]
     for p_ex in extrap_hits:
         assert abs(float(p_ex["mtz_isigi"]) - 6.0) < 1e-3
+
+
+def test_cg4d_bandpass_single_slider_blue_alpha_overlap_and_snap(tmp_path):
+    """Verify CG4D [2.8, 4.5] Å wide default, active Colorscale Crossover in Color: λ/Zone,
+    quantile wavelength histogram + overlap visualization on #wl-interval-slider,
+    and magnetic [ ] edge snapping onto empirical [3.1, 4.3] Å bandpass."""
+    import importlib.resources
+    import math
+    import re
+    import shutil
+    import subprocess
+
+    from subhkl.viz.rainbow_zones import (
+        _compute_wavelength_bandpass_profile,
+        _get_instrument_default_wavelength,
+        render_rainbow_html,
+    )
+
+    settings_data = json.loads(
+        importlib.resources.files("subhkl.resources")
+        .joinpath("reduction_settings.json")
+        .read_text(encoding="utf-8")
+    )
+    assert settings_data["CG4D"]["Wavelength"] == [2.8, 4.5]
+    assert _get_instrument_default_wavelength("CG4D") == (2.8, 4.5)
+
+    # Synthetic wide-band [2.50, 5.00] Å predicted-peak integration on CG4D where
+    # physical neutron bandpass is [3.10, 4.30] Å, contaminated in off-band wings by:
+    # - realistic ~5% Gaussian/background positive tails (I/σ ~ 2.5..3.2),
+    # - a Laue harmonic overlap (hkl=[2, 4, -6], gcd=2) with I/σ = 185 at λ = 2.62 Å,
+    # - a single cosmic-ray outlier with I/σ = 260 at λ = 4.88 Å,
+    # AND `integrated_sample_peaks` pre-filtered to I/σ >= 2.5 (matching `all_runs_data`).
+    rng = np.random.default_rng(42)
+    integ_peaks = []
+    lam_list = []
+    int_list = []
+    sig_list = []
+    hkl_list = []
+    for k in range(400):
+        lam = 2.503 + (k + 0.5) * (2.494 / 400.0)
+        in_band = 3.10 <= lam <= 4.30
+        hkl = [1, (k % 7) - 3, (k // 7) - 25]
+        if hkl[0] == 0 and hkl[1] == 0 and hkl[2] == 0:
+            hkl = [1, 1, 1]
+        # Ensure fundamental gcd == 1 except for injected harmonic overlaps
+        if math.gcd(math.gcd(abs(hkl[0]), abs(hkl[1])), abs(hkl[2])) > 1:
+            hkl[0] = 1
+        if in_band:
+            # Realistic quasi-Laue mixture: mostly weak high-res peaks + strong dome peaking near 3.55 Å
+            dome = math.sin(math.pi * (lam - 3.05) / 1.30)
+            snr = (
+                float(rng.uniform(5.5, 14.0 + 16.0 * max(0.0, dome)))
+                if (k % 4 == 0)
+                else float(rng.normal(0.45, 1.05))
+            )
+        else:
+            # Off-band wing: unit-normal noise + ~5% positive tail around 2.8σ
+            snr = 2.85 if (k % 20 == 3) else float(rng.normal(0.15, 0.95))
+        if abs(lam - 2.62) < 0.008:
+            # Harmonic multiple copying strong in-band spot onto 2.62 Å
+            hkl = [2, 4, -6]
+            snr = 185.0
+        elif abs(lam - 4.88) < 0.005:
+            # Single isolated cosmic-ray outlier at 4.88 Å
+            snr = 260.0
+        sigma = 10.0
+        intensity = snr * sigma
+        lam_list.append(lam)
+        int_list.append(intensity)
+        sig_list.append(sigma)
+        hkl_list.append(hkl)
+        az = -60.0 + (k % 25) * 4.8
+        el = -14.0 + (k // 25) * 1.8
+        gcd_ord = math.gcd(math.gcd(abs(hkl[0]), abs(hkl[1])), abs(hkl[2]))
+        integ_peaks.append(
+            {
+                "hkl": hkl,
+                "harmonic_order": max(1, gcd_ord),
+                "asu_orbit_id": f"{hkl[0]},{hkl[1]},{hkl[2]}",
+                "orbit_color_idx": k % 8,
+                "wavelength": round(lam, 4),
+                "d_spacing": round(max(1.25, 0.55 * lam), 4),
+                "az_deg": round(az, 3),
+                "el_deg": round(el, 3),
+                "det_x": round(az, 3),
+                "det_y": round(math.tan(math.radians(el)), 4),
+                "zone_ids": ["z0"],
+                "g_sample": [0.0, 0.6, 0.8],
+                "intensity": round(intensity, 3),
+                "sigma": sigma,
+                "isigi": round(snr, 3),
+                "unscaled_isigi": round(snr, 3),
+                "observed": bool(snr >= 3.0),
+                "uncertain": False,
+                "ellipse": None,
+            }
+        )
+
+    wl_prof = _compute_wavelength_bandpass_profile(
+        np.asarray(lam_list, dtype=float),
+        np.asarray(int_list, dtype=float),
+        np.asarray(sig_list, dtype=float),
+        hkl=np.asarray(hkl_list, dtype=np.int64),
+    )
+    assert wl_prof is not None
+    # Simulate `all_runs_data` SNR>=2.5 truncation on `integrated_sample_peaks`
+    truncated_sample_peaks = [p for p in integ_peaks if p["unscaled_isigi"] >= 2.5]
+
+    payload = {
+        "instrument": "CG4D",
+        "artifact_kind": "integrated",
+        "space_group": "P 21 21 21",
+        "wavelength_range": [2.5, 5.0],
+        "d_min": 1.25,
+        "cell": [50.0, 60.0, 70.0, 90.0, 90.0, 90.0],
+        "default_projection": "cylindrical",
+        "default_peak_source": "integrated",
+        "panels": [
+            {
+                "bank_id": 1,
+                "name": "det1",
+                "az_min": -170.0,
+                "az_max": 170.0,
+                "el_min": -25.0,
+                "el_max": 25.0,
+                "y_min": -0.5,
+                "y_max": 0.5,
+            }
+        ],
+        "zones": [
+            {
+                "zone_id": "z0",
+                "label": "[100]",
+                "rainbow_color": "#38bdf8",
+                "angular_rms_deg": 0.12,
+                "n_peaks": 250,
+                "d_direct": 50.0,
+                "axis_lab": [0.0, 1.0, 0.0],
+                "axis_crystal": [1.0, 0.0, 0.0],
+                "continuous_segments": [],
+                "detector_segments": [],
+                "wulff_points": [],
+            }
+        ],
+        "predicted_peaks": integ_peaks,
+        "predicted_sample_peaks": integ_peaks,
+        "integrated_peaks": integ_peaks,
+        "integrated_sample_peaks": truncated_sample_peaks,
+        "wavelength_bandpass_profile": wl_prof,
+        "ladder_steps": [],
+        "pipeline_stages": [],
+    }
+    html_doc = render_rainbow_html(payload=payload)
+    assert 'id="cs-wl-interval-slider"' not in html_doc
+    assert 'id="btn-cs-wl-auto"' not in html_doc
+    assert 'id="btn-cs-wl-apply"' not in html_doc
+    assert 'id="wl-interval-slider"' in html_doc
+    assert 'id="canvas-wl-carpet"' in html_doc
+    assert 'class="controls-section-divider"' in html_doc
+
+    # Visualization controls [Detector Contrast, Spot Color, Colorscale Crossover]
+    # are grouped above the divider, before physical parameters [Wavelength λ, Resolution d_min]
+    pos_spot = html_doc.index('id="sel-spot-color"')
+    pos_emph = html_doc.index('id="slider-color-emphasis"')
+    pos_div = html_doc.index('class="controls-section-divider"')
+    pos_wl = html_doc.index('id="wl-interval-slider"')
+    pos_dmin = html_doc.index('id="slider-dmin"')
+    assert pos_spot < pos_emph < pos_div < pos_wl < pos_dmin
+
+    # Physical .wl-track-fill has no rainbow gradient
+    m_wl_css = re.search(r"\.wl-track-fill\s*\{([^}]*)\}", html_doc)
+    assert m_wl_css is not None
+    assert "hsla(265" not in m_wl_css.group(1)
+    assert "rgba(56, 189, 248" in m_wl_css.group(1)
+
+    if not shutil.which("node"):
+        return
+
+    script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+    assert len(script_blocks) >= 1
+    inline_js = script_blocks[-1]
+
+    harness_js = (
+        """
+const elems = new Map();
+const ctxLogs = new Map();
+function makeCtx(id = "") {
+  const log = { fills: [], strokes: [], rects: [], rectCount: 0, fillCalls: 0 };
+  if (id) ctxLogs.set(id, log);
+  const ctx = {
+    fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+    textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+    setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+    transform() {},
+    clearRect() { log.fills.length = 0; log.strokes.length = 0; log.rects.length = 0; log.rectCount = 0; },
+    fillRect(x, y, w, h) { log.rectCount += 1; const fs = String(ctx.fillStyle); log.fills.push(fs); log.rects.push({ x, y, w, h, fill: fs }); },
+    strokeRect() { log.strokes.push(String(ctx.strokeStyle)); },
+    beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+    arc() {}, ellipse() {}, quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+    stroke() { log.strokes.push(String(ctx.strokeStyle)); },
+    fill() { log.fillCalls += 1; log.fills.push(String(ctx.fillStyle)); },
+    clip() {}, save() {}, restore() {}, setLineDash() {},
+    fillText() {}, strokeText() {}, drawImage() {},
+    measureText(t) { return { width: String(t).length * 6 }; },
+    createLinearGradient() { return { addColorStop() {} }; },
+    createRadialGradient() { return { addColorStop() {} }; },
+    getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+    putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+  };
+  return ctx;
+}
+function makeEl(id = "") {
+  const listeners = {};
+  const styleProps = {};
+  const isSliderOrCarpet = id === "wl-interval-slider" || id === "canvas-wl-carpet";
+  const el = {
+    id, tagName: id.startsWith("sel-") ? "SELECT" : "DIV",
+    value: id === "slider-color-emphasis" ? "0.38" : (id === "sel-spot-color" ? "wavelength" : ""),
+    min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: isSliderOrCarpet ? 300 : 1400, height: isSliderOrCarpet ? 11 : 700,
+    clientWidth: isSliderOrCarpet ? 300 : 1400, clientHeight: isSliderOrCarpet ? 11 : 700,
+    scrollWidth: 300, scrollHeight: 240, scrollTop: 0, offsetWidth: 300, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null,
+    dataset: {},
+    style: new Proxy(styleProps, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: {
+      _s: new Set(),
+      add(...c) { c.forEach(x => this._s.add(x)); },
+      remove(...c) { c.forEach(x => this._s.delete(x)); },
+      toggle(c, f) { if (f === undefined ? !this._s.has(c) : f) { this._s.add(c); return true; } this._s.delete(c); return false; },
+      contains(c) { return this._s.has(c); }
+    },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) { (listeners[evObj.type] || []).forEach(fn => fn.call(el, evObj)); },
+    click() { el.dispatchEvent({ type: "click", target: el, preventDefault() {}, stopPropagation() {} }); },
+    focus() {}, blur() {}, select() {}, remove() {},
+    appendChild(ch) { this.children.push(ch); ch.parentElement = this; return ch; },
+    insertBefore(ch) { this.children.push(ch); ch.parentElement = this; return ch; },
+    replaceChildren(...ch) { this.children = ch; },
+    setAttribute(k, v) { this[k] = v; },
+    getAttribute(k) { return this[k] ?? null; },
+    removeAttribute(k) { delete this[k]; },
+    contains(target) { return target === el; },
+    getBoundingClientRect() {
+      return {
+        left: 0, top: 0,
+        right: isSliderOrCarpet ? 300 : 1400,
+        bottom: isSliderOrCarpet ? 11 : 700,
+        width: isSliderOrCarpet ? 300 : 1400,
+        height: isSliderOrCarpet ? 11 : 700,
+      };
+    },
+    getContext() { if (!el._ctx) el._ctx = makeCtx(id); return el._ctx; },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+  };
+  return el;
+}
+function getEl(id) {
+  if (!elems.has(id)) elems.set(id, makeEl(id));
+  return elems.get(id);
+}
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.sessionStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.location = { href: "about:srcdoc", origin: "http://localhost:8080", pathname: "/", search: "" };
+globalThis.navigator = { clipboard: { writeText: async () => {} } };
+globalThis.Image = class { set src(v) { this._src = v; } };
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.AbortController = class { constructor() { this.signal = {}; } abort() {} };
+let rafCb = null;
+globalThis.requestAnimationFrame = (fn) => { rafCb = fn; return 1; };
+globalThis.cancelAnimationFrame = () => {};
+globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => "" });
+globalThis.document = {
+  body: makeEl("body"),
+  documentElement: makeEl("html"),
+  baseURI: "http://localhost:8080/",
+  getElementById: (id) => getEl(id),
+  createElement: (tag) => makeEl(tag),
+  createTextNode: (txt) => ({ textContent: txt }),
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  addEventListener: () => {},
+  removeEventListener: () => {},
+};
+"""
+        + inline_js
+        + """
+;
+// Trigger initial animation frame so Detector & Wulff canvases paint
+getEl("canvas-detector").getContext("2d");
+getEl("canvas-wulff").getContext("2d");
+if (rafCb) { const cb = rafCb; rafCb = null; cb(); }
+
+// 1. Color: λ/Zone initial state -> Colorscale Crossover is ACTIVE (not disabled),
+// shows the [λ_min, λ_max] rainbow gradient, and adjusts spectral hue midpoint λ ~ X.XX Å
+const slEmph = getEl("slider-color-emphasis");
+const lblEmph = getEl("lbl-color-emphasis");
+const initEmphDisabled = Boolean(slEmph.disabled);
+const initWlGrad = slEmph.style.getPropertyValue("--cs-gradient");
+const initLblEmph = lblEmph.textContent;
+const initWlHasCarpet = getEl("wl-track-fill").classList.contains("has-carpet");
+
+// Drag single knob on Colorscale Crossover -> shifts spectral hue midpoint λ ~ X.XX Å
+slEmph.value = "0.70";
+slEmph.dispatchEvent({ type: "input", target: slEmph });
+const shiftedLblEmph = lblEmph.textContent;
+
+// Wide [2.50, 5.00] Å selection vs [3.10, 4.30] Å integrated band on #canvas-wl-carpet:
+// Pure monochrome/sky-blue (zero rainbow hsla(..., 95%, ...) fills on physical Wavelength slider!)
+const carpetLog = ctxLogs.get("canvas-wl-carpet");
+const wideAnyRainbowOnWl = carpetLog.fills.some(s => s.startsWith("hsla(") && s.includes("95%"));
+const wideOverlapCyanCount = carpetLog.fills.filter(s => s.startsWith("rgba(56, 189, 248,")).length;
+const wideNoiseSlateCount = carpetLog.fills.filter(s => s === "rgba(148, 163, 184, 0.14)").length;
+
+// 2. Narrow [λ_min, λ_max] to [3.40, 4.00] Å -> unselected integrated WL band [3.10..3.40) and (4.00..4.30]
+// renders in cerulean blue outside [ ], while Colorscale Crossover updates its λ midpoint to [3.40, 4.00] Å
+const slWlMin = getEl("slider-wl-min");
+const slWlMax = getEl("slider-wl-max");
+slWlMin.value = "3.40";
+slWlMin.dispatchEvent({ type: "input", target: slWlMin });
+slWlMax.value = "4.00";
+slWlMax.dispatchEvent({ type: "input", target: slWlMax });
+
+const narrowBlueBarsCount = carpetLog.fills.filter(s => s.startsWith("hsla(204.0, 94%, 52%,")).length;
+const narrowSkyStrokes = carpetLog.strokes.filter(s => s.startsWith("rgba(56, 189, 248,")).length;
+const narrowOverlapCyanCount = carpetLog.fills.filter(s => s.startsWith("rgba(56, 189, 248,")).length;
+const narrowAnyRainbowOnWl = carpetLog.fills.some(s => s.startsWith("hsla(") && s.includes("95%"));
+const narrowLblEmph = lblEmph.textContent;
+
+// Verify quantile outlier rejection directly on rendered #canvas-wl-carpet bars:
+// off-band wings [2.50, 2.98] & [4.42, 5.00] Å draw 0 signal bars despite harmonic/cosmic-ray outliers
+const domLo = parseFloat(slWlMin.min);
+const domHi = parseFloat(slWlMax.max);
+const sigRects = carpetLog.rects.filter(
+  r => r.fill.startsWith("rgba(56, 189, 248,") || r.fill.startsWith("hsla(204.0, 94%, 52%,")
+);
+const rectLam = (r) => domLo + ((r.x + 0.5 * r.w) / 300.0) * (domHi - domLo);
+const offBandRectCount = sigRects.filter(r => {
+  const l = rectLam(r);
+  return l < 2.98 || l > 4.42;
+}).length;
+const inBandMaxBarH = sigRects
+  .filter(r => { const l = rectLam(r); return l >= 3.25 && l <= 3.95; })
+  .reduce((m, r) => Math.max(m, r.h), 0.0);
+
+// 3. Magnetic edge snapping on #wl-interval-slider (width = 300px, rail domain = [domLo, domHi]):
+const wlToClientX = (lam) => ((lam - domLo) / Math.max(0.05, domHi - domLo)) * 300;
+const wlSlider = getEl("wl-interval-slider");
+const knobMin = getEl("wl-knob-min");
+const knobMax = getEl("wl-knob-max");
+wlSlider.dispatchEvent({ type: "pointerdown", button: 0, target: knobMin, clientX: wlToClientX(3.40), pointerId: 1, preventDefault() {} });
+wlSlider.dispatchEvent({ type: "pointermove", target: wlSlider, clientX: wlToClientX(3.17), shiftKey: false, altKey: false });
+const snappedLo = parseFloat(getEl("wl-val-min").textContent);
+const knobMinSnappedCls = knobMin.classList.contains("snapped-band-edge");
+
+// Holding Shift bypasses magnetic snap -> 0.05 Å grid (3.15 Å)
+wlSlider.dispatchEvent({ type: "pointermove", target: wlSlider, clientX: wlToClientX(3.15), shiftKey: true, altKey: false });
+const shiftBypassLo = parseFloat(getEl("wl-val-min").textContent);
+// Release back onto magnetic snap
+wlSlider.dispatchEvent({ type: "pointermove", target: wlSlider, clientX: wlToClientX(3.17), shiftKey: false, altKey: false });
+wlSlider.dispatchEvent({ type: "pointerup", pointerId: 1 });
+
+// Drag ] knob near upper band edge ~4.30 Å (raw λ = 4.22 Å)
+wlSlider.dispatchEvent({ type: "pointerdown", button: 0, target: knobMax, clientX: wlToClientX(4.00), pointerId: 2, preventDefault() {} });
+wlSlider.dispatchEvent({ type: "pointermove", target: wlSlider, clientX: wlToClientX(4.22), shiftKey: false, altKey: false });
+wlSlider.dispatchEvent({ type: "pointerup", pointerId: 2 });
+const snappedHi = parseFloat(getEl("wl-val-max").textContent);
+const knobMaxSnappedCls = knobMax.classList.contains("snapped-band-edge");
+
+// Hover tooltip on #wl-interval-slider reports integrated band
+wlSlider.dispatchEvent({ type: "pointermove", target: wlSlider, clientX: wlToClientX(3.70) });
+const hoverSliderTitle = wlSlider.title;
+
+// 4. Switch to Color: I/σ -> λ rainbow disappears from Colorscale Crossover (shows I/σ gradient instead)
+const selColor = getEl("sel-spot-color");
+selColor.value = "isigi";
+selColor.dispatchEvent({ type: "change", target: selColor });
+const isigiEmphDisabled = Boolean(slEmph.disabled);
+const isigiGrad = slEmph.style.getPropertyValue("--cs-gradient");
+const isigiLblEmph = lblEmph.textContent;
+
+console.log(JSON.stringify({
+  initEmphDisabled,
+  initWlGrad,
+  initLblEmph,
+  shiftedLblEmph,
+  narrowLblEmph,
+  initWlHasCarpet,
+  wideAnyRainbowOnWl,
+  wideOverlapCyanCount,
+  wideNoiseSlateCount,
+  narrowBlueBarsCount,
+  narrowSkyStrokes,
+  narrowOverlapCyanCount,
+  narrowAnyRainbowOnWl,
+  offBandRectCount,
+  inBandMaxBarH,
+  snappedLo,
+  knobMinSnappedCls,
+  shiftBypassLo,
+  snappedHi,
+  knobMaxSnappedCls,
+  hoverSliderTitle,
+  isigiEmphDisabled,
+  isigiGrad,
+  isigiLblEmph,
+}));
+"""
+    )
+    harness_file = tmp_path / "bandpass_viz_harness.js"
+    harness_file.write_text(harness_js, encoding="utf-8")
+    res = subprocess.run(
+        ["node", str(harness_file)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    out = json.loads(res.stdout.strip().splitlines()[-1])
+
+    # 1. Colorscale Crossover is active in Color: λ/Zone, displays λ rainbow gradient, and shifts spectral midpoint
+    assert out["initEmphDisabled"] is False
+    assert "hsla(265.0, 95%, 60%," in out["initWlGrad"]
+    assert "hsla(0.0, 95%, 60%," in out["initWlGrad"]
+    assert out["initLblEmph"] == "λ ~ 3.45 Å"
+    assert out["shiftedLblEmph"] == "λ ~ 4.25 Å"
+    assert out["narrowLblEmph"] == "λ ~ 3.82 Å"
+
+    # 2. Physical Wavelength λ [Å] rail is monochrome/sky-blue (zero rainbow hues), showing overlap vs noise vs outside-bracket blue
+    assert out["initWlHasCarpet"] is True
+    assert out["wideAnyRainbowOnWl"] is False
+    assert out["narrowAnyRainbowOnWl"] is False
+    assert out["wideOverlapCyanCount"] >= 15
+    assert out["wideNoiseSlateCount"] >= 20
+    assert out["narrowBlueBarsCount"] >= 8
+    assert out["narrowSkyStrokes"] >= 2
+    assert out["narrowOverlapCyanCount"] >= 8
+    # Off-band wings [2.50, 2.98] & [4.42, 5.00] Å render zero signal bars despite harmonic/cosmic-ray outliers
+    assert out["offBandRectCount"] == 0
+    assert out["inBandMaxBarH"] >= 8.0
+
+    # 3. Switching Spot Color away from Color: λ/Zone removes λ rainbow from Colorscale Crossover
+    assert out["isigiEmphDisabled"] is False
+    assert "hsla(265.0, 95%, 60%," not in out["isigiGrad"]
+    assert "λ ~" not in out["isigiLblEmph"]
+
+    # 4. Magnetic snapping snaps [ and ] onto [3.10, 4.30] Å quantile edges (with Shift bypass)
+    assert abs(out["snappedLo"] - 3.10) <= 0.06
+    assert out["knobMinSnappedCls"] is True
+    assert abs(out["shiftBypassLo"] - 3.15) < 1e-6
+    assert abs(out["snappedHi"] - 4.30) <= 0.10
+    assert out["knobMaxSnappedCls"] is True
+    assert "Q[1..99%] band ≈" in out["hoverSliderTitle"]

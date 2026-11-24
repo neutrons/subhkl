@@ -4118,6 +4118,15 @@ def _extract_from_h5(
                         "sigma": None,
                     }
 
+        # Compute exact unfiltered wavelength bandpass quantile profile across ALL
+        # runs BEFORE SNR>=2.5 truncation (`all_runs_data`) or active-frame slicing.
+        wavelength_bandpass_profile = _compute_wavelength_bandpass_profile(
+            lam,
+            intensity,
+            sigma,
+            hkl=hkl,
+        )
+
         # Capture all-runs sample-space peak arrays before filtering to active_frame
         all_runs_data: dict[str, Any] | None = None
         if (
@@ -4733,6 +4742,7 @@ def _extract_from_h5(
             "merged_i": merged_i,
             "merged_sigi": merged_sigi,
             "merge_metrics": merge_metrics,
+            "wavelength_bandpass_profile": wavelength_bandpass_profile,
             "all_runs_data": all_runs_data,
             "predicted_frame_data": predicted_frame_data,
             "predicted_all_runs_data": predicted_all_runs_data,
@@ -4749,6 +4759,110 @@ def _extract_from_h5(
             "frames": frames_meta,
             "frame_index": active_frame,
         }
+
+
+def _compute_wavelength_bandpass_profile(
+    lam: np.ndarray | None,
+    intensity: np.ndarray | None,
+    sigma: np.ndarray | None,
+    *,
+    hkl: np.ndarray | None = None,
+    bin_step: float = 0.05,
+) -> dict[str, Any] | None:
+    """Compute unfiltered, outlier-robust per-bin wavelength I/σ quantiles.
+
+    Excludes higher harmonic orders (``gcd(|h|,|k|,|l|) > 1``) when enough
+    fundamental reflections exist so Laue harmonic spot overlaps do not leak
+    strong in-band intensities onto off-band wavelengths, and Winsorizes extreme
+    single-spot I/σ outliers at the 98.5th percentile.
+    """
+    if lam is None or intensity is None or sigma is None:
+        return None
+    lam_a = np.asarray(lam, dtype=float).ravel()
+    int_a = np.asarray(intensity, dtype=float).ravel()
+    sig_a = np.asarray(sigma, dtype=float).ravel()
+    n_tot = len(lam_a)
+    if n_tot < 6 or len(int_a) != n_tot or len(sig_a) != n_tot:
+        return None
+    valid = (
+        np.isfinite(lam_a)
+        & (lam_a > 0.05)
+        & np.isfinite(int_a)
+        & np.isfinite(sig_a)
+        & (sig_a > 0.0)
+    )
+    if int(np.sum(valid)) < 6:
+        return None
+    if hkl is not None:
+        hkl_a = np.asarray(hkl, dtype=np.int64)
+        if hkl_a.ndim == 2 and len(hkl_a) == n_tot and hkl_a.shape[1] >= 3:
+            gcds = np.gcd.reduce(np.abs(hkl_a[:, :3]), axis=1)
+            fund = valid & (gcds <= 1)
+            if int(np.sum(fund)) >= 20:
+                valid = fund
+    w = lam_a[valid]
+    s = int_a[valid] / sig_a[valid]
+    finite_s = np.isfinite(s)
+    if int(np.sum(finite_s)) < 6:
+        return None
+    w = w[finite_s]
+    s = s[finite_s]
+
+    step = max(0.01, float(bin_step))
+    q_cap = max(4.0, float(np.quantile(s, 0.985)))
+    s_win = np.minimum(s, q_cap)
+
+    lo_edge = round(float(np.floor(float(np.min(w)) / step) * step), 4)
+    hi_edge = round(float(np.ceil(float(np.max(w)) / step) * step), 4)
+    if hi_edge <= lo_edge + 1e-6:
+        hi_edge = round(lo_edge + step, 4)
+    n_bins = max(1, min(240, round((hi_edge - lo_edge) / step)))
+    edges = lo_edge + np.arange(n_bins + 1, dtype=float) * step
+
+    counts_out: list[int] = []
+    q50_out: list[float | None] = []
+    q75_out: list[float | None] = []
+    q90_out: list[float | None] = []
+    f_strong_out: list[float] = []
+
+    bin_idx = np.clip(
+        np.floor((w - lo_edge) / step).astype(np.int64),
+        0,
+        n_bins - 1,
+    )
+    for b_i in range(n_bins):
+        m = bin_idx == b_i
+        c = int(np.sum(m))
+        counts_out.append(c)
+        if c == 0:
+            q50_out.append(None)
+            q75_out.append(None)
+            q90_out.append(None)
+            f_strong_out.append(0.0)
+        elif c == 1:
+            v0 = round(float(s_win[m][0]), 3)
+            q50_out.append(v0)
+            q75_out.append(v0)
+            q90_out.append(v0)
+            f_strong_out.append(1.0 if float(s[m][0]) >= 4.0 else 0.0)
+        else:
+            sb = s_win[m]
+            q50_v, q75_v, q90_v = np.quantile(sb, [0.50, 0.75, 0.90])
+            q50_out.append(round(float(q50_v), 3))
+            q75_out.append(round(float(q75_v), 3))
+            q90_out.append(round(float(q90_v), 3))
+            f_strong_out.append(round(float(np.mean(s[m] >= 4.0)), 4))
+
+    return {
+        "bin_lo": lo_edge,
+        "bin_step": round(step, 4),
+        "edges": [round(float(x), 4) for x in edges],
+        "n": counts_out,
+        "q50": q50_out,
+        "q75": q75_out,
+        "q90": q90_out,
+        "f_strong": f_strong_out,
+    }
 
 
 def _h5_has_tof_data(*candidates: str | os.PathLike[str] | None) -> bool:
@@ -8839,6 +8953,7 @@ def build_rainbow_zone_payload(
     merged_i_arr = None
     merged_sigi_arr = None
     merge_metrics: dict[str, Any] | None = None
+    wavelength_bandpass_profile: dict[str, Any] | None = None
     all_runs_data: dict[str, Any] | None = None
     predicted_frame_data: dict[str, np.ndarray] | None = None
     predicted_all_runs_data: dict[str, Any] | None = None
@@ -8898,6 +9013,7 @@ def build_rainbow_zone_payload(
         merged_i_arr = extracted.get("merged_i")
         merged_sigi_arr = extracted.get("merged_sigi")
         merge_metrics = extracted.get("merge_metrics")
+        wavelength_bandpass_profile = extracted.get("wavelength_bandpass_profile")
         all_runs_data = extracted.get("all_runs_data")
         predicted_frame_data = extracted.get("predicted_frame_data")
         predicted_all_runs_data = extracted.get("predicted_all_runs_data")
@@ -9825,6 +9941,16 @@ def build_rainbow_zone_payload(
             else None
         ),
         "merge_metrics": merge_metrics,
+        "wavelength_bandpass_profile": (
+            wavelength_bandpass_profile
+            if wavelength_bandpass_profile is not None
+            else _compute_wavelength_bandpass_profile(
+                lam_arr,
+                intensity_arr,
+                sigma_arr,
+                hkl=hkl_arr,
+            )
+        ),
         "peaks": peaks_list,
         "sample_peaks": sample_peaks,
         "predicted_peaks": predicted_peaks,
@@ -9875,6 +10001,7 @@ def merge_frame_only_payload(
         "sample_peaks",
         "predicted_sample_peaks",
         "integrated_sample_peaks",
+        "wavelength_bandpass_profile",
         "pixel_mask_bits",
         "mtz_overlay_name",
         "mtz_overlay_reflections",
@@ -9899,6 +10026,7 @@ def build_frame_only_response(payload: dict[str, Any]) -> dict[str, Any]:
         "sample_peaks",
         "predicted_sample_peaks",
         "integrated_sample_peaks",
+        "wavelength_bandpass_profile",
         "pixel_mask_bits",
         "merge_metrics",
         "beamline_detectors",
@@ -9940,9 +10068,10 @@ def render_rainbow_html(
         if projection in ("cylindrical", "spherical")
         else payload.get("default_projection", default_projection_for_instrument(inst))
     )
-    init_wl = payload.get("wavelength_range") or [2.8, 4.5]
-    init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
-    init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
+    def_wl_init = _get_instrument_default_wavelength(inst)
+    init_wl = payload.get("wavelength_range") or [def_wl_init[0], def_wl_init[1]]
+    init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else float(def_wl_init[0])
+    init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else float(def_wl_init[1])
     init_wl_dom_min = min(0.20, max(0.05, math.floor(init_wl_min * 20.0) / 20.0))
     init_wl_dom_max = max(
         6.0, math.ceil(max(init_wl_max * 1.35, init_wl_max + 0.5) * 2.0) / 2.0
@@ -11276,7 +11405,13 @@ def render_rainbow_html(
     cursor: ew-resize;
   }}
 
-  /* Dual-bracket [ and ] wavelength interval slider */
+  .controls-section-divider {{
+    height: 1px;
+    margin: 4px 0 3px 0;
+    background: rgba(38, 49, 79, 0.85);
+  }}
+
+  /* Dual-bracket [ and ] wavelength interval slider (monochrome/sky-blue physical parameter rail) */
   .wl-interval-slider {{
     position: relative;
     height: 18px;
@@ -11301,27 +11436,48 @@ def render_rainbow_html(
     position: absolute;
     left: 0;
     right: 0;
-    height: 6px;
-    border-radius: 3px;
-    background: rgba(15, 23, 42, 0.88);
+    height: 10px;
+    border-radius: 4px;
+    background: #0b1120;
     border: 1px solid rgba(148, 163, 184, 0.36);
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.52);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.58);
+    overflow: hidden;
+    pointer-events: none;
+  }}
+
+  .wl-carpet-canvas {{
+    display: block;
+    width: 100%;
+    height: 100%;
     pointer-events: none;
   }}
 
   .wl-track-fill {{
     position: absolute;
-    height: 6px;
-    border-radius: 2px;
+    height: 10px;
+    border-radius: 3px;
     background: linear-gradient(
       90deg,
-      hsla(265, 92%, 62%, 0.88) 0%,
-      hsla(195, 95%, 56%, 0.88) 34%,
-      hsla(120, 82%, 52%, 0.88) 68%,
-      hsla(12, 92%, 58%, 0.90) 100%
+      rgba(56, 189, 248, 0.34) 0%,
+      rgba(14, 165, 233, 0.48) 100%
     );
-    box-shadow: 0 0 6px rgba(56, 189, 248, 0.25);
+    border-top: 1px solid rgba(125, 211, 252, 0.55);
+    border-bottom: 1px solid rgba(125, 211, 252, 0.55);
+    box-shadow: 0 0 5px rgba(56, 189, 248, 0.18);
     pointer-events: none;
+  }}
+
+  .wl-track-fill.has-carpet {{
+    background: rgba(148, 163, 184, 0.10);
+    border-top: 1px solid rgba(226, 232, 240, 0.68);
+    border-bottom: 1px solid rgba(226, 232, 240, 0.68);
+    box-shadow: 0 0 5px rgba(56, 189, 248, 0.22);
+  }}
+
+  .wl-bracket-knob.snapped-band-edge {{
+    border-color: #38bdf8;
+    color: #7dd3fc;
+    box-shadow: 0 0 6px rgba(56, 189, 248, 0.72);
   }}
 
   .wl-bracket-knob {{
@@ -11649,31 +11805,6 @@ def render_rainbow_html(
           </div>
           <input type="range" id="slider-det-alpha" min="0.0" max="1.0" step="0.05" value="0.85" />
 
-          <div class="slider-row">
-            <span>Colorscale Crossover</span>
-            <span id="lbl-color-emphasis" style="white-space:nowrap;">-3.0 · 3.0 · 20.0</span>
-          </div>
-          <input type="range" id="slider-color-emphasis" min="0.05" max="0.95" step="0.01" value="0.38" title="Drag knob to tune colorscale contrast / midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
-
-          <div class="slider-row">
-            <span>Wavelength λ [Å]</span>
-            <span id="wl-readout" title="Click λ_min or λ_max to enter an exact wavelength [Å]">[<span id="wl-val-min" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact λ_min [Å]">{init_wl_min:.2f}</span>, <span id="wl-val-max" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact λ_max [Å]">{init_wl_max:.2f}</span>] Å</span>
-          </div>
-          <div class="wl-interval-slider" id="wl-interval-slider" title="Active wavelength interval [λ_min, λ_max] in Å — drag [ and ] brackets (double-click to reset)">
-            <input type="range" id="slider-wl-min" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_min:.2f}" aria-label="Minimum wavelength λ_min [Å]" />
-            <input type="range" id="slider-wl-max" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_max:.2f}" aria-label="Maximum wavelength λ_max [Å]" />
-            <div class="wl-track-rail"></div>
-            <div class="wl-track-fill" id="wl-track-fill" style="left:{init_wl_pct_lo:.2f}%;width:{init_wl_pct_w:.2f}%;"></div>
-            <button type="button" class="wl-bracket-knob wl-knob-min" id="wl-knob-min" style="left:{init_wl_pct_lo:.2f}%;" title="Minimum wavelength λ_min [Å] (drag or Left/Right arrows)">[</button>
-            <button type="button" class="wl-bracket-knob wl-knob-max" id="wl-knob-max" style="left:{init_wl_pct_hi:.2f}%;" title="Maximum wavelength λ_max [Å] (drag or Left/Right arrows)">]</button>
-          </div>
-
-          <div class="slider-row">
-            <span>Resolution Cutoff d_min [Å]</span>
-            <span id="lbl-dmin-val" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact resolution cutoff d_min [Å]">{init_dmin:.2f} Å</span>
-          </div>
-          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å] (0.05 Å slider steps; click value for 0.01 Å input)" />
-
           <div class="slider-row" style="margin-top:2px;">
             <span>Spot Color</span>
             <select id="sel-spot-color" title="Color reflections on Detector & Wulff Net by Wavelength, ASU Orbit, Divergent Quantile I/σ, .mtz I/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
@@ -11685,6 +11816,35 @@ def render_rainbow_html(
               <option value="scale">Color: Scale</option>
             </select>
           </div>
+
+          <div class="slider-row" id="colorscale-slider-row">
+            <span id="lbl-colorscale-title">Colorscale Crossover</span>
+            <span id="lbl-color-emphasis" style="white-space:nowrap;">-3.0 · 3.0 · 20.0</span>
+          </div>
+          <input type="range" id="slider-color-emphasis" min="0.05" max="0.95" step="0.01" value="0.38" title="Drag knob to tune colorscale contrast / midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
+
+          <div class="controls-section-divider" role="separator" aria-hidden="true"></div>
+
+          <div class="slider-row">
+            <span>Wavelength λ [Å]</span>
+            <span id="wl-readout" title="Click λ_min or λ_max to enter an exact wavelength [Å]">[<span id="wl-val-min" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact λ_min [Å]">{init_wl_min:.2f}</span>, <span id="wl-val-max" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact λ_max [Å]">{init_wl_max:.2f}</span>] Å</span>
+          </div>
+          <div class="wl-interval-slider" id="wl-interval-slider" title="Active wavelength interval [λ_min, λ_max] in Å — drag [ and ] brackets (double-click to reset)">
+            <input type="range" id="slider-wl-min" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_min:.2f}" aria-label="Minimum wavelength λ_min [Å]" />
+            <input type="range" id="slider-wl-max" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_max:.2f}" aria-label="Maximum wavelength λ_max [Å]" />
+            <div class="wl-track-rail">
+              <canvas id="canvas-wl-carpet" class="wl-carpet-canvas" aria-hidden="true"></canvas>
+            </div>
+            <div class="wl-track-fill" id="wl-track-fill" style="left:{init_wl_pct_lo:.2f}%;width:{init_wl_pct_w:.2f}%;"></div>
+            <button type="button" class="wl-bracket-knob wl-knob-min" id="wl-knob-min" style="left:{init_wl_pct_lo:.2f}%;" title="Minimum wavelength λ_min [Å] (drag or Left/Right arrows)">[</button>
+            <button type="button" class="wl-bracket-knob wl-knob-max" id="wl-knob-max" style="left:{init_wl_pct_hi:.2f}%;" title="Maximum wavelength λ_max [Å] (drag or Left/Right arrows)">]</button>
+          </div>
+
+          <div class="slider-row">
+            <span>Resolution Cutoff d_min [Å]</span>
+            <span id="lbl-dmin-val" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact resolution cutoff d_min [Å]">{init_dmin:.2f} Å</span>
+          </div>
+          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å] (0.05 Å slider steps; click value for 0.01 Å input)" />
           <div id="mask-legend-row" class="slider-row" style="display:none;margin-top:3px;padding-top:3px;border-top:1px solid rgba(38,49,79,0.75);font-size:0.61rem;gap:6px;flex-wrap:wrap;">
             <span style="display:inline-flex;align-items:center;gap:4px;" title="Dead detector banks and cryostat/panel shadows ignored during solve, prediction &amp; integration">
               <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(56,189,248,0.62);border:1px solid #38bdf8;"></span>
@@ -14910,15 +15070,459 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   const wlKnobMax = document.getElementById("wl-knob-max");
   const MIN_WL_SPAN = 0.05;
 
+  const _lambdaSnrCarpetCache = {{ sig: "", bins: [], hasSnr: false, domLo: 0, domHi: 0, peakSignal: 0 }};
+
+  function _getIntegratedCarpetPeakPool() {{
+    const samp = (typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" && Array.isArray(INTEGRATED_SAMPLE_PEAKS))
+      ? INTEGRATED_SAMPLE_PEAKS
+      : [];
+    const frm = (typeof INTEGRATED_PEAKS !== "undefined" && Array.isArray(INTEGRATED_PEAKS))
+      ? INTEGRATED_PEAKS
+      : [];
+    if (samp.length > 0 && frm.length >= 20 && typeof peakUnscaledIsigi === "function") {{
+      // `INTEGRATED_SAMPLE_PEAKS` (`all_runs_data`) is pre-filtered to I/σ >= 2.5 for Wulff payload compactness;
+      // if no backend `wavelength_bandpass_profile` is present, prefer unfiltered `INTEGRATED_PEAKS` when available.
+      let sampHasSub2 = false;
+      for (let i = 0; i < Math.min(samp.length, 200); i++) {{
+        const v = peakUnscaledIsigi(samp[i]);
+        if (Number.isFinite(v) && v < 2.0) {{ sampHasSub2 = true; break; }}
+      }}
+      if (!sampHasSub2) {{
+        let frmHasSub2 = false;
+        for (let i = 0; i < Math.min(frm.length, 200); i++) {{
+          const v = peakUnscaledIsigi(frm[i]);
+          if (Number.isFinite(v) && v < 2.0) {{ frmHasSub2 = true; break; }}
+        }}
+        if (frmHasSub2) return frm;
+      }}
+    }}
+    if (samp.length > 0) return samp;
+    if (frm.length > 0) return frm;
+    return [];
+  }}
+
   function getWavelengthSliderBounds() {{
     const defWl = getDefaultWavelengthForInstrument(DATA.instrument);
     const baseLo = Number(_payloadBaseParams.lamMin) || defWl[0] || 2.0;
     const baseHi = Number(_payloadBaseParams.lamMax) || defWl[1] || 4.5;
     const curLo = (Number.isFinite(state.lamMin) && state.lamMin > 0) ? state.lamMin : baseLo;
     const curHi = (Number.isFinite(state.lamMax) && state.lamMax > curLo) ? state.lamMax : Math.max(curLo + MIN_WL_SPAN, baseHi);
-    const domMin = Math.min(0.20, Math.max(0.05, Math.floor(Math.min(defWl[0] || 0.20, baseLo, curLo) * 20) / 20));
-    const domMax = Math.max(6.0, Math.ceil(Math.max((defWl[1] || 4.5) * 1.35, baseHi * 1.15, curHi) * 2) / 2);
+    let minPool = curLo;
+    let maxPool = curHi;
+    const prof = (typeof DATA !== "undefined" && DATA && DATA.wavelength_bandpass_profile && typeof DATA.wavelength_bandpass_profile === "object")
+      ? DATA.wavelength_bandpass_profile
+      : null;
+    if (prof && Array.isArray(prof.n) && prof.n.length > 0 && Number.isFinite(Number(prof.bin_lo)) && Number.isFinite(Number(prof.bin_step))) {{
+      const pLo = Number(prof.bin_lo);
+      const pHi = pLo + prof.n.length * Number(prof.bin_step);
+      if (pLo > 0.05 && pLo < minPool) minPool = pLo;
+      if (pHi > maxPool) maxPool = pHi;
+    }} else {{
+      const pool = typeof _getIntegratedCarpetPeakPool === "function" ? _getIntegratedCarpetPeakPool() : [];
+      for (let i = 0; i < pool.length; i++) {{
+        const wl = pool[i] && pool[i].wavelength;
+        if (typeof wl === "number" && Number.isFinite(wl) && wl > 0.05) {{
+          if (wl < minPool) minPool = wl;
+          if (wl > maxPool) maxPool = wl;
+        }}
+      }}
+    }}
+    const domMin = Math.min(0.20, Math.max(0.05, Math.floor(Math.min(defWl[0] || 0.20, baseLo, curLo, minPool) * 20) / 20));
+    const domMax = Math.max(6.0, Math.ceil(Math.max((defWl[1] || 4.5) * 1.35, baseHi * 1.15, curHi, maxPool) * 2) / 2);
     return [domMin, domMax];
+  }}
+
+  function _linearQuantileSorted(sortedArr, q) {{
+    const n = sortedArr.length;
+    if (n === 0) return NaN;
+    if (n === 1) return sortedArr[0];
+    const pos = Math.max(0.0, Math.min(1.0, q)) * (n - 1);
+    const loIdx = Math.floor(pos);
+    const frac = pos - loIdx;
+    return sortedArr[loIdx] + frac * (sortedArr[Math.min(n - 1, loIdx + 1)] - sortedArr[loIdx]);
+  }}
+
+  function _hklGcdOrder(p) {{
+    if (p && typeof p.harmonic_order === "number" && p.harmonic_order >= 1) return p.harmonic_order;
+    if (!p || !Array.isArray(p.hkl) || p.hkl.length < 3) return 1;
+    const gcd2 = (a, b) => {{
+      let x = Math.abs(Math.trunc(a));
+      let y = Math.abs(Math.trunc(b));
+      while (y !== 0) {{ const t = x % y; x = y; y = t; }}
+      return x;
+    }};
+    const g = gcd2(gcd2(p.hkl[0], p.hkl[1]), p.hkl[2]);
+    return g >= 1 ? g : 1;
+  }}
+
+  function computeLambdaSnrCarpetBins(domLo, domHi, nBins = 64) {{
+    const prof = (typeof DATA !== "undefined" && DATA && DATA.wavelength_bandpass_profile && typeof DATA.wavelength_bandpass_profile === "object")
+      ? DATA.wavelength_bandpass_profile
+      : null;
+    const hasProf = Boolean(
+      prof &&
+      Array.isArray(prof.n) &&
+      Array.isArray(prof.q90) &&
+      Array.isArray(prof.f_strong) &&
+      prof.n.length > 0 &&
+      Number.isFinite(Number(prof.bin_lo)) &&
+      Number.isFinite(Number(prof.bin_step)) &&
+      Number(prof.bin_step) > 0
+    );
+    const pool = hasProf ? [] : _getIntegratedCarpetPeakPool();
+    const epoch = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
+    const profSig = hasProf ? `prof:${{prof.bin_lo}}:${{prof.bin_step}}:${{prof.n.length}}:${{prof.n[0]}}:${{prof.n[prof.n.length - 1]}}` : `pool:${{pool.length}}`;
+    const sig = `${{epoch}}|${{profSig}}|${{domLo.toFixed(3)}}|${{domHi.toFixed(3)}}|${{nBins}}`;
+    if (_lambdaSnrCarpetCache.sig === sig) {{
+      return _lambdaSnrCarpetCache;
+    }}
+
+    const span = Math.max(MIN_WL_SPAN, domHi - domLo);
+    const binW = span / nBins;
+    let bins = [];
+    let totalObs = 0;
+
+    if (hasProf) {{
+      const pLo0 = Number(prof.bin_lo);
+      const pStep = Number(prof.bin_step);
+      const pLen = prof.n.length;
+      // 3-bin running median at physical 0.05 Å resolution rejects isolated single-bin
+      // cosmic-ray / sparse-bin spikes before resampling onto arbitrary canvas pixel widths.
+      const med3Prof = (srcArr) => {{
+        const out = new Array(pLen).fill(NaN);
+        for (let j = 0; j < pLen; j++) {{
+          if ((Number(prof.n[j]) || 0) <= 0 || !Number.isFinite(Number(srcArr[j]))) continue;
+          const c = Number(srcArr[j]);
+          const p = (j > 0 && (Number(prof.n[j - 1]) || 0) > 0 && Number.isFinite(Number(srcArr[j - 1]))) ? Number(srcArr[j - 1]) : 0.0;
+          const nx = (j < pLen - 1 && (Number(prof.n[j + 1]) || 0) > 0 && Number.isFinite(Number(srcArr[j + 1]))) ? Number(srcArr[j + 1]) : 0.0;
+          out[j] = Math.max(Math.min(p, c), Math.min(Math.max(p, c), nx));
+        }}
+        return out;
+      }};
+      const pQ90Med = med3Prof(prof.q90);
+      const pFStrongMed = med3Prof(prof.f_strong);
+      for (let bIdx = 0; bIdx < nBins; bIdx++) {{
+        const bLo = domLo + bIdx * binW;
+        const bHi = bLo + binW;
+        const lamMid = 0.5 * (bLo + bHi);
+        const j0 = Math.max(0, Math.floor((bLo - pLo0) / pStep));
+        const j1 = Math.min(pLen - 1, Math.ceil((bHi - pLo0) / pStep) - 1);
+        let wCount = 0.0;
+        let wSum = 0.0;
+        let q50Acc = 0.0;
+        let q75Acc = 0.0;
+        let q90Acc = 0.0;
+        let fStrongAcc = 0.0;
+        for (let j = j0; j <= j1; j++) {{
+          const nj = Number(prof.n[j]) || 0;
+          if (nj <= 0) continue;
+          const segLo = pLo0 + j * pStep;
+          const segHi = segLo + pStep;
+          const ov = Math.max(0.0, Math.min(bHi, segHi) - Math.max(bLo, segLo));
+          if (ov <= 0.0) continue;
+          const fracOv = ov / pStep;
+          const wt = nj * fracOv;
+          wCount += wt;
+          const q90j = pQ90Med[j];
+          if (Number.isFinite(q90j)) {{
+            wSum += wt;
+            q50Acc += wt * (Number.isFinite(Number(prof.q50 && prof.q50[j])) ? Number(prof.q50[j]) : 0.0);
+            q75Acc += wt * (Number.isFinite(Number(prof.q75 && prof.q75[j])) ? Number(prof.q75[j]) : q90j);
+            q90Acc += wt * q90j;
+            fStrongAcc += wt * (Number.isFinite(pFStrongMed[j]) ? pFStrongMed[j] : 0.0);
+          }}
+        }}
+        const nEff = Math.round(wCount);
+        totalObs += nEff;
+        if (nEff <= 0 || wSum <= 0.0) {{
+          bins.push({{ lamMid, n: 0, obsFrac: 0.0, sig: 0.0, medSnr: NaN, q75Snr: NaN, q90Snr: NaN }});
+        }} else {{
+          bins.push({{
+            lamMid,
+            n: nEff,
+            obsFrac: fStrongAcc / wSum,
+            sig: 0.0,
+            medSnr: q50Acc / wSum,
+            q75Snr: q75Acc / wSum,
+            q90Snr: q90Acc / wSum,
+          }});
+        }}
+      }}
+    }} else {{
+      // Fallback: compute Winsorized per-bin quantiles from unscaled measured integrated I/σ
+      // (never `mtz_isigi`, and excluding higher harmonic multiples gcd(|h|,|k|,|l|) > 1 when >= 20 fundamentals exist).
+      const candAll = [];
+      const candFund = [];
+      for (let i = 0; i < pool.length; i++) {{
+        const p = pool[i];
+        if (!p || typeof p.wavelength !== "number" || !Number.isFinite(p.wavelength)) continue;
+        if (p.wavelength < domLo || p.wavelength > domHi) continue;
+        const snr = typeof peakUnscaledIsigi === "function"
+          ? peakUnscaledIsigi(p)
+          : ((typeof p.unscaled_isigi === "number" && Number.isFinite(p.unscaled_isigi))
+            ? p.unscaled_isigi
+            : ((typeof p.intensity === "number" && typeof p.sigma === "number" && p.sigma > 0) ? (p.intensity / p.sigma) : NaN));
+        if (!Number.isFinite(snr)) continue;
+        const entry = {{ wl: p.wavelength, snr }};
+        candAll.push(entry);
+        if (_hklGcdOrder(p) <= 1) candFund.push(entry);
+      }}
+      const chosen = candFund.length >= 20 ? candFund : candAll;
+      totalObs = chosen.length;
+      const allSnrSorted = chosen.map((e) => e.snr).sort((a, b) => a - b);
+      const qCap = Math.max(4.0, Number.isFinite(_linearQuantileSorted(allSnrSorted, 0.985)) ? _linearQuantileSorted(allSnrSorted, 0.985) : 4.0);
+
+      const rawLists = Array.from({{ length: nBins }}, () => []);
+      const rawStrong = new Array(nBins).fill(0);
+      for (let i = 0; i < chosen.length; i++) {{
+        const e = chosen[i];
+        const idx = Math.max(0, Math.min(nBins - 1, Math.floor(((e.wl - domLo) / span) * nBins)));
+        rawLists[idx].push(Math.min(e.snr, qCap));
+        if (e.snr >= 4.0) rawStrong[idx]++;
+      }}
+      bins = rawLists.map((arr, bIdx) => {{
+        arr.sort((a, b) => a - b);
+        const n = arr.length;
+        const lamMid = domLo + ((bIdx + 0.5) / nBins) * span;
+        if (n === 0) {{
+          return {{ lamMid, n: 0, obsFrac: 0.0, sig: 0.0, medSnr: NaN, q75Snr: NaN, q90Snr: NaN }};
+        }}
+        return {{
+          lamMid,
+          n,
+          obsFrac: rawStrong[bIdx] / n,
+          sig: 0.0,
+          medSnr: _linearQuantileSorted(arr, 0.50),
+          q75Snr: _linearQuantileSorted(arr, 0.75),
+          q90Snr: _linearQuantileSorted(arr, 0.90),
+        }};
+      }});
+    }}
+
+    // Quantile noise-floor subtraction across populated bins + Bayesian count shrinkage:
+    // Off-band noise/harmonic leakage has q90(I/σ) <= ~2.0 and P(I/σ >= 4) <= ~1.8%.
+    let popBins = bins.filter((b) => b.n >= 4 && Number.isFinite(b.q90Snr));
+    if (popBins.length < 6) {{
+      popBins = bins.filter((b) => b.n >= 2 && Number.isFinite(b.q90Snr));
+    }}
+    const popCountsSorted = popBins.map((b) => b.n).sort((a, b) => a - b);
+    const medPopCount = popCountsSorted.length > 0 ? _linearQuantileSorted(popCountsSorted, 0.50) : 4.0;
+    const kShrink = Math.min(4.0, Math.max(1.0, 0.15 * medPopCount));
+
+    let q90Floor = 1.85;
+    let fStrongFloor = 0.010;
+    if (popBins.length >= 8) {{
+      const q90Sorted = popBins.map((b) => b.q90Snr).sort((a, b) => a - b);
+      const fSorted = popBins.map((b) => b.obsFrac).sort((a, b) => a - b);
+      q90Floor = Math.min(2.05, Math.max(1.35, _linearQuantileSorted(q90Sorted, 0.12)));
+      fStrongFloor = Math.min(0.018, Math.max(0.002, _linearQuantileSorted(fSorted, 0.12)));
+    }}
+
+    const rawExcQ = new Array(bins.length).fill(0.0);
+    const rawExcF = new Array(bins.length).fill(0.0);
+    for (let i = 0; i < bins.length; i++) {{
+      const b = bins[i];
+      if (b.n <= 0 || !Number.isFinite(b.q90Snr)) continue;
+      const shrink = b.n / (b.n + kShrink);
+      rawExcQ[i] = Math.max(0.0, b.q90Snr - q90Floor) * shrink;
+      rawExcF[i] = Math.max(0.0, b.obsFrac - fStrongFloor) * shrink;
+    }}
+
+    const smoothPopulated = (arr) => {{
+      // 3-bin running median rejects isolated single-bin cosmic-ray / sparse-bin spikes
+      // while preserving genuine multi-bin physical bandpasses (>= 0.15 Å).
+      const med = new Array(arr.length).fill(0.0);
+      for (let i = 0; i < arr.length; i++) {{
+        if (bins[i].n <= 0) continue;
+        const p = (i > 0 && bins[i - 1].n > 0) ? arr[i - 1] : 0.0;
+        const c = arr[i];
+        const nx = (i < arr.length - 1 && bins[i + 1].n > 0) ? arr[i + 1] : 0.0;
+        med[i] = Math.max(Math.min(p, c), Math.min(Math.max(p, c), nx));
+      }}
+      const out = new Array(arr.length).fill(0.0);
+      for (let i = 0; i < arr.length; i++) {{
+        if (bins[i].n <= 0) continue;
+        const p = (i > 0 && bins[i - 1].n > 0) ? med[i - 1] : med[i];
+        const nx = (i < arr.length - 1 && bins[i + 1].n > 0) ? med[i + 1] : med[i];
+        out[i] = 0.25 * p + 0.50 * med[i] + 0.25 * nx;
+      }}
+      return out;
+    }};
+
+    const smQ = smoothPopulated(rawExcQ);
+    const smF = smoothPopulated(rawExcF);
+    const maxQ = smQ.reduce((m, v) => (v > m ? v : m), 0.0);
+    const maxF = smF.reduce((m, v) => (v > m ? v : m), 0.0);
+    const hasRealSignal = totalObs >= 6 && (maxQ > 0.20 || maxF > 0.012);
+
+    let maxCombined = 0.0;
+    const combined = new Array(bins.length).fill(0.0);
+    if (hasRealSignal) {{
+      for (let i = 0; i < bins.length; i++) {{
+        if (bins[i].n <= 0) continue;
+        const nq = maxQ > 0.20 ? (smQ[i] / maxQ) : 0.0;
+        const nf = maxF > 0.012 ? (smF[i] / maxF) : 0.0;
+        combined[i] = 0.55 * nq + 0.45 * nf;
+        if (combined[i] > maxCombined) maxCombined = combined[i];
+      }}
+    }}
+    for (let i = 0; i < bins.length; i++) {{
+      if (!hasRealSignal || maxCombined <= 1e-6 || bins[i].n <= 0) {{
+        bins[i].sig = 0.0;
+      }} else {{
+        const normSig = combined[i] / maxCombined;
+        bins[i].sig = normSig >= 0.08 ? Math.min(1.0, normSig) : 0.0;
+      }}
+    }}
+
+    _lambdaSnrCarpetCache.sig = sig;
+    _lambdaSnrCarpetCache.bins = bins;
+    _lambdaSnrCarpetCache.hasSnr = totalObs >= 6 && maxCombined > 1e-6;
+    _lambdaSnrCarpetCache.domLo = domLo;
+    _lambdaSnrCarpetCache.domHi = domHi;
+    _lambdaSnrCarpetCache.peakSignal = maxQ;
+    return _lambdaSnrCarpetCache;
+  }}
+
+  function detectBandpassFromIsigi() {{
+    const [domLo, domHi] = getWavelengthSliderBounds();
+    const span = Math.max(MIN_WL_SPAN, domHi - domLo);
+    const nBins = Math.max(16, Math.min(160, Math.round(span / 0.05)));
+    const carpet = computeLambdaSnrCarpetBins(domLo, domHi, nBins);
+    if (!carpet.hasSnr || !carpet.bins.length) {{
+      return {{ valid: false, lo: state.lamMin, hi: state.lamMax }};
+    }}
+    const bins = carpet.bins;
+    let totalMass = 0.0;
+    for (let i = 0; i < bins.length; i++) {{
+      totalMass += bins[i].sig;
+    }}
+    if (totalMass <= 1e-6) {{
+      return {{ valid: false, lo: state.lamMin, hi: state.lamMax }};
+    }}
+    // 1%..99% quantiles of the baseline-subtracted density spectrum exclude edge outliers
+    // while avoiding 1/λ^4 Ewald-sphere candidate-count skew.
+    const binW = span / nBins;
+    const interpCdfAt = (targetQ) => {{
+      let acc = 0.0;
+      for (let i = 0; i < bins.length; i++) {{
+        const wMass = bins[i].sig;
+        if (wMass <= 0.0) continue;
+        const nextAcc = acc + wMass;
+        const c0 = acc / totalMass;
+        const c1 = nextAcc / totalMass;
+        if (targetQ <= c1 || i === bins.length - 1) {{
+          const t = c1 > c0 ? Math.max(0.0, Math.min(1.0, (targetQ - c0) / (c1 - c0))) : 0.0;
+          return domLo + (i + t) * binW;
+        }}
+        acc = nextAcc;
+      }}
+      return domHi;
+    }};
+    const rawLo = interpCdfAt(0.01);
+    const rawHi = interpCdfAt(0.99);
+    const lo = Math.max(domLo, Math.round(rawLo * 20) / 20);
+    const hi = Math.min(domHi, Math.max(lo + MIN_WL_SPAN, Math.round(rawHi * 20) / 20));
+    return {{ valid: true, lo, hi }};
+  }}
+
+  function renderLambdaSnrCarpets() {{
+    const wlCanvas = typeof document !== "undefined" && document ? document.getElementById("canvas-wl-carpet") : null;
+    const [domLo, domHi] = getWavelengthSliderBounds();
+    const band = detectBandpassFromIsigi();
+    if (wlKnobMin && wlKnobMin.classList) {{
+      const snappedMin = Boolean(band.valid && Math.abs(state.lamMin - band.lo) < 0.015);
+      wlKnobMin.classList.toggle("snapped-band-edge", snappedMin);
+    }}
+    if (wlKnobMax && wlKnobMax.classList) {{
+      const snappedMax = Boolean(band.valid && Math.abs(state.lamMax - band.hi) < 0.015);
+      wlKnobMax.classList.toggle("snapped-band-edge", snappedMax);
+    }}
+    if (!wlCanvas || typeof wlCanvas.getContext !== "function") return;
+    const rect = typeof wlCanvas.getBoundingClientRect === "function" ? wlCanvas.getBoundingClientRect() : {{ width: 220, height: 11 }};
+    const w = Math.max(80, Math.round(rect.width || wlCanvas.clientWidth || 220));
+    const h = Math.max(6, Math.round(rect.height || wlCanvas.clientHeight || 11));
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+    const targetW = Math.max(80, Math.round(w * dpr));
+    const targetH = Math.max(6, Math.round(h * dpr));
+    if (wlCanvas.width !== targetW) wlCanvas.width = targetW;
+    if (wlCanvas.height !== targetH) wlCanvas.height = targetH;
+    const ctx = wlCanvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const nBins = Math.max(48, Math.min(120, Math.round(w / 2.2)));
+    const carpet = computeLambdaSnrCarpetBins(domLo, domHi, nBins);
+    if (wlTrackFill && wlTrackFill.classList) {{
+      wlTrackFill.classList.toggle("has-carpet", Boolean(carpet.hasSnr));
+    }}
+    if (!carpet.hasSnr) return;
+
+    const span = Math.max(MIN_WL_SPAN, domHi - domLo);
+    const winLo = state.lamMin;
+    const winHi = state.lamMax;
+    const bins = carpet.bins;
+
+    for (let i = 0; i < bins.length; i++) {{
+      const b = bins[i];
+      const x0 = (i / bins.length) * w;
+      const bw = Math.max(1.0, (w / bins.length) + 0.45);
+      const lam = b ? b.lamMid : (domLo + ((i + 0.5) / bins.length) * span);
+      const inWin = lam >= winLo - 1e-6 && lam <= winHi + 1e-6;
+      const sig = b ? b.sig : 0.0;
+      if (inWin) {{
+        // Subtle slate physical window backdrop across [λ_min, λ_max], overlaid by
+        // strictly proportional sky-cyan bars showing measured quantile signal.
+        ctx.fillStyle = "rgba(148, 163, 184, 0.14)";
+        ctx.fillRect(x0, 0, bw, h);
+        if (sig > 0.06) {{
+          const barH = Math.max(1.2, sig * 0.90 * h);
+          ctx.fillStyle = `rgba(56, 189, 248, ${{(0.42 + 0.54 * sig).toFixed(3)}})`;
+          ctx.fillRect(x0, h - barH, bw, barH);
+        }}
+      }} else if (sig > 0.06) {{
+        // Unselected measured WL band outside [ ]: proportional cerulean-blue bar.
+        const barH = Math.max(1.2, sig * 0.90 * h);
+        ctx.fillStyle = `hsla(204.0, 94%, 52%, ${{(0.38 + 0.54 * sig).toFixed(3)}})`;
+        ctx.fillRect(x0, h - barH, bw, barH);
+      }}
+    }}
+
+    // Crisp sky-blue upper signal contour across the measured WL band
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < bins.length; i++) {{
+      const b = bins[i];
+      if (!b || b.sig <= 0.06) {{
+        started = false;
+        continue;
+      }}
+      const cx = ((i + 0.5) / bins.length) * w;
+      const cy = Math.max(1.0, Math.min(h - 1.0, h * (1.0 - 0.90 * b.sig)));
+      if (!started) {{
+        ctx.moveTo(cx, cy);
+        started = true;
+      }} else {{
+        ctx.lineTo(cx, cy);
+      }}
+    }}
+    ctx.strokeStyle = "rgba(56, 189, 248, 0.92)";
+    ctx.lineWidth = 1.25;
+    ctx.stroke();
+
+    // Vertical sky-blue snap-edge markers at 1%..99% quantile bandpass [lo, hi]
+    if (band.valid) {{
+      ctx.strokeStyle = "rgba(56, 189, 248, 0.95)";
+      ctx.lineWidth = 1.5;
+      [band.lo, band.hi].forEach((edgeLam) => {{
+        const ex = Math.max(0.75, Math.min(w - 0.75, ((edgeLam - domLo) / span) * w));
+        ctx.beginPath();
+        ctx.moveTo(ex, 0);
+        ctx.lineTo(ex, h);
+        ctx.stroke();
+      }});
+    }}
   }}
 
   function updateWavelengthLabels() {{
@@ -14963,11 +15567,14 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }}
     if (wlKnobMin) {{
       wlKnobMin.style.left = `${{pctLo.toFixed(2)}}%`;
-      wlKnobMin.title = `Minimum wavelength λ_min = ${{lo.toFixed(2)}} Å (drag [ or use Left/Right arrows)`;
+      wlKnobMin.title = `Minimum wavelength λ_min = ${{lo.toFixed(2)}} Å (drag [ to snap to integrated band edge, or Left/Right arrows)`;
     }}
     if (wlKnobMax) {{
       wlKnobMax.style.left = `${{pctHi.toFixed(2)}}%`;
-      wlKnobMax.title = `Maximum wavelength λ_max = ${{hi.toFixed(2)}} Å (drag ] or use Left/Right arrows)`;
+      wlKnobMax.title = `Maximum wavelength λ_max = ${{hi.toFixed(2)}} Å (drag ] to snap to integrated band edge, or Left/Right arrows)`;
+    }}
+    if (typeof renderLambdaSnrCarpets === "function") {{
+      renderLambdaSnrCarpets();
     }}
     if (typeof updateColorscaleSliderGradient === "function") {{
       updateColorscaleSliderGradient();
@@ -15840,9 +16447,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     return Math.pow(u, gamma);
   }}
 
-  // Vibrant spectral color preset for wavelength / zone highlights (crossover knob shifts spectral midpoint)
+  // Vibrant spectral color preset for wavelength / zone highlights:
+  // Limits [lamMin, lamMax] come from Wavelength λ [Å]; Colorscale Crossover shifts the spectral hue midpoint.
   function wavelengthToColor(lam, alpha = 1.0) {{
-    const u = Math.max(0, Math.min(1, (lam - state.lamMin) / Math.max(0.05, state.lamMax - state.lamMin)));
+    const lMin = (Number.isFinite(state.lamMin) && state.lamMin > 0) ? state.lamMin : 1.0;
+    const lMax = (Number.isFinite(state.lamMax) && state.lamMax > lMin) ? state.lamMax : (lMin + 1.0);
+    const u = Math.max(0, Math.min(1, (lam - lMin) / Math.max(0.05, lMax - lMin)));
     const t = applyCrossoverCurve(u);
     const hue = (1.0 - t) * 265;
     return `hsla(${{hue.toFixed(1)}}, 95%, 60%, ${{alpha}})`;
@@ -16407,6 +17017,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       }}
       const crossLam = lMin + c * Math.max(0.05, lMax - lMin);
       label = `λ ~ ${{crossLam.toFixed(2)}} Å`;
+      tooltip = `Spectral hue midpoint λ ~ ${{crossLam.toFixed(2)}} Å across [${{lMin.toFixed(2)}}, ${{lMax.toFixed(2)}}] Å (limits set by Wavelength λ [Å] slider)`;
     }}
     state.colorCrossover = prevC;
     return {{
@@ -16417,15 +17028,22 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   }}
 
   function updateColorscaleSliderGradient() {{
+    const activeMode = state.wulffColorMode || "wavelength";
     const c = getColorCrossover();
-    const spec = buildColorscaleGradientSpec(state.wulffColorMode || "wavelength", c);
+    const spec = buildColorscaleGradientSpec(activeMode, c);
     if (slColorEmphasis) {{
+      slColorEmphasis.disabled = false;
+      slColorEmphasis.setAttribute("aria-disabled", "false");
       slColorEmphasis.style.setProperty("--cs-gradient", spec.gradient);
+      slColorEmphasis.title = spec.tooltip || "Drag knob to tune colorscale contrast / midpoint crossover (double-click to reset)";
     }}
-    const lbl = document.getElementById("lbl-color-emphasis");
+    const lbl = typeof document !== "undefined" && document ? document.getElementById("lbl-color-emphasis") : null;
     if (lbl) {{
       lbl.textContent = spec.label;
       lbl.title = spec.tooltip || "";
+    }}
+    if (typeof renderLambdaSnrCarpets === "function") {{
+      renderLambdaSnrCarpets();
     }}
   }}
 
@@ -22234,11 +22852,13 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   if (slColorEmphasis) {{
     slColorEmphasis.addEventListener("input", () => {{
+      if (slColorEmphasis.disabled) return;
       const v = parseFloat(slColorEmphasis.value);
       state.colorCrossover = Number.isFinite(v) ? Math.max(0.05, Math.min(0.95, v)) : DEFAULT_COLOR_CROSSOVER;
       updateColorscaleSliderGradient();
     }});
     slColorEmphasis.addEventListener("dblclick", () => {{
+      if (slColorEmphasis.disabled) return;
       slColorEmphasis.value = DEFAULT_COLOR_CROSSOVER.toFixed(2);
       state.colorCrossover = DEFAULT_COLOR_CROSSOVER;
       updateColorscaleSliderGradient();
@@ -22518,17 +23138,29 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   if (wlSliderWrap) {{
     let activeWlDragEnd = null;
-    const clientXToSnappedWl = (clientX) => {{
+    const SNAP_WL_TOL_ANG = 0.12;
+    const clientXToSnappedWl = (clientX, dragEnd = null, bypassSnap = false) => {{
       const rect = wlSliderWrap.getBoundingClientRect();
       const width = Math.max(1, rect.width);
       const frac = Math.max(0, Math.min(1, (clientX - rect.left) / width));
       const [domMin, domMax] = getWavelengthSliderBounds();
       const raw = domMin + frac * (domMax - domMin);
+      if (!bypassSnap && typeof detectBandpassFromIsigi === "function") {{
+        const band = detectBandpassFromIsigi();
+        if (band && band.valid) {{
+          if (dragEnd === "min" && Math.abs(raw - band.lo) <= SNAP_WL_TOL_ANG && band.lo <= state.lamMax - MIN_WL_SPAN) {{
+            return band.lo;
+          }}
+          if (dragEnd === "max" && Math.abs(raw - band.hi) <= SNAP_WL_TOL_ANG && band.hi >= state.lamMin + MIN_WL_SPAN) {{
+            return band.hi;
+          }}
+        }}
+      }}
       return Math.round(raw * 20) / 20;
     }};
-    const applyDraggedWl = (clientX) => {{
+    const applyDraggedWl = (clientX, bypassSnap = false) => {{
       if (!activeWlDragEnd) return;
-      const snapped = clientXToSnappedWl(clientX);
+      const snapped = clientXToSnappedWl(clientX, activeWlDragEnd, bypassSnap);
       const prevLo = state.lamMin;
       const prevHi = state.lamMax;
       if (activeWlDragEnd === "min") {{
@@ -22542,27 +23174,46 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }};
     wlSliderWrap.addEventListener("pointerdown", (ev) => {{
       if (ev.button !== undefined && ev.button !== 0) return;
-      if (ev.target === wlKnobMin || (wlKnobMin && wlKnobMin.contains(ev.target))) {{
+      const bypassSnap = Boolean(ev.shiftKey || ev.altKey);
+      if (ev.target === wlKnobMin || (wlKnobMin && typeof wlKnobMin.contains === "function" && wlKnobMin.contains(ev.target))) {{
         activeWlDragEnd = "min";
-      }} else if (ev.target === wlKnobMax || (wlKnobMax && wlKnobMax.contains(ev.target))) {{
+      }} else if (ev.target === wlKnobMax || (wlKnobMax && typeof wlKnobMax.contains === "function" && wlKnobMax.contains(ev.target))) {{
         activeWlDragEnd = "max";
       }} else {{
-        const clickWl = clientXToSnappedWl(ev.clientX);
+        const clickWl = clientXToSnappedWl(ev.clientX, null, true);
         const dLo = Math.abs(clickWl - state.lamMin);
         const dHi = Math.abs(clickWl - state.lamMax);
         activeWlDragEnd = (dLo < dHi || (dLo === dHi && clickWl < state.lamMin)) ? "min" : "max";
-        applyDraggedWl(ev.clientX);
+        applyDraggedWl(ev.clientX, bypassSnap);
       }}
       if (wlKnobMin) wlKnobMin.classList.toggle("dragging", activeWlDragEnd === "min");
       if (wlKnobMax) wlKnobMax.classList.toggle("dragging", activeWlDragEnd === "max");
       if (typeof wlSliderWrap.setPointerCapture === "function" && ev.pointerId !== undefined) {{
         try {{ wlSliderWrap.setPointerCapture(ev.pointerId); }} catch (_e) {{}}
       }}
-      ev.preventDefault();
+      if (typeof ev.preventDefault === "function") ev.preventDefault();
     }});
     wlSliderWrap.addEventListener("pointermove", (ev) => {{
-      if (!activeWlDragEnd) return;
-      applyDraggedWl(ev.clientX);
+      if (activeWlDragEnd) {{
+        applyDraggedWl(ev.clientX, Boolean(ev.shiftKey || ev.altKey));
+        return;
+      }}
+      if (typeof wlSliderWrap.getBoundingClientRect === "function" && Number.isFinite(ev.clientX)) {{
+        const rect = wlSliderWrap.getBoundingClientRect();
+        const frac = Math.max(0, Math.min(1, (ev.clientX - rect.left) / Math.max(1, rect.width)));
+        const [domLo, domHi] = getWavelengthSliderBounds();
+        const carpet = computeLambdaSnrCarpetBins(domLo, domHi, 64);
+        if (carpet.hasSnr && carpet.bins.length > 0) {{
+          const bIdx = Math.min(carpet.bins.length - 1, Math.floor(frac * carpet.bins.length));
+          const b = carpet.bins[bIdx];
+          const band = detectBandpassFromIsigi();
+          const bandNote = band.valid ? ` · Q[1..99%] band ≈ [${{band.lo.toFixed(2)}}, ${{band.hi.toFixed(2)}}] Å` : "";
+          if (b && b.n > 0) {{
+            const q90Txt = Number.isFinite(b.q90Snr) ? b.q90Snr.toFixed(1) : "–";
+            wlSliderWrap.title = `λ ≈ ${{b.lamMid.toFixed(2)}} Å · n=${{b.n}} · q90(I/σ)=${{q90Txt}} · P(I/σ≥4)=${{Math.round(100 * b.obsFrac)}}%${{bandNote}}`;
+          }}
+        }}
+      }}
     }});
     const stopWlDrag = (ev) => {{
       if (!activeWlDragEnd) return;
@@ -23522,6 +24173,13 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     _dynViewportPatchCache.sig = "";
     INTEGRATED_PEAKS = nextBuckets.integPeaks;
     INTEGRATED_SAMPLE_PEAKS = nextBuckets.integSample;
+    if (newPayload.wavelength_bandpass_profile !== undefined) {{
+      DATA.wavelength_bandpass_profile = newPayload.wavelength_bandpass_profile || null;
+    }} else if (!isFrameSwitch && INTEGRATED_PEAKS.length === 0 && INTEGRATED_SAMPLE_PEAKS.length === 0) {{
+      DATA.wavelength_bandpass_profile = null;
+    }}
+    _lambdaSnrCarpetCache.sig = "";
+    updateWavelengthLabels();
     if (newPayload.merge_metrics !== undefined) {{
       DATA.merge_metrics = newPayload.merge_metrics || null;
     }} else if (!isFrameSwitch) {{
