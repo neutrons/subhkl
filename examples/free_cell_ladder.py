@@ -14,19 +14,26 @@ Observations: spot directions d_m (sample frame), sin(theta_m), weights.
    least squares on all indexed vectors; reduction.
 
 Status (prototype, first step towards estimating the cell inside the
-ladder so that Laue and time-of-flight data share one path):
+ladder so that Laue and time-of-flight data share one path).  Blind cell
+against the known one:
 
-- IMAGINE-X T4 lysozyme, five runs, geometry and rotations from an earlier
-  solve: the true primitive lattice with absolute scale, 62.1 62.5 99.6,
-  89.4 90.8 118.9 against 62.2 62.2 97.1, 90 90 120.  Ladder lengths are
-  within 5% for vectors up to about 170 A and saturate near 200 A.
-- The same data, one run alone (512 spots): the right lattice with angles
-  off by up to 9 degrees.
-- MANDI Mpro complex with the time of flight ignored: roughly the primitive
-  cell of the I-centred lattice (55.0 62.0 64.2 against 55.1 63.1 64.2).
-- Fails on MANDI T4 lysozyme with the time of flight ignored, on single
-  MANDI runs, and on IMAGINE-X L1 MBL (where the Funk peaks are not lattice
-  directions to begin with).
+- IMAGINE-X T4 lysozyme, five runs: 62.1 62.5 99.6, 89.4 90.8 118.9
+  against 62.2 62.2 97.1, 90 90 120 (the true primitive lattice).
+- IMAGINE-X L1 MBL, fourteen runs: 72.8 95.5 101.5, 89.4 90.3 105.8
+  against 69.0 90.9 97.9, 89.9 90.0 106.1.  This needed the spots that stay
+  on one detector pixel across runs to be removed: they gave a family of
+  Funk peaks on a cone about the rotation axis, as strong as the true ones.
+- MANDI with the time of flight ignored: Mpro complex 54.3 63.0 64.7,
+  80.5 106.9 112.7 against the primitive cell 55.1 63.1 64.2, 78.0 110.7
+  111.8; T4 lysozyme 54.3 59.5 92.8, 86.8 92.3 115.4 against 61.0 61.0
+  97.2, 90 90 120 (the right lattice, lengths 5-11% short).
+- Single runs: roughly right for IMAGINE-X T4 lysozyme and MANDI Mpro,
+  wrong for MANDI T4 lysozyme.
+
+The IMAGINE-X cases used detector geometry and rotations from an earlier
+solve, the MANDI cases nominal detectors and rotations from align_runs.
+Lengths carry a bias of a few percent that follows the assumed lower band
+edge, and ladders longer than about 180 A are not resolved.
 
 Usage:
     python free_cell_ladder.py merged.h5 INSTRUMENT lam_min lam_max [--geometry solve.h5]
@@ -46,11 +53,20 @@ from subhkl.instrument.goniometer import Goniometer
 from subhkl.search.blind_cell import cell_of, pixel_positions, reduce_basis
 
 
-def spots(merged, instrument, rotations, images=None, min_z=8.0):
+def spots(merged, instrument, rotations, images=None, min_z=8.0, drop_fixed=True):
+    """Spot directions (sample frame), weights and sin(theta).
+
+    With ``drop_fixed``, spots that recur at the same detector pixel in three
+    or more runs are left out: a Bragg spot moves when the crystal turns, a
+    detector artefact or a feature fixed in the laboratory does not, and such
+    features produce Funk peaks on a cone about the rotation axis.
+    """
     dirs, wts, sth = [], [], []
+    where = []
     cache = {}
     with h5py.File(merged, "r") as f:
         bank_ids = f["bank_ids"][()]
+        offsets = f["file_offsets"][()] if "file_offsets" in f else np.array([0])
         for i in range(f["images"].shape[0]) if images is None else images:
             img = f["images"][i].astype(np.float64)
             fine, coarse = gaussian_filter(img, 1.5), gaussian_filter(img, 10.0)
@@ -79,7 +95,18 @@ def spots(merged, instrument, rotations, images=None, min_z=8.0):
             dirs.append((q / norm[:, None]) @ rotations[i])
             sth.append(0.5 * norm)
             wts.append((fine - coarse)[rr, cc])
+            run = int(np.searchsorted(offsets, i, side="right") - 1)
+            where.append(
+                np.stack([np.full(len(rr), bank), rr, cc, np.full(len(rr), run)], 1)
+            )
     dirs, wts, sth = np.concatenate(dirs), np.concatenate(wts), np.concatenate(sth)
+    where = np.concatenate(where)
+    if drop_fixed and len(np.unique(where[:, 3])) >= 3:
+        cell = (where[:, 0] * 4096 + where[:, 1] // 4) * 4096 + where[:, 2] // 4
+        key = np.unique(np.stack([cell, where[:, 3]], 1), axis=0)
+        cells, n_runs = np.unique(key[:, 0], return_counts=True)
+        fixed = np.isin(cell, cells[n_runs >= 3])
+        dirs, wts, sth = dirs[~fixed], wts[~fixed], sth[~fixed]
     return dirs, np.minimum(wts, np.quantile(wts, 0.95)), sth
 
 
@@ -155,6 +182,17 @@ def main():
     ap.add_argument("--images", type=int, nargs=2, action="append")
     ap.add_argument("--poles", type=int, default=30)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument(
+        "--max-length",
+        type=float,
+        default=180.0,
+        help="ladders longer than this are not resolved [A]",
+    )
+    ap.add_argument(
+        "--keep-fixed",
+        action="store_true",
+        help="keep spots that stay on one pixel across runs",
+    )
     args = ap.parse_args()
 
     if args.geometry:
@@ -169,7 +207,9 @@ def main():
     if args.rotations:
         rot = np.load(args.rotations)
     images = [i for a, b in args.images for i in range(a, b)] if args.images else None
-    dirs, wts, sth = spots(args.merged, args.instrument, rot, images)
+    dirs, wts, sth = spots(
+        args.merged, args.instrument, rot, images, drop_fixed=not args.keep_fixed
+    )
     poles, heights = zone_poles(dirs, wts, n_poles=args.poles)
     true = None
     if args.reference:
@@ -213,11 +253,11 @@ def main():
             k = int(np.argmax(cosang - 1e-4 * Xl / Xl.max()))
             ang = np.degrees(np.arccos(min(cosang[k], 1.0)))
             line += f"       {ang:5.2f} deg  {tuple(int(t) for t in uvw[k])!s:14s} {Xl[k]:7.2f}   {L / Xl[k]:6.3f}"
-            if ang < 0.5 and band > 1.5 and gap < 0.5:
+            if ang < 0.5 and band > 1.5 and gap < 1.0 and L < args.max_length:
                 ratios.append(L / Xl[k])
         if not args.quiet:
             print(line)
-        if np.isfinite(L) and band > 1.5 and gap < 0.5:
+        if np.isfinite(L) and band > 1.5 and gap < 1.0 and L < args.max_length:
             vecs.append(p * L)
             score.append(band - gap)
     if ratios:
