@@ -4,6 +4,20 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Blind unit cell for time-of-flight data (`blind_cell`)**:
+  - `subhkl.search.blind_cell.find_cell` finds the unit cell with its absolute
+    scale, the orientation and the lattice symmetry from the 3D Fourier
+    transform of the raw events, with no cell, peaks or space group given.
+    `write_seed` stores the result as a P 1 solve file for
+    `solve --refinement band --bootstrap`.
+  - The conventional cell and centring are derived for every lattice type
+    from the lattice's own rotation axes, and a centred lattice is seeded in
+    its conventional cell (`I 1`, `C 1`, ...).
+
 ## [1.7.3]
 
 ### Fixed
