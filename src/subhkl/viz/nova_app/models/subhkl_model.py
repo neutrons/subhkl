@@ -112,21 +112,21 @@ class SubhklConfig(BaseModel):
         description="Unit cell gamma (deg)",
     )
     wavelength_min: float = Field(
-        default=2.8,
+        default=3.1,
         gt=0.05,
         le=30.0,
         title="λ min (Å)",
         description="Minimum incident wavelength (Å)",
     )
     wavelength_max: float = Field(
-        default=4.5,
+        default=4.3,
         gt=0.05,
         le=30.0,
         title="λ max (Å)",
         description="Maximum incident wavelength (Å)",
     )
     d_min: float = Field(
-        default=1.4,
+        default=1.55,
         gt=0.3,
         le=20.0,
         title="d_min (Å)",
