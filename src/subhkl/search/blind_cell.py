@@ -355,6 +355,245 @@ def merge_radial_peaks(pos, height, angle_deg=2.0, rel_length=0.12):
     return out_p[order], out_h[order]
 
 
+def laue_observations(
+    merged,
+    instrument,
+    wavelength,
+    d_min,
+    frames=None,
+    rotations=None,
+    binning=None,
+    max_bins=65536,
+):
+    """Count bins as the orientation search sees them, for scoring lattices.
+
+    The images are binned so that a reflection fills about one bin; each bin
+    gets the weight of ``blind_band.count_search_weights`` (the square root
+    of its Poisson deviance against the local background, with background
+    fluctuations suppressed), its scattering-vector direction in the sample
+    frame, and the interval of |q| the wavelength band allows.
+
+    Returns:
+        dict with ``dirs`` (M, 3), ``q_lo``, ``q_hi`` [1/Angstrom] and
+        ``weights`` (sum 1)
+    """
+    from scipy.ndimage import median_filter
+
+    from subhkl.search.blind_band import count_search_weights
+
+    lam_lo, lam_hi = float(wavelength[0]), float(wavelength[1])
+    dirs, wts, qlo, qhi = [], [], [], []
+    cache = {}
+    with h5py.File(merged, "r") as f:
+        n_img = f["images"].shape[0]
+        bank_ids = f["bank_ids"][()]
+        rot = Goniometer.from_h5_file(f).rotation
+        if rot.ndim == 2:
+            rot = np.broadcast_to(rot, (n_img, 3, 3))
+        if rotations is not None:
+            rot = np.asarray(rotations)
+        for i in range(n_img) if frames is None else frames:
+            img = f["images"][i].astype(np.float64)
+            b = binning or (8 if min(img.shape) >= 512 else 4)
+            hb, wb = img.shape[0] // b, img.shape[1] // b
+            y = img[: hb * b, : wb * b].reshape(hb, b, wb, b).sum(axis=(1, 3))
+            mu = np.maximum(median_filter(y, size=7, mode="nearest"), 0.5)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                dev = 2.0 * (np.where(y > 0, y * np.log(y / mu), 0.0) - (y - mu))
+            w = count_search_weights(np.where(y > mu, dev, 0.0))
+            w[0], w[-1], w[:, 0], w[:, -1] = 0.0, 0.0, 0.0, 0.0
+            br, bc = np.nonzero(w > 0.5)
+            if len(br) == 0:
+                continue
+            bank = int(bank_ids[i])
+            if bank not in cache:
+                cache[bank] = pixel_positions(instrument, bank, img.shape).astype(
+                    np.float64
+                )
+            xyz = cache[bank][(br * b + b // 2) * img.shape[1] + bc * b + b // 2]
+            q = xyz / np.linalg.norm(xyz, axis=1)[:, None] - np.array([0.0, 0.0, 1.0])
+            two_sin = np.linalg.norm(q, axis=1)
+            dirs.append((q / two_sin[:, None]) @ rot[i])
+            wts.append(w[br, bc])
+            qlo.append(two_sin / lam_hi)
+            qhi.append(np.minimum(two_sin / lam_lo, 1.0 / d_min))
+    if not dirs:
+        raise ValueError("No count bin stands above its background.")
+    dirs, wts, qlo, qhi = (np.concatenate(v) for v in (dirs, wts, qlo, qhi))
+    ok = qhi > 1.02 * qlo
+    dirs, wts, qlo, qhi = dirs[ok], wts[ok], qlo[ok], qhi[ok]
+    if len(wts) > max_bins:
+        top = np.argsort(-wts)[:max_bins]
+        dirs, wts, qlo, qhi = dirs[top], wts[top], qlo[top], qhi[top]
+    return {"dirs": dirs, "q_lo": qlo, "q_hi": qhi, "weights": wts / wts.sum()}
+
+
+def candidate_lattices(pos, height, n_peaks=30, n_fit=80, tol=0.15, max_candidates=300):
+    """Lattices that triples of the strongest map peaks span.
+
+    Each triple of non-coplanar peaks is taken as a basis, refined by least
+    squares on the peaks it indexes, and reduced.  Duplicates (the same
+    lattice within 3% and 2 degrees) are dropped.  The map alone cannot say
+    which of them is the lattice (a strong peak at half a lattice vector, or
+    a missing short one, gives sub- and superlattices that index the peaks
+    almost as well); ``ladder_scores`` decides.
+
+    Returns:
+        list of (basis, share of the peak weight it indexes), best share first
+    """
+    import itertools
+
+    keep = [i for i in range(len(pos)) if tuple(pos[i]) > tuple(-pos[i])]
+    pos, height = pos[keep], height[keep]
+    top = pos[:n_peaks]
+    fit_p, fit_h = pos[:n_fit], height[:n_fit]
+    found = []
+    for i, j, k in itertools.combinations(range(len(top)), 3):
+        A = np.stack([top[i], top[j], top[k]], 1)
+        if abs(np.linalg.det(A)) < 0.15 * np.prod(np.linalg.norm(A, axis=0)):
+            continue
+        good = None
+        for _ in range(2):
+            c = np.linalg.solve(A, fit_p.T).T
+            nint = np.rint(c)
+            good = (np.abs(c - nint).max(axis=1) < tol) & (np.abs(nint).sum(axis=1) > 0)
+            if good.sum() < 4:
+                break
+            N, X, W = nint[good].T, fit_p[good].T, fit_h[good]
+            M = (N * W) @ N.T
+            if abs(np.linalg.det(M)) < 1e-9:
+                break
+            A = (X * W) @ N.T @ np.linalg.inv(M)
+        if good is None or good.sum() < 4:
+            continue
+        found.append((reduce_basis(A), float(fit_h[good].sum() / fit_h.sum())))
+    found.sort(key=lambda t: -t[1])
+    unique = []
+    for A, share in found:
+        cell = np.array(cell_of(A))
+        same = False
+        for B, _s in unique:
+            other = np.array(cell_of(B))
+            if np.allclose(cell[:3], other[:3], rtol=0.03) and np.allclose(
+                cell[3:], other[3:], atol=2.0
+            ):
+                T = np.linalg.solve(B, A)
+                if np.abs(T - np.rint(T)).max() < 0.15:
+                    same = True
+                    break
+        if not same:
+            unique.append((A, share))
+        if len(unique) >= max_candidates:
+            break
+    return unique
+
+
+_LADDER_UVW = None
+
+
+def _ladder_vectors(A, n_zones):
+    """The ``n_zones`` shortest primitive lattice vectors of a basis and
+    their weights 1/|x| (normalised)."""
+    global _LADDER_UVW
+    if _LADDER_UVW is None:
+        r = range(-4, 5)
+        _LADDER_UVW = np.array(
+            [
+                (a, b, c)
+                for a in r
+                for b in r
+                for c in r
+                if np.gcd.reduce([abs(a), abs(b), abs(c)]) == 1
+                and (a, b, c) > (0, 0, 0)
+            ]
+        )
+    X = _LADDER_UVW @ np.asarray(A).T
+    length = np.linalg.norm(X, axis=1)
+    order = np.argsort(length)[:n_zones]
+    w = 1.0 / length[order]
+    return X[order], w / w.sum(), _LADDER_UVW[order]
+
+
+def ladder_scores(bases, obs, n_zones=60, n_null=24, polish=True):
+    """The orientation search's band objective for a list of lattices.
+
+    For a lattice vector x and a count bin with direction d and |q| between
+    q_lo and q_hi, the Laue condition x.q = integer is averaged over that
+    interval (``scan_band.band_sum``); the score sums it over the bins and
+    over the ``n_zones`` shortest lattice vectors with weights 1/|x|.  A
+    lattice with a spurious short vector, or with a true one missing, scores
+    lower than the lattice itself, and so does one at the wrong scale.
+
+    Args:
+        bases: list of (3, 3) direct bases, columns [Angstrom], sample frame
+        obs: output of ``laue_observations``
+        n_null: random orientations of the best lattice for its z-score
+        polish: refine the best lattice on the objective
+    Returns:
+        (scores (len(bases),), index of the best, its basis after the
+        polish, its score, its z-score against random orientations)
+    """
+    import jax
+    import jax.numpy as jnp
+    from scipy.optimize import minimize
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.search.scan_band import band_sum
+
+    D, LO, HI, W = (
+        jnp.asarray(obs[k], dtype=jnp.float32)
+        for k in ("dirs", "q_lo", "q_hi", "weights")
+    )
+    score = jax.jit(lambda X, zw: band_sum(X, D, LO, HI, W, zw))
+    scores = np.zeros(len(bases))
+    for n, A in enumerate(bases):
+        X, zw, _uvw = _ladder_vectors(A, n_zones)
+        scores[n] = float(
+            score(jnp.asarray(X, jnp.float32), jnp.asarray(zw, jnp.float32))
+        )
+    best = int(np.argmax(scores))
+    A = np.array(bases[best], dtype=float)
+    top = float(scores[best])
+    if polish:
+        _X, zw, uvw = _ladder_vectors(A, n_zones)
+        uvw_j, zw_j = jnp.asarray(uvw, jnp.float32), jnp.asarray(zw, jnp.float32)
+        A0 = jnp.asarray(A, jnp.float32)
+
+        def neg(delta):
+            return -band_sum(uvw_j @ (A0 + delta.reshape(3, 3)).T, D, LO, HI, W, zw_j)
+
+        fun = jax.jit(jax.value_and_grad(neg))
+
+        def f(delta):
+            v, g = fun(jnp.asarray(delta, jnp.float32))
+            return float(v), np.asarray(g, dtype=np.float64)
+
+        res = minimize(
+            f, np.zeros(9), jac=True, method="L-BFGS-B", options={"maxiter": 60}
+        )
+        if -res.fun > top:
+            # The polish is kept for shape and orientation only.  The objective
+            # assumes a flat spectrum between the band limits and gains a few
+            # percent by shrinking the lattice when the real spectrum is
+            # narrower, so the volume is put back to what the map gave.
+            moved = A + res.x.reshape(3, 3)
+            moved = moved * (abs(np.linalg.det(A)) / abs(np.linalg.det(moved))) ** (
+                1 / 3
+            )
+            A, top = reduce_basis(moved), float(-res.fun)
+    X, zw, _uvw = _ladder_vectors(A, n_zones)
+    null = np.array(
+        [
+            float(
+                score(jnp.asarray(X @ Rn.T, jnp.float32), jnp.asarray(zw, jnp.float32))
+            )
+            for Rn in Rotation.random(n_null, random_state=1).as_matrix()
+        ]
+    )
+    z = (top - null.mean()) / max(float(null.std()), 1e-12)
+    return scores, best, A, top, float(z)
+
+
 def bragg_excess(grid, sigma=4.0, k=5.0):
     """Counts above the local background, zero elsewhere.
 
@@ -983,22 +1222,66 @@ def find_cell(
         raise ValueError(
             "Fewer than three peaks in the direct-space map: no lattice in the events."
         )
-    A, good, diag = lattice_basis(pos, height, g, voxel)
-    say(
-        f"lattice: {int(good.sum())} of {len(pos)} map peaks indexed "
-        f"({100 * diag['indexed_weight']:.0f}% of the peak weight), "
-        f"rms misfit {diag['rms_misfit']:.2f} A, third-axis comb {diag['third_axis_score']:.2f}"
-    )
-    dens = np.array(density)
-    nz = np.argwhere(dens > 0)
-    wts = dens[dens > 0]
-    if len(wts) > 400000:  # streaks fill many voxels: the heaviest carry the lattice
-        top = np.argsort(-wts)[:400000]
-        nz, wts = nz[top], wts[top]
-    q_pts = (nz + 0.5) * (2.0 * q_max / grid) - q_max
-    extent = 330.0 if wavelength is None else min(330.0, 0.45 * grid * voxel)
-    A, before, after = refine_basis(A, q_pts, wts, extent=extent)
-    diag.update(fourier_sum_before=before, fourier_sum_after=after, events=n_events)
+    if wavelength is not None:
+        # The map proposes, the ladder objective decides: a linear map takes
+        # every structure in the data for a peak, whereas a score of a whole
+        # lattice on the count bins averages out what does not belong to it.
+        cands = candidate_lattices(pos, height)
+        if not cands:
+            raise ValueError(
+                "No three independent peaks in the direct-space map: no lattice in the images."
+            )
+        obs = laue_observations(
+            merged, instrument, wavelength, d_min, frames=frames, rotations=rotations
+        )
+        scores, best, A, top, z = ladder_scores([c[0] for c in cands], obs)
+        order = np.argsort(-scores)
+        other = next(
+            (
+                float(scores[i])
+                for i in order[1:]
+                if abs(
+                    abs(np.linalg.det(np.linalg.solve(cands[best][0], cands[i][0])))
+                    - 1.0
+                )
+                > 0.2
+            ),
+            float("nan"),
+        )
+        diag = {
+            "candidates": len(cands),
+            "ladder_score": top,
+            "ladder_z": z,
+            "next_other_lattice_score": other,
+            "map_share_of_winner": cands[best][1],
+            "map_rank_of_winner": int(best),
+            "bins": len(obs["weights"]),
+            "events": n_events,
+        }
+        say(
+            f"{len(cands)} candidate lattices from the map, scored on {len(obs['weights'])} count bins: "
+            f"best {1e3 * top:.2f} (z {z:.0f} against random orientations), next different lattice "
+            f"{1e3 * other:.2f}; the map alone ranked it {best + 1}"
+        )
+    else:
+        A, good, diag = lattice_basis(pos, height, g, voxel)
+        say(
+            f"lattice: {int(good.sum())} of {len(pos)} map peaks indexed "
+            f"({100 * diag['indexed_weight']:.0f}% of the peak weight), "
+            f"rms misfit {diag['rms_misfit']:.2f} A, third-axis comb {diag['third_axis_score']:.2f}"
+        )
+        dens = np.array(density)
+        nz = np.argwhere(dens > 0)
+        wts = dens[dens > 0]
+        if (
+            len(wts) > 400000
+        ):  # streaks fill many voxels: the heaviest carry the lattice
+            top = np.argsort(-wts)[:400000]
+            nz, wts = nz[top], wts[top]
+        q_pts = (nz + 0.5) * (2.0 * q_max / grid) - q_max
+        extent = 330.0 if wavelength is None else min(330.0, 0.45 * grid * voxel)
+        A, before, after = refine_basis(A, q_pts, wts, extent=extent)
+        diag.update(fourier_sum_before=before, fourier_sum_after=after, events=n_events)
     info = describe_lattice(A)
     say(
         "primitive cell: a={:.2f} b={:.2f} c={:.2f} alpha={:.2f} beta={:.2f} gamma={:.2f}".format(

@@ -14,6 +14,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     transform of the raw events, with no cell, peaks or space group given.
     `write_seed` stores the result as a P 1 solve file for
     `solve --refinement band --bootstrap`.
+  - `find_cell(wavelength=(lam_min, lam_max))` finds the cell from Laue images
+    without event times, on the same code path: each reflection is spread
+    along its radial streak over the band before the Fourier transform. The
+    map proposes candidate lattices and the orientation search's band
+    objective, evaluated on the count bins (`ladder_scores`), decides among
+    them. On IMAGINE-X T4 lysozyme and L1 MBL and on MANDI T4 lysozyme and
+    Mpro with the time of flight ignored it returns the right lattice, with
+    centring, and the scale within 3%.
   - `align_runs` measures the goniometer's rotation errors from the data,
     with no cell and no model of the goniometer: each run on its own gives
     the lattice in its nominal frame, and the rotation between the per-run

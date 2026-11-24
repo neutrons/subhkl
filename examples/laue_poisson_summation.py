@@ -9,25 +9,35 @@ code as for time-of-flight events.  A lattice vector does not need its own
 zone (h.x = 0) to have been measured, because the first-order planes
 contribute too.
 
+The map only proposes.  It is linear in the weights, so every structure in
+the data makes peaks, and a strong peak at half a lattice vector or a
+missing short one gives sub- and superlattices that index the peaks almost
+as well.  ``find_cell`` therefore takes many candidate lattices from the
+map and lets the orientation search's own objective decide: the Laue
+condition averaged over the band, summed over the shortest lattice vectors
+and over the count bins with their significance weights
+(``ladder_scores``).  A whole lattice is scored, so what does not belong to
+it averages out.
+
 Status, all runs of each dataset, blind cell against the known one:
 
-- IMAGINE-X T4 lysozyme: 62.6 62.7 98.2, 89.9 90.1 119.9 against
-  62.2 62.2 97.1, 90 90 120.
-- MANDI T4 lysozyme with the time of flight ignored: 54.3 54.4 86.6,
-  89.6 90.3 119.9 against 61.0 61.0 97.2, 90 90 120: the right lattice and
-  shape (c/a 1.594 against 1.594), all lengths 11% short.
-- MANDI Mpro complex as Laue: 51.5 59.7 59.8, 79.0 110.3 110.7 against the
-  primitive cell 55.1 63.1 64.2, 78.0 110.7 111.8 (lengths 6% short).
-- IMAGINE-X L1 MBL: 35.5 90.4 100.4, 90.1 90.1 96.1 against 69.0 90.9 97.9,
-  89.9 90.0 106.1: the basis picked half of [-1 1 0], so the cell has half
-  the volume.
+- IMAGINE-X T4 lysozyme: 62.4 62.5 97.9, 90.1 90.1 119.9, hexagonal,
+  against 62.2 62.2 97.1, 90 90 120.
+- IMAGINE-X L1 MBL: 70.7 100.1 93.4, beta 106.1, primitive monoclinic,
+  against 69.0 97.9 90.9, 106.1.  The map alone ranked a lattice with half
+  the volume first; the score puts the true one first (34 against 22).
+- MANDI T4 lysozyme with the time of flight ignored: 60.8 61.0 97.3,
+  89.7 90.3 119.6 against 61.0 61.0 97.2, 90 90 120.
+- MANDI Mpro complex as Laue: I-centred monoclinic 53.3 78.7 85.4, beta
+  96.7 against 54.7 80.5 88.0, 96.4.
 
-The overall scale follows the assumed spectrum (a smooth bump over the
-band unless one is given); the shape does not.  Counting every significant
-pixel instead of one entry per reflection lost the lattice on IMAGINE-X.
-The IMAGINE-X cases used detector geometry and rotations from an earlier
-solve (--geometry), the MANDI cases nominal detectors and rotations from
-``align_runs`` (--rotations).
+The scale is within 3% in all four.  It comes from the map; the final
+polish on the objective is kept for shape and orientation only, because the
+objective assumes a flat spectrum over the band and gains by shrinking the
+lattice when the real spectrum is narrower.  The IMAGINE-X cases used
+detector geometry and rotations from an earlier solve (--geometry), the
+MANDI cases nominal detectors and rotations from ``align_runs``
+(--rotations).
 
 Usage:
     python laue_poisson_summation.py merged.h5 INSTRUMENT lam_min lam_max [--geometry solve.h5]

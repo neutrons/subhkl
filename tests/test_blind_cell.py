@@ -6,12 +6,14 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from subhkl.search.blind_cell import (
+    candidate_lattices,
     cell_of,
     centring_of,
     conventional_basis,
     describe_lattice,
     direct_space_map,
     find_peaks,
+    ladder_scores,
     lattice_basis,
     lattice_operations,
     merge_radial_peaks,
@@ -249,3 +251,65 @@ def test_laue_streaks_transform_to_the_direct_lattice():
     assert np.allclose(found[:3] / found[0], want[:3] / want[0], atol=0.04)
     assert np.allclose(found[3:], want[3:], atol=2.0)
     assert abs(found[0] / want[0] - 1.0) < 0.08
+
+
+def _laue_bins(A_true, rng, lam=(3.0, 4.3), q_cut=0.30, n_stray=0):
+    """Count bins of a Laue pattern: directions, |q| intervals, weights."""
+    recip = np.linalg.inv(A_true).T
+    r = np.arange(-14, 15)
+    hkl = np.array(
+        [(h, k, l) for h in r for k in r for l in r if (h, k, l) != (0, 0, 0)]
+    )
+    q = hkl @ recip.T
+    q = q[(np.linalg.norm(q, axis=1) < q_cut) & (rng.random(len(q)) < 0.5)]
+    two_sin = np.linalg.norm(q, axis=1) * rng.uniform(lam[0], lam[1], len(q))
+    dirs = q / np.linalg.norm(q, axis=1)[:, None]
+    if n_stray:
+        stray = rng.normal(size=(n_stray, 3))
+        dirs = np.concatenate([dirs, stray / np.linalg.norm(stray, axis=1)[:, None]])
+        two_sin = np.concatenate([two_sin, rng.uniform(0.2, 1.2, n_stray)])
+    w = np.ones(len(dirs))
+    return {
+        "dirs": dirs,
+        "q_lo": two_sin / lam[1],
+        "q_hi": two_sin / lam[0],
+        "weights": w / w.sum(),
+    }
+
+
+def test_ladder_score_prefers_the_lattice_over_its_relatives():
+    """With as many stray bins as reflections, the true lattice outscores a
+    lattice with one axis halved, one with an axis doubled, and itself at
+    the wrong scale."""
+    rng = np.random.default_rng(13)
+    A = Rotation.from_euler("xyz", [12, -28, 47], degrees=True).as_matrix() @ _basis(
+        (40.0, 52.0, 66.0, 90.0, 104.0, 90.0)
+    )
+    obs = _laue_bins(A, rng, n_stray=3000)
+    halved, doubled = A.copy(), A.copy()
+    halved[:, 0] *= 0.5
+    doubled[:, 2] *= 2.0
+    bases = [halved, doubled, 0.88 * A, A, 1.12 * A]
+    scores, best, _A, _top, z = ladder_scores(bases, obs, n_zones=40, polish=False)
+    assert best == 3
+    assert scores[3] > 1.1 * max(scores[0], scores[1], scores[2], scores[4])
+    assert z > 8
+
+
+def test_candidate_lattices_contain_the_lattice():
+    rng = np.random.default_rng(17)
+    A = _basis((40.0, 52.0, 66.0, 90.0, 104.0, 90.0))
+    r = range(-2, 3)
+    n = np.array([(a, b, c) for a in r for b in r for c in r if (a, b, c) != (0, 0, 0)])
+    pos = n @ A.T + rng.normal(0.0, 0.3, (len(n), 3))
+    height = 1.0 / np.linalg.norm(pos, axis=1) + rng.uniform(0.0, 0.002, len(n))
+    order = np.argsort(-height)
+    cands = candidate_lattices(pos[order], height[order], n_peaks=12)
+    assert len(cands) >= 1
+    want = np.array(cell_of(reduce_basis(A)))
+    hit = [
+        np.allclose(np.array(cell_of(B))[:3], want[:3], rtol=0.03)
+        and np.allclose(np.array(cell_of(B))[3:], want[3:], atol=2.0)
+        for B, _share in cands
+    ]
+    assert any(hit)
