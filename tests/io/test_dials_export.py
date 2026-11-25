@@ -485,6 +485,70 @@ def test_roundtrip_s1_magnitude(tmp_path):
         assert abs((s1[0] ** 2 + s1[1] ** 2 + s1[2] ** 2) ** 0.5 - 1.0 / wl) < 1e-6
 
 
+def test_roundtrip_integrated_has_xyzcal_and_d(tmp_path):
+    """Integrated rows sit at their predicted positions: xyzcal.px (which
+    dials.export reads) and xyzobs.px.value both hold (col, row), and d comes
+    from the crystal's cell, as dials.scale expects."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+
+    h5 = tmp_path / "integrated.h5"
+    _write_integrated(str(h5))
+    refl_path = str(tmp_path / "integrated.refl")
+    dx.hdf5_to_dials(
+        str(h5), str(tmp_path / "integrated.expt"), refl_path, instrument="CG4D"
+    )
+
+    refl = flex.reflection_table.from_file(refl_path)
+    expected = [(1.0, 5.0, 0.0), (2.0, 6.0, 0.0), (3.0, 7.0, 0.0)]
+    assert list(refl["xyzcal.px"]) == expected
+    assert list(refl["xyzobs.px.value"]) == expected
+    # Orthorhombic 10 x 11 x 12 cell: 1/d^2 = (h/a)^2 + (k/b)^2 + (l/c)^2.
+    for (h, k, l), d in zip(refl["miller_index"], refl["d"]):
+        assert d == pytest.approx(
+            ((h / 10) ** 2 + (k / 11) ** 2 + (l / 12) ** 2) ** -0.5
+        )
+
+
+def test_roundtrip_predicted_has_d_but_no_observation(tmp_path):
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+
+    h5 = tmp_path / "pred.h5"
+    _write_merged_predictor(str(h5))
+    with h5py.File(h5, "a") as f:
+        f["sample/a"], f["sample/b"], f["sample/c"] = 10.0, 11.0, 12.0
+        f["sample/alpha"] = f["sample/beta"] = f["sample/gamma"] = 90.0
+        f["sample/space_group"] = b"P 1"
+        f["sample/U"] = np.eye(3)
+        f["sample/B"] = np.diag([1 / 10.0, 1 / 11.0, 1 / 12.0])
+    refl_path = str(tmp_path / "pred.refl")
+    dx.hdf5_to_dials(str(h5), str(tmp_path / "pred.expt"), refl_path, instrument="CG4D")
+    refl = flex.reflection_table.from_file(refl_path)
+    assert "xyzcal.px" in refl
+    assert "xyzobs.px.value" not in refl
+    assert all(d > 0 for d in refl["d"])
+
+
+def test_roundtrip_unindexed_rows_get_zero_d(tmp_path):
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+
+    h5 = tmp_path / "indexed.h5"
+    _write_indexed(str(h5))
+    with h5py.File(h5, "a") as f:
+        for key, vals in (("h", [1, 0, -1]), ("k", [0, 0, 1]), ("l", [1, 0, 2])):
+            del f[f"peaks/{key}"]
+            f[f"peaks/{key}"] = np.array(vals)
+    refl_path = str(tmp_path / "indexed.refl")
+    dx.hdf5_to_dials(
+        str(h5), str(tmp_path / "indexed.expt"), refl_path, instrument="CG4D"
+    )
+    d = list(flex.reflection_table.from_file(refl_path)["d"])
+    assert d[1] == 0.0
+    assert d[0] > 0 and d[2] > 0
+
+
 def test_roundtrip_sample_offset_shifts_detector(tmp_path):
     """A sample offset shifts each frame's detector by -R @ offset (millimetres)."""
     pytest.importorskip("dxtbx")

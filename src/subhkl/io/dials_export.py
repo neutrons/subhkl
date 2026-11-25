@@ -960,6 +960,13 @@ def _build_reflection_table(
         ]
         table["miller_index"] = flex.miller_index(hkl)
 
+        # Resolution d (Angstroms) from the exported crystal's unit cell, as
+        # DIALS computes it; unindexed (0, 0, 0) rows get 0.
+        crystal = experiments[0].crystal if len(experiments) else None
+        if crystal is not None:
+            uc = crystal.get_unit_cell()
+            table["d"] = flex.double([uc.d(m) if m != (0, 0, 0) else 0.0 for m in hkl])
+
     # Per-reflection wavelength (subhkl is polychromatic / Laue).
     if peaks["lambda"] is not None:
         table["wavelength"] = flex.double([float(x) for x in peaks["lambda"]])
@@ -970,8 +977,20 @@ def _build_reflection_table(
             (float(c), float(r), 0.0)
             for r, c in zip(peaks["pixel_r"], peaks["pixel_c"])
         ]
-        key = "xyzcal.px" if peaks.get("predicted") else "xyzobs.px.value"
-        table[key] = flex.vec3_double(xyz_px)
+        # The integrator integrates at the predicted positions and writes those
+        # back as the peak position, so integrated rows (hkl + intensity, no
+        # finder width) carry it as dials.integrate's xyzcal.px.  subhkl
+        # measures no separate centroid, so xyzobs.px.value -- which
+        # dials.export and dials.scale read -- holds the same position.
+        integrated_at_prediction = (
+            peaks["h"] is not None
+            and peaks["intensity"] is not None
+            and not peaks.get("sigma_is_width")
+        )
+        if peaks.get("predicted") or integrated_at_prediction:
+            table["xyzcal.px"] = flex.vec3_double(xyz_px)
+        if not peaks.get("predicted"):
+            table["xyzobs.px.value"] = flex.vec3_double(xyz_px)
 
     # Finder detections: peaks/sigma is each spot's fitted Gaussian width in
     # pixels, so its square is the spot's positional variance in x and y (the
