@@ -482,11 +482,13 @@ def run_index(
 
     per_run_file_offsets = None
     per_run_files = None
+    merged_stack_images = None
     if original_nexus_filename and instrument_name:
         is_merged = False
         with h5py.File(original_nexus_filename, "r") as f_check:
             if "images" in f_check and "goniometer/axes" in f_check:
                 is_merged = True
+                merged_stack_images = int(f_check["images"].shape[0])
                 axes = f_check["goniometer/axes"][()]
                 angles = f_check["goniometer/angles"][()]
                 per_run_file_offsets = (
@@ -627,6 +629,26 @@ def run_index(
                 elif boot_ang.T.shape == cur.shape:
                     opt.goniometer_angles = boot_ang.T
                     input_data["goniometer/angles"] = boot_ang
+
+    # A merged stack stores goniometer angles once per panel image (runs are
+    # blocks of images marked by file_offsets), while peaks/run_index is the
+    # run.  Fit each peak with its own image's angles: indexing the per-image
+    # table by run number would give every run after the first the angles of
+    # an image of run 0.  The per-run frame map below already treats these
+    # columns as images.
+    if (
+        merged_stack_images is not None
+        and opt.goniometer_angles is not None
+        and "peaks/image_index" in input_data
+    ):
+        image_index = np.asarray(input_data["peaks/image_index"], dtype=int)
+        n_columns = np.asarray(opt.goniometer_angles).shape[-1]
+        if (
+            n_columns == merged_stack_images
+            and image_index.size
+            and int(image_index.max()) < n_columns
+        ):
+            opt.frame_indices = image_index
 
     # Apply the console messages appropriately
     if refine_goniometer:

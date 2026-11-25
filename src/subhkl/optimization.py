@@ -1537,6 +1537,10 @@ class FindUB:
         self.base_sample_offset = np.zeros(3)
         self.base_gonio_offset = None
         self.fixed_rot_params = np.zeros(3)
+        # Per-peak column into goniometer_angles when those are stored per
+        # stack image (a merged stack) rather than per run; run_indices stays
+        # the run numbering written to the output.
+        self.frame_indices = None
 
         if filename is not None:
             self.load_peaks(filename)
@@ -1899,7 +1903,9 @@ class FindUB:
             num_obs = kf_ki_dir_lab.shape[1]
 
         static_R_input = self.R if self.R is not None else np.eye(3)
-        if self.run_indices is not None:
+        # Per-image angles are looked up by each peak's image; nothing to
+        # reduce or remap by run.
+        if self.run_indices is not None and self.frame_indices is None:
             max_run_id = int(np.max(self.run_indices))
             num_runs_range = max_run_id + 1
             unique_runs, first_indices = np.unique(self.run_indices, return_index=True)
@@ -2168,7 +2174,11 @@ class FindUB:
             beam_nominal=self.ki_vec,
             static_R=static_R_input,
             kf_lab_fixed_vectors=kf_ki_dir_lab,
-            peak_run_indices=self.run_indices,
+            peak_run_indices=(
+                self.frame_indices
+                if self.frame_indices is not None
+                else self.run_indices
+            ),
             refine_detector=refine_detector,
             detector_params=detector_params,
             peak_pixel_coords=peak_pixel_coords,

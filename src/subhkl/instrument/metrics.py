@@ -34,6 +34,38 @@ def _get_safe_R_stack(R_file_in, run_indices_in, target_len):
     return [R_file_in] * target_len
 
 
+def per_image_geometry_index(f_handle, run_indices, n_peaks):
+    """Per-peak row into ``goniometer/R`` / ``goniometer/angles``.
+
+    A merged image stack stores the goniometer once per panel image, which the
+    indexer copies into its output, while ``peaks/run_index`` is the run.  When
+    the table has more rows than there are runs and covers every peak's
+    ``peaks/image_index``, each peak's row is its image; otherwise it is its
+    run (per-run or per-peak tables), as before.
+    """
+    if run_indices is None or "peaks/image_index" not in f_handle:
+        return run_indices
+    image_index = np.asarray(f_handle["peaks/image_index"][()], dtype=int)
+    run_indices = np.asarray(run_indices, dtype=int)
+    if image_index.shape != run_indices.shape or not image_index.size:
+        return run_indices
+    for key in ("goniometer/R", "goniometer/angles"):
+        if key not in f_handle:
+            continue
+        rows = f_handle[key].shape[0]
+        if key == "goniometer/angles" and f_handle[key].ndim == 2:
+            # angles may be stored (rows, axes) or (axes, rows)
+            rows = max(f_handle[key].shape)
+        if (
+            rows != n_peaks
+            and rows > int(run_indices.max()) + 1
+            and rows > int(image_index.max())
+        ):
+            return image_index
+        return run_indices
+    return run_indices
+
+
 def resolve_indices(f_handle):
     if "peaks/run_index" in f_handle:
         return f_handle["peaks/run_index"][()]
@@ -302,6 +334,7 @@ def compute_metrics(
             matched_frame,
             matched_panel,
         ) = [], [], [], [], [], [], [], [], []
+        matched_geom = None
 
         # ==========================================
         # TWO FILE COMPARISON
@@ -415,7 +448,8 @@ def compute_metrics(
                 matched_run = r_idx
                 matched_frame = frame_idx
                 matched_panel = panel_idx
-                matched_R = _get_safe_R_stack(R_file, matched_run, len(matched_h))
+                matched_geom = per_image_geometry_index(f, r_idx, len(matched_h))
+                matched_R = _get_safe_R_stack(R_file, matched_geom, len(matched_h))
 
         h = np.array(matched_h)
         k = np.array(matched_k)
@@ -424,6 +458,11 @@ def compute_metrics(
         xyz_det = np.array(matched_xyz)
         R_all = np.array(matched_R)
         run_index = np.array(matched_run)
+        # Row of each peak in the goniometer tables (its image for per-image
+        # tables, else its run); run_index keeps the reported numbering.
+        geom_index = (
+            np.array(matched_geom) if matched_geom is not None else run_index.copy()
+        )
         frame_index = np.array(matched_frame)
         panel_index = np.array(matched_panel)
 
@@ -444,6 +483,7 @@ def compute_metrics(
         xyz_det = xyz_det[mask]
         R_all = R_all[mask]
         run_index = run_index[mask]
+        geom_index = geom_index[mask]
         frame_index = frame_index[mask]
         panel_index = panel_index[mask]
 
@@ -462,6 +502,7 @@ def compute_metrics(
             xyz_det = xyz_det[d_mask]
             R_all = R_all[d_mask]
             run_index = run_index[d_mask]
+            geom_index = geom_index[d_mask]
             frame_index = frame_index[d_mask]
             panel_index = panel_index[d_mask]
             d_filter_message = f"Filtered to {len(h)} peaks with d >= {d_min} A."
@@ -471,9 +512,9 @@ def compute_metrics(
             if gonio_angles.ndim == 2:
                 num_axes = len(gonio_axes) if gonio_axes is not None else 1
                 if gonio_angles.shape[1] == num_axes:
-                    gonio_angles_mapped = gonio_angles[run_index, :]
+                    gonio_angles_mapped = gonio_angles[geom_index, :]
                 else:
-                    gonio_angles_mapped = gonio_angles[:, run_index].T
+                    gonio_angles_mapped = gonio_angles[:, geom_index].T
             else:
                 gonio_angles_mapped = gonio_angles
         else:
@@ -493,14 +534,14 @@ def compute_metrics(
             gonio_angles=gonio_angles_mapped,
             gonio_offsets=gonio_offsets,  # <-- Pass Down
             per_run_trans=(
-                per_run_trans[frame_to_run[run_index]]
+                per_run_trans[frame_to_run[geom_index]]
                 if per_run_trans is not None
                 and frame_to_run is not None
-                and np.max(run_index) < len(frame_to_run)
+                and np.max(geom_index) < len(frame_to_run)
                 else (
-                    per_run_trans[run_index]
+                    per_run_trans[geom_index]
                     if per_run_trans is not None
-                    and np.max(run_index) < len(per_run_trans)
+                    and np.max(geom_index) < len(per_run_trans)
                     else None
                 )
             ),
