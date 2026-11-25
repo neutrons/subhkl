@@ -1657,17 +1657,20 @@ def get_nodal_surfaces_js() -> str:
           "uniform float uCamDist;",
           "varying vec3 vNorm;",
           "varying vec3 vSamplePos;",
+          "varying float vEyeDist;",
           "void main() {",
           "  vec3 p = uRot * ((aPos - uCenter) * uInvScale);",
           "  vec3 n = normalize(uRot * aNorm);",
-          "  float dist = max(0.35, uCamDist - p.z);",
+          "  float eyeDist = uCamDist - p.z;",
+          "  float dist = max(0.28, eyeDist);",
           "  float kD = sqrt(uCamDist * uCamDist - 1.0);",
           "  float persp = kD / dist;",
           "  float clipX = p.x * persp * uAspectX;",
           "  float clipY = p.y * persp * uAspectY;",
-          "  float clipZ = clamp(-p.z * 0.45, -0.98, 0.98);",
+          "  float clipZ = clamp(-p.z * 0.40, -0.98, 0.98);",
           "  vNorm = n;",
           "  vSamplePos = aPos;",
+          "  vEyeDist = eyeDist;",
           "  gl_Position = vec4(clipX, clipY, clipZ, 1.0);",
           "}",
         ].join("\n");
@@ -1683,7 +1686,9 @@ def get_nodal_surfaces_js() -> str:
           "uniform float uSlabHalfThick;",
           "varying vec3 vNorm;",
           "varying vec3 vSamplePos;",
+          "varying float vEyeDist;",
           "void main() {",
+          "  if (vEyeDist < 0.28) discard;",
           "  vec3 dRoi = vSamplePos - uClipCenter;",
           "  if (dot(dRoi, dRoi) > uClipRadius * uClipRadius) discard;",
           "  if (uSlabActive > 0.5) {",
@@ -1742,24 +1747,27 @@ def get_nodal_surfaces_js() -> str:
           "uniform float uHalfWidthPx;",
           "varying vec3 vSamplePos;",
           "varying float vEdge;",
-          "vec3 projPt(vec3 g) {",
+          "varying float vEyeDist;",
+          "vec4 projPt(vec3 g) {",
           "  vec3 p = uRot * ((g - uCenter) * uInvScale);",
-          "  float dist = max(0.35, uCamDist - p.z);",
+          "  float eyeDist = uCamDist - p.z;",
+          "  float dist = max(0.28, eyeDist);",
           "  float kD = sqrt(uCamDist * uCamDist - 1.0);",
           "  float persp = kD / dist;",
-          "  return vec3(p.x * persp * uAspectX, p.y * persp * uAspectY, clamp(-p.z * 0.45 - 0.004, -0.99, 0.99));",
+          "  return vec4(p.x * persp * uAspectX, p.y * persp * uAspectY, clamp(-p.z * 0.40 - 0.004, -0.99, 0.99), eyeDist);",
           "}",
           "void main() {",
-          "  vec3 c0 = projPt(aPos0);",
-          "  vec3 c1 = projPt(aPos1);",
+          "  vec4 c0 = projPt(aPos0);",
+          "  vec4 c1 = projPt(aPos1);",
           "  vec2 dPx = (c1.xy - c0.xy) * 0.5 * uViewportPx;",
           "  float dLen = length(dPx);",
           "  vec2 dir = dLen > 1e-3 ? (dPx / dLen) : vec2(1.0, 0.0);",
           "  vec2 perp = vec2(-dir.y, dir.x);",
-          "  vec3 baseC = mix(c0, c1, aSide.x);",
+          "  vec4 baseC = mix(c0, c1, aSide.x);",
           "  vec2 offClip = (perp * (aSide.y * uHalfWidthPx) + dir * ((aSide.x - 0.5) * 1.2)) * (2.0 / uViewportPx);",
           "  vSamplePos = mix(aPos0, aPos1, aSide.x);",
           "  vEdge = aSide.y;",
+          "  vEyeDist = baseC.w;",
           "  gl_Position = vec4(baseC.xy + offClip, baseC.z, 1.0);",
           "}",
         ].join("\n");
@@ -1774,7 +1782,9 @@ def get_nodal_surfaces_js() -> str:
           "uniform float uSlabHalfThick;",
           "varying vec3 vSamplePos;",
           "varying float vEdge;",
+          "varying float vEyeDist;",
           "void main() {",
+          "  if (vEyeDist < 0.28) discard;",
           "  vec3 dRoi = vSamplePos - uClipCenter;",
           "  if (dot(dRoi, dRoi) > uClipRadius * uClipRadius) discard;",
           "  if (uSlabActive > 0.5) {",
@@ -1891,6 +1901,12 @@ def get_nodal_surfaces_js() -> str:
       return Rtot;
     }
 
+    function get3DZoom() {
+      const z = Number(deps.state && deps.state.recip3dZoom);
+      if (!Number.isFinite(z) || z <= 0.0) return 1.0;
+      return Math.max(0.35, Math.min(3.6, z));
+    }
+
     function get3DSceneBounds(liveRoi) {
       const st = deps.state;
       const invDmin = 1.0 / Math.max(0.4, Number(st.dMin) || 1.5);
@@ -1901,7 +1917,10 @@ def get_nodal_surfaces_js() -> str:
       const radius = nodalData && nodalData.has_phases
         ? Math.max(latticeScaleR, roi.radiusG * 1.12)
         : invDmin;
-      return { center: [animCenterG[0], animCenterG[1], animCenterG[2]], radius: Math.max(0.008, radius), invDmin };
+      const cx = Number.isFinite(animCenterG[0]) ? animCenterG[0] : 0.0;
+      const cy = Number.isFinite(animCenterG[1]) ? animCenterG[1] : 0.0;
+      const cz = Number.isFinite(animCenterG[2]) ? animCenterG[2] : 0.0;
+      return { center: [cx, cy, cz], radius: Math.max(0.008, radius), invDmin };
     }
 
     function projectPoint3D(gSample, Rtot, center, invScale, cx, cy, Rpx, zoom) {
@@ -1913,10 +1932,14 @@ def get_nodal_surfaces_js() -> str:
       const pz = Rtot[2][0] * dx + Rtot[2][1] * dy + Rtot[2][2] * dz;
       const D = 2.8;
       const kD = Math.sqrt(D * D - 1.0);
-      const dist = Math.max(0.35, D - pz);
+      const eyeDist = D - pz;
+      const dist = Math.max(0.28, eyeDist);
       const persp = kD / dist;
       const scale = Rpx * zoom;
-      return [cx + px * persp * scale, cy - py * persp * scale, pz, (D - 0.2) / dist];
+      const sx = cx + px * persp * scale;
+      const sy = cy - py * persp * scale;
+      const vis = eyeDist >= 0.28 && Number.isFinite(sx) && Number.isFinite(sy);
+      return [sx, sy, pz, (D - 0.2) / dist, vis];
     }
 
     function renderSurfacesAndVortices3D(ctx, w, h, dpr, Rtot, center, invScale, Rpx, zoom, liveRoi, isExp) {
@@ -2144,7 +2167,14 @@ def get_nodal_surfaces_js() -> str:
       const targetW = Math.round(rect.width * dpr);
       const targetH = Math.round(rect.height * dpr);
       const Rg = deps.getActiveGoniometerR();
+      if (!Number.isFinite(panCenterG[0]) || !Number.isFinite(panCenterG[1]) || !Number.isFinite(panCenterG[2])) {
+        panCenterG = [0.0, 0.0, 0.0];
+      }
       const liveRoi = resolveLiveRoi();
+      if (!Number.isFinite(animCenterG[0]) || !Number.isFinite(animCenterG[1]) || !Number.isFinite(animCenterG[2])) {
+        animCenterG = [liveRoi.centerG[0], liveRoi.centerG[1], liveRoi.centerG[2]];
+      }
+      const zoom3d = get3DZoom();
 
       // Smoothly glide camera center toward liveRoi.centerG when translating between Origin / Peak / Pan
       const tgt = liveRoi.centerG;
@@ -2170,7 +2200,7 @@ def get_nodal_surfaces_js() -> str:
         targetW, targetH,
         (st.wulffYawDeg || 0).toFixed(3),
         (st.wulffPitchDeg || 0).toFixed(3),
-        (st.wulffZoom || 1).toFixed(4),
+        zoom3d.toFixed(4),
         st.wulffExpanded ? 1 : 0,
         st.wulffScope,
         st.wulffColorMode,
@@ -2217,7 +2247,7 @@ def get_nodal_surfaces_js() -> str:
       const cx = w * 0.5;
       const cy = h * 0.5;
       const Rpx = Math.min(w, h) * 0.41;
-      const zoom = st.wulffZoom || 1.0;
+      const zoom = zoom3d;
       const isExp = Boolean(st.wulffExpanded);
       const Rtot = buildCameraTransform(Rg);
       const bounds = get3DSceneBounds(liveRoi);
@@ -2426,11 +2456,13 @@ def get_nodal_surfaces_js() -> str:
           const isFocus = deps.isSameReflection(p, st.selectedPeakObj) || deps.isSameReflection(p, st.hoveredPeakObj);
           if (distC > maxClipR && !isFocus) continue;
           const pr = projectPoint3D([gx, gy, gz], Rtot, center, invScale, cx, cy, Rpx, zoom);
-          drawList.push({ p, x: pr[0], y: pr[1], z: pr[2], sc: pr[3], isFocus });
+          if (pr[4]) {
+            drawList.push({ p, x: pr[0], y: pr[1], z: pr[2], sc: pr[3], isFocus });
+          }
           if (st.showWulffFriedel) {
             const prF = projectPoint3D([-gx, -gy, -gz], Rtot, center, invScale, cx, cy, Rpx, zoom);
             const distCF = Math.hypot(-gx - center[0], -gy - center[1], -gz - center[2]);
-            if (distCF <= maxClipR) {
+            if (distCF <= maxClipR && prF[4]) {
               drawList.push({ p, x: prF[0], y: prF[1], z: prF[2], sc: prF[3], isFocus: false, isFriedel: true });
             }
           }
@@ -2478,7 +2510,8 @@ def get_nodal_surfaces_js() -> str:
         const roiTag = liveRoi.slabActive
           ? `Zone ${liveRoi.zoneLabel || "disk"}`
           : `${liveRoi.mult.toFixed(1)}×a⋆`;
-        if (st.showNodalSurfacesRe) pills.push({ txt: `Re[${fLbl}]=0 • ${roiTag}`, col: "#22d3ee" });
+        const zoomTag = Math.abs(zoom - 1.0) > 0.03 ? ` • ${zoom.toFixed(2)}×` : "";
+        if (st.showNodalSurfacesRe) pills.push({ txt: `Re[${fLbl}]=0 • ${roiTag}${zoomTag}`, col: "#22d3ee" });
         if (st.showNodalSurfacesIm) {
           pills.push({
             txt: nodalData.is_real_only ? `Im[${fLbl}]≡0 (centric)` : `Im[${fLbl}]=0`,
@@ -2820,38 +2853,67 @@ def get_nodal_surfaces_js() -> str:
 
     // Translate 3D reciprocal-space ROI smoothly via Shift+drag / right-drag on the 3D canvas
     function panByScreenDelta(dxPx, dyPx, canvasW, canvasH) {
+      const dx = Math.max(-80.0, Math.min(80.0, Number(dxPx) || 0.0));
+      const dy = Math.max(-80.0, Math.min(80.0, Number(dyPx) || 0.0));
+      if (dx === 0.0 && dy === 0.0) return;
+      const cw = (Number.isFinite(canvasW) && canvasW > 20.0) ? canvasW : 360.0;
+      const ch = (Number.isFinite(canvasH) && canvasH > 20.0) ? canvasH : 360.0;
       const st = deps.state;
+      if (!Number.isFinite(panCenterG[0]) || !Number.isFinite(panCenterG[1]) || !Number.isFinite(panCenterG[2])) {
+        panCenterG = [0.0, 0.0, 0.0];
+      }
       const curRoi = resolveLiveRoi();
       if (st.nodalRoiMode !== "pan") {
-        panCenterG = [curRoi.centerG[0], curRoi.centerG[1], curRoi.centerG[2]];
+        panCenterG = [
+          Number.isFinite(curRoi.centerG[0]) ? curRoi.centerG[0] : 0.0,
+          Number.isFinite(curRoi.centerG[1]) ? curRoi.centerG[1] : 0.0,
+          Number.isFinite(curRoi.centerG[2]) ? curRoi.centerG[2] : 0.0,
+        ];
         st.nodalRoiMode = "pan";
       }
       const Rg = deps.getActiveGoniometerR();
       const Rtot = buildCameraTransform(Rg);
       const bounds = get3DSceneBounds(curRoi);
-      const Rpx = Math.min(canvasW, canvasH) * 0.41;
-      const zoom = st.wulffZoom || 1.0;
+      const Rpx = Math.min(cw, ch) * 0.41;
+      const zoom = get3DZoom();
       const D = 2.8;
       const persp0 = Math.sqrt(D * D - 1.0) / D;
       const pxPerNorm = Math.max(12.0, Rpx * zoom * persp0);
-      const dCamX = -dxPx / pxPerNorm;
-      const dCamY = dyPx / pxPerNorm;
+      const dCamX = -dx / pxPerNorm;
+      const dCamY = dy / pxPerNorm;
       const scaleG = bounds.radius;
-      // g_sample_delta = scaleG * Rtot^T * [dCamX, dCamY, 0]
-      panCenterG = [
-        panCenterG[0] + scaleG * (Rtot[0][0] * dCamX + Rtot[1][0] * dCamY),
-        panCenterG[1] + scaleG * (Rtot[0][1] * dCamX + Rtot[1][1] * dCamY),
-        panCenterG[2] + scaleG * (Rtot[0][2] * dCamX + Rtot[1][2] * dCamY),
-      ];
-      animCenterG = [panCenterG[0], panCenterG[1], panCenterG[2]];
+      let nx = panCenterG[0] + scaleG * (Rtot[0][0] * dCamX + Rtot[1][0] * dCamY);
+      let ny = panCenterG[1] + scaleG * (Rtot[0][1] * dCamX + Rtot[1][1] * dCamY);
+      let nz = panCenterG[2] + scaleG * (Rtot[0][2] * dCamX + Rtot[1][2] * dCamY);
+      const maxPanR = Math.max(0.20, bounds.invDmin * 1.25);
+      const nNorm = Math.hypot(nx, ny, nz);
+      if (nNorm > maxPanR && nNorm > 1e-8) {
+        const k = maxPanR / nNorm;
+        nx *= k; ny *= k; nz *= k;
+      }
+      panCenterG = [nx, ny, nz];
+      animCenterG = [nx, ny, nz];
       onLiveRoiChanged();
     }
 
     function resetPanToOrigin() {
       panCenterG = [0.0, 0.0, 0.0];
+      animCenterG = [0.0, 0.0, 0.0];
       if (deps.state.nodalRoiMode === "pan") {
         deps.state.nodalRoiMode = "origin";
       }
+      last3DRenderSig = "";
+      onLiveRoiChanged();
+    }
+
+    function resetView3D() {
+      panCenterG = [0.0, 0.0, 0.0];
+      animCenterG = [0.0, 0.0, 0.0];
+      deps.state.recip3dZoom = 1.0;
+      if (deps.state.nodalRoiMode === "pan") {
+        deps.state.nodalRoiMode = "origin";
+      }
+      last3DRenderSig = "";
       onLiveRoiChanged();
     }
 
@@ -2963,6 +3025,7 @@ def get_nodal_surfaces_js() -> str:
       onLiveRoiChanged,
       panByScreenDelta,
       resetPanToOrigin,
+      resetView3D,
       clearRefMtz,
       render3DReciprocalView,
       findNearestPeak3D,

@@ -395,6 +395,7 @@ def test_apply_mtz_frame_preservation_and_js_controller_projections(tmp_path: Pa
     assert "Unit Cell..." in html
     assert '<option value="zone">ROI: Zone Disk</option>' in html
     assert '<option value="pan">ROI: Pan 3D</option>' in html
+    assert 'id="btn-nodal-reset"' in html
     assert "createNodalSurfacesController" in html
 
     if shutil.which("node") is None:
@@ -487,9 +488,15 @@ def test_apply_mtz_frame_preservation_and_js_controller_projections(tmp_path: Pa
       state.nodalRoiMode = "zone";
       ctrl.onLiveRoiChanged();
       ctrl.panByScreenDelta(18, -12);
+      const panCenter2Arg = ctrl.resolveLiveRoi().centerG.slice();
+      ctrl.panByScreenDelta(24, 15, 400, 400);
+      const panCenter4Arg = ctrl.resolveLiveRoi().centerG.slice();
+      const panFinite = panCenter2Arg.every(Number.isFinite) && panCenter4Arg.every(Number.isFinite);
       const modeAfterPan = state.nodalRoiMode;
-      ctrl.resetPanToOrigin();
+      state.recip3dZoom = 3.4;
+      ctrl.resetView3D();
       const modeAfterReset = state.nodalRoiMode;
+      const zoomAfterReset = state.recip3dZoom;
       const fetchesDuringCachedRoi = fetchCount;
 
       // Simulate heterodyne active state and instant clearRefMtz() restoration
@@ -507,8 +514,10 @@ def test_apply_mtz_frame_preservation_and_js_controller_projections(tmp_path: Pa
         strokesAfterWulff,
         strokesAfterDet,
         fetchesDuringCachedRoi,
+        panFinite,
         modeAfterPan,
         modeAfterReset,
+        zoomAfterReset,
         clearedActive: Boolean(cleared && cleared.heterodyne_active),
         clearedFormula: cleared ? cleared.formula_label : "",
       }}));
@@ -524,8 +533,10 @@ def test_apply_mtz_frame_preservation_and_js_controller_projections(tmp_path: Pa
     assert counts["strokesAfterWulff"] > counts["strokesAfter3D"]
     assert counts["strokesAfterDet"] > counts["strokesAfterWulff"]
     assert counts["fetchesDuringCachedRoi"] == 0
+    assert counts["panFinite"] is True
     assert counts["modeAfterPan"] == "pan"
     assert counts["modeAfterReset"] == "origin"
+    assert counts["zoomAfterReset"] == 1.0
     assert counts["clearedActive"] is False
     assert counts["clearedFormula"] == "F(G)"
 

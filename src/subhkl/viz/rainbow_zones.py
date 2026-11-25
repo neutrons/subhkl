@@ -12745,7 +12745,7 @@ def render_rainbow_html(
       <button id="btn-stereo-toggle" title="Show/Hide 3D Crystal Stereogram Inset">
         Wulff
       </button>
-      <button id="btn-reset-view" title="Reset Zoom, Pan, and Parallax">
+      <button id="btn-reset-view" title="Reset Detector, Wulff, and 3D Reciprocal Space Zoom, Pan &amp; Parallax">
         Reset
       </button>
       <button id="btn-new-tab" style="border-color:var(--accent-gold);color:var(--accent-gold);" title="Open this view in its own full-screen browser tab">
@@ -12839,6 +12839,7 @@ def render_rainbow_html(
               <option value="product">F₀*·F</option>
               <option value="single">Single F</option>
             </select>
+            <button id="btn-nodal-reset" type="button" title="Reset 3D Reciprocal Space zoom, camera angle, and ROI translation (or double-click 3D view)">Reset 3D</button>
             <input type="file" id="inp-ref-mtz-file" accept=".mtz" style="display:none;" />
           </div>
           <canvas id="canvas-stereo" style="flex:1;width:100%;min-height:0;cursor:grab;"></canvas>
@@ -15554,6 +15555,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
+    recip3dZoom: 1.0,
     stereoViewMode: "wulff",       // "wulff" | "recip3d"
     showNodalSurfacesRe: true,     // Cyan Re(Z)=0 nodal surface in 3D Reciprocal Space
     showNodalSurfacesIm: true,     // Coral-Rose Im(Z)=0 nodal surface in 3D Reciprocal Space
@@ -24677,7 +24679,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           const incDx = ev.clientX - wulffLastClient[0];
           const incDy = ev.clientY - wulffLastClient[1];
           wulffLastClient = [ev.clientX, ev.clientY];
-          nodalCtrl.panByScreenDelta(incDx, incDy);
+          nodalCtrl.panByScreenDelta(incDx, incDy, rect.width, rect.height);
           syncNodalUI();
           _lastWulffRenderSig = "";
           renderStereoInset(true);
@@ -24713,11 +24715,34 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }});
     stereoCanvas.addEventListener("wheel", (ev) => {{
       ev.preventDefault();
-      const rawDy = ev.deltaMode === 1 ? ev.deltaY * 16 : (ev.deltaMode === 2 ? ev.deltaY * 100 : ev.deltaY);
-      const clampedDy = Math.max(-50, Math.min(50, rawDy));
-      const sensitivity = ev.ctrlKey ? 0.0035 : 0.0016;
-      const factor = Math.exp(-clampedDy * sensitivity);
-      state.wulffZoom = Math.max(0.6, Math.min(14.0, (state.wulffZoom || 1.0) * factor));
+      // Ignore horizontal-dominant two-finger trackpad swipes so accidental sideways brushes do not zoom
+      if (!ev.ctrlKey && ev.deltaMode === 0 && Math.abs(ev.deltaX) > Math.abs(ev.deltaY) * 1.4) {{
+        return;
+      }}
+      let factor = 1.0;
+      if (ev.ctrlKey) {{
+        // Trackpad pinch-to-zoom (gentle 1:1 rate)
+        const dyPinch = Math.max(-14.0, Math.min(14.0, Number(ev.deltaY) || 0.0));
+        factor = Math.exp(-dyPinch * 0.0020);
+      }} else if (ev.deltaMode === 0) {{
+        // High-frequency pixel-mode trackpad two-finger scroll (strongly damped against momentum spikes)
+        const dyPad = Math.max(-14.0, Math.min(14.0, Number(ev.deltaY) || 0.0));
+        factor = Math.exp(-dyPad * 0.00060);
+      }} else {{
+        // Discrete line/page mouse wheel (~5.5% per wheel click)
+        const rawDy = (ev.deltaMode === 1 ? ev.deltaY * 16.0 : ev.deltaY * 80.0) || 0.0;
+        const clampedDy = Math.max(-32.0, Math.min(32.0, rawDy));
+        factor = Math.exp(-clampedDy * 0.0017);
+      }}
+      if (state.stereoViewMode === "recip3d") {{
+        const cur3d = Number.isFinite(state.recip3dZoom) && state.recip3dZoom > 0 ? state.recip3dZoom : 1.0;
+        state.recip3dZoom = Math.max(0.35, Math.min(3.6, cur3d * factor));
+      }} else {{
+        const curW = Number.isFinite(state.wulffZoom) && state.wulffZoom > 0 ? state.wulffZoom : 1.0;
+        state.wulffZoom = Math.max(0.6, Math.min(10.0, curW * factor));
+      }}
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
     }}, {{ passive: false }});
     stereoCanvas.addEventListener("click", (ev) => {{
       if (wulffDragMoved) {{
@@ -24740,7 +24765,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }});
     stereoCanvas.addEventListener("dblclick", () => {{
       if (state.stereoViewMode === "recip3d" && nodalCtrl) {{
-        nodalCtrl.resetPanToOrigin();
+        nodalCtrl.resetView3D();
         syncNodalUI();
         _lastWulffRenderSig = "";
         renderStereoInset(true);
@@ -25646,13 +25671,31 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }});
   }}
 
+  const btnNodalReset = document.getElementById("btn-nodal-reset");
+  if (btnNodalReset) {{
+    btnNodalReset.addEventListener("click", () => {{
+      state.recip3dZoom = 1.0;
+      state.nodalRoiRadiusMult = 2.5;
+      state.nodalRoiMode = "origin";
+      syncWulffYawFromDetector();
+      state.wulffPitchDeg = -18.0;
+      if (nodalCtrl) nodalCtrl.resetView3D();
+      syncNodalUI();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      renderDetector();
+    }});
+  }}
+
   document.getElementById("btn-reset-view").addEventListener("click", () => {{
     state.detZoom = 1.0;
     state.detPanX = 0.0;
     state.detPanY = 0.0;
     syncWulffYawFromDetector();
-    state.wulffPitchDeg = 0.0;
+    state.wulffPitchDeg = state.stereoViewMode === "recip3d" ? -18.0 : 0.0;
     state.wulffZoom = 1.0;
+    state.recip3dZoom = 1.0;
+    if (nodalCtrl) nodalCtrl.resetView3D();
     state.selectedPeakId = null;
     state.selectedPeakObj = null;
     state.hoveredPeakId = null;
@@ -25666,7 +25709,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     state.showNodalPoints = true;
     state.holzOrders = new Set();
     syncNodalAndHolzButtons();
+    syncWulffUI();
+    syncNodalUI();
     setMaxZoneOrder(1);
+    _lastWulffRenderSig = "";
+    renderStereoInset(true);
+    renderDetector();
   }});
 
   // --- Minimalist 80s Pixel-Font Exit & Cleanup Controller ---
