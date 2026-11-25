@@ -1936,6 +1936,14 @@ def run_merge_images(
     merger = ImageStackMerger(h5_files)
     merger.merge(output_filename)
 
+    # Propagate the instrument name from the reduced inputs so the merged file is
+    # self-describing -- the --dials export needs it to build the detector, and it
+    # spares downstream steps from having to be told the instrument again.
+    instrument = None
+    with h5py.File(h5_files[0], "r") as src:
+        if "instrument" in src.attrs:
+            instrument = src.attrs["instrument"]
+
     with h5py.File(output_filename, "a") as f:
         f["sample/a"] = a
         f["sample/b"] = b
@@ -1944,6 +1952,8 @@ def run_merge_images(
         f["sample/beta"] = beta
         f["sample/gamma"] = gamma
         f["sample/space_group"] = space_group.encode("utf-8")
+        if instrument is not None:
+            f.attrs["instrument"] = instrument
 
     print(f"Successfully created {output_filename} with unit cell info embedded.")
 

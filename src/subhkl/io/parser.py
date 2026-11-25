@@ -37,6 +37,81 @@ from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
 
 app = typer.Typer()
 
+# Shared help text so every command documents the flag identically.
+_DIALS_HELP = (
+    "Also write the program's output as a DIALS ExperimentList (.expt) and "
+    "reflection_table (.refl) pair. Requires the DIALS/dxtbx toolkit."
+)
+_DIALS_PREFIX_HELP = (
+    "Output stem for the --dials files (default: the program's output filename "
+    "with its extension replaced by .expt/.refl)."
+)
+_DIALS_POLY_HELP = (
+    "Export a Laue PolychromaticBeam instead of the default monochromatic beam. "
+    "More faithful to the physics, but standard DIALS tools (dials.show, "
+    "dials.image_viewer) assume a monochromatic beam and cannot open it."
+)
+_DIALS_WAVELENGTH_HELP = (
+    "Nominal (peak) wavelength in Angstroms for the monochromatic DIALS beam. "
+    "Only sets the beam model for DIALS tooling; the true per-reflection "
+    "wavelengths are always kept in the reflection table. Defaults to the data's "
+    "representative wavelength."
+)
+
+# Reusable option annotations for the two extra --dials knobs, so every command
+# declares them identically.
+_DialsPolyOpt = Annotated[
+    bool, typer.Option("--dials-polychromatic", help=_DIALS_POLY_HELP)
+]
+_DialsWavelengthOpt = Annotated[
+    float | None, typer.Option("--dials-wavelength", help=_DIALS_WAVELENGTH_HELP)
+]
+
+
+def _maybe_export_dials(
+    enabled: bool,
+    read_path: str,
+    name_base: str,
+    instrument: str | None = None,
+    prefix: str | None = None,
+    image_source: str | None = None,
+    polychromatic: bool = False,
+    wavelength: float | None = None,
+):
+    """Emit DIALS .expt/.refl from a subhkl HDF5 output when --dials is set.
+
+    ``image_source`` is the image stack (a reduce/merge HDF5) whose pixels back
+    this output; when given, an ImageSet is attached so the .expt opens in DIALS
+    image tools. ``polychromatic``/``wavelength`` select the exported beam model
+    (see :func:`subhkl.io.dials_export.hdf5_to_dials`).
+    """
+    if not enabled:
+        return
+    # Importing our own module is safe without DIALS (dxtbx is imported lazily);
+    # the toolkit is only pulled in inside hdf5_to_dials.
+    from subhkl.io.dials_export import dials_output_paths, hdf5_to_dials
+
+    expt_path, refl_path = dials_output_paths(name_base, prefix)
+    try:
+        _, refl_path = hdf5_to_dials(
+            read_path,
+            expt_path,
+            refl_path,
+            instrument=instrument,
+            image_source=image_source,
+            polychromatic=polychromatic,
+            wavelength=wavelength,
+        )
+    except ImportError as exc:
+        # DIALS/dxtbx is not installed. The program's native output above has
+        # already been written, so warn about the --dials step only rather than
+        # failing the whole command with a traceback.
+        typer.echo(f"Skipping --dials export: {exc}", err=True)
+        return
+    print(f"Wrote DIALS ExperimentList to {expt_path}")
+    if refl_path is not None:
+        print(f"Wrote DIALS reflection_table to {refl_path}")
+
 
 def detect_runner_hostname() -> str:
     """Detect the execution host name (including inside GPU Docker containers)."""
@@ -623,6 +698,12 @@ def finder(
         ),
     ] = "poisson",
     max_workers: int = 16,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
     multi_gpu: Annotated[
         bool,
         typer.Option(
@@ -674,6 +755,16 @@ def finder(
         max_workers=max_workers,
         multi_gpu=multi_gpu,
         static_mask_file=static_mask_file,
+    )
+    _maybe_export_dials(
+        dials,
+        output_filename,
+        output_filename,
+        instrument,
+        dials_prefix,
+        image_source=filename,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -914,6 +1005,12 @@ def indexer(
         int | None, typer.Option(help="Number of lambda candidates (default: 64)")
     ] = None,
     index: Annotated[bool | None, typer.Option("--index/--no-index")] = None,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
     radial_weight: Annotated[
         float,
         typer.Option(
@@ -1085,6 +1182,16 @@ def indexer(
         hkl_metric_floor=hkl_metric_floor,
         multi_gpu=multi_gpu,
     )
+    _maybe_export_dials(
+        dials,
+        output_peaks_filename,
+        output_peaks_filename,
+        instrument_name,
+        dials_prefix,
+        image_source=original_nexus_filename,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
+    )
 
 
 @app.command()
@@ -1225,6 +1332,12 @@ def integrator(
     max_workers: Annotated[
         int | None, typer.Option(help="Maximum number of CPU tasks for visualization.")
     ] = None,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
     tof_gate: Annotated[
         str,
         typer.Option(
@@ -1359,6 +1472,16 @@ def integrator(
         instrument=instrument,
         pointer_meta=scan_ptr,
     )
+    _maybe_export_dials(
+        dials,
+        output_filename,
+        output_filename,
+        instrument,
+        dials_prefix,
+        image_source=resolved_scan,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
+    )
 
 
 # The command's historical name; same callback, flagged deprecated in --help
@@ -1451,6 +1574,17 @@ def metrics(
             "overall histogram, 30 for the --per-run per-frame histogram).",
         ),
     ] = None,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None,
+        typer.Option(
+            "--dials-prefix",
+            help="Output stem for the --dials files (default: metrics.expt/.refl). "
+            "Exports the reflections of the primary file being evaluated.",
+        ),
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     """
     CLI command to compute and display indexing quality metrics.
@@ -1484,6 +1618,15 @@ def metrics(
         plot_output=plot_output,
         plot_bins=bins,
     )
+    _maybe_export_dials(
+        dials,
+        file1,
+        dials_prefix if dials_prefix else "metrics",
+        instrument,
+        dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
+    )
 
 
 @app.command()
@@ -1498,6 +1641,12 @@ def peak_predictor(
     wavel_min: float | None = None,
     wavel_max: float | None = None,
     max_workers: int = 16,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
     rel_border_width: Annotated[
         float,
         typer.Option(
@@ -1582,6 +1731,16 @@ def peak_predictor(
         rel_border_width=rel_border_width,
         static_mask_file=resolved_mask,
     )
+    _maybe_export_dials(
+        dials,
+        integration_peaks_filename,
+        integration_peaks_filename,
+        instrument,
+        dials_prefix,
+        image_source=resolved_scan,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
+    )
 
 
 @app.command()
@@ -1608,6 +1767,12 @@ def mtz_exporter(
             "fitted goniometer corrections."
         ),
     ] = None,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     resolved_idx, _ = _resolve_cli_input(indexed_h5_filename)
     resolved_pred, _ = _resolve_cli_input(predictions_file)
@@ -1619,6 +1784,17 @@ def mtz_exporter(
         space_group,
         predictions_file=resolved_pred,
         corrections_file=resolved_corr,
+    )
+    # The reflection information lives in the input indexed HDF5; the DIALS
+    # files are named after the MTZ output.
+    _maybe_export_dials(
+        dials,
+        indexed_h5_filename,
+        output_mtz_filename,
+        None,
+        dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -1633,6 +1809,12 @@ def reduce(
     wavelength_max: Annotated[
         float | None, typer.Option(help="Override max wavelength")
     ] = None,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
     store_events: Annotated[
         bool | None,
         typer.Option(
@@ -1653,6 +1835,15 @@ def reduce(
         wavelength_min,
         wavelength_max,
         store_events=store_events,
+    )
+    _maybe_export_dials(
+        dials,
+        output_filename,
+        output_filename,
+        instrument,
+        dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -1727,6 +1918,12 @@ def merge_images(
     beta: float = typer.Argument(..., help="Unit cell parameter beta"),
     gamma: float = typer.Argument(..., help="Unit cell parameter gamma"),
     space_group: str = typer.Argument(..., help="Space group (e.g. 'P 1')"),
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
     shared_pointer_out: Annotated[
         str | None,
         typer.Option(
@@ -1847,6 +2044,16 @@ def merge_images(
         print(str(e))
         raise typer.Exit(code=1)
 
+    _maybe_export_dials(
+        dials,
+        output_filename,
+        output_filename,
+        instrument,
+        dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
+    )
+
 
 @app.command("cleanup-shared")
 def cleanup_shared_cmd(
@@ -1923,6 +2130,12 @@ def finder_visualize(
     n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
     max_workers: int | None = None,
     show_progress: bool = True,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     """
     Redraw the finder's unrolled-detector plots from an existing output file.
@@ -1945,6 +2158,18 @@ def finder_visualize(
         n_sigma=n_sigma,
         max_workers=max_workers,
         show_progress=show_progress,
+    )
+    # The plots are PNGs; the DIALS files carry the peaks being drawn, named
+    # after the peaks file and backed by the images, as `finder --dials` writes.
+    _maybe_export_dials(
+        dials,
+        peaks_filename,
+        peaks_filename,
+        instrument,
+        dials_prefix,
+        image_source=images_filename,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -1972,6 +2197,12 @@ def integrator_visualize(
     n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
     max_workers: int | None = None,
     show_progress: bool = True,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     """
     Redraw the RBF integrator's unrolled-detector plots from an existing output file.
@@ -1992,6 +2223,17 @@ def integrator_visualize(
         n_sigma=n_sigma,
         max_workers=max_workers,
         show_progress=show_progress,
+    )
+    # As finder-visualize: export the integrated peaks being drawn.
+    _maybe_export_dials(
+        dials,
+        peaks_filename,
+        peaks_filename,
+        instrument,
+        dials_prefix,
+        image_source=images_filename,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -2132,6 +2374,12 @@ def static_mask(
             "illumination edge runs percents of ambient per pixel."
         ),
     ] = 0.02,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     """Build a static-structure mask from frame stacks of one instrument.
 
@@ -2160,6 +2408,17 @@ def static_mask(
         static_quantile=static_quantile,
         grad_min_frac=grad_min_frac,
     )
+    # The mask is a one-frame-per-bank image stack carrying the instrument
+    # name from its inputs.
+    _maybe_export_dials(
+        dials,
+        output_filename,
+        output_filename,
+        None,
+        dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
+    )
 
 
 @app.command()
@@ -2172,6 +2431,12 @@ def sum_images(
             "inputs `static-mask` will see."
         ),
     ],
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     """Sum each bank's deduplicated frames into a one-frame-per-bank stack.
 
@@ -2187,6 +2452,17 @@ def sum_images(
         output_filename=output_filename,
         input_filenames=list(input_filenames),
     )
+    # Like reduce: the summed stack is the output.  Its goniometer angles are
+    # placeholders, so the exported scan geometry is not physical.
+    _maybe_export_dials(
+        dials,
+        output_filename,
+        output_filename,
+        None,
+        dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
+    )
 
 
 @app.command()
@@ -2200,6 +2476,12 @@ def mask_visualize(
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 600,
     max_workers: int | None = None,
     show_progress: bool = True,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     """
     Draw the static mask over the frames it applies to.
@@ -2216,6 +2498,17 @@ def mask_visualize(
         dpi=dpi,
         max_workers=max_workers,
         show_progress=show_progress,
+    )
+    # The plots are PNGs; the DIALS files carry the mask being drawn, which is
+    # itself a one-frame-per-bank image stack.
+    _maybe_export_dials(
+        dials,
+        mask_filename,
+        mask_filename,
+        instrument,
+        dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
