@@ -173,10 +173,16 @@ def _collect_flat_peaks(f):
         "lambda": col("peaks/lambda"),
         "intensity": col("peaks/intensity"),
         "sigma": col("peaks/sigma"),
-        # True when peaks/sigma is the finder's spot width, not an intensity sigma.
+        # True when peaks/sigma is the finder's spot width, not an intensity
+        # sigma: tagged as such by the finder, or carried without any
+        # intensity (an intensity sigma never is) -- the indexer copies the
+        # finder's peaks without the tag.
         "sigma_is_width": (
             "peaks/sigma" in f
-            and _decode(f["peaks/sigma"].attrs.get("quantity", "")) == _WIDTH_QUANTITY
+            and (
+                _decode(f["peaks/sigma"].attrs.get("quantity", "")) == _WIDTH_QUANTITY
+                or "peaks/intensity" not in f
+            )
         ),
         "two_theta": col("peaks/two_theta"),
         "azimuthal": col("peaks/azimuthal"),
@@ -926,6 +932,110 @@ def _attach_imageset(experiments, stack_path, layout, container_path, instrument
         print(f"Note: could not attach DIALS ImageSet ({exc}); wrote geometry only.")
 
 
+def _still_image_index(expt):
+    """Index of a still experiment's image within its ImageSet (0 if none)."""
+    try:
+        return int(expt.imageset.indices()[0])
+    except Exception:  # noqa: BLE001 - no ImageSet, or one without indices
+        return 0
+
+
+def _laue_s1(expt, hkl):
+    """Diffracted wavevector of ``hkl`` at the wavelength where it diffracts.
+
+    Laue: the reflection lands at the wavelength satisfying |s0 + q| = |s0|,
+    i.e. lambda = -2 (u . q) / |q|^2 for unit beam direction u and
+    q = S F A h. Returns ``None`` when no positive wavelength satisfies it.
+    """
+    S = np.asarray(expt.goniometer.get_setting_rotation()).reshape(3, 3)
+    F = np.asarray(expt.goniometer.get_fixed_rotation()).reshape(3, 3)
+    A = np.asarray(expt.crystal.get_A()).reshape(3, 3)
+    q = S @ F @ A @ np.asarray(hkl, dtype=float)
+    u = np.asarray(expt.beam.get_unit_s0(), dtype=float)
+    qq = float(q @ q)
+    if qq <= 0:
+        return None
+    lam = -2.0 * float(u @ q) / qq
+    if lam <= 0:
+        return None
+    return u / lam + q
+
+
+def _add_derived_geometry(flex, table, experiments):
+    """Fill the geometry columns DIALS derives from positions and models.
+
+    Mirrors what dials.index / dials.predict add, computed through the
+    exported experiments so it is consistent with them:
+
+    - ``xyzcal.px`` for indexed rows that lack it: where ``S F A h`` diffracts
+      at its Laue wavelength, through the row's panel ((0, 0, 0) for unindexed
+      rows or a ray missing the panel, as DIALS leaves unpredicted rows);
+    - ``xyzobs.mm.value``/``.variance`` from ``xyzobs.px`` (DIALS'
+      ``centroid_px_to_mm``) on indexed tables with positional variances;
+    - ``xyzcal.mm`` from ``xyzcal.px``;
+    - ``s1`` where missing: the ray to the row's position scaled to
+      1/``wavelength``.
+    """
+    n = len(table)
+    if n == 0 or not len(experiments):
+        return
+    ids = list(table["id"])
+    panels = list(table["panel"])
+
+    has_hkl = "miller_index" in table and experiments[0].crystal is not None
+    if has_hkl and "xyzcal.px" not in table and experiments[0].goniometer:
+        cal = []
+        for i, hkl in enumerate(table["miller_index"]):
+            pos = (0.0, 0.0, 0.0)
+            if hkl != (0, 0, 0):
+                expt = experiments[ids[i]]
+                s1 = _laue_s1(expt, hkl)
+                if s1 is not None:
+                    try:
+                        x, y = expt.detector[panels[i]].get_ray_intersection_px(
+                            _floats(s1)
+                        )
+                        pos = (float(x), float(y), 0.0)
+                    except RuntimeError:
+                        pass
+            cal.append(pos)
+        table["xyzcal.px"] = flex.vec3_double(cal)
+
+    # Strong spots alone stay as dials.find_spots writes them (pixels only);
+    # dials.index adds the millimetre centroids, so indexed tables carry them.
+    if (
+        "miller_index" in table
+        and "xyzobs.px.value" in table
+        and "xyzobs.px.variance" in table
+    ):
+        table.centroid_px_to_mm(experiments)
+
+    if "xyzcal.px" in table and "xyzcal.mm" not in table:
+        mm = []
+        for i, (x, y, z) in enumerate(table["xyzcal.px"]):
+            panel = experiments[ids[i]].detector[panels[i]]
+            mx, my = panel.pixel_to_millimeter((x, y))
+            mm.append((float(mx), float(my), float(z)))
+        table["xyzcal.mm"] = flex.vec3_double(mm)
+
+    if "s1" not in table and "wavelength" in table:
+        key = "xyzobs.px.value" if "xyzobs.px.value" in table else "xyzcal.px"
+        if key in table:
+            s1 = []
+            for i, (x, y, _) in enumerate(table[key]):
+                lam = float(table["wavelength"][i])
+                lab = np.asarray(
+                    experiments[ids[i]].detector[panels[i]].get_pixel_lab_coord((x, y))
+                )
+                norm = np.linalg.norm(lab)
+                if lam > 0 and norm > 0:
+                    v = lab / norm / lam
+                    s1.append((float(v[0]), float(v[1]), float(v[2])))
+                else:
+                    s1.append((0.0, 0.0, 0.0))
+            table["s1"] = flex.vec3_double(s1)
+
+
 def _build_reflection_table(
     flex, peaks, frame_to_expt, bank_to_panel, experiments, peak_s_lab=None
 ):
@@ -979,11 +1089,19 @@ def _build_reflection_table(
         table["wavelength"] = flex.double([float(x) for x in peaks["lambda"]])
 
     # Observed / calculated pixel positions: DIALS x=fast=column, y=slow=row.
+    # The frame coordinate follows DIALS for stills: an observed centroid sits
+    # mid-image, at z = (image index) + 0.5, the index being the experiment's
+    # image in its ImageSet (what dials.find_spots writes on the same .expt; 0
+    # without images), while a calculated position has z = 0, as
+    # dials.predict gives a still.
     if peaks["pixel_r"] is not None and peaks["pixel_c"] is not None:
-        xyz_px = [
-            (float(c), float(r), 0.0)
-            for r, c in zip(peaks["pixel_r"], peaks["pixel_c"])
+        obs_z = np.array([_still_image_index(e) + 0.5 for e in experiments])
+        obs_z = obs_z[ids] if len(obs_z) else np.full(n, 0.5)
+        xyz_obs = [
+            (float(c), float(r), float(z))
+            for r, c, z in zip(peaks["pixel_r"], peaks["pixel_c"], obs_z)
         ]
+        xyz_px = [(x, y, 0.0) for x, y, _ in xyz_obs]
         # The integrator integrates at the predicted positions and writes those
         # back as the peak position, so integrated rows (hkl + intensity, no
         # finder width) carry it as dials.integrate's xyzcal.px.  subhkl
@@ -997,7 +1115,7 @@ def _build_reflection_table(
         if peaks.get("predicted") or integrated_at_prediction:
             table["xyzcal.px"] = flex.vec3_double(xyz_px)
         if not peaks.get("predicted"):
-            table["xyzobs.px.value"] = flex.vec3_double(xyz_px)
+            table["xyzobs.px.value"] = flex.vec3_double(xyz_obs)
 
     # Finder detections: peaks/sigma is each spot's fitted Gaussian width in
     # pixels, so its square is the spot's positional variance in x and y (the
@@ -1032,6 +1150,8 @@ def _build_reflection_table(
         table["s1"] = flex.vec3_double(
             [(float(v[0]), float(v[1]), float(v[2])) for v in s1]
         )
+
+    _add_derived_geometry(flex, table, experiments)
 
     # Intensities.
     if peaks["intensity"] is not None:

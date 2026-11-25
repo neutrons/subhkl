@@ -500,9 +500,18 @@ def test_roundtrip_integrated_has_xyzcal_and_d(tmp_path):
     )
 
     refl = flex.reflection_table.from_file(refl_path)
-    expected = [(1.0, 5.0, 0.0), (2.0, 6.0, 0.0), (3.0, 7.0, 0.0)]
-    assert list(refl["xyzcal.px"]) == expected
-    assert list(refl["xyzobs.px.value"]) == expected
+    # A calculated position has z = 0 (dials.predict on a still); the observed
+    # copy sits mid-image, z = 0.5 with no ImageSet attached.
+    assert list(refl["xyzcal.px"]) == [
+        (1.0, 5.0, 0.0),
+        (2.0, 6.0, 0.0),
+        (3.0, 7.0, 0.0),
+    ]
+    assert list(refl["xyzobs.px.value"]) == [
+        (1.0, 5.0, 0.5),
+        (2.0, 6.0, 0.5),
+        (3.0, 7.0, 0.5),
+    ]
     # Orthorhombic 10 x 11 x 12 cell: 1/d^2 = (h/a)^2 + (k/b)^2 + (l/c)^2.
     for (h, k, l), d in zip(refl["miller_index"], refl["d"]):
         assert d == pytest.approx(
@@ -919,6 +928,135 @@ def test_roundtrip_missing_recorded_source_gives_geometry_only(tmp_path):
     assert len(experiments) == 2
     assert experiments[0].identifier == dx.experiment_identifier(str(peaks), 0)
     assert all(e.imageset is None for e in experiments)
+
+
+def test_roundtrip_observed_z_is_the_image_index_plus_half(tmp_path):
+    """Observed centroids sit mid-image on the experiment's own image, as
+    dials.find_spots writes them on the same .expt: z = 0.5 on frame 0's
+    image and 1.5 on frame 1's."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+
+    stack = tmp_path / "merged.h5"
+    _write_merged_stack(str(stack))
+    peaks = tmp_path / "found.h5"
+    _write_peaks_on(str(peaks), frames=[0, 1], banks=[11, 12])
+    refl_path = str(tmp_path / "found.refl")
+    dx.hdf5_to_dials(
+        str(peaks),
+        str(tmp_path / "found.expt"),
+        refl_path,
+        instrument="CG4D",
+        image_source=str(stack),
+    )
+    refl = flex.reflection_table.from_file(refl_path)
+    assert [z for _, _, z in refl["xyzobs.px.value"]] == [0.5, 1.5]
+
+
+def _write_indexer_like(path, pixel, panel_bank, q):
+    """Indexer output: finder spots (untagged width, no intensity) with one
+    reflection (1, 0, 0) set up to diffract at ``pixel`` and one unindexed
+    spot.  The cell puts a* along ``q`` with |a*| = |q| (frame 0, R = I)."""
+    q = np.asarray(q, dtype=float)
+    qn = np.linalg.norm(q)
+    x = np.array([1.0, 0.0, 0.0])
+    v = np.cross(x, q / qn)
+    c = float(x @ (q / qn))
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    U = np.eye(3) + vx + vx @ vx / (1 + c)  # rotates x onto q
+    with h5py.File(path, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f["instrument/wavelength"] = [2.0, 10.0]
+        f["sample/a"], f["sample/b"], f["sample/c"] = 1 / qn, 11.0, 12.0
+        f["sample/alpha"] = f["sample/beta"] = f["sample/gamma"] = 90.0
+        f["sample/space_group"] = b"P 1"
+        f["sample/U"] = U
+        f["sample/B"] = np.diag([qn, 1 / 11.0, 1 / 12.0])
+        f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
+        f["peaks/h"] = np.array([1, 0])
+        f["peaks/k"] = np.array([0, 0])
+        f["peaks/l"] = np.array([0, 0])
+        f["peaks/lambda"] = np.array([3.0, 3.0])
+        f["peaks/sigma"] = np.array([2.0, 3.0])  # finder width, tag lost
+        f["peaks/pixel_r"] = np.array([pixel[1] + 4.0, 10.0])
+        f["peaks/pixel_c"] = np.array([pixel[0] + 3.0, 10.0])
+        f["bank"] = np.array([panel_bank, panel_bank])
+        f["peaks/run_index"] = np.array([0, 0])
+        f["goniometer/axes"] = np.array([[0, 1, 0, 1]], dtype=float)
+        f["goniometer/angles"] = np.array([[0.0]])
+
+
+def test_roundtrip_indexer_carries_dials_index_columns(tmp_path):
+    """The indexer export carries what dials.index writes: strong flags and
+    positional variances from the finder width, xyzcal.px/mm where S F A h
+    diffracts, xyzobs.mm from DIALS' own conversion, and s1."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+    from dxtbx.model.experiment_list import ExperimentListFactory
+
+    # Pick a target pixel on a real CG4D panel, and the q that diffracts
+    # there at 3 Angstrom.
+    probe = tmp_path / "probe.h5"
+    _write_peaks_on(str(probe), frames=[0], banks=[11])
+    probe_expt = str(tmp_path / "probe.expt")
+    dx.hdf5_to_dials(str(probe), probe_expt, str(tmp_path / "p.refl"), "CG4D")
+    el = ExperimentListFactory.from_json_file(probe_expt, check_format=False)
+    panel = el[0].detector[0]
+    W, H = panel.get_image_size()
+    pixel = (W / 3.0, H / 2.0)
+    lab = np.asarray(panel.get_pixel_lab_coord(pixel))
+    u = np.asarray(el[0].beam.get_unit_s0())
+    q = (lab / np.linalg.norm(lab) - u) / 3.0
+
+    h5 = tmp_path / "indexed.h5"
+    _write_indexer_like(str(h5), pixel, 11, q)
+    expt_path = str(tmp_path / "indexed.expt")
+    refl_path = str(tmp_path / "indexed.refl")
+    dx.hdf5_to_dials(str(h5), expt_path, refl_path, instrument="CG4D")
+    refl = flex.reflection_table.from_file(refl_path)
+    experiments = ExperimentListFactory.from_json_file(expt_path, check_format=False)
+
+    for key in (
+        "s1",
+        "xyzcal.px",
+        "xyzcal.mm",
+        "xyzobs.mm.value",
+        "xyzobs.mm.variance",
+    ):
+        assert key in refl
+    assert list(refl.get_flags(refl.flags.strong)) == [True, True]
+    assert list(refl.get_flags(refl.flags.indexed)) == [True, False]
+    assert [v[0] for v in refl["xyzobs.px.variance"]] == [4.0, 9.0]
+    assert "intensity.sum.variance" not in refl
+
+    cx, cy, cz = refl["xyzcal.px"][0]
+    assert (cx, cy) == pytest.approx(pixel, abs=1e-6)
+    assert cz == 0.0
+    assert refl["xyzcal.px"][1] == (0.0, 0.0, 0.0)
+
+    p0 = experiments[0].detector[0]
+    ox, oy, _ = refl["xyzobs.px.value"][0]
+    assert refl["xyzobs.mm.value"][0][:2] == pytest.approx(
+        p0.pixel_to_millimeter((ox, oy))
+    )
+    assert refl["xyzcal.mm"][0][:2] == pytest.approx(p0.pixel_to_millimeter((cx, cy)))
+    s1 = np.asarray(refl["s1"][0])
+    assert np.linalg.norm(s1) == pytest.approx(1 / 3.0)
+
+
+def test_finder_export_keeps_dials_find_spots_columns(tmp_path):
+    """Strong spots alone get no millimetre or s1 columns, as from
+    dials.find_spots."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+
+    h5 = tmp_path / "finder.h5"
+    _write_tagged_finder(str(h5))
+    refl_path = str(tmp_path / "finder.refl")
+    dx.hdf5_to_dials(str(h5), str(tmp_path / "finder.expt"), refl_path, "CG4D")
+    refl = flex.reflection_table.from_file(refl_path)
+    assert "xyzobs.mm.value" not in refl
+    assert "s1" not in refl
 
 
 def test_experiment_identifier_is_a_reproducible_unique_uuid(tmp_path, monkeypatch):

@@ -173,21 +173,27 @@ Closest DIALS CLI parallel per program
        `Finder spots in DIALS tools`_.
      - ``dials.find_spots`` (strong.refl)
    * - ``indexer``
-     - Indexed reflections: ``miller_index``, ``wavelength``,
-       ``xyzobs.px.value``, ``d`` + crystal model per frame. Only rows with a
-       Miller index carry the ``indexed`` flag; unindexed rows keep
-       ``(0, 0, 0)`` and ``d`` = 0.
+     - Indexed reflections, laid out as ``dials.index`` writes them: the
+       finder's spots (``strong`` flag, ``xyzobs.px.value``/``variance``) with
+       ``miller_index``, ``wavelength``, ``d``, ``s1``, ``xyzobs.mm.*`` and
+       ``xyzcal.px``/``.mm`` + crystal model per frame. ``xyzcal`` is where
+       ``S · F · A · h`` diffracts at its Laue wavelength, computed through the
+       exported models. Only rows with a Miller index carry the ``indexed``
+       flag; unindexed rows keep ``(0, 0, 0)``, ``d`` = 0 and ``xyzcal`` =
+       ``(0, 0, 0)``. ``dials.refine`` accepts the files once reflections with
+       ``d`` < λ/2 of the nominal beam are filtered out, but it refines a
+       monochromatic still model, so its results do not describe Laue data.
      - ``dials.index`` (indexed.expt + indexed.refl); ``dials.refine`` for the
        geometry refinement it also does.
    * - ``peak_predictor``
-     - Predicted reflections: ``xyzcal.px``, ``miller_index``, ``wavelength``,
-       ``d``, ``predicted`` flag; one experiment per stack frame, with the
+     - Predicted reflections: ``xyzcal.px``/``.mm``, ``s1``, ``miller_index``,
+       ``wavelength``, ``d``, ``predicted`` flag; one experiment per stack frame, with the
        images attached.
      - ``dials.predict``
    * - ``integrator``
      - Integrated reflections from RBF profile fitting: ``intensity.sum``,
-       ``miller_index``, ``wavelength``, ``d``, ``xyzcal.px``, and ``s1`` when
-       the file carries lab-frame peak positions. subhkl integrates at the
+       ``miller_index``, ``wavelength``, ``d``, ``s1``, ``xyzcal.px``/``.mm``.
+       subhkl integrates at the
        predicted positions and measures no separate centroid, so
        ``xyzobs.px.value`` (which ``dials.export`` and ``dials.scale`` read)
        holds the same position as ``xyzcal.px``. ``rbf-integrator`` is a
@@ -236,7 +242,8 @@ pixel masks.
 
 - **Positional variance is the spot's spread.** ``xyzobs.px.variance`` is
   ``(σ², σ², 1/12)``, where σ is the finder's fitted Gaussian width in pixels
-  (``peaks/sigma`` tagged ``quantity = gaussian_width_pixels``) and 1/12 is the
+  (``peaks/sigma`` tagged ``quantity = gaussian_width_pixels``, or carried with
+  no intensity, as the indexer copies it untagged) and 1/12 is the
   still-frame z variance ``dials.find_spots`` reports. ``dials.find_spots``
   reports the variance of the centroid instead, which is roughly σ² divided by
   the spot's counts, so these values are typically 50–100× larger than native.
@@ -246,7 +253,11 @@ pixel masks.
 - **Widths are bounded by the finder's sigma bank.** σ ranges over the
   finder's width bank (1.5–5 px by default), so the smallest variances pile up
   at the bank's lower edge.
-- **The z centroid is 0.0.** Native stills place it at the frame centre, 0.5.
+- **The z centroid is mid-image.** Observed centroids have z = (image index) +
+  0.5, the index being the experiment's image in its ImageSet: 0.5 on the first
+  frame, 1.5 on the second, exactly as ``dials.find_spots`` writes them on the
+  same ``.expt`` (0.5 when no images are attached). Calculated positions
+  (``xyzcal``) have z = 0, as ``dials.predict`` gives a still.
 
 What this means for DIALS tools run on the finder export (``finder.expt`` +
 ``finder.refl`` in place of ``imported.expt`` + ``strong.refl``):
