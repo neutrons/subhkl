@@ -167,21 +167,30 @@ Closest DIALS CLI parallel per program
        cell metadata; no ``.refl``.
      - ``dials.import`` / ``dials.combine_experiments``
    * - ``finder``
-     - Observed peaks: ``xyzobs.px.value``, ``intensity.sum``, ``panel``,
-       per-frame experiments.
+     - Observed peaks flagged ``strong``: ``xyzobs.px.value``,
+       ``xyzobs.px.variance`` (from the fitted spot width), ``panel``, per-frame
+       experiments. No intensities or shoeboxes; see
+       `Finder spots in DIALS tools`_.
      - ``dials.find_spots`` (strong.refl)
    * - ``indexer``
-     - Indexed reflections: ``miller_index``, ``wavelength``, ``xyzobs.px``,
-       ``intensity`` + crystal model per frame.
+     - Indexed reflections: ``miller_index``, ``wavelength``,
+       ``xyzobs.px.value``, ``d`` + crystal model per frame. Only rows with a
+       Miller index carry the ``indexed`` flag; unindexed rows keep
+       ``(0, 0, 0)`` and ``d`` = 0.
      - ``dials.index`` (indexed.expt + indexed.refl); ``dials.refine`` for the
        geometry refinement it also does.
    * - ``peak_predictor``
      - Predicted reflections: ``xyzcal.px``, ``miller_index``, ``wavelength``,
-       ``predicted`` flag.
+       ``d``, ``predicted`` flag; one experiment per stack frame, with the
+       images attached.
      - ``dials.predict``
    * - ``integrator``
      - Integrated reflections from RBF profile fitting: ``intensity.sum``,
-       ``miller_index``, ``wavelength``, ``s1``. ``rbf-integrator`` is a
+       ``miller_index``, ``wavelength``, ``d``, ``xyzcal.px``, and ``s1`` when
+       the file carries lab-frame peak positions. subhkl integrates at the
+       predicted positions and measures no separate centroid, so
+       ``xyzobs.px.value`` (which ``dials.export`` and ``dials.scale`` read)
+       holds the same position as ``xyzcal.px``. ``rbf-integrator`` is a
        deprecated alias for this command.
      - ``dials.integrate`` (integrated.refl, profile-fitting path)
    * - ``mtz_exporter``
@@ -214,6 +223,65 @@ Closest DIALS CLI parallel per program
        so the exported scan geometry is not physical.
      - ``dials.merge_cbf`` (sums images)
 
+Finder spots in DIALS tools
+---------------------------
+
+``finder --dials`` writes the equivalent of a ``dials.find_spots`` strong.refl,
+but only with the columns subhkl's finder measures. Each spot has
+``xyzobs.px.value``, ``xyzobs.px.variance``, ``panel``, ``id`` and the ``strong``
+flag. A native strong.refl also carries ``bbox``, ``shoebox``, ``n_signal`` and
+``intensity.sum.value``/``variance``; the finder export has none of these,
+because the finder fits spot positions and widths, not summed intensities or
+pixel masks.
+
+- **Positional variance is the spot's spread.** ``xyzobs.px.variance`` is
+  ``(σ², σ², 1/12)``, where σ is the finder's fitted Gaussian width in pixels
+  (``peaks/sigma`` tagged ``quantity = gaussian_width_pixels``) and 1/12 is the
+  still-frame z variance ``dials.find_spots`` reports. ``dials.find_spots``
+  reports the variance of the centroid instead, which is roughly σ² divided by
+  the spot's counts, so these values are typically 50–100× larger than native.
+  The ranking between spots is meaningful, but tools that weight by inverse
+  variance (``dials.refine``, ``dials.index`` refinement) treat finder spots as
+  less precise than native ones.
+- **Widths are bounded by the finder's sigma bank.** σ ranges over the
+  finder's width bank (1.5–5 px by default), so the smallest variances pile up
+  at the bank's lower edge.
+- **The z centroid is 0.0.** Native stills place it at the frame centre, 0.5.
+
+What this means for DIALS tools run on the finder export (``finder.expt`` +
+``finder.refl`` in place of ``imported.expt`` + ``strong.refl``):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 65
+
+   * - Works as with a native strong.refl
+     - Needs columns the finder export lacks
+   * - ``dials.index``, ``dials.search_beam_position``, ``dials.refine``,
+       ``laue.index``, ``laue.optimize_indexing``: these use centroid positions
+       and their variances.
+
+       ``dials.reciprocal_lattice_viewer``: positions only.
+
+       ``laue.predict`` and ``laue.integrate``: they build shoeboxes from
+       predictions rather than from the strong spots.
+     - **Shoeboxes or bounding boxes:** ``dials.image_viewer`` draws the spot
+       centroids, but its bounding-box and strong-pixel overlays need ``bbox``
+       and ``shoebox``. ``dials.integrate``'s automatic profile model (rotation
+       data) estimates the beam divergence from the strong spots' shoebox pixels,
+       so set its profile parameters explicitly. ``dials.analyse_output`` and
+       ``dials.filter_reflections`` with shoebox or bbox filters also need them.
+
+       **Intensities:** ``dials.spot_counts_per_image`` and similar per-image
+       reports (total intensity, resolution estimates),
+       ``dials.filter_reflections`` intensity or I/σ cuts,
+       ``dials.analyse_output`` intensity plots, and any indexing option that
+       picks the brightest spots first.
+
+The indexing, refinement and Laue integration paths therefore run on the finder
+export directly. The gaps affect viewer overlays, per-image diagnostics and
+``dials.integrate``'s automatic profile model.
+
 Comparing outputs against DIALS / Laue-DIALS
 --------------------------------------------
 
@@ -243,8 +311,9 @@ beam with the true per-reflection wavelength in the reflection table's
        rotation (``dials.show``).
    * - ``finder``
      - ``laue.find_spots`` (``dials.find_spots``)
-     - Strong-spot tables: counts per panel/frame, ``xyzobs.px`` centroid
-       overlap, ``intensity.sum`` distributions. Overlay both on the images with
+     - Strong-spot tables: counts per panel/frame and ``xyzobs.px`` centroid
+       overlap (subhkl's finder records no intensity, so there is no
+       ``intensity.sum`` to compare). Overlay both on the images with
        ``dials.image_viewer scan.expt strong.refl``.
    * - ``indexer``
      - ``laue.index`` → ``laue.optimize_indexing`` → ``laue.refine``
