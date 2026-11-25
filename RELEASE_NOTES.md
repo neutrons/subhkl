@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.7.3]
 
+### Added
+
+- **Quantile wavelength bandpass histogram and separated visualization controls (`rainbow_zones`, `nova_rainbow_view`)**:
+  - Added an empirical wavelength profile from fundamental reflections before
+    Wulff-sample intensity filtering, with smoothing and baseline rejection to
+    suppress cosmic-ray and harmonic outliers. The histogram distinguishes
+    in-band and out-of-band signal and supports snapping wavelength limits to
+    the measured bandpass.
+  - Separated visualization controls from physical wavelength and resolution
+    parameters. The `λ/Zone` colorscale crossover now adjusts the spectral
+    midpoint independently, while CG4D starts with a wide `[2.8, 4.5] Å`
+    integration window for interactive bandpass inspection.
+- **Post-merge structure-factor and predicted `I/σ` spot colorscales (`rainbow_zones`, `nova_rainbow_view`)**:
+  - Added `|F_obs|²` and globally scaled external `.mtz` `|F_calc|²` colorscales
+    with matched bounds, plus a post-merge predicted `I_pred/σ` colorscale
+    evaluated at each frame's diffracted wavelength.
+  - The predicted scale is restricted to the active wavelength bandpass and
+    unavailable before Careless merge; run- and frame-specific observations
+    remain isolated.
+
 ### Changed
 
 - **Time-of-flight integration fits each detector image once, in position and time (`tof_joint`, `integrator --tof-fit`)**:
