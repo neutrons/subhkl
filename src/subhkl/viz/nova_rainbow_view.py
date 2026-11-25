@@ -5289,7 +5289,9 @@ class NovaGalaxyPipelineRunner:
                 data=np.bytes_(metrics_raw.encode("utf-8")),
             )
 
-            merged_map: dict[tuple[int, int, int], tuple[float, float]] = {}
+            merged_map: dict[
+                tuple[int, int, int], tuple[float, float, float, float]
+            ] = {}
             if os.path.isfile(merged_mtz_path):
                 mtz_m = gemmi.read_mtz_file(merged_mtz_path)
                 mcols = {c.label: np.array(c, dtype=np.float64) for c in mtz_m.columns}
@@ -5304,13 +5306,44 @@ class NovaGalaxyPipelineRunner:
                         ),
                     ),
                 )
+                mF_raw = mcols.get("F", mcols.get("F(+)", None))
+                mSF_raw = mcols.get(
+                    "SIGF",
+                    mcols.get(
+                        "SigF",
+                        mcols.get("SIGF(+)", mcols.get("SigF(+)", None)),
+                    ),
+                )
+                if mF_raw is not None and mSF_raw is not None:
+                    mF = mF_raw
+                    mSF = np.maximum(mSF_raw, 1e-6)
+                else:
+                    i_pos = np.maximum(mI, 0.0)
+                    s_pos = np.maximum(mS, 1e-6)
+                    disc = np.maximum(0.0, i_pos * i_pos - 0.5 * s_pos * s_pos)
+                    sigf2 = np.maximum(1e-12, i_pos - np.sqrt(disc))
+                    low_m = i_pos <= (np.sqrt(0.5) * s_pos)
+                    mF = np.sqrt(np.maximum(0.0, i_pos - np.where(low_m, 0.0, sigf2)))
+                    mSF = np.sqrt(sigf2)
+                    if np.any(low_m):
+                        f_low = np.where(mI > 0.0, np.sqrt(i_pos), 0.0)
+                        sf_low = s_pos / np.maximum(
+                            2.0 * np.maximum(f_low, np.sqrt(0.5 * s_pos)), 1e-6
+                        )
+                        mF = np.where(low_m, f_low, mF)
+                        mSF = np.where(low_m, np.maximum(sf_low, 1e-6), mSF)
                 for j in range(mtz_m.nreflections):
                     mkey = (
                         int(mcols["H"][j]),
                         int(mcols["K"][j]),
                         int(mcols["L"][j]),
                     )
-                    merged_map[mkey] = (float(mI[j]), float(mS[j]))
+                    merged_map[mkey] = (
+                        float(mI[j]),
+                        float(mS[j]),
+                        float(mF[j]),
+                        float(mSF[j]),
+                    )
                 if merged_map:
                     asu_keys_arr = np.asarray(list(merged_map.keys()), dtype=np.int32)
                     asu_i_arr = np.asarray(
@@ -5319,10 +5352,18 @@ class NovaGalaxyPipelineRunner:
                     asu_sigi_arr = np.asarray(
                         [v[1] for v in merged_map.values()], dtype=np.float64
                     )
+                    asu_f_arr = np.asarray(
+                        [v[2] for v in merged_map.values()], dtype=np.float64
+                    )
+                    asu_sigf_arr = np.asarray(
+                        [v[3] for v in merged_map.values()], dtype=np.float64
+                    )
                     for c_ds_name, c_arr in (
                         ("asu_hkl", asu_keys_arr),
                         ("merged_i", asu_i_arr),
                         ("merged_sigi", asu_sigi_arr),
+                        ("merged_f", asu_f_arr),
+                        ("merged_sigf", asu_sigf_arr),
                     ):
                         if c_ds_name in cgrp:
                             del cgrp[c_ds_name]
@@ -5385,6 +5426,8 @@ class NovaGalaxyPipelineRunner:
                     ipreds = np.full(n_peaks, np.nan, dtype=np.float64)
                     merged_i = np.full(n_peaks, np.nan, dtype=np.float64)
                     merged_sigi = np.full(n_peaks, np.nan, dtype=np.float64)
+                    merged_f = np.full(n_peaks, np.nan, dtype=np.float64)
+                    merged_sigf = np.full(n_peaks, np.nan, dtype=np.float64)
                     asu_hkl_arr = np.zeros((n_peaks, 3), dtype=np.int32)
 
                     for i in range(n_peaks):
@@ -5392,7 +5435,12 @@ class NovaGalaxyPipelineRunner:
                         key = (int(h_asu[0]), int(h_asu[1]), int(h_asu[2]))
                         asu_hkl_arr[i] = key
                         if key in merged_map:
-                            merged_i[i], merged_sigi[i] = merged_map[key]
+                            (
+                                merged_i[i],
+                                merged_sigi[i],
+                                merged_f[i],
+                                merged_sigf[i],
+                            ) = merged_map[key]
                         cands = pred_map.get(key)
                         if cands:
                             best = min(
@@ -5426,6 +5474,8 @@ class NovaGalaxyPipelineRunner:
                         ("careless_ipred", ipreds),
                         ("merged_i", merged_i),
                         ("merged_sigi", merged_sigi),
+                        ("merged_f", merged_f),
+                        ("merged_sigf", merged_sigf),
                         ("asu_hkl", asu_hkl_arr),
                     ):
                         if ds_name in pgrp:

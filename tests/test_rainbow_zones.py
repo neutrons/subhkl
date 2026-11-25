@@ -2122,13 +2122,17 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert 'id="slider-dmin"' in html_doc
     assert 'id="slider-dmin" min="0.50" max="5.00" step="0.05"' in html_doc
     assert 'id="sel-spot-color"' in html_doc
+    assert "max-width: 158px;" in html_doc
     assert '<option value="isigi">Color: I/σ</option>' in html_doc
-    assert '<option value="mtz_isigi">Color: .mtz I/σ</option>' in html_doc
+    assert '<option value="fobs">Color: |F_obs|²</option>' in html_doc
+    assert '<option value="mtz_fcalc">Color: |F_calc|²</option>' in html_doc
+    assert '<option value="ipred_isigi">Color: I_pred/σ</option>' in html_doc
     assert 'id="slider-color-emphasis"' in html_doc
     assert 'id="slider-parallax"' not in html_doc
     assert 'id="btn-peaks-mtz"' not in html_doc
     assert "hasIntegratedIsigi" in html_doc
-    assert "hasMtzIsigi" in html_doc
+    assert "hasMtzFcalcSq" in html_doc
+    assert "hasIpredIsigi" in html_doc
     assert "syncDminControls" in html_doc
     assert "Runner host:" in html_doc
     from subhkl.io.parser import detect_runner_hostname
@@ -3035,7 +3039,7 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     assert payload_mtz["space_group"] == "P 21 21 21"
     assert np.allclose(payload_mtz["cell"], cell_orig, atol=1e-3)
     assert payload_mtz["default_peak_source"] == "integrated"
-    assert payload_mtz["default_color_mode"] == "mtz_isigi"
+    assert payload_mtz["default_color_mode"] == "mtz_fcalc"
     assert "mtz_peaks" not in payload_mtz
     assert "mtz_sample_peaks" not in payload_mtz
     # Only panels with predicted peaks (first_bk) may carry .mtz projections!
@@ -3117,7 +3121,7 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     assert resp_mtz.status == 200
     doc_mtz = json.loads(resp_mtz.body.decode("utf-8"))
     assert doc_mtz["default_peak_source"] == "integrated"
-    assert doc_mtz["default_color_mode"] == "mtz_isigi"
+    assert doc_mtz["default_color_mode"] == "mtz_fcalc"
     assert doc_mtz["space_group"] == "P 21 21 21"
     assert np.allclose(np.asarray(doc_mtz["b_matrix"]), B_orig, atol=1e-5)
     assert sub_m.data.peaks_file == str(integ_h5)
@@ -3196,7 +3200,9 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     assert 'id="btn-peaks-mtz"' not in html_doc
     assert 'id="btn-wulff-friedel"' in html_doc
     assert "Color: I/σ</option>" in html_doc
-    assert "Color: .mtz I/σ</option>" in html_doc
+    assert "Color: |F_obs|²</option>" in html_doc
+    assert "Color: |F_calc|²</option>" in html_doc
+    assert "Color: I_pred/σ</option>" in html_doc
     assert 'id="slider-color-emphasis"' in html_doc
     assert "repeating-conic-gradient" in html_doc  # Photoshop transparency checkerboard
     assert "--cs-gradient" in html_doc
@@ -3217,11 +3223,28 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
         "applyCrossoverCurve",
         "wavelengthToColor",
         "computeQuantileScaleBounds",
+        "hasExternalMtzOverlay",
+        "hasCarelessMergedState",
+        "peakFobsSqRaw",
+        "peakFobsSq",
+        "getEffectiveCarelessScaleProfile",
+        "interpCarelessProfileSeries",
+        "estimateCarelessScaleForPeak",
+        "estimateCarelessSnrScaleForPeak",
+        "getMtzToCarelessIScaleFactor",
+        "peakMtzFcalcSq",
+        "peakIpredIsigi",
+        "isMtzColorMode",
+        "isQuantileSnrColorMode",
         "getPeakDataAvailability",
         "peakUnscaledIsigi",
         "peakMtzIsigi",
         "hasIntegratedIsigi",
+        "hasFobsSq",
         "hasMtzIsigi",
+        "hasMtzFcalcSq",
+        "hasIpredIsigi",
+        "preferredFallbackColorMode",
         "scaleToColor",
         "isigiToColor",
         "hexToRgba",
@@ -3248,10 +3271,20 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
 const DATA = {json.dumps(payload_mtz)};
 const DEFAULT_COLOR_CROSSOVER = 0.38;
 const ORBIT_PALETTE = ["#ff38b4", "#00e5ff", "#fbbf24", "#10b981"];
+const _baselineMeasCache = {{
+  carelessIAsuLookup: DATA.careless_i_asu_lookup || null,
+  carelessFAsuLookup: DATA.careless_f_asu_lookup || null,
+  mtzFAsuLookup: DATA.mtz_f_asu_lookup || null,
+}};
+let _mtzCarelessAlignCache = {{ sig: "", kI: 1.0 }};
+let _jsCarelessProfileCache = {{ sig: "", prof: null }};
 let _peakDataAvailabilitySig = "";
 let _peakDataAvailability = {{
   hasIsigi: false,
+  hasFobsSq: false,
   hasMtzIsigi: false,
+  hasMtzFcalcSq: false,
+  hasIpredIsigi: false,
   hasResiduals: false,
   hasScales: false,
   isigiTop: 40.0,
@@ -3280,7 +3313,7 @@ const state = {{
   peakSource: DATA.default_peak_source || "integrated",
   wulffScope: "all_runs",
   showWulffFriedel: true,
-  wulffColorMode: DATA.default_color_mode || "mtz_isigi",
+  wulffColorMode: DATA.default_color_mode || "mtz_fcalc",
   colorCrossover: 0.38,
   lamMin: 2.8,
   lamMax: 4.5,
@@ -3312,7 +3345,7 @@ function mat3Vec(M, v) {{
   ];
 }}
 function hasMergedCarelessData() {{ return false; }}
-function isPeakVisible(p) {{ return state.wulffColorMode !== "mtz_isigi" || Number.isFinite(peakMtzIsigi(p)); }}
+function isPeakVisible(p) {{ return state.wulffColorMode !== "mtz_fcalc" || Number.isFinite(peakMtzFcalcSq(p)); }}
 function zoneColor() {{ return "rgba(255,100,100,1)"; }}
 function residualToColor() {{ return "rgba(255,255,255,1)"; }}
 function syncColorModeSelectors() {{}}
@@ -3414,17 +3447,17 @@ applyPeakSource("predicted", false);
 const nPredFrame = PEAKS.length;
 const nPredWulff = getActiveWulffPeaks().length;
 const predShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse)) ? "ellipse" : "circle";
-const hasMtzCol = hasMtzIsigi();
+const hasMtzCol = hasMtzFcalcSq();
 const hasPredCrossLinkedIsigi = hasIntegratedIsigi();
-const mtzColStrokePred = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzIsigi(p))), 1.0);
+const mtzColStrokePred = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzFcalcSq(p))), 1.0);
 const scalePredTop = scaleToColor(10.0, 1.0);
-const gradMtzIsigi = buildColorscaleGradientSpec("mtz_isigi", 0.38);
+const gradMtzIsigi = buildColorscaleGradientSpec("mtz_fcalc", 0.38);
 
 applyPeakSource("integrated", false);
 const nIntegFrame = PEAKS.length;
 const nIntegWulff = getActiveWulffPeaks().length;
 const integShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse) && PEAKS[0].ellipse.length >= 6) ? "ellipse" : "circle";
-const mtzColStrokeInteg = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzIsigi(p))), 1.0);
+const mtzColStrokeInteg = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzFcalcSq(p))), 1.0);
 const scaleIntegTop = scaleToColor(10.0, 1.0);
 
 console.log(JSON.stringify({{
@@ -3962,7 +3995,7 @@ def test_mtz_vectorized_speed_and_multirun_dedup(tmp_path):
 
     assert elapsed < 3.0, f"Vectorized MTZ load took too long: {elapsed:.2f}s"
     np.testing.assert_allclose(out["b_matrix"], b_before)
-    assert out["default_color_mode"] == "mtz_isigi"
+    assert out["default_color_mode"] == "mtz_fcalc"
     assert "mtz_peaks" not in out
     mtz_frame = [p for p in out["predicted_peaks"] if p.get("mtz_isigi") is not None]
     mtz_all = [
@@ -4697,7 +4730,7 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
     assert np.allclose(np.asarray(overlaid["u_matrix"]), U_solve, atol=1e-7)
     assert overlaid["space_group"] == solve_sg
     assert np.allclose(overlaid["cell"], solve_cell, atol=1e-3)
-    assert overlaid["default_color_mode"] == "mtz_isigi"
+    assert overlaid["default_color_mode"] == "mtz_fcalc"
     assert "mtz_peaks" not in overlaid
     assert isinstance(overlaid.get("mtz_overlay_warning"), str)
     assert "P 32 2 1" in overlaid["mtz_overlay_warning"]
@@ -10577,7 +10610,9 @@ function makeEl(id, tag = "SPAN", initText = "") {{
     options: [
       {{ value: "wavelength", textContent: "Color: λ/Zone", style: {{}} }},
       {{ value: "isigi", textContent: "Color: I/σ", style: {{}} }},
-      {{ value: "mtz_isigi", textContent: "Color: .mtz I/σ", style: {{}} }},
+      {{ value: "fobs", textContent: "Color: |F_obs|²", style: {{}} }},
+      {{ value: "mtz_fcalc", textContent: "Color: |F_calc|²", style: {{}} }},
+      {{ value: "ipred_isigi", textContent: "Color: I_pred/σ", style: {{}} }},
       {{ value: "residual", textContent: "Color: ΔI/σ Residual", style: {{}} }},
       {{ value: "scale", textContent: "Color: Scale", style: {{}} }},
     ],
@@ -13111,3 +13146,640 @@ console.log(JSON.stringify({
     assert abs(out["snappedHi"] - 4.30) <= 0.10
     assert out["knobMaxSnappedCls"] is True
     assert "Q[1..99%] band ≈" in out["hoverSliderTitle"]
+
+
+def test_mtz_f_global_scaling_careless_fobs_and_instrument_units(tmp_path) -> None:
+    """Verify .mtz F global normalization, Careless F_obs/σ_F colorscale, f_calc phase immunity, and Σ(λ)·F̃² instrument units."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        apply_mtz_to_payload,
+        build_frame_only_response,
+        build_rainbow_zone_payload,
+        merge_frame_only_payload,
+        render_rainbow_html,
+    )
+
+    cell_vals = [54.0, 62.0, 74.0, 90.0, 90.0, 90.0]
+    sg_name = "P 21 21 21"
+    uc = gemmi.UnitCell(*cell_vals)
+    sg = gemmi.find_spacegroup_by_name(sg_name)
+    asu = gemmi.ReciprocalAsu(sg)
+    ops = sg.operations()
+    b_mat = np.asarray(uc.frac.mat.tolist(), dtype=float).T
+
+    # 0. Build a baseline geometry payload to sample realistic in-band reflections on CG4D
+    solve_h5 = tmp_path / "cg4d_geom_seed.h5"
+    with h5py.File(solve_h5, "w") as shf:
+        shf.attrs["instrument"] = "CG4D"
+        shf["sample/space_group"] = sg_name
+        shf["sample/cell"] = np.array(cell_vals, dtype=float)
+        shf["sample/U"] = np.eye(3)
+        shf["sample/B"] = b_mat
+        shf["goniometer/R"] = np.eye(3)[None, :, :]
+        shf["goniometer/angles"] = np.zeros((1, 1), dtype=float)
+        shf["instrument/wavelength"] = np.array([2.8, 4.5], dtype=float)
+
+    geom_payload = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        instrument="CG4D",
+        space_group=sg_name,
+        wavelength_range=(2.8, 4.5),
+        d_min=2.4,
+        frame_index=0,
+        include_panel_images=False,
+    )
+    pred_pks = geom_payload["predicted_peaks"]
+    assert len(pred_pks) >= 24
+
+    # Deduplicate ASU reflections and pick 16 measured observations + unmeasured predicted reflections
+    seen_asu: dict[tuple[int, int, int], dict] = {}
+    for pk in pred_pks:
+        h_raw = [int(x) for x in pk["hkl"]]
+        ha, _ = asu.to_asu(h_raw, ops)
+        akey = (int(ha[0]), int(ha[1]), int(ha[2]))
+        if akey not in seen_asu:
+            seen_asu[akey] = pk
+    asu_items = list(seen_asu.items())
+    assert len(asu_items) >= 16
+    meas_items = asu_items[:12]
+    unmeas_items = asu_items[12:18]
+
+    # True normalized Careless F_obs, SigF_obs, and wavelength-dependent Careless scale Σ(λ)
+    # Peak flux around λ=3.35 Å (Σ ≈ 220), weaker wing around λ=4.35 Å (Σ ≈ 45)
+    def true_sigma_of_lambda(lam_val: float) -> float:
+        return float(35.0 + 195.0 * np.exp(-0.5 * ((lam_val - 3.35) / 0.38) ** 2))
+
+    rng = np.random.default_rng(202604)
+    true_f_map: dict[tuple[int, int, int], tuple[float, float, float, float]] = {}
+    for idx_a, (akey, _pk) in enumerate(asu_items[:24]):
+        f_obs = float(0.45 + 0.18 * (idx_a % 9) + 0.05 * rng.uniform())
+        sigf_obs = float(0.08 + 0.02 * (idx_a % 4))
+        # Careless truncated-normal posterior second moment: I = F^2 + SigF^2
+        i_obs_m = float(f_obs * f_obs + sigf_obs * sigf_obs)
+        sigi_obs_m = float(2.0 * f_obs * sigf_obs)
+        true_f_map[akey] = (i_obs_m, sigi_obs_m, f_obs, sigf_obs)
+
+    # Write integrated.h5 with 2 frames and Careless work_dir (merged.mtz + predictions.mtz)
+    integ_h5 = tmp_path / "cg4d_integ_fobs.h5"
+    work_dir = tmp_path / "careless_work"
+    work_dir.mkdir()
+    n_obs = len(meas_items)
+    obs_lams = np.linspace(2.90, 4.40, n_obs, dtype=np.float64)
+    obs_scales = np.array([true_sigma_of_lambda(w) for w in obs_lams], dtype=np.float64)
+    obs_h = np.array([it[1]["hkl"][0] for it in meas_items], dtype=np.int32)
+    obs_k = np.array([it[1]["hkl"][1] for it in meas_items], dtype=np.int32)
+    obs_l = np.array([it[1]["hkl"][2] for it in meas_items], dtype=np.int32)
+    obs_ipred = np.array(
+        [obs_scales[i] * true_f_map[meas_items[i][0]][0] for i in range(n_obs)],
+        dtype=np.float64,
+    )
+    # Detector Poisson + background counting noise: σ_{I_obs} = sqrt(σ_bg^2 + I_pred)
+    obs_sigi = np.sqrt(100.0 + np.maximum(obs_ipred, 0.0))
+    obs_iobs = obs_ipred + np.linspace(-0.6, 0.7, n_obs) * obs_sigi
+    obs_runs = np.array(
+        [0 if i < n_obs // 2 else 1 for i in range(n_obs)], dtype=np.int32
+    )
+
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        hf.create_dataset(
+            "files", data=np.array(["run0.nxs.h5", "run1.nxs.h5"], dtype="S16")
+        )
+        hf["sample/space_group"] = sg_name
+        hf["sample/cell"] = np.array(cell_vals, dtype=float)
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = b_mat
+        hf["goniometer/R"] = np.repeat(np.eye(3)[None, :, :], 2, axis=0)
+        hf["instrument/wavelength"] = np.array([2.8, 4.5], dtype=float)
+        pk = hf.create_group("peaks")
+        pk["h"] = obs_h
+        pk["k"] = obs_k
+        pk["l"] = obs_l
+        pk["run_index"] = obs_runs
+        pk["bank"] = np.array(
+            [int(it[1].get("bank") or 1) for it in meas_items], dtype=np.int32
+        )
+        pk["pixel_r"] = np.full(n_obs, 128.0, dtype=np.float64)
+        pk["pixel_c"] = np.full(n_obs, 128.0, dtype=np.float64)
+        pk["intensity"] = obs_iobs
+        pk["sigma"] = obs_sigi
+        pk["lambda"] = obs_lams
+
+    # Write Careless merged.mtz (with explicit F, SigF, I, SigI) and predictions.mtz
+    mtz_m = gemmi.Mtz(with_base=True)
+    mtz_m.spacegroup = sg
+    mtz_m.set_cell_for_all(uc)
+    mtz_m.add_dataset("careless")
+    mtz_m.add_column("F", "F")
+    mtz_m.add_column("SigF", "Q")
+    mtz_m.add_column("I", "J")
+    mtz_m.add_column("SigI", "Q")
+    m_rows = [
+        [ak[0], ak[1], ak[2], vals[2], vals[3], vals[0], vals[1]]
+        for ak, vals in true_f_map.items()
+    ]
+    mtz_m.set_data(np.asarray(m_rows, dtype=np.float32))
+    mtz_m.write_to_file(str(work_dir / "merged.mtz"))
+
+    mtz_p = gemmi.Mtz(with_base=True)
+    mtz_p.spacegroup = sg
+    mtz_p.set_cell_for_all(uc)
+    mtz_p.add_dataset("predictions")
+    for cname, ctype in (
+        ("Iobs", "J"),
+        ("SigIobs", "Q"),
+        ("Ipred", "J"),
+        ("SigIpred", "Q"),
+        ("Scale", "R"),
+    ):
+        mtz_p.add_column(cname, ctype)
+    p_rows = []
+    for i in range(n_obs):
+        ak = meas_items[i][0]
+        p_rows.append(
+            [
+                ak[0],
+                ak[1],
+                ak[2],
+                obs_iobs[i],
+                obs_sigi[i],
+                obs_ipred[i],
+                0.15 * obs_sigi[i],
+                obs_scales[i],
+            ]
+        )
+    mtz_p.set_data(np.asarray(p_rows, dtype=np.float32))
+    mtz_p.write_to_file(str(work_dir / "predictions.mtz"))
+    (work_dir / "careless_metrics.json").write_text(
+        json.dumps({"cc_half": 0.991, "n_merged_asu": len(true_f_map)}),
+        encoding="utf-8",
+    )
+
+    runner = NovaGalaxyPipelineRunner.__new__(NovaGalaxyPipelineRunner)
+    runner._stamp_careless_merge_into_h5(str(integ_h5), str(work_dir), {})
+
+    with h5py.File(integ_h5, "r") as hf_chk:
+        assert "merged_f" in hf_chk["careless"]
+        assert "merged_sigf" in hf_chk["careless"]
+        assert "merged_f" in hf_chk["peaks"]
+        assert "merged_sigf" in hf_chk["peaks"]
+
+    careless_payload = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        instrument="CG4D",
+        frame_index=0,
+        d_min=2.4,
+        include_panel_images=False,
+        include_all_runs_peaks=True,
+    )
+    assert careless_payload["artifact_kind"] == "merged_careless"
+    assert isinstance(careless_payload.get("careless_f_asu_lookup"), dict)
+    assert len(careless_payload["careless_f_asu_lookup"]) == len(true_f_map)
+    assert isinstance(careless_payload.get("careless_scale_profile"), dict)
+    assert careless_payload["careless_scale_profile"]["global_median"] > 30.0
+
+    # Verify F_obs / σ_F is populated on both integrated observations and unmeasured predicted HKLs
+    ak0, (_, _, f0_true, sf0_true) = next(iter(true_f_map.items()))
+    lu_f0 = careless_payload["careless_f_asu_lookup"][f"{ak0[0]},{ak0[1]},{ak0[2]}"]
+    assert abs(lu_f0[0] - f0_true) < 1e-3
+    assert abs(lu_f0[1] - sf0_true) < 1e-3
+    integ0 = careless_payload["integrated_peaks"][0]
+    ak_i0 = tuple(int(x) for x in integ0["asu_hkl"])
+    assert abs(integ0["merged_f"] - true_f_map[ak_i0][2]) < 1e-3
+    assert (
+        abs(integ0["merged_fsigf"] - (true_f_map[ak_i0][2] / true_f_map[ak_i0][3]))
+        < 1e-2
+    )
+
+    # 1. Arbitrary-unit external .mtz with (F, SIGF, I, SIGI) scaled by 420x:
+    #    - Divides out single global scale (~420.0) to match Careless F_obs via careless_shared_q75
+    #    - Preserves Careless merged_i / merged_f intact (does NOT clobber!)
+    #    - Maps normalized F̃(hkl)^2 back into instrument detector units via Σ(λ) · F̃^2
+    arb_scale = 420.0
+    ext_mtz = gemmi.Mtz(with_base=True)
+    ext_mtz.spacegroup = sg
+    ext_mtz.set_cell_for_all(uc)
+    ext_mtz.add_dataset("external_ref")
+    ext_mtz.add_column("F", "F")
+    ext_mtz.add_column("SIGF", "Q")
+    ext_mtz.add_column("I", "J")
+    ext_mtz.add_column("SIGI", "Q")
+    ext_rows = [
+        [
+            ak[0],
+            ak[1],
+            ak[2],
+            arb_scale * vals[2],
+            arb_scale * vals[3],
+            (arb_scale**2) * (vals[2] ** 2),
+            (arb_scale**2) * vals[1],
+        ]
+        for ak, vals in true_f_map.items()
+    ]
+    ext_mtz.set_data(np.asarray(ext_rows, dtype=np.float32))
+    ext_mtz_path = tmp_path / "external_420x.mtz"
+    ext_mtz.write_to_file(str(ext_mtz_path))
+
+    overlaid_f = apply_mtz_to_payload(
+        careless_payload,
+        ext_mtz_path,
+        {"name": "very_long_refinement_structure_factors_5vnq_3.74A_final_model.mtz"},
+    )
+    assert overlaid_f["mtz_has_f_column"] is True
+    assert overlaid_f["mtz_has_sigf_column"] is True
+    assert overlaid_f["mtz_f_column"] == "F"
+    assert overlaid_f["mtz_sigf_column"] == "SIGF"
+    assert overlaid_f["mtz_scale_basis"] == "careless_shared_q75"
+    assert overlaid_f["default_color_mode"] == "mtz_fcalc"
+
+    ov_integ0 = overlaid_f["integrated_peaks"][0]
+    # Careless merged_i and merged_f were NOT clobbered by the arbitrary 420^2-scaled external MTZ!
+    assert ov_integ0["merged_i"] == integ0["merged_i"]
+    assert ov_integ0["merged_f"] == integ0["merged_f"]
+    assert abs(ov_integ0["merged_i"] - true_f_map[ak_i0][0]) < 1e-2
+    assert abs(ov_integ0["merged_f"] - true_f_map[ak_i0][2]) < 1e-3
+    # Normalized |F̃_calc|² sits on the exact same Q75 scale as Careless |F_obs|² (`merged_i`)!
+    shared_fcalc_sq = [
+        float(overlaid_f["mtz_f_asu_lookup"][k][3])
+        for k in overlaid_f["careless_i_asu_lookup"]
+        if k in overlaid_f["mtz_f_asu_lookup"]
+    ]
+    shared_fobs_sq = [
+        float(overlaid_f["careless_i_asu_lookup"][k][0])
+        for k in overlaid_f["careless_i_asu_lookup"]
+        if k in overlaid_f["mtz_f_asu_lookup"]
+    ]
+    assert (
+        abs(np.quantile(shared_fcalc_sq, 0.75) - np.quantile(shared_fobs_sq, 0.75))
+        < 1e-3
+    )
+    assert abs(ov_integ0["mtz_i_norm"] - (ov_integ0["mtz_f"] ** 2)) < 1e-3
+    # Post-merge I_pred/σ uses Σ_obs * |F̃_calc|² / σ_{I_obs} on integrated peaks and Σ(λ)/σ(λ) * |F̃_calc|² on predicted peaks
+    expected_inst0 = float(ov_integ0["careless_scale"]) * float(ov_integ0["mtz_i_norm"])
+    expected_ipred_snr0 = expected_inst0 / float(ov_integ0["sigma"])
+    assert (
+        abs(float(ov_integ0["mtz_inst_i"]) - expected_inst0) / max(expected_inst0, 1e-6)
+        < 1e-2
+    )
+    assert (
+        abs(float(ov_integ0["mtz_ipred_isigi"]) - expected_ipred_snr0)
+        / max(expected_ipred_snr0, 1e-6)
+        < 1e-2
+    )
+
+    unmeas_key_set = {it[0] for it in unmeas_items}
+    unmeas_preds = [
+        p
+        for p in overlaid_f["predicted_peaks"]
+        if tuple(int(x) for x in p["asu_hkl"]) in unmeas_key_set
+        and p.get("mtz_ipred_isigi") is not None
+    ]
+    assert len(unmeas_preds) >= 2
+    for upk in unmeas_preds:
+        assert upk.get("careless_scale") is None
+        assert float(upk["mtz_inst_i"]) > 0.0
+        assert float(upk["mtz_ipred_isigi"]) > 0.0
+        # Σ(λ) > 30 across [2.8, 4.5] Å -> instrument intensity is dramatically scaled above unit |F̃_calc|^2
+        assert float(upk["mtz_inst_i"]) > 20.0 * float(upk["mtz_i_norm"])
+
+    # Frame-only fast switch preserves careless_scale_profile, careless_i_asu_lookup, careless_f_asu_lookup, and mtz_f_* lookups
+    fast_f1 = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        instrument="CG4D",
+        frame_index=1,
+        d_min=2.4,
+        include_panel_images=False,
+        include_all_runs_peaks=False,
+    )
+    merged_f1 = merge_frame_only_payload(overlaid_f, dict(fast_f1))
+    assert merged_f1["careless_scale_profile"] == overlaid_f["careless_scale_profile"]
+    assert merged_f1["careless_i_asu_lookup"] == overlaid_f["careless_i_asu_lookup"]
+    assert merged_f1["careless_f_asu_lookup"] == overlaid_f["careless_f_asu_lookup"]
+    assert merged_f1["mtz_f_asu_lookup"] == overlaid_f["mtz_f_asu_lookup"]
+    assert merged_f1["mtz_has_f_column"] is True
+    resp_f1 = build_frame_only_response(merged_f1)
+    assert "careless_scale_profile" not in resp_f1
+    assert "careless_i_asu_lookup" not in resp_f1
+    assert "careless_f_asu_lookup" not in resp_f1
+    assert "mtz_f_asu_lookup" not in resp_f1
+
+    # 2. Calculated model .mtz with ('f_calc', 'F') and ('PHIf_calc', 'P') BEFORE merging (like 5vnq-3.74.mtz):
+    #    - PHIf_calc (type 'P') is NEVER treated as SIGF
+    #    - Before Careless merge, `fobs` (|F_obs|²) and `ipred_isigi` (I_pred/σ) MUST be disabled!
+    fcalc_mtz = gemmi.Mtz(with_base=True)
+    fcalc_mtz.spacegroup = sg
+    fcalc_mtz.set_cell_for_all(uc)
+    fcalc_mtz.add_dataset("model_fcalc")
+    fcalc_mtz.add_column("f_calc", "F")
+    fcalc_mtz.add_column("PHIf_calc", "P")
+    fcalc_rows = [
+        [
+            ak[0],
+            ak[1],
+            ak[2],
+            800.0 * vals[2],
+            float(
+                ((idx_r * 73) % 360) - 180
+            ),  # signed phase angle in degrees, including 0° and negatives!
+        ]
+        for idx_r, (ak, vals) in enumerate(true_f_map.items())
+    ]
+    fcalc_mtz.set_data(np.asarray(fcalc_rows, dtype=np.float32))
+    fcalc_path = tmp_path / "model_5vnq_like.mtz"
+    fcalc_mtz.write_to_file(str(fcalc_path))
+
+    standalone_fcalc = apply_mtz_to_payload(
+        geom_payload, fcalc_path, {"name": "model_5vnq_like.mtz"}
+    )
+    assert standalone_fcalc["mtz_has_f_column"] is True
+    assert standalone_fcalc["mtz_has_sigf_column"] is False
+    assert standalone_fcalc["mtz_f_column"] == "f_calc"
+    assert standalone_fcalc["mtz_sigf_column"] is None
+    assert standalone_fcalc["mtz_scale_basis"] == "unit_wilson_rms"
+    assert standalone_fcalc["default_color_mode"] == "mtz_fcalc"
+    fcalc_matched = [
+        p
+        for p in standalone_fcalc["predicted_peaks"]
+        if p.get("mtz_i_norm") is not None
+    ]
+    assert len(fcalc_matched) >= 12
+    assert all(
+        p["mtz_i_norm"] >= 0.0
+        and p.get("mtz_sigf") is None
+        and p.get("mtz_ipred_isigi") is None
+        and p.get("merged_i") is None
+        for p in fcalc_matched
+    )
+
+    if not shutil.which("node"):
+        return
+
+    # 3. Full Node VM check on rendered HTML/JS for:
+    #    - Concise non-overflowing #sel-spot-color labels even with a 62-char .mtz filename
+    #    - Paired |F_obs|² <-> |F_calc|² shared colorbar bounds and I/σ <-> I_pred/σ shared colorbar bounds
+    #    - Pre-merge gating (`fobs` and `ipred_isigi` strictly disabled before Careless merge!)
+    #    - λ-dependent I_pred/σ across goniometer frames + hard [λ_min, λ_max] slider bandpass cutoff
+    html_doc = render_rainbow_html(payload=overlaid_f)
+    for opt_val in ("isigi", "fobs", "mtz_fcalc", "ipred_isigi"):
+        assert f'value="{opt_val}"' in html_doc
+
+    inline_js = re.findall(r"<script>([\s\S]*?)</script>", html_doc)[-1]
+    assert inline_js.rstrip().endswith("})();")
+    instrumented_js = (
+        inline_js.rstrip()[: -len("})();")]
+        + "\nglobalThis.__rz = { state, DATA, PEAKS, getPeakDataAvailability, peakStrokeColor, peakFobsSq, peakMtzFcalcSq, peakIpredIsigi, isPeakVisible, recomputeBoundsAndReload, updatePeakInspector, syncWulffUI };\n})();"
+    )
+    opt_defs = [
+        ("wavelength", "Color: λ/Zone"),
+        ("orbit", "Color: ASU Orbit"),
+        ("isigi", "Color: I/σ"),
+        ("fobs", "Color: |F_obs|²"),
+        ("mtz_fcalc", "Color: |F_calc|²"),
+        ("ipred_isigi", "Color: I_pred/σ"),
+        ("residual", "Color: ΔI/σ Residual"),
+        ("scale", "Color: Scale"),
+    ]
+    js_opts_literal = json.dumps(
+        [{"value": k, "textContent": lbl, "disabled": False} for k, lbl in opt_defs]
+    )
+
+    vm_js = (
+        f"""
+const elems = new Map();
+function makeSelectOptions() {{
+  return {js_opts_literal}.map(o => ({{ ...o, title: "", style: {{}} }}));
+}}
+function makeCtx() {{
+  return {{
+    fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+    textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+    setTransform() {{}}, resetTransform() {{}}, scale() {{}}, translate() {{}}, rotate() {{}}, transform() {{}},
+    clearRect() {{}}, fillRect() {{}}, strokeRect() {{}}, beginPath() {{}}, closePath() {{}},
+    moveTo() {{}}, lineTo() {{}}, arc() {{}}, ellipse() {{}}, quadraticCurveTo() {{}}, bezierCurveTo() {{}},
+    rect() {{}}, roundRect() {{}}, stroke() {{}}, fill() {{}}, clip() {{}}, save() {{}}, restore() {{}},
+    setLineDash() {{}}, fillText() {{}}, strokeText() {{}}, drawImage() {{}},
+    measureText(t) {{ return {{ width: String(t).length * 6 }}; }},
+    createLinearGradient() {{ return {{ addColorStop() {{}} }}; }},
+    createRadialGradient() {{ return {{ addColorStop() {{}} }}; }},
+    getImageData(x, y, w, h) {{ return {{ data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }}; }},
+    putImageData() {{}}, createImageData(w, h) {{ return {{ data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }}; }},
+  }};
+}}
+function makeEl(id = "") {{
+  const listeners = {{}};
+  const styleProps = {{}};
+  const isSelColor = id === "sel-spot-color" || id === "sel-wulff-color";
+  const el = {{
+    id, tagName: isSelColor ? "SELECT" : "DIV",
+    value: id === "slider-color-emphasis" ? "0.38" : (isSelColor ? "mtz_fcalc" : ""),
+    min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: 1200, height: 640, clientWidth: 1200, clientHeight: 640,
+    scrollWidth: 300, scrollHeight: 240, scrollTop: 0, offsetWidth: 300, offsetHeight: 36,
+    files: [], options: isSelColor ? makeSelectOptions() : [], children: [], parentElement: null,
+    dataset: {{}},
+    style: new Proxy(styleProps, {{
+      get(t, k) {{
+        if (k === "setProperty") return (p, v) => {{ t[p] = v; }};
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      }},
+      set(t, k, v) {{ t[k] = v; return true; }}
+    }}),
+    classList: {{
+      _s: new Set(),
+      add(...c) {{ c.forEach(x => this._s.add(x)); }},
+      remove(...c) {{ c.forEach(x => this._s.delete(x)); }},
+      toggle(c, f) {{ if (f === undefined ? !this._s.has(c) : f) {{ this._s.add(c); return true; }} this._s.delete(c); return false; }},
+      contains(c) {{ return this._s.has(c); }}
+    }},
+    addEventListener(ev, fn) {{ (listeners[ev] = listeners[ev] || []).push(fn); }},
+    removeEventListener() {{}},
+    dispatchEvent(evObj) {{ (listeners[evObj.type] || []).forEach(fn => fn.call(el, evObj)); }},
+    click() {{ el.dispatchEvent({{ type: "click", target: el, preventDefault() {{}}, stopPropagation() {{}} }}); }},
+    focus() {{}}, blur() {{}}, select() {{}}, remove() {{}},
+    appendChild(ch) {{ this.children.push(ch); ch.parentElement = this; return ch; }},
+    insertBefore(ch) {{ this.children.push(ch); ch.parentElement = this; return ch; }},
+    replaceChildren(...ch) {{ this.children = ch; }},
+    setAttribute(k, v) {{ this[k] = v; }},
+    getAttribute(k) {{ return this[k] ?? null; }},
+    removeAttribute(k) {{ delete this[k]; }},
+    contains(target) {{ return target === el; }},
+    getBoundingClientRect() {{ return {{ left: 0, top: 0, right: 1200, bottom: 640, width: 1200, height: 640 }}; }},
+    getContext() {{ if (!el._ctx) el._ctx = makeCtx(); return el._ctx; }},
+    querySelector() {{ return null; }},
+    querySelectorAll() {{ return []; }},
+    closest() {{ return null; }},
+  }};
+  return el;
+}}
+function getEl(id) {{
+  if (!elems.has(id)) elems.set(id, makeEl(id));
+  return elems.get(id);
+}}
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {{}};
+globalThis.removeEventListener = () => {{}};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.localStorage = {{ getItem() {{ return null; }}, setItem() {{}}, removeItem() {{}} }};
+globalThis.sessionStorage = {{ getItem() {{ return null; }}, setItem() {{}}, removeItem() {{}} }};
+globalThis.location = {{ href: "about:srcdoc", origin: "http://localhost:8080", pathname: "/", search: "" }};
+globalThis.navigator = {{ clipboard: {{ writeText: async () => {{}} }} }};
+globalThis.Image = class {{ set src(v) {{ this._src = v; }} }};
+globalThis.ResizeObserver = class {{ observe() {{}} disconnect() {{}} }};
+globalThis.MutationObserver = class {{ observe() {{}} disconnect() {{}} }};
+globalThis.AbortController = class {{ constructor() {{ this.signal = {{}}; }} abort() {{}} }};
+let rafCb = null;
+globalThis.requestAnimationFrame = (fn) => {{ rafCb = fn; return 1; }};
+globalThis.cancelAnimationFrame = () => {{}};
+globalThis.fetch = async () => ({{ ok: false, status: 404, json: async () => ({{}}), text: async () => "" }});
+globalThis.document = {{
+  body: makeEl("body"),
+  documentElement: makeEl("html"),
+  baseURI: "http://localhost:8080/",
+  getElementById: (id) => getEl(id),
+  createElement: (tag) => makeEl(tag),
+  createTextNode: (txt) => ({{ textContent: txt }}),
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  addEventListener: () => {{}},
+  removeEventListener: () => {{}},
+}};
+"""
+        + instrumented_js
+        + f"""
+;
+const {{ state, DATA, PEAKS, getPeakDataAvailability, peakStrokeColor, peakFobsSq, peakMtzFcalcSq, peakIpredIsigi, isPeakVisible, recomputeBoundsAndReload, updatePeakInspector, syncWulffUI }} = globalThis.__rz;
+getEl("canvas-detector").getContext("2d");
+getEl("canvas-wulff").getContext("2d");
+if (rafCb) {{ const cb = rafCb; rafCb = null; cb(); }}
+
+const selSpot = getEl("sel-spot-color");
+const slEmph = getEl("slider-color-emphasis");
+const initMode = state.wulffColorMode;
+const optStatesPostMerge = Object.fromEntries(
+  selSpot.options.map(o => [o.value, {{ disabled: o.disabled, text: o.textContent, title: o.title }}])
+);
+const initTooltip = slEmph.title;
+const availPost = getPeakDataAvailability();
+const boundsMatchF = JSON.stringify(availPost.mtzFcalcBounds) === JSON.stringify(availPost.fobsBounds);
+const boundsMatchSnr = JSON.stringify(availPost.ipredIsigiBounds) === JSON.stringify(availPost.isigiBounds);
+
+// Switch to |F_obs|² (`fobs`)
+selSpot.value = "fobs";
+selSpot.dispatchEvent({{ type: "change", target: selSpot }});
+const fobsTooltip = slEmph.title;
+const fobsStroke = peakStrokeColor(PEAKS[0], 1.0);
+
+// Switch to I_pred/σ (`ipred_isigi`) and check λ-dependent illumination + hard [λ_min, λ_max] bandpass!
+selSpot.value = "ipred_isigi";
+selSpot.dispatchEvent({{ type: "change", target: selSpot }});
+const ipredTooltip = slEmph.title;
+state.lamMin = 3.10;
+state.lamMax = 4.45;
+const hiFluxProbe = {{ asu_hkl: PEAKS[0].asu_hkl, hkl: PEAKS[0].hkl, wavelength: 3.35, d_spacing: 2.6, mtz_f: 1.25, mtz_i_norm: 1.5625 }};
+const loFluxProbe = {{ asu_hkl: PEAKS[0].asu_hkl, hkl: PEAKS[0].hkl, wavelength: 4.40, d_spacing: 2.6, mtz_f: 1.25, mtz_i_norm: 1.5625 }};
+const outOfBandProbe = {{ asu_hkl: PEAKS[0].asu_hkl, hkl: PEAKS[0].hkl, wavelength: 2.95, d_spacing: 2.6, mtz_f: 1.25, mtz_i_norm: 1.5625 }};
+const ipredHiFlux = peakIpredIsigi(hiFluxProbe);
+const ipredLoFlux = peakIpredIsigi(loFluxProbe);
+const ipredOutBand = peakIpredIsigi(outOfBandProbe);
+const visInBand = isPeakVisible(hiFluxProbe);
+const visOutBand = isPeakVisible(outOfBandProbe);
+
+// Inspector readout includes |F_obs|²=..., |F_calc|²=..., and I_pred/σ=... for in-band peaks (and omits I_pred/σ outside [λ_min, λ_max])
+const inBandPeak = PEAKS.find(p => p.wavelength >= state.lamMin && p.wavelength <= state.lamMax) || PEAKS[PEAKS.length - 1];
+updatePeakInspector(inBandPeak);
+const inspectorHtml = getEl("inspector-box").innerHTML;
+
+// Reload pre-merge standalone f_calc payload -> `fobs` and `ipred_isigi` MUST be disabled, while `mtz_fcalc` is enabled!
+const preMergeDoc = {json.dumps(standalone_fcalc)};
+recomputeBoundsAndReload(preMergeDoc, {{ resetSelectedFrame: true }});
+syncWulffUI();
+const preMergeMode = state.wulffColorMode;
+const optStatesPreMerge = Object.fromEntries(
+  selSpot.options.map(o => [o.value, {{ disabled: o.disabled, text: o.textContent }}])
+);
+selSpot.value = "ipred_isigi";
+selSpot.dispatchEvent({{ type: "change", target: selSpot }});
+const blockedIpredMode = state.wulffColorMode;
+
+console.log(JSON.stringify({{
+  initMode,
+  optStatesPostMerge,
+  initTooltip,
+  boundsMatchF,
+  boundsMatchSnr,
+  fobsTooltip,
+  fobsStroke,
+  ipredTooltip,
+  ipredHiFlux,
+  ipredLoFlux,
+  ipredOutBandIsNaN: !Number.isFinite(ipredOutBand),
+  visInBand,
+  visOutBand,
+  inspectorHtml,
+  preMergeMode,
+  optStatesPreMerge,
+  blockedIpredMode,
+}}));
+"""
+    )
+    vm_file = tmp_path / "mtz_f_scaling_vm.js"
+    vm_file.write_text(vm_js, encoding="utf-8")
+    vm_res = subprocess.run(
+        ["node", str(vm_file)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    vm_out = json.loads(vm_res.stdout.strip().splitlines()[-1])
+
+    assert vm_out["initMode"] == "mtz_fcalc"
+    assert vm_out["optStatesPostMerge"]["fobs"]["disabled"] is False
+    assert vm_out["optStatesPostMerge"]["mtz_fcalc"]["disabled"] is False
+    assert vm_out["optStatesPostMerge"]["ipred_isigi"]["disabled"] is False
+    # Concise option labels never append long .mtz filenames (filename lives in .title tooltip instead)
+    assert vm_out["optStatesPostMerge"]["mtz_fcalc"]["text"] == "Color: |F_calc|²"
+    assert vm_out["optStatesPostMerge"]["ipred_isigi"]["text"] == "Color: I_pred/σ"
+    assert (
+        "very_long_refinement_structure_factors"
+        in vm_out["optStatesPostMerge"]["mtz_fcalc"]["title"]
+    )
+    # Paired colorbars share identical quantile bounds for direct 1-to-1 comparison
+    assert vm_out["boundsMatchF"] is True
+    assert vm_out["boundsMatchSnr"] is True
+    assert "|F_calc|²" in vm_out["initTooltip"]
+    assert "|F_obs|²" in vm_out["fobsTooltip"]
+    assert vm_out["fobsStroke"].startswith("rgba(") and not vm_out[
+        "fobsStroke"
+    ].endswith("0.000)")
+    assert "I_pred/σ" in vm_out["ipredTooltip"]
+    # Illumination across frames + hard [λ_min, λ_max] slider bandpass cutoff
+    assert vm_out["ipredHiFlux"] > 1.2 * vm_out["ipredLoFlux"]
+    assert vm_out["ipredOutBandIsNaN"] is True
+    assert vm_out["visInBand"] is True
+    assert vm_out["visOutBand"] is False
+    assert "|F_obs|²=" in vm_out["inspectorHtml"]
+    assert "|F_calc|²=" in vm_out["inspectorHtml"]
+    assert "I_pred/σ=" in vm_out["inspectorHtml"]
+    # Pre-merge gating: `fobs` and `ipred_isigi` strictly disabled before Careless merge!
+    assert vm_out["preMergeMode"] == "mtz_fcalc"
+    assert vm_out["optStatesPreMerge"]["mtz_fcalc"]["disabled"] is False
+    assert vm_out["optStatesPreMerge"]["fobs"]["disabled"] is True
+    assert vm_out["optStatesPreMerge"]["ipred_isigi"]["disabled"] is True
+    assert vm_out["blockedIpredMode"] == "mtz_fcalc"
