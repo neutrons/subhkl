@@ -876,6 +876,51 @@ def test_roundtrip_indexed_flag_skips_unindexed_peaks(tmp_path):
     assert list(refl.get_flags(refl.flags.indexed)) == [True, False, True]
 
 
+def test_roundtrip_recorded_source_stack_backs_the_export(tmp_path):
+    """A file that records its image stack in the ``source`` attribute (as the
+    integrator does) exports with that stack's identifiers and images even
+    when no image_source is passed -- the mtz-exporter and metrics case."""
+    pytest.importorskip("dxtbx")
+    from dxtbx.model.experiment_list import ExperimentListFactory
+
+    stack = tmp_path / "merged.h5"
+    _write_merged_stack(str(stack))
+    peaks = tmp_path / "integrated.h5"
+    _write_peaks_on(str(peaks), frames=[0, 1], banks=[11, 12])
+    with h5py.File(peaks, "a") as f:
+        f.attrs["source"] = str(stack)
+
+    expt_path = str(tmp_path / "integrated.expt")
+    dx.hdf5_to_dials(
+        str(peaks), expt_path, str(tmp_path / "integrated.refl"), instrument="CG4D"
+    )
+    experiments = ExperimentListFactory.from_json_file(expt_path, check_format=True)
+    assert [e.identifier for e in experiments] == [
+        dx.experiment_identifier(str(stack), 0),
+        dx.experiment_identifier(str(stack), 1),
+    ]
+    assert all(e.imageset is not None for e in experiments)
+
+
+def test_roundtrip_missing_recorded_source_gives_geometry_only(tmp_path):
+    pytest.importorskip("dxtbx")
+    from dxtbx.model.experiment_list import ExperimentListFactory
+
+    peaks = tmp_path / "integrated.h5"
+    _write_peaks_on(str(peaks), frames=[0, 1], banks=[11, 12])
+    with h5py.File(peaks, "a") as f:
+        f.attrs["source"] = str(tmp_path / "moved_away.h5")
+
+    expt_path = str(tmp_path / "integrated.expt")
+    dx.hdf5_to_dials(
+        str(peaks), expt_path, str(tmp_path / "integrated.refl"), instrument="CG4D"
+    )
+    experiments = ExperimentListFactory.from_json_file(expt_path, check_format=False)
+    assert len(experiments) == 2
+    assert experiments[0].identifier == dx.experiment_identifier(str(peaks), 0)
+    assert all(e.imageset is None for e in experiments)
+
+
 def test_experiment_identifier_is_a_reproducible_unique_uuid(tmp_path, monkeypatch):
     import uuid
 

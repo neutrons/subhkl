@@ -724,11 +724,18 @@ def hdf5_to_dials(
         sample_offset = _read_sample_offset(f)
 
         # Resolve the pixel-data stack (if any) and its (frame, panel) layout.
+        # Without an explicit image_source, a file that records the stack it
+        # came from (the ``source`` attribute subhkl steps write) is backed by
+        # that stack, so its experiments keep the stack's identifiers and
+        # images.  A moved or missing stack falls through to geometry only.
+        recorded_source = _decode(f.attrs["source"]) if "source" in f.attrs else None
         stack_path = None
         if image_source and _file_has_images(image_source):
             stack_path = image_source
         elif "images" in f:
             stack_path = h5_path
+        elif recorded_source and _file_has_images(recorded_source):
+            stack_path = recorded_source
 
         layout = None
         stack_rotations = None
