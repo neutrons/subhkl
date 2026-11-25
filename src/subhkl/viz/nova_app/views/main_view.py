@@ -369,13 +369,28 @@ class MainApp:
 
                             ds_info_mtz = {"name": os.path.basename(local_fp_raw)}
                             sub_model = self.view_model.model.subhkl
+                            eff_het = (
+                                "auto"
+                                if (
+                                    sub_model.ref_mtz_overlay_path
+                                    and local_fp_raw != sub_model.mtz_overlay_path
+                                )
+                                else sub_model.heterodyne_mode
+                            )
                             sub_model.payload = apply_mtz_to_payload(
                                 sub_model.payload or {},
                                 local_fp_raw,
                                 ds_info_mtz,
                                 ref_mtz_path=sub_model.ref_mtz_overlay_path,
-                                heterodyne_mode=sub_model.heterodyne_mode,
+                                heterodyne_mode=eff_het,
                             )
+                            if isinstance(sub_model.payload.get("nodal_data"), dict):
+                                sub_model.heterodyne_mode = str(
+                                    sub_model.payload["nodal_data"].get(
+                                        "heterodyne_mode"
+                                    )
+                                    or sub_model.heterodyne_mode
+                                )
                             sub_model.mtz_overlay_path = local_fp_raw
                             sub_model.mtz_overlay_info = ds_info_mtz
                             return (sub_model.payload, 200)
@@ -517,13 +532,28 @@ class MainApp:
                         )
                         if ingest_kind == "mtz_overlay":
                             sub_model = self.view_model.model.subhkl
+                            eff_het = (
+                                "auto"
+                                if (
+                                    sub_model.ref_mtz_overlay_path
+                                    and local_h5 != sub_model.mtz_overlay_path
+                                )
+                                else sub_model.heterodyne_mode
+                            )
                             sub_model.payload = apply_mtz_to_payload(
                                 cur_p,
                                 local_h5,
                                 ds_info,
                                 ref_mtz_path=sub_model.ref_mtz_overlay_path,
-                                heterodyne_mode=sub_model.heterodyne_mode,
+                                heterodyne_mode=eff_het,
                             )
+                            if isinstance(sub_model.payload.get("nodal_data"), dict):
+                                sub_model.heterodyne_mode = str(
+                                    sub_model.payload["nodal_data"].get(
+                                        "heterodyne_mode"
+                                    )
+                                    or sub_model.heterodyne_mode
+                                )
                             sub_model.mtz_overlay_path = local_h5
                             sub_model.mtz_overlay_info = ds_info
                             return (sub_model.payload, 200)

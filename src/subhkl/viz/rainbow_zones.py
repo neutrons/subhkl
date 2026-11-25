@@ -11522,6 +11522,43 @@ def render_rainbow_html(
     text-overflow: ellipsis;
   }}
 
+  .stereo-nodal-bar button.nodal-ref-loading {{
+    border-color: rgba(148, 163, 184, 0.5);
+    color: #94a3b8;
+    background: rgba(51, 65, 85, 0.42);
+    max-width: 108px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0.88;
+  }}
+
+  .mtz-status-badge {{
+    display: inline-flex;
+    align-items: center;
+    font-size: calc(0.60rem * var(--bottom-bar-scale, 1));
+    font-family: var(--font-display);
+    padding: 2px calc(6px * var(--bottom-bar-scale, 1));
+    border-radius: 4px;
+    border: 1px solid rgba(56, 189, 248, 0.48);
+    background: rgba(14, 116, 144, 0.18);
+    color: var(--accent-cyan);
+    max-width: calc(140px * var(--bottom-bar-scale, 1));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+
+  .mtz-status-badge.loading {{
+    border-color: rgba(148, 163, 184, 0.48);
+    background: rgba(51, 65, 85, 0.42);
+    color: #94a3b8;
+    opacity: 0.9;
+  }}
+
+  .mtz-status-badge.hidden {{
+    display: none !important;
+  }}
+
   #slider-nodal-roi {{
     width: 48px;
     height: 10px;
@@ -12788,12 +12825,13 @@ def render_rainbow_html(
             <button id="btn-nodal-re" type="button" class="active-btn nodal-re-pill" title="Toggle simulated Re=0 nodal surface in 3D Reciprocal Space">Re=0</button>
             <button id="btn-nodal-im" type="button" class="active-btn nodal-im-pill" title="Toggle simulated Im=0 nodal surface in 3D Reciprocal Space">Im=0</button>
             <button id="btn-nodal-vortices" type="button" class="active-btn nodal-vortex-pill" title="Toggle 1D phase vortices (Re=0 ∩ Im=0) across 3D Reciprocal Space, Wulff Net, and Detector Panels">Vortices</button>
-            <select id="sel-nodal-roi" title="3D Nodal Surface Region of Interest (Origin sphere, Selected Bragg Peak, or Active Laue Zone slab)">
+            <select id="sel-nodal-roi" title="3D Nodal Surface Region of Interest (Origin sphere, Selected Bragg Peak sphere, Active Laue Zone disk, or Shift+Drag / Right+Drag 3D Pan)">
               <option value="origin">ROI: Origin</option>
               <option value="peak">ROI: Peak</option>
-              <option value="zone">ROI: Zone</option>
+              <option value="zone">ROI: Zone Disk</option>
+              <option value="pan">ROI: Pan 3D</option>
             </select>
-            <input type="range" id="slider-nodal-roi" min="1.2" max="5.5" step="0.3" value="2.5" title="Adjust 3D nodal surface ROI radius (2.5× a⋆)" />
+            <input type="range" id="slider-nodal-roi" min="0.8" max="5.5" step="0.1" value="2.5" title="Adjust 3D nodal surface ROI radius (2.5× a⋆)" />
             <button id="btn-load-ref-mtz" type="button" title="Load heterodyne reference F₀ .mtz (with phase, e.g. heavy-atom / reference structure factor) for interference nodal surfaces &amp; vortices">Ref F₀</button>
             <button id="btn-clear-ref-mtz" type="button" class="hidden" title="Clear heterodyne reference F₀ .mtz">×</button>
             <select id="sel-heterodyne-mode" class="hidden" title="Heterodyne interference term with Reference F₀">
@@ -12873,7 +12911,7 @@ def render_rainbow_html(
               <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(180,255,20,0.88);border:1px solid #b4ff14;"></span>
               <span id="lbl-mask-bright">Bright 0.00%</span>
             </span>
-            <span style="display:inline-flex;align-items:center;gap:4px;" title="Detector panel perimeter border exclusion width (adjust 'border' in Unit cell / Params)">
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Detector panel perimeter border exclusion width (adjust 'border' in Unit Cell...)">
               <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(251,146,60,0.52);border:1px solid #fb923c;"></span>
               <span id="lbl-mask-edge">Edge {init_border * 100.0:.1f}%</span>
             </span>
@@ -12954,11 +12992,12 @@ def render_rainbow_html(
         <span id="lbl-execute" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));color:var(--text-dim);font-family:var(--font-display);">EXECUTE:</span>
         <div id="pipeline-stages" style="display:flex;align-items:center;gap:calc(4px * var(--bottom-bar-scale, 1));"></div>
         <button id="btn-params-toggle" title="Configure unit cell, space group, panel border exclusion, and solve binning">
-          Unit cell / Params
+          Unit Cell...
         </button>
         <button id="btn-files-toggle" title="Download NDIP / workflow artifacts for the current step (switch steps with &lt; &gt; arrows)">
           Files
         </button>
+        <span id="mtz-status-badge" class="mtz-status-badge hidden" title="Loaded structure-factor .mtz file"></span>
         <span id="galaxy-status-badge" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));font-family:var(--font-display);padding:2px calc(6px * var(--bottom-bar-scale, 1));border-radius:4px;border:1px solid #334155;color:var(--text-dim);white-space:nowrap;" title="Execution backend status (LOCAL or NDIP Galaxy/Pulsar)">
           LOCAL
         </span>
@@ -23559,6 +23598,44 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     nodalCtrl.setNodalData(DATA.nodal_data);
   }}
 
+  let _mtzLoadingState = {{ active: false, name: "" }};
+  let _refMtzLoadingState = {{ active: false, name: "" }};
+
+  function updateMtzStatusBadge(loading = false, loadingName = "") {{
+    _mtzLoadingState = {{
+      active: Boolean(loading),
+      name: loadingName ? String(loadingName) : "",
+    }};
+    const badge = document.getElementById("mtz-status-badge");
+    if (!badge) return;
+    if (_mtzLoadingState.active) {{
+      const nm = _mtzLoadingState.name || "structure factors";
+      badge.textContent = `MTZ: ${{nm}}…`;
+      badge.title = `Loading .mtz file: ${{nm}}`;
+      badge.classList.remove("hidden");
+      badge.classList.add("loading");
+    }} else if (DATA && DATA.mtz_overlay_name) {{
+      const nm = String(DATA.mtz_overlay_name);
+      const phiNote = DATA.mtz_has_phases
+        ? ` • phases (${{DATA.mtz_phi_column || "PHI"}})`
+        : "";
+      const refNote = Number(DATA.mtz_overlay_reflections) > 0
+        ? ` • ${{DATA.mtz_overlay_reflections}} refls`
+        : "";
+      badge.textContent = `MTZ: ${{nm}}`;
+      badge.title = `Loaded .mtz: ${{nm}}${{refNote}}${{phiNote}}`;
+      badge.classList.remove("hidden", "loading");
+    }} else {{
+      badge.textContent = "";
+      badge.title = "Loaded structure-factor .mtz file";
+      badge.classList.remove("loading");
+      badge.classList.add("hidden");
+    }}
+    if (typeof fitHorizontalBars === "function") {{
+      fitHorizontalBars(false);
+    }}
+  }}
+
   function syncNodalUI() {{
     const btnWulff = document.getElementById("btn-view-wulff");
     const btn3D = document.getElementById("btn-view-recip3d");
@@ -23611,14 +23688,23 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       slRoi.title = `Adjust 3D nodal surface ROI radius (${{mult.toFixed(1)}}× a⋆)`;
     }}
     const refName = (nd && nd.ref_name) || (DATA && DATA.ref_mtz_overlay_name) || "";
-    const hasRef = Boolean((nd && nd.ref_has_phases) || refName);
+    const hasRef = Boolean(!_refMtzLoadingState.active && ((nd && nd.ref_has_phases) || refName));
     if (btnRef) {{
-      btnRef.disabled = !hasPhasedMtz;
-      btnRef.textContent = hasRef ? `F₀: ${{refName || "Loaded"}}` : "Ref F₀";
-      btnRef.classList.toggle("nodal-ref-active", hasRef);
-      btnRef.title = hasRef
-        ? `Heterodyne Reference F₀ (${{refName}}) — click to replace`
-        : "Load heterodyne reference F₀ .mtz (with phase, e.g. heavy-atom / reference structure factor) for interference nodal surfaces & vortices";
+      btnRef.disabled = !hasPhasedMtz || _refMtzLoadingState.active;
+      if (_refMtzLoadingState.active) {{
+        const loadNm = _refMtzLoadingState.name || "Ref F₀";
+        btnRef.textContent = `F₀: ${{loadNm}}…`;
+        btnRef.classList.remove("nodal-ref-active");
+        btnRef.classList.add("nodal-ref-loading");
+        btnRef.title = `Loading heterodyne Reference F₀: ${{loadNm}}`;
+      }} else {{
+        btnRef.textContent = hasRef ? `F₀: ${{refName || "Loaded"}}` : "Ref F₀";
+        btnRef.classList.remove("nodal-ref-loading");
+        btnRef.classList.toggle("nodal-ref-active", hasRef);
+        btnRef.title = hasRef
+          ? `Heterodyne Reference F₀ (${{refName}}) — click to replace`
+          : "Load heterodyne reference F₀ .mtz (with phase, e.g. heavy-atom / reference structure factor) for interference nodal surfaces & vortices";
+      }}
     }}
     if (btnClearRef) {{
       btnClearRef.classList.toggle("hidden", !hasRef);
@@ -23640,10 +23726,14 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   function maybeRefreshNodalRoiOnSelection(kind) {{
     if (!nodalCtrl || !nodalCtrl.hasPhases()) return;
-    if (kind === "peak" && state.nodalRoiMode === "peak") {{
-      nodalCtrl.scheduleRoiRefresh(60);
-    }} else if (kind === "zone" && state.nodalRoiMode === "zone") {{
-      nodalCtrl.scheduleRoiRefresh(60);
+    if (
+      (kind === "peak" && state.nodalRoiMode === "peak") ||
+      (kind === "zone" && state.nodalRoiMode === "zone")
+    ) {{
+      nodalCtrl.onLiveRoiChanged();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      renderDetector();
     }}
   }}
 
@@ -23678,6 +23768,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.showNodalSurfacesRe ? 1 : 0,
       state.showNodalSurfacesIm ? 1 : 0,
       state.showPhaseVortices ? 1 : 0,
+      state.nodalRoiMode || "origin",
+      (Number(state.nodalRoiRadiusMult) || 2.5).toFixed(2),
       hasNodalCtrl ? nodalCtrl.getDataSeq() : 0,
       state.wulffScope,
       state.wulffColorMode,
@@ -24331,6 +24423,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   window.addEventListener("mouseup", (ev) => {{
     isPanningDet = false;
     isDraggingWulff = false;
+    isPanning3DRecip = false;
     if (!isParallaxTriggerActive(ev)) {{
       state.targetParallaxX = 0.0;
       state.targetParallaxY = 0.0;
@@ -24534,13 +24627,27 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }}
   }});
 
-  // Interactive 3D Yaw/Pitch Drag + Wheel Zoom + Symmetry Starburst Selection on Wulff Net Canvas
+  // Interactive 3D Yaw/Pitch Drag + Shift/Right-Drag 3D Pan + Wheel Zoom + Symmetry Starburst Selection
   let isDraggingWulff = false;
+  let isPanning3DRecip = false;
+  let wulffDragMoved = false;
   let wulffDragStart = [0, 0, 0, 0];
+  let wulffLastClient = [0, 0];
   if (stereoCanvas) {{
+    stereoCanvas.addEventListener("contextmenu", (ev) => {{
+      if (state.stereoViewMode === "recip3d") ev.preventDefault();
+    }});
     stereoCanvas.addEventListener("mousedown", (ev) => {{
       isDraggingWulff = true;
+      wulffDragMoved = false;
+      isPanning3DRecip = Boolean(
+        state.stereoViewMode === "recip3d" &&
+        nodalCtrl &&
+        (ev.shiftKey || ev.button === 1 || ev.button === 2)
+      );
+      if (isPanning3DRecip) ev.preventDefault();
       wulffDragStart = [ev.clientX, ev.clientY, state.wulffYawDeg, state.wulffPitchDeg];
+      wulffLastClient = [ev.clientX, ev.clientY];
       state.targetParallaxX = 0.0;
       state.targetParallaxY = 0.0;
     }});
@@ -24561,6 +24668,23 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       if (isDraggingWulff) {{
         const dx = ev.clientX - wulffDragStart[0];
         const dy = ev.clientY - wulffDragStart[1];
+        if (dx * dx + dy * dy > 16) wulffDragMoved = true;
+        if (
+          state.stereoViewMode === "recip3d" &&
+          nodalCtrl &&
+          (isPanning3DRecip || ev.shiftKey)
+        ) {{
+          const incDx = ev.clientX - wulffLastClient[0];
+          const incDy = ev.clientY - wulffLastClient[1];
+          wulffLastClient = [ev.clientX, ev.clientY];
+          nodalCtrl.panByScreenDelta(incDx, incDy);
+          syncNodalUI();
+          _lastWulffRenderSig = "";
+          renderStereoInset(true);
+          renderDetector();
+          return;
+        }}
+        wulffLastClient = [ev.clientX, ev.clientY];
         state.wulffYawDeg = ((wulffDragStart[2] - dx * 0.55 + 540) % 360) - 180;
         state.wulffPitchDeg = Math.max(-85, Math.min(85, wulffDragStart[3] + dy * 0.45));
         setDetectorCenterAzimuthDeg(wulffAzimuthToDetectorChiDeg(state.wulffYawDeg));
@@ -24596,6 +24720,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.wulffZoom = Math.max(0.6, Math.min(14.0, (state.wulffZoom || 1.0) * factor));
     }}, {{ passive: false }});
     stereoCanvas.addEventListener("click", (ev) => {{
+      if (wulffDragMoved) {{
+        wulffDragMoved = false;
+        return;
+      }}
       const rect = stereoCanvas.getBoundingClientRect();
       const mx = ev.clientX - rect.left;
       const my = ev.clientY - rect.top;
@@ -24608,6 +24736,15 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         state.activeOrbitId = hit.asu_orbit_id || null;
         updatePeakInspector(hit);
         maybeRefreshNodalRoiOnSelection("peak");
+      }}
+    }});
+    stereoCanvas.addEventListener("dblclick", () => {{
+      if (state.stereoViewMode === "recip3d" && nodalCtrl) {{
+        nodalCtrl.resetPanToOrigin();
+        syncNodalUI();
+        _lastWulffRenderSig = "";
+        renderStereoInset(true);
+        renderDetector();
       }}
     }});
   }}
@@ -25442,7 +25579,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     selNodalRoi.addEventListener("change", () => {{
       state.nodalRoiMode = selNodalRoi.value || "origin";
       syncNodalUI();
-      refreshNodalSurfacesFromServer({{ roi_mode: state.nodalRoiMode }});
+      if (nodalCtrl) nodalCtrl.onLiveRoiChanged();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      renderDetector();
     }});
   }}
   const slNodalRoi = document.getElementById("slider-nodal-roi");
@@ -25451,7 +25591,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const v = parseFloat(slNodalRoi.value);
       if (Number.isFinite(v)) state.nodalRoiRadiusMult = v;
       syncNodalUI();
-      if (nodalCtrl) nodalCtrl.scheduleRoiRefresh(180);
+      if (nodalCtrl) nodalCtrl.onLiveRoiChanged();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      renderDetector();
     }});
   }}
 
@@ -25467,21 +25610,26 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     inpRefMtzFile.addEventListener("change", async () => {{
       const f = inpRefMtzFile.files && inpRefMtzFile.files[0];
       if (!f || !nodalCtrl) return;
-      state.heterodyneMode = "delta";
-      await nodalCtrl.uploadAndSetRefMtz(f);
+      _refMtzLoadingState = {{ active: true, name: f.name }};
+      syncNodalUI();
+      try {{
+        await nodalCtrl.uploadAndSetRefMtz(f);
+      }} finally {{
+        _refMtzLoadingState = {{ active: false, name: "" }};
+        syncNodalUI();
+      }}
     }});
   }}
   if (btnClearRefMtz) {{
     btnClearRefMtz.addEventListener("click", async () => {{
       if (!nodalCtrl) return;
+      _refMtzLoadingState = {{ active: false, name: "" }};
       state.heterodyneMode = "single";
-      const nd = await refreshNodalSurfacesFromServer({{
-        heterodyne_mode: "single",
-        clear_ref_mtz: true,
-      }});
-      if (nd) {{
-        setStatusLine("[NODAL SURFACES]", "Cleared heterodyne reference F₀; restored single-field structure factor F(G).");
-      }}
+      await nodalCtrl.clearRefMtz();
+      syncNodalUI();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      renderDetector();
     }});
   }}
   if (selHetMode) {{
@@ -26114,6 +26262,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       if (nodalCtrl) nodalCtrl.setNodalData(DATA.nodal_data);
       syncNodalUI();
     }}
+    updateMtzStatusBadge(false);
     DATA.default_color_mode = newPayload.default_color_mode || null;
     const preferredSrc = isFrameSwitch
       ? state.peakSource
@@ -29548,7 +29697,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const isMtzFile = files.length === 1 && /\\.mtz$/i.test(files[0].name);
     const isRawNexus = !isMtzFile && (forceReduce || files.some(f => /\\.nxs(\\.h5)?$/i.test(f.name)));
     const statusTag = isMtzFile ? "[LOCAL MTZ]" : "[LOCAL HDF5]";
+    if (isMtzFile) {{
+      updateMtzStatusBadge(true, files[0].name);
+    }}
     try {{
+      try {{
       setStatusLine(
         statusTag,
         isRawNexus
@@ -29646,6 +29799,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       recomputeBoundsAndReload(newPayload);
     }} catch (err) {{
       setStatusLine("[LOCAL HDF5]", `<span style="color:#f87171;">Local HDF5 error: ${{err.message}}</span>`);
+    }}
+    }} finally {{
+      if (isMtzFile) {{
+        updateMtzStatusBadge(false);
+      }}
     }}
   }}
 
@@ -29864,6 +30022,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       }});
       return;
     }}
+    if (dsExt === "mtz") {{
+      updateMtzStatusBadge(true, dsName || dsId);
+    }}
     setGalaxyDatasetLoadingState(true, `${{dsHid}}${{dsName || dsId}}`);
     setStatusLine("[GALAXY HDF5]", `Downloading & loading dataset <strong>${{dsHid}}${{dsName || dsId}}</strong> from NDIP / Galaxy History…`);
     try {{
@@ -29950,6 +30111,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       setStatusLine("[GALAXY ERROR]", `<span style="color:#f87171;">${{err.message}}</span>`);
     }} finally {{
       setGalaxyDatasetLoadingState(false);
+      if (dsExt === "mtz") {{
+        updateMtzStatusBadge(false);
+      }}
     }}
   }}
 
@@ -30947,6 +31111,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: true }});
   renderUnitCellHistoryDropdown();
   updateHUD();
+  updateMtzStatusBadge(false);
+  syncNodalUI();
   fitHorizontalBars(true);
   requestAnimationFrame(animate);
 }})();

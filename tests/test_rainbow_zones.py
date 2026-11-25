@@ -2115,7 +2115,9 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert 'id="slider-wl-max"' in html_doc
     assert 'id="wl-knob-min"' in html_doc and ">[</button>" in html_doc
     assert 'id="wl-knob-max"' in html_doc and ">]</button>" in html_doc
-    assert "Unit cell / Params" in html_doc
+    assert "Unit Cell..." in html_doc
+    assert 'id="mtz-status-badge"' in html_doc
+    assert "updateMtzStatusBadge" in html_doc
     assert 'id="inp-lmin"' not in html_doc
     assert 'id="inp-lmax"' not in html_doc
     assert 'id="inp-dmin"' not in html_doc

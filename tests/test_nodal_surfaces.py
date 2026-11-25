@@ -391,6 +391,10 @@ def test_apply_mtz_frame_preservation_and_js_controller_projections(tmp_path: Pa
     html = render_rainbow_html(enriched)
     assert 'id="btn-view-recip3d"' in html
     assert 'id="stereo-nodal-bar"' in html
+    assert 'id="mtz-status-badge"' in html
+    assert "Unit Cell..." in html
+    assert '<option value="zone">ROI: Zone Disk</option>' in html
+    assert '<option value="pan">ROI: Pan 3D</option>' in html
     assert "createNodalSurfacesController" in html
 
     if shutil.which("node") is None:
@@ -403,6 +407,14 @@ def test_apply_mtz_frame_preservation_and_js_controller_projections(tmp_path: Pa
     js_driver = f"""
     {get_nodal_surfaces_js()}
     global.atob = (b64) => Buffer.from(b64, "base64").toString("binary");
+    let fetchCount = 0;
+    global.fetch = async () => {{
+      fetchCount++;
+      return {{
+        ok: true,
+        json: async () => ({{ ok: true, nodal_data: {nd_json} }}),
+      }};
+    }};
     let strokeCalls = 0;
     let fillCalls = 0;
     const mockCtx = {{
@@ -427,7 +439,9 @@ def test_apply_mtz_frame_preservation_and_js_controller_projections(tmp_path: Pa
       wulffScope: "1_frame", wulffColorMode: "mtz_fcalc",
       showWulffFriedel: true, showNodalPoints: true, showZoneArcs: true,
       showNodalSurfacesRe: true, showNodalSurfacesIm: true, showPhaseVortices: true,
-      nodalSurfaceAlpha: 0.56, nodalRoiMode: "origin",
+      nodalSurfaceAlpha: 0.56, nodalRoiMode: "origin", nodalRoiRadiusMult: 2.5,
+      selectedPeakObj: {{ id: 1, hkl: [1, 0, 0] }},
+      selectedZoneId: 0,
       dMin: 1.5, lamMin: 0.8, lamMax: 8.0, activeZones: new Set([0]),
     }};
     const ctrl = createNodalSurfacesController({{
@@ -456,14 +470,49 @@ def test_apply_mtz_frame_preservation_and_js_controller_projections(tmp_path: Pa
       setStatusLine: () => {{}},
       onUpdated: () => {{}},
     }});
-    ctrl.render3DReciprocalView(mockCanvas, true);
-    const strokesAfter3D = strokeCalls;
-    const fillsAfter3D = fillCalls;
-    ctrl.renderWulffVortices(mockCtx, 200, 200, 160, true);
-    const strokesAfterWulff = strokeCalls;
-    ctrl.renderDetectorVortices(mockCtx, 800, 500);
-    const strokesAfterDet = strokeCalls;
-    console.log(JSON.stringify({{ strokesAfter3D, fillsAfter3D, strokesAfterWulff, strokesAfterDet }}));
+    (async () => {{
+      ctrl.render3DReciprocalView(mockCanvas, true);
+      const strokesAfter3D = strokeCalls;
+      const fillsAfter3D = fillCalls;
+      ctrl.renderWulffVortices(mockCtx, 200, 200, 160, true);
+      const strokesAfterWulff = strokeCalls;
+      ctrl.renderDetectorVortices(mockCtx, 800, 500);
+      const strokesAfterDet = strokeCalls;
+
+      // Live slider & ROI mode switches inside cached brick must NOT hit fetch()!
+      state.nodalRoiRadiusMult = 1.6;
+      ctrl.onLiveRoiChanged();
+      state.nodalRoiMode = "peak";
+      ctrl.onLiveRoiChanged();
+      state.nodalRoiMode = "zone";
+      ctrl.onLiveRoiChanged();
+      ctrl.panByScreenDelta(18, -12);
+      const modeAfterPan = state.nodalRoiMode;
+      ctrl.resetPanToOrigin();
+      const modeAfterReset = state.nodalRoiMode;
+      const fetchesDuringCachedRoi = fetchCount;
+
+      // Simulate heterodyne active state and instant clearRefMtz() restoration
+      const hetClone = JSON.parse(JSON.stringify({nd_json}));
+      hetClone.heterodyne_active = true;
+      hetClone.heterodyne_mode = "delta";
+      hetClone.ref_name = "heavy_ref.mtz";
+      hetClone.ref_has_phases = true;
+      hetClone.formula_label = "F₀*·(F − F₀)";
+      ctrl.setNodalData(hetClone);
+      const cleared = await ctrl.clearRefMtz();
+      console.log(JSON.stringify({{
+        strokesAfter3D,
+        fillsAfter3D,
+        strokesAfterWulff,
+        strokesAfterDet,
+        fetchesDuringCachedRoi,
+        modeAfterPan,
+        modeAfterReset,
+        clearedActive: Boolean(cleared && cleared.heterodyne_active),
+        clearedFormula: cleared ? cleared.formula_label : "",
+      }}));
+    }})();
     """
     js_file = tmp_path / "run_ctrl.js"
     js_file.write_text(js_driver, encoding="utf-8")
@@ -474,3 +523,89 @@ def test_apply_mtz_frame_preservation_and_js_controller_projections(tmp_path: Pa
     assert counts["fillsAfter3D"] > 20
     assert counts["strokesAfterWulff"] > counts["strokesAfter3D"]
     assert counts["strokesAfterDet"] > counts["strokesAfterWulff"]
+    assert counts["fetchesDuringCachedRoi"] == 0
+    assert counts["modeAfterPan"] == "pan"
+    assert counts["modeAfterReset"] == "origin"
+    assert counts["clearedActive"] is False
+    assert counts["clearedFormula"] == "F(G)"
+
+
+def test_heterodyne_physical_scale_cancellation_and_onlyh_auto_mode(tmp_path: Path):
+    """Physical scale preservation cancels F_heavy exactly when q75_all != q75_heavy, and *onlyH* defaults to product."""
+    from subhkl.viz.nodal_surfaces import infer_default_heterodyne_mode
+
+    assert infer_default_heterodyne_mode("5VNQ_onlyH_2.18.mtz") == "product"
+    assert infer_default_heterodyne_mode("5vnq_all.mtz") == "delta"
+
+    heavy_mtz = tmp_path / "5vnq_heavy.mtz"
+    all_mtz = tmp_path / "5vnq_all.mtz"
+    onlyh_mtz = tmp_path / "5VNQ_onlyH_2.18.mtz"
+
+    # Multi-atom heavy substructure + large protonation perturbation so q75(F_all) != q75(F_heavy)
+    heavy_atoms = [
+        ((0.0, 0.0, 0.0), 14.0),
+        ((0.19, 0.37, 0.11), 9.0),
+        ((0.41, 0.13, 0.29), 8.5),
+    ]
+    h_site = [((0.25, 0.0, 0.0), -18.0)]
+    ub, _ = _write_synthetic_phased_mtz(
+        heavy_mtz,
+        spacegroup_name="P 1",
+        cell_params=(10.0, 10.0, 10.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=heavy_atoms,
+        d_min=2.5,
+    )
+    _write_synthetic_phased_mtz(
+        all_mtz,
+        spacegroup_name="P 1",
+        cell_params=(10.0, 10.0, 10.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=[*heavy_atoms, *h_site],
+        d_min=2.5,
+    )
+    _write_synthetic_phased_mtz(
+        onlyh_mtz,
+        spacegroup_name="P 1",
+        cell_params=(10.0, 10.0, 10.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=[((0.25, 0.0, 0.0), 3.8)],
+        d_min=2.5,
+    )
+
+    f_heavy = load_phased_structure_factor_field(str(heavy_mtz))
+    f_all = load_phased_structure_factor_field(str(all_mtz))
+    assert not np.isclose(f_heavy["q75_f"], f_all["q75_f"], rtol=0.05)
+
+    # F_heavy* * (F_all - F_heavy) has exact opposite sign to F_heavy* * F_onlyH, so identical zero locus!
+    nd_delta = compute_nodal_surfaces_payload(
+        mtz_path=str(all_mtz),
+        ub_matrix=ub,
+        d_min=2.5,
+        ref_mtz_path=str(heavy_mtz),
+        heterodyne_mode="auto",
+        roi_grid_size=24,
+        vortex_grid_size=24,
+    )
+    nd_prod = compute_nodal_surfaces_payload(
+        mtz_path=str(onlyh_mtz),
+        ub_matrix=ub,
+        d_min=2.5,
+        ref_mtz_path=str(heavy_mtz),
+        heterodyne_mode="auto",
+        roi_grid_size=24,
+        vortex_grid_size=24,
+    )
+    assert nd_delta["heterodyne_mode"] == "delta"
+    assert nd_prod["heterodyne_mode"] == "product"
+    assert nd_delta["re_surface"]["n_tris"] == nd_prod["re_surface"]["n_tris"]
+    assert nd_delta["im_surface"]["n_tris"] == nd_prod["im_surface"]["n_tris"]
+    assert "brick" in nd_delta and nd_delta["brick"]["radius_mult"] >= 4.0
+
+    # Same-file guard falls back cleanly instead of producing a degenerate 0 field
+    nd_same = compute_nodal_surfaces_payload(
+        mtz_path=str(heavy_mtz),
+        ub_matrix=ub,
+        d_min=2.5,
+        ref_mtz_path=str(heavy_mtz),
+        heterodyne_mode="delta",
+    )
+    assert nd_same["heterodyne_active"] is False
+    assert nd_same["re_surface"]["n_tris"] > 10

@@ -10616,13 +10616,26 @@ def serve_rainbow_zones(
                         from subhkl.viz.rainbow_zones import apply_mtz_to_payload
 
                         ds_info_mtz = {"name": os.path.basename(fp_raw)}
+                        eff_het = (
+                            "auto"
+                            if (
+                                vm.ref_mtz_overlay_path
+                                and fp_raw != vm.mtz_overlay_path
+                            )
+                            else vm.heterodyne_mode
+                        )
                         vm.payload = apply_mtz_to_payload(
                             vm.payload or {},
                             fp_raw,
                             ds_info_mtz,
                             ref_mtz_path=vm.ref_mtz_overlay_path,
-                            heterodyne_mode=vm.heterodyne_mode,
+                            heterodyne_mode=eff_het,
                         )
+                        if isinstance(vm.payload.get("nodal_data"), dict):
+                            vm.heterodyne_mode = str(
+                                vm.payload["nodal_data"].get("heterodyne_mode")
+                                or vm.heterodyne_mode
+                            )
                         vm.mtz_overlay_path = fp_raw
                         vm.mtz_overlay_info = ds_info_mtz
                         body = json.dumps(vm.payload).encode("utf-8")
@@ -10740,13 +10753,26 @@ def serve_rainbow_zones(
                         has_active_geometry=has_active_geom,
                     )
                     if ingest_kind == "mtz_overlay":
+                        eff_het = (
+                            "auto"
+                            if (
+                                vm.ref_mtz_overlay_path
+                                and local_h5 != vm.mtz_overlay_path
+                            )
+                            else vm.heterodyne_mode
+                        )
                         vm.payload = apply_mtz_to_payload(
                             cur_p,
                             local_h5,
                             ds_info,
                             ref_mtz_path=vm.ref_mtz_overlay_path,
-                            heterodyne_mode=vm.heterodyne_mode,
+                            heterodyne_mode=eff_het,
                         )
+                        if isinstance(vm.payload.get("nodal_data"), dict):
+                            vm.heterodyne_mode = str(
+                                vm.payload["nodal_data"].get("heterodyne_mode")
+                                or vm.heterodyne_mode
+                            )
                         vm.mtz_overlay_path = local_h5
                         vm.mtz_overlay_info = ds_info
                         body = json.dumps(vm.payload).encode("utf-8")

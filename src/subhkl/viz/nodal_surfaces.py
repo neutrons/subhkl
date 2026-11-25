@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import math
 import os
+import re
 from collections import OrderedDict
 from typing import Any
 
@@ -59,7 +60,19 @@ _PHI_LABEL_PRIORITY: tuple[str, ...] = (
 
 _PHASED_FIELD_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
 _GLOBAL_VORTEX_CACHE: OrderedDict[tuple[Any, ...], list[dict[str, Any]]] = OrderedDict()
-_MAX_FIELD_CACHE_ENTRIES = 8
+_BRICK_PAYLOAD_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+_MAX_FIELD_CACHE_ENTRIES = 10
+_MAX_BRICK_CACHE_ENTRIES = 16
+_SUBSTRUCTURE_NAME_RE = re.compile(
+    r"(?:only[_-]?h|[_-]h[_-]|diff|delta|fofc|delfwt|substruct)", re.IGNORECASE
+)
+
+
+def infer_default_heterodyne_mode(primary_name: str | None) -> str:
+    """Return 'product' when primary .mtz filename denotes an isolated substructure/difference map, else 'delta'."""
+    if primary_name and _SUBSTRUCTURE_NAME_RE.search(str(primary_name)):
+        return "product"
+    return "delta"
 
 
 def detect_mtz_f_and_phase_columns(mtz: Any) -> tuple[Any | None, Any | None]:
@@ -207,17 +220,16 @@ def load_phased_structure_factor_field(
     f_norm = f_amp / q75_f
     z_asu = f_norm * np.exp(1j * phi_rad)
 
-    # Build ASU amplitude map (using active/MTZ reciprocal ASU) for inter-MTZ heterodyne scale matching
+    # Build raw ASU amplitude map (in native MTZ amplitude units) for physical heterodyne scale matching
     ops = mtz_sg.operations()
     asu_helper = gemmi.ReciprocalAsu(mtz_sg)
     asu_amp_map: dict[tuple[int, int, int], float] = {}
-    # Sample up to 25,000 reflections for robust shared-ASU median/Q75 scale alignment
     step_sample = max(1, len(hkl) // 25000)
     for idx_s in range(0, len(hkl), step_sample):
         hk_list = [int(hkl[idx_s, 0]), int(hkl[idx_s, 1]), int(hkl[idx_s, 2])]
         asu_hkl, _ = asu_helper.to_asu(hk_list, ops)
         asu_amp_map[(int(asu_hkl[0]), int(asu_hkl[1]), int(asu_hkl[2]))] = float(
-            f_norm[idx_s]
+            f_amp[idx_s]
         )
 
     # Vectorized space-group expansion with exact translation phase shifts:
@@ -315,11 +327,28 @@ def compute_shared_scale_ratio(
     primary_field: dict[str, Any],
     ref_field: dict[str, Any],
 ) -> float:
-    """Compute robust amplitude ratio matching normalized primary |F| onto reference |F_0| on shared ASU HKLs."""
+    """Compute multiplier `s` in `s * F_norm - F0_norm` so subtraction preserves true physical ΔF = F_raw - F0_raw.
+
+    Since `F_norm = F_raw / q75_f` and `F0_norm = F0_raw / q75_0`:
+    - When both MTZs share a compatible physical scale (`0.1 <= q75_shared_raw(F) / q75_shared_raw(F0) <= 10.0`,
+      e.g. `f_calc` for all atoms vs heavy atoms), exact unnormalized subtraction `(F_raw - F0_raw) / q75_0`
+      requires `s = q75_f / q75_0` (NOT forcing `|F|` and `|F0|` to have equal Q75, which would leak F0 into ΔF).
+    - Only when raw scales differ by >10x (arbitrary unscaled experimental amplitudes vs model amplitudes)
+      do we align shared-ASU Q75 amplitudes via `s = (q75_f / q75_0) * (q75_shared_0 / q75_shared_f)`.
+    """
+    q75_f_global = float(primary_field.get("q75_f") or 1.0)
+    q75_0_global = float(ref_field.get("q75_f") or 1.0)
+    raw_unit_ratio = (
+        q75_f_global / q75_0_global
+        if (q75_f_global > 1e-12 and q75_0_global > 1e-12)
+        else 1.0
+    )
+
     map_f = primary_field.get("asu_amp_map") or {}
     map_0 = ref_field.get("asu_amp_map") or {}
     if not map_f or not map_0:
-        return 1.0
+        return float(raw_unit_ratio) if 0.1 <= raw_unit_ratio <= 10.0 else 1.0
+
     shared_f: list[float] = []
     shared_0: list[float] = []
     it_small, it_large, flip = (
@@ -335,15 +364,21 @@ def compute_shared_scale_ratio(
                 shared_f.append(v_s)
                 shared_0.append(v_l)
     if len(shared_f) < 5:
-        return 1.0
+        return float(raw_unit_ratio) if 0.1 <= raw_unit_ratio <= 10.0 else 1.0
+
     arr_f = np.asarray(shared_f, dtype=np.float64)
     arr_0 = np.asarray(shared_0, dtype=np.float64)
-    q75_f = float(np.percentile(arr_f, 75.0))
-    q75_0 = float(np.percentile(arr_0, 75.0))
-    if q75_f > 1e-9 and q75_0 > 1e-9:
-        ratio = q75_0 / q75_f
-        if np.isfinite(ratio) and 0.05 <= ratio <= 20.0:
-            return float(ratio)
+    sh_q75_f = float(np.percentile(arr_f, 75.0))
+    sh_q75_0 = float(np.percentile(arr_0, 75.0))
+    if sh_q75_f > 1e-9 and sh_q75_0 > 1e-9:
+        shared_raw_ratio = sh_q75_f / sh_q75_0
+        if 0.1 <= shared_raw_ratio <= 10.0:
+            # Same physical scale (e.g. F_all vs F_heavy): preserve exact F_raw - F0_raw!
+            return float(raw_unit_ratio)
+        # Wildly different arbitrary scales: align shared ASU Q75 before subtracting
+        aligned = raw_unit_ratio * (sh_q75_0 / sh_q75_f)
+        if np.isfinite(aligned) and 0.05 <= aligned <= 20.0:
+            return float(aligned)
     return 1.0
 
 
@@ -605,9 +640,10 @@ def extract_vortex_polylines(
     visited: set[int] = set()
     raw_chains: list[tuple[list[int], bool]] = []
 
-    # 1. Open curves entering through grid boundary (or orphan starts)
+    # 1. Open curves entering through grid boundary (or orphan starts) — O(N) predecessor lookup!
+    has_predecessor = set(next_puncture.values())
     start_candidates = sorted(is_boundary_entry) + [
-        pid for pid in range(len(puncture_hkl)) if pid not in next_puncture.values()
+        pid for pid in range(len(puncture_hkl)) if pid not in has_predecessor
     ]
     seen_starts: set[int] = set()
     for sp in start_candidates:
@@ -833,23 +869,21 @@ def compute_nodal_surfaces_payload(
     heterodyne_mode: str = "delta",
     roi_mode: str = "origin",
     roi_center_hkl: list[float] | tuple[float, float, float] | None = None,
+    roi_center_g_override: list[float] | tuple[float, float, float] | None = None,
     roi_zone_uvw: list[int] | tuple[int, int, int] | None = None,
     roi_zone_order: int = 0,
     roi_radius_mult: float = 2.5,
-    roi_grid_size: int = 46,
-    vortex_shell_mult: float = 3.6,
-    vortex_grid_size: int = 48,
+    roi_grid_size: int = 58,
+    vortex_shell_mult: float = 4.2,
+    vortex_grid_size: int = 58,
+    cache_radius_mult: float = 4.2,
 ) -> dict[str, Any]:
-    """Compute scoped 3D Re=0 & Im=0 nodal meshes and 1D phase-vortex curves in sample reciprocal space.
+    """Compute cached 3D Re=0 & Im=0 nodal meshes and 1D phase-vortex curves in sample reciprocal space.
 
-    Parameters
-    ----------
-    mtz_path : path to primary phased .mtz (e.g. simulated structure factors F, PHIf).
-    ub_matrix : 3x3 active UB matrix mapping [h, k, l]^T -> G_sample (in A^-1, |G| = 1/d).
-    ref_mtz_path : optional heterodyne reference F_0 .mtz with phases.
-    heterodyne_mode : "delta" [F0* . (F - F0)], "product" [F0* . F], or "single" [F].
-    roi_mode : "origin" | "peak" | "zone".
-    roi_radius_mult : ROI radius in units of mean reciprocal basis length mean(|a*|, |b*|, |c*|).
+    To enable zero-latency client-side 3D ROI translation (Origin / Peak / Zone / Free Pan) and
+    smooth 60-fps ROI radius slider clipping without server round-trips, the server evaluates and
+    caches an uncropped spherical 3D brick (`brick_radius_g >= max(roi_radius, cache_radius_mult * a*)`)
+    while also returning exact live ROI metadata (`roi`) for initial framing and unit tests.
     """
     ub = np.asarray(ub_matrix, dtype=np.float64)
     if ub.shape != (3, 3):
@@ -886,23 +920,36 @@ def compute_nodal_surfaces_payload(
     ref_field: dict[str, Any] | None = None
     ref_warning: str | None = None
     if ref_mtz_path and os.path.isfile(str(ref_mtz_path)):
-        ref_loaded = load_phased_structure_factor_field(
-            ref_mtz_path,
-            space_group_override=space_group_override,
-            d_min_floor=min(d_min_eff, 1.5),
-        )
-        if ref_loaded.get("has_phases"):
-            ref_field = ref_loaded
-        else:
+        if os.path.abspath(str(ref_mtz_path)) == os.path.abspath(str(mtz_path)):
             ref_warning = (
-                f"Reference MTZ '{ref_loaded.get('name')}' has no phase column (type 'P'); "
-                "showing single-MTZ nodal surfaces."
+                f"Reference MTZ '{os.path.basename(str(ref_mtz_path))}' matches the primary MTZ; "
+                "showing single-field F(G)."
             )
+        else:
+            ref_loaded = load_phased_structure_factor_field(
+                ref_mtz_path,
+                space_group_override=space_group_override,
+                d_min_floor=min(d_min_eff, 1.5),
+            )
+            if ref_loaded.get("has_phases"):
+                ref_field = ref_loaded
+            else:
+                ref_warning = (
+                    f"Reference MTZ '{ref_loaded.get('name')}' has no phase column (type 'P'); "
+                    "showing single-MTZ nodal surfaces."
+                )
 
-    het_active = bool(ref_field is not None and heterodyne_mode != "single")
-    eff_het_mode = str(heterodyne_mode or "delta").lower() if het_active else "single"
+    req_het = str(heterodyne_mode or "delta").lower()
+    if req_het == "auto":
+        req_het = infer_default_heterodyne_mode(primary.get("name"))
+    het_active = bool(ref_field is not None and req_het != "single")
+    eff_het_mode = req_het if het_active else "single"
     if eff_het_mode not in ("single", "delta", "product"):
-        eff_het_mode = "delta" if het_active else "single"
+        eff_het_mode = (
+            infer_default_heterodyne_mode(primary.get("name"))
+            if het_active
+            else "single"
+        )
 
     f_to_f0_scale = (
         compute_shared_scale_ratio(primary, ref_field)
@@ -910,8 +957,8 @@ def compute_nodal_surfaces_payload(
         else 1.0
     )
 
-    # Resolve ROI center & geometry in sample reciprocal space (A^-1)
-    r_mult = float(np.clip(roi_radius_mult, 1.0, 8.0))
+    # Resolve requested ROI center & geometry in sample reciprocal space (A^-1)
+    r_mult = float(np.clip(roi_radius_mult, 0.8, 8.0))
     roi_radius_g = min(g_max, r_mult * mean_g_star)
 
     mode_roi = str(roi_mode or "origin").lower()
@@ -922,17 +969,23 @@ def compute_nodal_surfaces_payload(
 
     if mode_roi == "peak" and roi_center_hkl is not None and len(roi_center_hkl) == 3:
         center_hkl = np.asarray(roi_center_hkl, dtype=np.float64)
+    elif (
+        mode_roi == "pan"
+        and roi_center_g_override is not None
+        and len(roi_center_g_override) == 3
+    ):
+        center_hkl = ub_inv @ np.asarray(roi_center_g_override, dtype=np.float64)
+    elif mode_roi == "pan" and roi_center_hkl is not None and len(roi_center_hkl) == 3:
+        center_hkl = np.asarray(roi_center_hkl, dtype=np.float64)
     elif mode_roi == "zone" and roi_zone_uvw is not None and len(roi_zone_uvw) == 3:
         uvw = np.asarray(roi_zone_uvw, dtype=np.float64)
-        # Direct-lattice zone axis in sample frame: t_sample = UB^(-T) * uvw
         t_sample = ub_inv_t @ uvw
         t_norm = float(np.linalg.norm(t_sample))
         if t_norm > 1e-8:
             slab_normal_g = t_sample / t_norm
             slab_offset_g = float(roi_zone_order) / t_norm
-            slab_half_thickness_g = max(0.55 * mean_g_star, 0.18 * roi_radius_g)
-            roi_radius_g = min(g_max, max(roi_radius_g, 1.45 * r_mult * mean_g_star))
-            # Center ROI on the closest point of the HOLZ plane G . n = slab_offset_g to the origin
+            slab_half_thickness_g = max(0.48 * mean_g_star, 0.20 * roi_radius_g)
+            roi_radius_g = min(g_max, max(roi_radius_g, 1.35 * r_mult * mean_g_star))
             center_g_zone = slab_offset_g * slab_normal_g
             center_hkl = ub_inv @ center_g_zone
         else:
@@ -942,102 +995,138 @@ def compute_nodal_surfaces_payload(
 
     roi_center_g = ub @ center_hkl
 
-    # Bounding box in fractional Miller space covering the Cartesian sphere |G - roi_center_g| <= roi_radius_g:
-    # For each Miller component d, max |delta h_d| = roi_radius_g * ||row_d(UB^-1)||_2
+    # Choose cached uncropped 3D spherical brick covering at least cache_radius_mult * mean_g_star:
+    # Keep brick anchored at origin (0,0,0) whenever the requested ROI fits inside the origin brick
+    # so switching Origin <-> Zone <-> nearby Peaks or dragging the slider hits the exact same brick!
+    brick_mult = max(float(cache_radius_mult), float(vortex_shell_mult), r_mult * 1.15)
+    brick_radius_g = min(g_max, brick_mult * mean_g_star)
+    dist_origin_g = float(np.linalg.norm(roi_center_g))
+    if dist_origin_g + roi_radius_g <= brick_radius_g * 0.96:
+        brick_center_hkl = np.zeros(3, dtype=np.float64)
+    else:
+        # Quantize off-origin brick center to integer Miller lattice so nearby pan/peak clicks share cache
+        brick_center_hkl = np.round(center_hkl).astype(np.float64)
+        # Ensure brick radius comfortably encloses (roi_center_g, roi_radius_g)
+        brick_center_try_g = ub @ brick_center_hkl
+        needed_r = (
+            float(np.linalg.norm(roi_center_g - brick_center_try_g))
+            + roi_radius_g * 1.08
+        )
+        brick_radius_g = max(brick_radius_g, min(g_max * 1.15, needed_r))
+
+    brick_center_g = ub @ brick_center_hkl
     ub_inv_row_norms = np.linalg.norm(ub_inv, axis=1)
-    half_span_hkl = np.maximum(roi_radius_g * ub_inv_row_norms * 1.04, 0.75)
-
-    # Keep Miller step <= 0.22 so Re=0 / Im=0 oscillations on scale Delta h ~ 1 are well-resolved,
-    # while capping grid dimension at 64 for sub-100ms response.
+    half_span_hkl = np.maximum(brick_radius_g * ub_inv_row_norms * 1.04, 0.85)
     max_span_h = float(np.max(2.0 * half_span_hkl))
-    n_grid_roi = int(
-        np.clip(max(int(roi_grid_size), math.ceil(max_span_h / 0.22)), 32, 64)
+    n_grid_brick = int(
+        np.clip(max(int(roi_grid_size), math.ceil(max_span_h / 0.24)), 30, 68)
     )
 
-    h0_roi = np.linspace(
-        center_hkl[0] - half_span_hkl[0],
-        center_hkl[0] + half_span_hkl[0],
-        n_grid_roi,
-    )
-    h1_roi = np.linspace(
-        center_hkl[1] - half_span_hkl[1],
-        center_hkl[1] + half_span_hkl[1],
-        n_grid_roi,
-    )
-    h2_roi = np.linspace(
-        center_hkl[2] - half_span_hkl[2],
-        center_hkl[2] + half_span_hkl[2],
-        n_grid_roi,
+    brick_cache_key = (
+        primary.get("path"),
+        primary.get("q75_f"),
+        ref_field.get("path") if ref_field is not None else None,
+        ref_field.get("q75_f") if ref_field is not None else None,
+        eff_het_mode,
+        round(float(f_to_f0_scale), 5),
+        round(float(g_max), 4),
+        tuple(np.round(ub.ravel(), 5).tolist()),
+        tuple(np.round(brick_center_hkl, 2).tolist()),
+        round(float(brick_radius_g), 4),
+        n_grid_brick,
     )
 
-    Z_roi = evaluate_combined_complex_grid(
-        primary,
-        h0_roi,
-        h1_roi,
-        h2_roi,
-        ref_field=ref_field,
-        heterodyne_mode=eff_het_mode,
-        f_to_f0_scale=f_to_f0_scale,
-    )
-    amp_roi = float(np.percentile(np.abs(Z_roi), 90.0)) if Z_roi.size > 0 else 0.0
-    is_real_only = bool(float(np.max(np.abs(Z_roi.imag))) <= 1e-4 * max(amp_roi, 1e-12))
+    cached_brick = _BRICK_PAYLOAD_CACHE.get(brick_cache_key)
+    if cached_brick is not None:
+        _BRICK_PAYLOAD_CACHE.move_to_end(brick_cache_key)
+        is_real_only = cached_brick["is_real_only"]
+        re_mesh = cached_brick["re_surface"]
+        im_mesh = cached_brick["im_surface"]
+        brick_vortices = cached_brick["brick_vortices"]
+    else:
+        h0_b = np.linspace(
+            brick_center_hkl[0] - half_span_hkl[0],
+            brick_center_hkl[0] + half_span_hkl[0],
+            n_grid_brick,
+        )
+        h1_b = np.linspace(
+            brick_center_hkl[1] - half_span_hkl[1],
+            brick_center_hkl[1] + half_span_hkl[1],
+            n_grid_brick,
+        )
+        h2_b = np.linspace(
+            brick_center_hkl[2] - half_span_hkl[2],
+            brick_center_hkl[2] + half_span_hkl[2],
+            n_grid_brick,
+        )
 
-    re_mesh = _extract_single_isosurface_mesh(
-        Z_roi.real,
-        amp_roi,
-        h0_roi,
-        h1_roi,
-        h2_roi,
-        ub,
-        ub_inv_t,
-        g_max=g_max,
-        roi_center_g=roi_center_g,
-        roi_radius_g=roi_radius_g,
-        slab_normal_g=slab_normal_g,
-        slab_offset_g=slab_offset_g,
-        slab_half_thickness_g=slab_half_thickness_g,
-    )
-    im_mesh = _extract_single_isosurface_mesh(
-        Z_roi.imag,
-        amp_roi,
-        h0_roi,
-        h1_roi,
-        h2_roi,
-        ub,
-        ub_inv_t,
-        g_max=g_max,
-        roi_center_g=roi_center_g,
-        roi_radius_g=roi_radius_g,
-        slab_normal_g=slab_normal_g,
-        slab_offset_g=slab_offset_g,
-        slab_half_thickness_g=slab_half_thickness_g,
-    )
+        Z_brick = evaluate_combined_complex_grid(
+            primary,
+            h0_b,
+            h1_b,
+            h2_b,
+            ref_field=ref_field,
+            heterodyne_mode=eff_het_mode,
+            f_to_f0_scale=f_to_f0_scale,
+        )
+        amp_brick = (
+            float(np.percentile(np.abs(Z_brick), 90.0)) if Z_brick.size > 0 else 0.0
+        )
+        is_real_only = bool(
+            float(np.max(np.abs(Z_brick.imag))) <= 1e-4 * max(amp_brick, 1e-12)
+        )
 
-    # Extract fine ROI 1D vortices (matching the 3D ROI surfaces)
-    roi_vortices = extract_vortex_polylines(
-        Z_roi,
-        h0_roi,
-        h1_roi,
-        h2_roi,
-        ub,
-        g_max=g_max,
-        roi_center_g=roi_center_g,
-        roi_radius_g=roi_radius_g,
-        slab_normal_g=slab_normal_g,
-        slab_offset_g=slab_offset_g,
-        slab_half_thickness_g=slab_half_thickness_g,
-        max_polylines=200,
-    )
+        # Extract uncropped spherical brick meshes (slab/ROI radius clipping happens live on client GPU!)
+        re_mesh = _extract_single_isosurface_mesh(
+            Z_brick.real,
+            amp_brick,
+            h0_b,
+            h1_b,
+            h2_b,
+            ub,
+            ub_inv_t,
+            g_max=g_max,
+            roi_center_g=brick_center_g,
+            roi_radius_g=brick_radius_g,
+        )
+        im_mesh = _extract_single_isosurface_mesh(
+            Z_brick.imag,
+            amp_brick,
+            h0_b,
+            h1_b,
+            h2_b,
+            ub,
+            ub_inv_t,
+            g_max=g_max,
+            roi_center_g=brick_center_g,
+            roi_radius_g=brick_radius_g,
+        )
+        brick_vortices = extract_vortex_polylines(
+            Z_brick,
+            h0_b,
+            h1_b,
+            h2_b,
+            ub,
+            g_max=g_max,
+            roi_center_g=brick_center_g,
+            roi_radius_g=brick_radius_g,
+            max_polylines=320,
+        )
+        _BRICK_PAYLOAD_CACHE[brick_cache_key] = {
+            "is_real_only": is_real_only,
+            "re_surface": re_mesh,
+            "im_surface": im_mesh,
+            "brick_vortices": brick_vortices,
+        }
+        while len(_BRICK_PAYLOAD_CACHE) > _MAX_BRICK_CACHE_ENTRIES:
+            _BRICK_PAYLOAD_CACHE.popitem(last=False)
 
-    # Also extract broader crystal-shell 1D vortices around origin for Wulff & Detector projections
+    # Also ensure origin-shell vortices are available when viewing an off-origin peak brick
     shell_radius_g = min(
-        g_max, max(roi_radius_g, float(vortex_shell_mult) * mean_g_star)
+        g_max, max(brick_radius_g, float(vortex_shell_mult) * mean_g_star)
     )
-    if (
-        mode_roi == "origin"
-        and abs(shell_radius_g - roi_radius_g) <= 0.15 * mean_g_star
-    ):
-        global_vortices = roi_vortices
+    if float(np.linalg.norm(brick_center_hkl)) < 1e-6:
+        global_vortices = brick_vortices
     else:
         v_cache_key = (
             primary.get("path"),
@@ -1056,10 +1145,10 @@ def compute_nodal_surfaces_payload(
                 np.clip(
                     max(
                         int(vortex_grid_size),
-                        math.ceil(float(np.max(2.0 * shell_half_hkl)) / 0.34),
+                        math.ceil(float(np.max(2.0 * shell_half_hkl)) / 0.30),
                     ),
                     34,
-                    54,
+                    58,
                 )
             )
             hv0 = np.linspace(-shell_half_hkl[0], shell_half_hkl[0], n_grid_v)
@@ -1083,7 +1172,7 @@ def compute_nodal_surfaces_payload(
                 g_max=shell_radius_g,
                 roi_center_g=np.zeros(3, dtype=np.float64),
                 roi_radius_g=shell_radius_g,
-                max_polylines=280,
+                max_polylines=320,
             )
             _GLOBAL_VORTEX_CACHE[v_cache_key] = global_vortices
             while len(_GLOBAL_VORTEX_CACHE) > _MAX_FIELD_CACHE_ENTRIES:
@@ -1114,6 +1203,13 @@ def compute_nodal_surfaces_payload(
         "formula_label": formula_label,
         "mean_g_star": round(mean_g_star, 6),
         "g_max": round(g_max, 5),
+        "brick": {
+            "center_hkl": [round(float(x), 3) for x in brick_center_hkl],
+            "center_g": [round(float(x), 5) for x in brick_center_g],
+            "radius_g": round(float(brick_radius_g), 5),
+            "radius_mult": round(float(brick_radius_g / max(mean_g_star, 1e-6)), 2),
+            "grid_size": n_grid_brick,
+        },
         "roi": {
             "mode": mode_roi,
             "center_hkl": [round(float(x), 3) for x in center_hkl],
@@ -1133,11 +1229,11 @@ def compute_nodal_surfaces_payload(
                 if slab_half_thickness_g is not None
                 else None
             ),
-            "grid_size": n_grid_roi,
+            "grid_size": n_grid_brick,
         },
         "re_surface": re_mesh,
         "im_surface": im_mesh,
-        "roi_vortices": roi_vortices,
+        "roi_vortices": brick_vortices,
         "vortices": global_vortices,
         "vortex_shell_radius_g": round(float(shell_radius_g), 5),
     }
@@ -1153,8 +1249,11 @@ def process_nodal_surfaces_api_request(
 ) -> tuple[dict[str, Any], int, str | None, str]:
     """Process a `POST /api/nodal_surfaces` request and return `(response_doc, status_code, next_ref_path, next_het_mode)`."""
     next_ref = ref_mtz_path
+    is_new_ref = False
     if req_json.get("clear_ref_mtz"):
         next_ref = None
+        if isinstance(payload, dict):
+            payload["ref_mtz_overlay_name"] = None
     elif req_json.get("ref_mtz_path"):
         cand_ref = str(req_json["ref_mtz_path"]).strip()
         if not os.path.isfile(cand_ref):
@@ -1164,11 +1263,20 @@ def process_nodal_surfaces_api_request(
                 next_ref,
                 heterodyne_mode,
             )
+        is_new_ref = cand_ref != ref_mtz_path
         next_ref = cand_ref
 
-    next_het = str(req_json.get("heterodyne_mode") or heterodyne_mode or "delta")
-    if next_het not in ("delta", "product", "single"):
-        next_het = "delta"
+    raw_req_het = req_json.get("heterodyne_mode")
+    if req_json.get("clear_ref_mtz") or not next_ref:
+        next_het = "single"
+    elif raw_req_het == "auto" or (is_new_ref and not raw_req_het):
+        next_het = infer_default_heterodyne_mode(
+            os.path.basename(mtz_path) if mtz_path else None
+        )
+    else:
+        next_het = str(raw_req_het or heterodyne_mode or "delta")
+        if next_het not in ("delta", "product", "single"):
+            next_het = "delta"
 
     if not mtz_path or not os.path.isfile(mtz_path):
         return (
@@ -1198,6 +1306,7 @@ def process_nodal_surfaces_api_request(
     roi_mode = str(req_json.get("roi_mode") or "origin")
     roi_radius_mult = float(req_json.get("roi_radius_mult") or 2.5)
     roi_center_hkl = req_json.get("roi_center_hkl")
+    roi_center_g = req_json.get("roi_center_g")
     roi_zone_uvw = req_json.get("roi_zone_uvw")
     roi_zone_order = int(req_json.get("roi_zone_order") or 0)
 
@@ -1209,6 +1318,7 @@ def process_nodal_surfaces_api_request(
         heterodyne_mode=next_het,
         roi_mode=roi_mode,
         roi_center_hkl=roi_center_hkl,
+        roi_center_g_override=roi_center_g,
         roi_zone_uvw=roi_zone_uvw,
         roi_zone_order=roi_zone_order,
         roi_radius_mult=roi_radius_mult,
@@ -1249,17 +1359,144 @@ def get_nodal_surfaces_js() -> str:
     let nodalData = deps.initialNodalData || null;
     let dataSeq = nodalData ? 1 : 0;
     let decodedCacheSig = "";
-    let decodedMeshes = { re: null, im: null };
+    let decodedMeshes = { re: null, im: null, vortex: null };
     let glCanvas = null;
     let gl = null;
     let glProg = null;
-    let glLineProg = null;
-    let glBufs = { re: null, im: null };
+    let glVortexProg = null;
+    let glBufs = { re: null, im: null, vortex: null };
     let glUnavailable = false;
     let last3DRenderSig = "";
     let screenPeakHits3D = [];
     let fetchInFlight = 0;
     let roiDebounceTimer = null;
+    let brickFetchInProgress = false;
+    const brickCache = new Map();
+    let lastSingleOriginData = (nodalData && nodalData.has_phases && !nodalData.ref_has_phases) ? nodalData : null;
+    let panCenterG = [0.0, 0.0, 0.0];
+    let animCenterG = [0.0, 0.0, 0.0];
+
+    function makeBrickKey(nd) {
+      if (!nd || !nd.has_phases) return "";
+      const bc = (nd.brick && Array.isArray(nd.brick.center_g))
+        ? nd.brick.center_g
+        : ((nd.roi && Array.isArray(nd.roi.center_g)) ? nd.roi.center_g : [0, 0, 0]);
+      const cKey = bc.map(v => Number(v || 0).toFixed(4)).join(",");
+      const refPart = nd.ref_has_phases ? (nd.ref_name || "ref") : "";
+      return `${nd.primary_name || ""}|${refPart}|${nd.heterodyne_mode || "single"}|${cKey}`;
+    }
+
+    function storeBrickInCache(nd) {
+      if (!nd || !nd.has_phases) return;
+      const key = makeBrickKey(nd);
+      if (key) {
+        if (brickCache.has(key)) brickCache.delete(key);
+        brickCache.set(key, nd);
+        while (brickCache.size > 14) {
+          const oldest = brickCache.keys().next().value;
+          brickCache.delete(oldest);
+        }
+      }
+      const bc = (nd.brick && Array.isArray(nd.brick.center_g)) ? nd.brick.center_g : [0, 0, 0];
+      if (!nd.ref_has_phases && Math.hypot(bc[0] || 0, bc[1] || 0, bc[2] || 0) < 1e-4) {
+        lastSingleOriginData = nd;
+      }
+    }
+
+    if (nodalData && nodalData.has_phases) {
+      storeBrickInCache(nodalData);
+    }
+
+    function computeMeanGStarFromUb(ub) {
+      if (!ub) return 0.04;
+      const a = Math.hypot(ub[0][0], ub[1][0], ub[2][0]);
+      const b = Math.hypot(ub[0][1], ub[1][1], ub[2][1]);
+      const c = Math.hypot(ub[0][2], ub[1][2], ub[2][2]);
+      return Math.max(1e-4, (a + b + c) / 3.0);
+    }
+
+    function resolveLiveRoi() {
+      const st = deps.state;
+      const ub = deps.getActiveUbMatrix();
+      const meanGStar = (nodalData && nodalData.brick && Number(nodalData.brick.mean_g_star) > 0)
+        ? Number(nodalData.brick.mean_g_star)
+        : ((nodalData && nodalData.roi && Number(nodalData.roi.mean_g_star) > 0)
+            ? Number(nodalData.roi.mean_g_star)
+            : computeMeanGStarFromUb(ub));
+      const mult = Math.max(0.6, Math.min(8.0, Number(st.nodalRoiRadiusMult) || 2.5));
+      const radiusG = Math.max(1e-4, mult * meanGStar);
+      const mode = st.nodalRoiMode || "origin";
+      let centerG = [0.0, 0.0, 0.0];
+      let slabActive = false;
+      let slabNormal = [0.0, 0.0, 1.0];
+      let slabOffset = 0.0;
+      let slabHalfThick = radiusG;
+      let zoneColor = "#38bdf8";
+      let zoneLabel = "";
+
+      if (mode === "peak") {
+        const sp = st.selectedPeakObj;
+        if (sp && Array.isArray(sp.hkl) && sp.hkl.length === 3 && ub) {
+          centerG = [
+            ub[0][0] * sp.hkl[0] + ub[0][1] * sp.hkl[1] + ub[0][2] * sp.hkl[2],
+            ub[1][0] * sp.hkl[0] + ub[1][1] * sp.hkl[1] + ub[1][2] * sp.hkl[2],
+            ub[2][0] * sp.hkl[0] + ub[2][1] * sp.hkl[1] + ub[2][2] * sp.hkl[2],
+          ];
+        } else if (nodalData && nodalData.roi && nodalData.roi.mode === "peak" && Array.isArray(nodalData.roi.center_g)) {
+          centerG = nodalData.roi.center_g.slice(0, 3);
+        }
+      } else if (mode === "pan") {
+        centerG = [panCenterG[0], panCenterG[1], panCenterG[2]];
+      } else if (mode === "zone") {
+        const actZones = deps.getActiveZoneObjects() || [];
+        const selZone = actZones.find(z => z.zone_id === st.selectedZoneId) || actZones[0] || null;
+        if (selZone && Array.isArray(selZone.uvw) && selZone.uvw.length === 3 && ub) {
+          const invUb = deps.mat3Inv(ub);
+          if (invUb) {
+            const u = selZone.uvw[0], v = selZone.uvw[1], ww = selZone.uvw[2];
+            const tx = invUb[0][0] * u + invUb[1][0] * v + invUb[2][0] * ww;
+            const ty = invUb[0][1] * u + invUb[1][1] * v + invUb[2][1] * ww;
+            const tz = invUb[0][2] * u + invUb[1][2] * v + invUb[2][2] * ww;
+            const tn = Math.hypot(tx, ty, tz);
+            if (tn > 1e-8) {
+              slabNormal = [tx / tn, ty / tn, tz / tn];
+              slabActive = true;
+              slabOffset = 0.0;
+              slabHalfThick = Math.max(0.38 * meanGStar, 0.22 * radiusG);
+              zoneColor = selZone.rainbow_color || "#38bdf8";
+              zoneLabel = selZone.label || `[${u} ${v} ${ww}]`;
+            }
+          }
+        }
+      }
+
+      return {
+        mode,
+        centerG,
+        radiusG,
+        meanGStar,
+        mult,
+        slabActive,
+        slabNormal,
+        slabOffset,
+        slabHalfThick,
+        zoneColor,
+        zoneLabel,
+      };
+    }
+
+    function pointInsideLiveRoi(pt, liveRoi) {
+      if (!liveRoi) return true;
+      const dx = pt[0] - liveRoi.centerG[0];
+      const dy = pt[1] - liveRoi.centerG[1];
+      const dz = pt[2] - liveRoi.centerG[2];
+      if (dx * dx + dy * dy + dz * dz > liveRoi.radiusG * liveRoi.radiusG) return false;
+      if (liveRoi.slabActive) {
+        const d = pt[0] * liveRoi.slabNormal[0] + pt[1] * liveRoi.slabNormal[1] + pt[2] * liveRoi.slabNormal[2] - liveRoi.slabOffset;
+        if (Math.abs(d) > liveRoi.slabHalfThick) return false;
+      }
+      return true;
+    }
 
     function decodeBase64Float32(b64) {
       if (!b64 || typeof b64 !== "string") return new Float32Array(0);
@@ -1295,28 +1532,74 @@ def get_nodal_surfaces_js() -> str:
       };
     }
 
+    function decodeVortexRibbonGeometry(vList) {
+      if (!Array.isArray(vList) || vList.length === 0) {
+        return { nSegs: 0, pos0: new Float32Array(0), pos1: new Float32Array(0), side: new Float32Array(0), indices: new Uint32Array(0) };
+      }
+      let nSegs = 0;
+      for (let vi = 0; vi < vList.length; vi++) {
+        const pts = vList[vi] && vList[vi].pts_g;
+        if (Array.isArray(pts) && pts.length >= 2) nSegs += (pts.length - 1);
+      }
+      if (nSegs === 0) {
+        return { nSegs: 0, pos0: new Float32Array(0), pos1: new Float32Array(0), side: new Float32Array(0), indices: new Uint32Array(0) };
+      }
+      const pos0 = new Float32Array(nSegs * 4 * 3);
+      const pos1 = new Float32Array(nSegs * 4 * 3);
+      const side = new Float32Array(nSegs * 4 * 2);
+      const indices = new Uint32Array(nSegs * 6);
+      const sideTemplate = [0.0, -1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0];
+      let sIdx = 0;
+      for (let vi = 0; vi < vList.length; vi++) {
+        const pts = vList[vi] && vList[vi].pts_g;
+        if (!Array.isArray(pts) || pts.length < 2) continue;
+        for (let i = 0; i < pts.length - 1; i++) {
+          const a = pts[i], b = pts[i + 1];
+          const vBase = sIdx * 4;
+          for (let k = 0; k < 4; k++) {
+            const pOff = (vBase + k) * 3;
+            pos0[pOff] = a[0]; pos0[pOff + 1] = a[1]; pos0[pOff + 2] = a[2];
+            pos1[pOff] = b[0]; pos1[pOff + 1] = b[1]; pos1[pOff + 2] = b[2];
+            const sOff = (vBase + k) * 2;
+            side[sOff] = sideTemplate[2 * k];
+            side[sOff + 1] = sideTemplate[2 * k + 1];
+          }
+          const iOff = sIdx * 6;
+          indices[iOff] = vBase;
+          indices[iOff + 1] = vBase + 1;
+          indices[iOff + 2] = vBase + 2;
+          indices[iOff + 3] = vBase;
+          indices[iOff + 4] = vBase + 2;
+          indices[iOff + 5] = vBase + 3;
+          sIdx++;
+        }
+      }
+      return { nSegs, pos0, pos1, side, indices };
+    }
+
     function ensureDecodedMeshes() {
       if (!nodalData || !nodalData.has_phases) {
-        decodedMeshes = { re: null, im: null };
+        decodedMeshes = { re: null, im: null, vortex: null };
         decodedCacheSig = "";
         return decodedMeshes;
       }
       const reM = nodalData.re_surface || {};
       const imM = nodalData.im_surface || {};
+      const vList = nodalData.vortices || nodalData.roi_vortices || [];
       const sig = [
-        nodalData.primary_name || "",
-        nodalData.ref_name || "",
-        nodalData.heterodyne_mode || "",
+        makeBrickKey(nodalData),
         reM.n_tris || 0,
         (reM.verts_b64 || "").slice(0, 24),
         imM.n_tris || 0,
         (imM.verts_b64 || "").slice(0, 24),
+        vList.length,
       ].join("|");
       if (sig === decodedCacheSig) return decodedMeshes;
       decodedCacheSig = sig;
       decodedMeshes = {
         re: decodeSingleMesh(reM),
         im: decodeSingleMesh(imM),
+        vortex: decodeVortexRibbonGeometry(vList),
       };
       uploadGlMeshes();
       last3DRenderSig = "";
@@ -1340,6 +1623,29 @@ def get_nodal_surfaces_js() -> str:
         }
         gl.getExtension("OES_element_index_uint");
 
+        function compileShader(type, src) {
+          const sh = gl.createShader(type);
+          gl.shaderSource(sh, src);
+          gl.compileShader(sh);
+          if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+            gl.deleteShader(sh);
+            return null;
+          }
+          return sh;
+        }
+
+        function linkProgram(vsSrc, fsSrc) {
+          const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+          const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+          if (!vs || !fs) return null;
+          const p = gl.createProgram();
+          gl.attachShader(p, vs);
+          gl.attachShader(p, fs);
+          gl.linkProgram(p);
+          if (!gl.getProgramParameter(p, gl.LINK_STATUS)) return null;
+          return p;
+        }
+
         const vsSrc = [
           "attribute vec3 aPos;",
           "attribute vec3 aNorm;",
@@ -1350,7 +1656,7 @@ def get_nodal_surfaces_js() -> str:
           "uniform float uAspectY;",
           "uniform float uCamDist;",
           "varying vec3 vNorm;",
-          "varying vec3 vViewPos;",
+          "varying vec3 vSamplePos;",
           "void main() {",
           "  vec3 p = uRot * ((aPos - uCenter) * uInvScale);",
           "  vec3 n = normalize(uRot * aNorm);",
@@ -1361,7 +1667,7 @@ def get_nodal_surfaces_js() -> str:
           "  float clipY = p.y * persp * uAspectY;",
           "  float clipZ = clamp(-p.z * 0.45, -0.98, 0.98);",
           "  vNorm = n;",
-          "  vViewPos = p;",
+          "  vSamplePos = aPos;",
           "  gl_Position = vec4(clipX, clipY, clipZ, 1.0);",
           "}",
         ].join("\n");
@@ -1369,9 +1675,20 @@ def get_nodal_surfaces_js() -> str:
         const fsSrc = [
           "precision mediump float;",
           "uniform vec4 uColor;",
+          "uniform vec3 uClipCenter;",
+          "uniform float uClipRadius;",
+          "uniform float uSlabActive;",
+          "uniform vec3 uSlabNormal;",
+          "uniform float uSlabOffset;",
+          "uniform float uSlabHalfThick;",
           "varying vec3 vNorm;",
-          "varying vec3 vViewPos;",
+          "varying vec3 vSamplePos;",
           "void main() {",
+          "  vec3 dRoi = vSamplePos - uClipCenter;",
+          "  if (dot(dRoi, dRoi) > uClipRadius * uClipRadius) discard;",
+          "  if (uSlabActive > 0.5) {",
+          "    if (abs(dot(vSamplePos, uSlabNormal) - uSlabOffset) > uSlabHalfThick) discard;",
+          "  }",
           "  vec3 N = normalize(vNorm);",
           "  if (!gl_FrontFacing) N = -N;",
           "  vec3 L1 = normalize(vec3(-0.38, 0.52, 0.76));",
@@ -1386,28 +1703,8 @@ def get_nodal_surfaces_js() -> str:
           "}",
         ].join("\n");
 
-        function compileShader(type, src) {
-          const sh = gl.createShader(type);
-          gl.shaderSource(sh, src);
-          gl.compileShader(sh);
-          if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-            gl.deleteShader(sh);
-            return null;
-          }
-          return sh;
-        }
-        const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
-        const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
-        if (!vs || !fs) {
-          glUnavailable = true;
-          gl = null;
-          return null;
-        }
-        const prog = gl.createProgram();
-        gl.attachShader(prog, vs);
-        gl.attachShader(prog, fs);
-        gl.linkProgram(prog);
-        if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        const prog = linkProgram(vsSrc, fsSrc);
+        if (!prog) {
           glUnavailable = true;
           gl = null;
           return null;
@@ -1423,7 +1720,101 @@ def get_nodal_surfaces_js() -> str:
           uAspectY: gl.getUniformLocation(prog, "uAspectY"),
           uCamDist: gl.getUniformLocation(prog, "uCamDist"),
           uColor: gl.getUniformLocation(prog, "uColor"),
+          uClipCenter: gl.getUniformLocation(prog, "uClipCenter"),
+          uClipRadius: gl.getUniformLocation(prog, "uClipRadius"),
+          uSlabActive: gl.getUniformLocation(prog, "uSlabActive"),
+          uSlabNormal: gl.getUniformLocation(prog, "uSlabNormal"),
+          uSlabOffset: gl.getUniformLocation(prog, "uSlabOffset"),
+          uSlabHalfThick: gl.getUniformLocation(prog, "uSlabHalfThick"),
         };
+
+        const vsVortexSrc = [
+          "attribute vec3 aPos0;",
+          "attribute vec3 aPos1;",
+          "attribute vec2 aSide;",
+          "uniform mat3 uRot;",
+          "uniform vec3 uCenter;",
+          "uniform float uInvScale;",
+          "uniform float uAspectX;",
+          "uniform float uAspectY;",
+          "uniform float uCamDist;",
+          "uniform vec2 uViewportPx;",
+          "uniform float uHalfWidthPx;",
+          "varying vec3 vSamplePos;",
+          "varying float vEdge;",
+          "vec3 projPt(vec3 g) {",
+          "  vec3 p = uRot * ((g - uCenter) * uInvScale);",
+          "  float dist = max(0.35, uCamDist - p.z);",
+          "  float kD = sqrt(uCamDist * uCamDist - 1.0);",
+          "  float persp = kD / dist;",
+          "  return vec3(p.x * persp * uAspectX, p.y * persp * uAspectY, clamp(-p.z * 0.45 - 0.004, -0.99, 0.99));",
+          "}",
+          "void main() {",
+          "  vec3 c0 = projPt(aPos0);",
+          "  vec3 c1 = projPt(aPos1);",
+          "  vec2 dPx = (c1.xy - c0.xy) * 0.5 * uViewportPx;",
+          "  float dLen = length(dPx);",
+          "  vec2 dir = dLen > 1e-3 ? (dPx / dLen) : vec2(1.0, 0.0);",
+          "  vec2 perp = vec2(-dir.y, dir.x);",
+          "  vec3 baseC = mix(c0, c1, aSide.x);",
+          "  vec2 offClip = (perp * (aSide.y * uHalfWidthPx) + dir * ((aSide.x - 0.5) * 1.2)) * (2.0 / uViewportPx);",
+          "  vSamplePos = mix(aPos0, aPos1, aSide.x);",
+          "  vEdge = aSide.y;",
+          "  gl_Position = vec4(baseC.xy + offClip, baseC.z, 1.0);",
+          "}",
+        ].join("\n");
+
+        const fsVortexSrc = [
+          "precision mediump float;",
+          "uniform vec3 uClipCenter;",
+          "uniform float uClipRadius;",
+          "uniform float uSlabActive;",
+          "uniform vec3 uSlabNormal;",
+          "uniform float uSlabOffset;",
+          "uniform float uSlabHalfThick;",
+          "varying vec3 vSamplePos;",
+          "varying float vEdge;",
+          "void main() {",
+          "  vec3 dRoi = vSamplePos - uClipCenter;",
+          "  if (dot(dRoi, dRoi) > uClipRadius * uClipRadius) discard;",
+          "  if (uSlabActive > 0.5) {",
+          "    if (abs(dot(vSamplePos, uSlabNormal) - uSlabOffset) > uSlabHalfThick) discard;",
+          "  }",
+          "  float ae = abs(vEdge);",
+          "  if (ae > 0.98) discard;",
+          "  vec3 core = vec3(0.992, 0.878, 0.278);",
+          "  vec3 halo = vec3(0.027, 0.035, 0.075);",
+          "  float t = smoothstep(0.48, 0.72, ae);",
+          "  vec3 rgb = mix(core, halo, t);",
+          "  float alpha = 1.0 - smoothstep(0.84, 0.98, ae);",
+          "  gl_FragColor = vec4(rgb, alpha);",
+          "}",
+        ].join("\n");
+
+        const vProg = linkProgram(vsVortexSrc, fsVortexSrc);
+        if (vProg) {
+          glVortexProg = {
+            prog: vProg,
+            aPos0: gl.getAttribLocation(vProg, "aPos0"),
+            aPos1: gl.getAttribLocation(vProg, "aPos1"),
+            aSide: gl.getAttribLocation(vProg, "aSide"),
+            uRot: gl.getUniformLocation(vProg, "uRot"),
+            uCenter: gl.getUniformLocation(vProg, "uCenter"),
+            uInvScale: gl.getUniformLocation(vProg, "uInvScale"),
+            uAspectX: gl.getUniformLocation(vProg, "uAspectX"),
+            uAspectY: gl.getUniformLocation(vProg, "uAspectY"),
+            uCamDist: gl.getUniformLocation(vProg, "uCamDist"),
+            uViewportPx: gl.getUniformLocation(vProg, "uViewportPx"),
+            uHalfWidthPx: gl.getUniformLocation(vProg, "uHalfWidthPx"),
+            uClipCenter: gl.getUniformLocation(vProg, "uClipCenter"),
+            uClipRadius: gl.getUniformLocation(vProg, "uClipRadius"),
+            uSlabActive: gl.getUniformLocation(vProg, "uSlabActive"),
+            uSlabNormal: gl.getUniformLocation(vProg, "uSlabNormal"),
+            uSlabOffset: gl.getUniformLocation(vProg, "uSlabOffset"),
+            uSlabHalfThick: gl.getUniformLocation(vProg, "uSlabHalfThick"),
+          };
+        }
+
         uploadGlMeshes();
         return gl;
       } catch (_err) {
@@ -1447,10 +1838,30 @@ def get_nodal_surfaces_js() -> str:
       return { vbo, nbo, ibo, count: m.faces.length, indexType: gl.UNSIGNED_INT };
     }
 
+    function uploadGlVortexRibbon(vr) {
+      if (!gl || !glVortexProg || !vr || !vr.nSegs) return null;
+      const b0 = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, b0);
+      gl.bufferData(gl.ARRAY_BUFFER, vr.pos0, gl.STATIC_DRAW);
+      const b1 = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, b1);
+      gl.bufferData(gl.ARRAY_BUFFER, vr.pos1, gl.STATIC_DRAW);
+      const bSide = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, bSide);
+      gl.bufferData(gl.ARRAY_BUFFER, vr.side, gl.STATIC_DRAW);
+      const ibo = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, vr.indices, gl.STATIC_DRAW);
+      return { b0, b1, bSide, ibo, count: vr.indices.length, indexType: gl.UNSIGNED_INT };
+    }
+
     function disposeGlMesh(b) {
       if (!gl || !b) return;
       if (b.vbo) gl.deleteBuffer(b.vbo);
       if (b.nbo) gl.deleteBuffer(b.nbo);
+      if (b.b0) gl.deleteBuffer(b.b0);
+      if (b.b1) gl.deleteBuffer(b.b1);
+      if (b.bSide) gl.deleteBuffer(b.bSide);
       if (b.ibo) gl.deleteBuffer(b.ibo);
     }
 
@@ -1458,8 +1869,10 @@ def get_nodal_surfaces_js() -> str:
       if (!gl || !glProg) return;
       disposeGlMesh(glBufs.re);
       disposeGlMesh(glBufs.im);
+      disposeGlMesh(glBufs.vortex);
       glBufs.re = decodedMeshes.re ? uploadGlSingleMesh(decodedMeshes.re) : null;
       glBufs.im = decodedMeshes.im ? uploadGlSingleMesh(decodedMeshes.im) : null;
+      glBufs.vortex = decodedMeshes.vortex ? uploadGlVortexRibbon(decodedMeshes.vortex) : null;
     }
 
     // Camera matrix matching projectToWulff right-handed SO(3) lab camera coupled with R_gonio
@@ -1469,10 +1882,6 @@ def get_nodal_surfaces_js() -> str:
       const pitchRad = (st.wulffPitchDeg || 0.0) * Math.PI / 180.0;
       const cy = Math.cos(yawRad), sy = Math.sin(yawRad);
       const cp = Math.cos(pitchRad), sp = Math.sin(pitchRad);
-      // R_cam * vLab:
-      // xCam = cy * vx - sy * vz
-      // yCam = sp * sy * vx + cp * vy + sp * cy * vz
-      // zCam = cp * sy * vx + sp * vy + cp * cy * vz  (note projectToWulff: y1=vy, z1=vx*sy+vz*cy; yCam=y1*cp-z1*sp; zCam=y1*sp+z1*cp)
       const Rc = [
         [cy, 0.0, -sy],
         [-sp * sy, cp, -sp * cy],
@@ -1482,24 +1891,17 @@ def get_nodal_surfaces_js() -> str:
       return Rtot;
     }
 
-    function get3DSceneBounds() {
+    function get3DSceneBounds(liveRoi) {
       const st = deps.state;
       const invDmin = 1.0 / Math.max(0.4, Number(st.dMin) || 1.5);
-      if (nodalData && nodalData.has_phases && nodalData.roi && st.nodalLockCameraToRoi) {
-        const c = nodalData.roi.center_g || [0, 0, 0];
-        const r = Math.max(0.01, Number(nodalData.roi.radius_g) || invDmin * 0.35);
-        return { center: c, radius: r, invDmin };
-      }
-      if (nodalData && nodalData.has_phases && nodalData.roi && st.nodalRoiMode === "peak" && nodalData.roi.mode === "peak") {
-        const c = nodalData.roi.center_g || [0, 0, 0];
-        const r = Math.max(0.01, Number(nodalData.roi.radius_g) || invDmin * 0.35);
-        return { center: c, radius: r * 1.15, invDmin };
-      }
-      // Default centered at origin, scaled comfortably so ROI + Bragg peaks are legible; zoomable up to 20x
-      const defaultR = (nodalData && nodalData.has_phases && nodalData.roi && Number(nodalData.roi.radius_g) > 0)
-        ? Math.min(invDmin, Math.max(Number(nodalData.roi.radius_g) * 1.35, invDmin * 0.32))
+      const roi = liveRoi || resolveLiveRoi();
+      // Anchor default scene radius to crystal reciprocal lattice scale (~3.5× mean a⋆),
+      // independent of the ROI slider so dragging the slider visibly grows/shrinks the ROI!
+      const latticeScaleR = Math.min(invDmin, Math.max(0.015, roi.meanGStar * 3.5));
+      const radius = nodalData && nodalData.has_phases
+        ? Math.max(latticeScaleR, roi.radiusG * 1.12)
         : invDmin;
-      return { center: [0.0, 0.0, 0.0], radius: Math.max(0.01, defaultR), invDmin };
+      return { center: [animCenterG[0], animCenterG[1], animCenterG[2]], radius: Math.max(0.008, radius), invDmin };
     }
 
     function projectPoint3D(gSample, Rtot, center, invScale, cx, cy, Rpx, zoom) {
@@ -1517,18 +1919,18 @@ def get_nodal_surfaces_js() -> str:
       return [cx + px * persp * scale, cy - py * persp * scale, pz, (D - 0.2) / dist];
     }
 
-    function renderSurfacesWebGLOrFallback(ctx, w, h, dpr, Rtot, center, invScale, Rpx, zoom) {
+    function renderSurfacesAndVortices3D(ctx, w, h, dpr, Rtot, center, invScale, Rpx, zoom, liveRoi, isExp) {
       const st = deps.state;
       if (!nodalData || !nodalData.has_phases) return;
-      if (!st.showNodalSurfacesRe && !st.showNodalSurfacesIm) return;
       ensureDecodedMeshes();
       const hasRe = st.showNodalSurfacesRe && decodedMeshes.re && decodedMeshes.re.nTris > 0;
       const hasIm = st.showNodalSurfacesIm && decodedMeshes.im && decodedMeshes.im.nTris > 0;
-      if (!hasRe && !hasIm) return;
+      const hasVor = st.showPhaseVortices && decodedMeshes.vortex && decodedMeshes.vortex.nSegs > 0;
+      if (!hasRe && !hasIm && !hasVor) return;
 
       const surfAlpha = Math.max(0.12, Math.min(0.92, Number(st.nodalSurfaceAlpha) || 0.56));
       const glCtx = initWebGLOverlay();
-      if (glCtx && glProg && (glBufs.re || glBufs.im)) {
+      if (glCtx && glProg && (glBufs.re || glBufs.im || glBufs.vortex)) {
         const tw = Math.max(1, Math.round(w * dpr));
         const th = Math.max(1, Math.round(h * dpr));
         if (glCanvas.width !== tw || glCanvas.height !== th) {
@@ -1546,60 +1948,107 @@ def get_nodal_surfaces_js() -> str:
           glCtx.ONE, glCtx.ONE_MINUS_SRC_ALPHA
         );
 
-        glCtx.useProgram(glProg.prog);
-        // Column-major 3x3 rotation matrix for GLSL
         const rotColMajor = new Float32Array([
           Rtot[0][0], Rtot[1][0], Rtot[2][0],
           Rtot[0][1], Rtot[1][1], Rtot[2][1],
           Rtot[0][2], Rtot[1][2], Rtot[2][2],
         ]);
-        glCtx.uniformMatrix3fv(glProg.uRot, false, rotColMajor);
-        glCtx.uniform3f(glProg.uCenter, center[0], center[1], center[2]);
-        glCtx.uniform1f(glProg.uInvScale, invScale);
         const scalePx = Rpx * zoom;
-        glCtx.uniform1f(glProg.uAspectX, scalePx / (0.5 * w));
-        glCtx.uniform1f(glProg.uAspectY, scalePx / (0.5 * h));
-        glCtx.uniform1f(glProg.uCamDist, 2.8);
+        const aspectX = scalePx / (0.5 * w);
+        const aspectY = scalePx / (0.5 * h);
 
-        function drawPass(buf, rgba, cullFaceMode, depthMask) {
-          if (!buf) return;
-          glCtx.depthMask(depthMask);
-          if (cullFaceMode) {
-            glCtx.enable(glCtx.CULL_FACE);
-            glCtx.cullFace(cullFaceMode);
-          } else {
-            glCtx.disable(glCtx.CULL_FACE);
+        if ((hasRe && glBufs.re) || (hasIm && glBufs.im)) {
+          glCtx.useProgram(glProg.prog);
+          glCtx.uniformMatrix3fv(glProg.uRot, false, rotColMajor);
+          glCtx.uniform3f(glProg.uCenter, center[0], center[1], center[2]);
+          glCtx.uniform1f(glProg.uInvScale, invScale);
+          glCtx.uniform1f(glProg.uAspectX, aspectX);
+          glCtx.uniform1f(glProg.uAspectY, aspectY);
+          glCtx.uniform1f(glProg.uCamDist, 2.8);
+          glCtx.uniform3f(glProg.uClipCenter, liveRoi.centerG[0], liveRoi.centerG[1], liveRoi.centerG[2]);
+          glCtx.uniform1f(glProg.uClipRadius, liveRoi.radiusG);
+          glCtx.uniform1f(glProg.uSlabActive, liveRoi.slabActive ? 1.0 : 0.0);
+          glCtx.uniform3f(glProg.uSlabNormal, liveRoi.slabNormal[0], liveRoi.slabNormal[1], liveRoi.slabNormal[2]);
+          glCtx.uniform1f(glProg.uSlabOffset, liveRoi.slabOffset);
+          glCtx.uniform1f(glProg.uSlabHalfThick, liveRoi.slabHalfThick);
+
+          function drawPass(buf, rgba, cullFaceMode, depthMask) {
+            if (!buf) return;
+            glCtx.depthMask(depthMask);
+            if (cullFaceMode) {
+              glCtx.enable(glCtx.CULL_FACE);
+              glCtx.cullFace(cullFaceMode);
+            } else {
+              glCtx.disable(glCtx.CULL_FACE);
+            }
+            glCtx.uniform4f(glProg.uColor, rgba[0], rgba[1], rgba[2], rgba[3]);
+            glCtx.bindBuffer(glCtx.ARRAY_BUFFER, buf.vbo);
+            glCtx.enableVertexAttribArray(glProg.aPos);
+            glCtx.vertexAttribPointer(glProg.aPos, 3, glCtx.FLOAT, false, 0, 0);
+            glCtx.bindBuffer(glCtx.ARRAY_BUFFER, buf.nbo);
+            glCtx.enableVertexAttribArray(glProg.aNorm);
+            glCtx.vertexAttribPointer(glProg.aNorm, 3, glCtx.FLOAT, false, 0, 0);
+            glCtx.bindBuffer(glCtx.ELEMENT_ARRAY_BUFFER, buf.ibo);
+            glCtx.drawElements(glCtx.TRIANGLES, buf.count, buf.indexType, 0);
           }
-          glCtx.uniform4f(glProg.uColor, rgba[0], rgba[1], rgba[2], rgba[3]);
-          glCtx.bindBuffer(glCtx.ARRAY_BUFFER, buf.vbo);
-          glCtx.enableVertexAttribArray(glProg.aPos);
-          glCtx.vertexAttribPointer(glProg.aPos, 3, glCtx.FLOAT, false, 0, 0);
-          glCtx.bindBuffer(glCtx.ARRAY_BUFFER, buf.nbo);
-          glCtx.enableVertexAttribArray(glProg.aNorm);
-          glCtx.vertexAttribPointer(glProg.aNorm, 3, glCtx.FLOAT, false, 0, 0);
-          glCtx.bindBuffer(glCtx.ELEMENT_ARRAY_BUFFER, buf.ibo);
-          glCtx.drawElements(glCtx.TRIANGLES, buf.count, buf.indexType, 0);
+
+          const colRe = [0.06, 0.78, 0.92, surfAlpha];
+          const colIm = [0.96, 0.30, 0.48, surfAlpha];
+          if (hasRe && glBufs.re) drawPass(glBufs.re, [colRe[0], colRe[1], colRe[2], surfAlpha * 0.78], glCtx.FRONT, true);
+          if (hasIm && glBufs.im) drawPass(glBufs.im, [colIm[0], colIm[1], colIm[2], surfAlpha * 0.78], glCtx.FRONT, true);
+          if (hasRe && glBufs.re) drawPass(glBufs.re, colRe, glCtx.BACK, false);
+          if (hasIm && glBufs.im) drawPass(glBufs.im, colIm, glCtx.BACK, false);
+          glCtx.disableVertexAttribArray(glProg.aPos);
+          glCtx.disableVertexAttribArray(glProg.aNorm);
         }
 
-        // Cyan Re(Z)=0 and Coral-Rose Im(Z)=0:
-        // Depth-prepass with subtle alpha + two-sided back-then-front blending for clean sheet intersections
-        const colRe = [0.06, 0.78, 0.92, surfAlpha];
-        const colIm = [0.96, 0.30, 0.48, surfAlpha];
-        if (hasRe && glBufs.re) drawPass(glBufs.re, [colRe[0], colRe[1], colRe[2], surfAlpha * 0.78], glCtx.FRONT, true);
-        if (hasIm && glBufs.im) drawPass(glBufs.im, [colIm[0], colIm[1], colIm[2], surfAlpha * 0.78], glCtx.FRONT, true);
-        if (hasRe && glBufs.re) drawPass(glBufs.re, colRe, glCtx.BACK, false);
-        if (hasIm && glBufs.im) drawPass(glBufs.im, colIm, glCtx.BACK, false);
+        // Depth-buffered 3D 1D phase-vortex ribbons sharing the surface depth buffer!
+        if (hasVor && glVortexProg && glBufs.vortex) {
+          glCtx.depthMask(true);
+          glCtx.disable(glCtx.CULL_FACE);
+          glCtx.useProgram(glVortexProg.prog);
+          glCtx.uniformMatrix3fv(glVortexProg.uRot, false, rotColMajor);
+          glCtx.uniform3f(glVortexProg.uCenter, center[0], center[1], center[2]);
+          glCtx.uniform1f(glVortexProg.uInvScale, invScale);
+          glCtx.uniform1f(glVortexProg.uAspectX, aspectX);
+          glCtx.uniform1f(glVortexProg.uAspectY, aspectY);
+          glCtx.uniform1f(glVortexProg.uCamDist, 2.8);
+          glCtx.uniform2f(glVortexProg.uViewportPx, tw, th);
+          glCtx.uniform1f(glVortexProg.uHalfWidthPx, (isExp ? 2.5 : 1.95) * dpr);
+          glCtx.uniform3f(glVortexProg.uClipCenter, liveRoi.centerG[0], liveRoi.centerG[1], liveRoi.centerG[2]);
+          glCtx.uniform1f(glVortexProg.uClipRadius, liveRoi.radiusG);
+          glCtx.uniform1f(glVortexProg.uSlabActive, liveRoi.slabActive ? 1.0 : 0.0);
+          glCtx.uniform3f(glVortexProg.uSlabNormal, liveRoi.slabNormal[0], liveRoi.slabNormal[1], liveRoi.slabNormal[2]);
+          glCtx.uniform1f(glVortexProg.uSlabOffset, liveRoi.slabOffset);
+          glCtx.uniform1f(glVortexProg.uSlabHalfThick, liveRoi.slabHalfThick);
+
+          const vb = glBufs.vortex;
+          glCtx.bindBuffer(glCtx.ARRAY_BUFFER, vb.b0);
+          glCtx.enableVertexAttribArray(glVortexProg.aPos0);
+          glCtx.vertexAttribPointer(glVortexProg.aPos0, 3, glCtx.FLOAT, false, 0, 0);
+          glCtx.bindBuffer(glCtx.ARRAY_BUFFER, vb.b1);
+          glCtx.enableVertexAttribArray(glVortexProg.aPos1);
+          glCtx.vertexAttribPointer(glVortexProg.aPos1, 3, glCtx.FLOAT, false, 0, 0);
+          glCtx.bindBuffer(glCtx.ARRAY_BUFFER, vb.bSide);
+          glCtx.enableVertexAttribArray(glVortexProg.aSide);
+          glCtx.vertexAttribPointer(glVortexProg.aSide, 2, glCtx.FLOAT, false, 0, 0);
+          glCtx.bindBuffer(glCtx.ELEMENT_ARRAY_BUFFER, vb.ibo);
+          glCtx.drawElements(glCtx.TRIANGLES, vb.count, vb.indexType, 0);
+          glCtx.disableVertexAttribArray(glVortexProg.aPos0);
+          glCtx.disableVertexAttribArray(glVortexProg.aPos1);
+          glCtx.disableVertexAttribArray(glVortexProg.aSide);
+        }
+
         glCtx.depthMask(true);
         glCtx.disable(glCtx.CULL_FACE);
-
         ctx.save();
         ctx.drawImage(glCanvas, 0, 0, w, h);
         ctx.restore();
         return;
       }
 
-      // Software Canvas2D depth-sorted painter's fallback (used in headless / non-WebGL environments)
-      const tris = [];
+      // Software Canvas2D depth-sorted fallback (used in headless / non-WebGL environments)
+      const items = [];
       const cx = w * 0.5, cy = h * 0.5;
       function collectSoftwareTris(mesh, baseRgb) {
         if (!mesh || !mesh.nTris) return;
@@ -1607,6 +2056,8 @@ def get_nodal_surfaces_js() -> str:
         const v = mesh.verts, n = mesh.norms, f = mesh.faces;
         for (let t = 0; t < mesh.nTris; t += stride) {
           const i0 = f[3 * t] * 3, i1 = f[3 * t + 1] * 3, i2 = f[3 * t + 2] * 3;
+          const mPt = [(v[i0] + v[i1] + v[i2]) / 3.0, (v[i0 + 1] + v[i1 + 1] + v[i2 + 1]) / 3.0, (v[i0 + 2] + v[i1 + 2] + v[i2 + 2]) / 3.0];
+          if (!pointInsideLiveRoi(mPt, liveRoi)) continue;
           const p0 = projectPoint3D([v[i0], v[i0 + 1], v[i0 + 2]], Rtot, center, invScale, cx, cy, Rpx, zoom);
           const p1 = projectPoint3D([v[i1], v[i1 + 1], v[i1 + 2]], Rtot, center, invScale, cx, cy, Rpx, zoom);
           const p2 = projectPoint3D([v[i2], v[i2 + 1], v[i2 + 2]], Rtot, center, invScale, cx, cy, Rpx, zoom);
@@ -1614,7 +2065,8 @@ def get_nodal_surfaces_js() -> str:
           const ny = Rtot[1][0] * n[i0] + Rtot[1][1] * n[i0 + 1] + Rtot[1][2] * n[i0 + 2];
           const nz = Rtot[2][0] * n[i0] + Rtot[2][1] * n[i0 + 1] + Rtot[2][2] * n[i0 + 2];
           const shade = 0.42 + 0.52 * Math.abs(-0.35 * nx + 0.45 * ny + 0.82 * nz);
-          tris.push({
+          items.push({
+            kind: "tri",
             z: (p0[2] + p1[2] + p2[2]) / 3.0,
             p0, p1, p2,
             fill: `rgba(${Math.round(baseRgb[0] * shade)},${Math.round(baseRgb[1] * shade)},${Math.round(baseRgb[2] * shade)},${surfAlpha.toFixed(2)})`,
@@ -1623,19 +2075,64 @@ def get_nodal_surfaces_js() -> str:
       }
       if (hasRe) collectSoftwareTris(decodedMeshes.re, [16, 205, 238]);
       if (hasIm) collectSoftwareTris(decodedMeshes.im, [246, 78, 125]);
-      tris.sort((a, b) => a.z - b.z);
+      if (hasVor) {
+        const vList = nodalData.vortices || nodalData.roi_vortices || [];
+        for (let vi = 0; vi < vList.length; vi++) {
+          const pts = vList[vi] && vList[vi].pts_g;
+          if (!Array.isArray(pts) || pts.length < 2) continue;
+          for (let pi = 0; pi < pts.length - 1; pi++) {
+            const a = pts[pi], b = pts[pi + 1];
+            const mid = [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]), 0.5 * (a[2] + b[2])];
+            if (!pointInsideLiveRoi(mid, liveRoi)) continue;
+            const p0 = projectPoint3D(a, Rtot, center, invScale, cx, cy, Rpx, zoom);
+            const p1 = projectPoint3D(b, Rtot, center, invScale, cx, cy, Rpx, zoom);
+            items.push({ kind: "seg", z: 0.5 * (p0[2] + p1[2]) + 0.005, p0, p1 });
+          }
+        }
+      }
+      items.sort((a, b) => a.z - b.z);
       ctx.save();
-      for (let i = 0; i < tris.length; i++) {
-        const tr = tris[i];
-        ctx.beginPath();
-        ctx.moveTo(tr.p0[0], tr.p0[1]);
-        ctx.lineTo(tr.p1[0], tr.p1[1]);
-        ctx.lineTo(tr.p2[0], tr.p2[1]);
-        ctx.closePath();
-        ctx.fillStyle = tr.fill;
-        ctx.fill();
+      ctx.lineCap = "round";
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (it.kind === "tri") {
+          ctx.beginPath();
+          ctx.moveTo(it.p0[0], it.p0[1]);
+          ctx.lineTo(it.p1[0], it.p1[1]);
+          ctx.lineTo(it.p2[0], it.p2[1]);
+          ctx.closePath();
+          ctx.fillStyle = it.fill;
+          ctx.fill();
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(it.p0[0], it.p0[1]);
+          ctx.lineTo(it.p1[0], it.p1[1]);
+          ctx.strokeStyle = "rgba(7, 9, 19, 0.88)";
+          ctx.lineWidth = isExp ? 4.2 : 3.2;
+          ctx.stroke();
+          ctx.strokeStyle = "#fde047";
+          ctx.lineWidth = isExp ? 2.2 : 1.6;
+          ctx.stroke();
+        }
       }
       ctx.restore();
+    }
+
+    function countLiveVortices(liveRoi) {
+      if (!nodalData || !nodalData.has_phases) return 0;
+      const vList = nodalData.vortices || nodalData.roi_vortices || [];
+      let n = 0;
+      for (let vi = 0; vi < vList.length; vi++) {
+        const pts = vList[vi] && vList[vi].pts_g;
+        if (!Array.isArray(pts) || pts.length < 2) continue;
+        for (let pi = 0; pi < pts.length; pi++) {
+          if (pointInsideLiveRoi(pts[pi], liveRoi)) {
+            n++;
+            break;
+          }
+        }
+      }
+      return n;
     }
 
     function render3DReciprocalView(stereoCanvas, forceRedraw) {
@@ -1647,9 +2144,28 @@ def get_nodal_surfaces_js() -> str:
       const targetW = Math.round(rect.width * dpr);
       const targetH = Math.round(rect.height * dpr);
       const Rg = deps.getActiveGoniometerR();
+      const liveRoi = resolveLiveRoi();
+
+      // Smoothly glide camera center toward liveRoi.centerG when translating between Origin / Peak / Pan
+      const tgt = liveRoi.centerG;
+      const remDist = Math.hypot(tgt[0] - animCenterG[0], tgt[1] - animCenterG[1], tgt[2] - animCenterG[2]);
+      if (remDist > 1e-6) {
+        const snapEps = Math.max(1e-5, liveRoi.meanGStar * 0.008);
+        if (remDist <= snapEps) {
+          animCenterG = [tgt[0], tgt[1], tgt[2]];
+        } else {
+          const alpha = 0.28;
+          animCenterG = [
+            animCenterG[0] + (tgt[0] - animCenterG[0]) * alpha,
+            animCenterG[1] + (tgt[1] - animCenterG[1]) * alpha,
+            animCenterG[2] + (tgt[2] - animCenterG[2]) * alpha,
+          ];
+        }
+      }
+
       const hovRef = st.hoveredPeakObj ? `${st.hoveredPeakObj.id}:${(st.hoveredPeakObj.hkl || []).join(",")}` : String(st.hoveredPeakId);
       const selRef = st.selectedPeakObj ? `${st.selectedPeakObj.id}:${(st.selectedPeakObj.hkl || []).join(",")}` : String(st.selectedPeakId);
-      const zonesKey = st.showZoneArcs ? Array.from(st.activeZones || []).join(",") : "off";
+      const zonesKey = st.showZoneArcs ? `${st.selectedZoneId || ""}:${Array.from(st.activeZones || []).join(",")}` : "off";
       const sig = [
         targetW, targetH,
         (st.wulffYawDeg || 0).toFixed(3),
@@ -1665,11 +2181,14 @@ def get_nodal_surfaces_js() -> str:
         st.showNodalSurfacesIm ? 1 : 0,
         st.showPhaseVortices ? 1 : 0,
         (st.nodalSurfaceAlpha || 0.56).toFixed(2),
-        st.nodalRoiMode || "origin",
+        liveRoi.mode,
+        liveRoi.radiusG.toFixed(5),
+        liveRoi.centerG[0].toFixed(5), liveRoi.centerG[1].toFixed(5), liveRoi.centerG[2].toFixed(5),
+        animCenterG[0].toFixed(5), animCenterG[1].toFixed(5), animCenterG[2].toFixed(5),
+        brickFetchInProgress ? 1 : 0,
         st.dMin, st.lamMin, st.lamMax,
         zonesKey, hovRef, selRef,
         decodedCacheSig,
-        nodalData && nodalData.roi ? `${nodalData.roi.radius_g}:${(nodalData.roi.center_g || []).join(",")}` : "noroi",
         Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[2][0].toFixed(5), Rg[2][2].toFixed(5),
       ].join("|");
 
@@ -1701,44 +2220,76 @@ def get_nodal_surfaces_js() -> str:
       const zoom = st.wulffZoom || 1.0;
       const isExp = Boolean(st.wulffExpanded);
       const Rtot = buildCameraTransform(Rg);
-      const bounds = get3DSceneBounds();
+      const bounds = get3DSceneBounds(liveRoi);
       const center = bounds.center;
       const sceneR = bounds.radius;
       const invScale = 1.0 / sceneR;
       const ub = deps.getActiveUbMatrix();
 
-      // 1. Wireframe ROI sphere (and outer d_min resolution sphere if visible)
-      function drawWireSphere(sphCenter, sphRadius, strokeCol, dashArr) {
+      // 1. Clean ROI boundary indicator:
+      //    - For Origin / Peak / Pan spheres: draw ONLY the outer view-plane silhouette ring (no internal great circles!)
+      //    - For Zone Disk: draw the 2 parallel circular rims of the active Laue-zone slab
+      function drawCircle3D(c3d, r3d, uVec, vVec, strokeCol, lineW, dashArr) {
+        if (!(r3d > 1e-6)) return;
         ctx.save();
         ctx.strokeStyle = strokeCol;
-        ctx.lineWidth = 1.0;
+        ctx.lineWidth = lineW || 1.1;
         if (dashArr) ctx.setLineDash(dashArr);
-        const axes = [[1, 0, 0, 0, 1, 0], [1, 0, 0, 0, 0, 1], [0, 1, 0, 0, 0, 1]];
-        const nSeg = 56;
-        for (let a = 0; a < axes.length; a++) {
-          const ax = axes[a];
-          ctx.beginPath();
-          for (let s = 0; s <= nSeg; s++) {
-            const th = (2.0 * Math.PI * s) / nSeg;
-            const ct = Math.cos(th), stt = Math.sin(th);
-            const gp = [
-              sphCenter[0] + sphRadius * (ct * ax[0] + stt * ax[3]),
-              sphCenter[1] + sphRadius * (ct * ax[1] + stt * ax[4]),
-              sphCenter[2] + sphRadius * (ct * ax[2] + stt * ax[5]),
-            ];
-            const pr = projectPoint3D(gp, Rtot, center, invScale, cx, cy, Rpx, zoom);
-            if (s === 0) ctx.moveTo(pr[0], pr[1]);
-            else ctx.lineTo(pr[0], pr[1]);
-          }
-          ctx.stroke();
+        ctx.beginPath();
+        const nSeg = 64;
+        for (let s = 0; s <= nSeg; s++) {
+          const th = (2.0 * Math.PI * s) / nSeg;
+          const ct = Math.cos(th), stt = Math.sin(th);
+          const gp = [
+            c3d[0] + r3d * (ct * uVec[0] + stt * vVec[0]),
+            c3d[1] + r3d * (ct * uVec[1] + stt * vVec[1]),
+            c3d[2] + r3d * (ct * uVec[2] + stt * vVec[2]),
+          ];
+          const pr = projectPoint3D(gp, Rtot, center, invScale, cx, cy, Rpx, zoom);
+          if (s === 0) ctx.moveTo(pr[0], pr[1]);
+          else ctx.lineTo(pr[0], pr[1]);
         }
+        ctx.stroke();
         ctx.restore();
       }
 
-      if (nodalData && nodalData.has_phases && nodalData.roi) {
-        drawWireSphere(nodalData.roi.center_g || [0, 0, 0], Number(nodalData.roi.radius_g) || sceneR, "rgba(56, 189, 248, 0.22)", [3, 4]);
+      // Camera right & up unit vectors in sample frame (rows 0 and 1 of orthogonal Rtot)
+      const camRight = [Rtot[0][0], Rtot[0][1], Rtot[0][2]];
+      const camUp = [Rtot[1][0], Rtot[1][1], Rtot[1][2]];
+      if (nodalData && nodalData.has_phases) {
+        if (liveRoi.slabActive) {
+          const nh = liveRoi.slabNormal;
+          const ref = Math.abs(nh[0]) < 0.85 ? [1, 0, 0] : [0, 1, 0];
+          let e1 = [nh[1] * ref[2] - nh[2] * ref[1], nh[2] * ref[0] - nh[0] * ref[2], nh[0] * ref[1] - nh[1] * ref[0]];
+          const e1n = Math.hypot(e1[0], e1[1], e1[2]) || 1.0;
+          e1 = [e1[0] / e1n, e1[1] / e1n, e1[2] / e1n];
+          const e2 = [nh[1] * e1[2] - nh[2] * e1[1], nh[2] * e1[0] - nh[0] * e1[2], nh[0] * e1[1] - nh[1] * e1[0]];
+          const rimR = Math.sqrt(Math.max(0.0, liveRoi.radiusG * liveRoi.radiusG - liveRoi.slabHalfThick * liveRoi.slabHalfThick));
+          for (let sgn = -1; sgn <= 1; sgn += 2) {
+            const cRim = [
+              liveRoi.centerG[0] + sgn * liveRoi.slabHalfThick * nh[0],
+              liveRoi.centerG[1] + sgn * liveRoi.slabHalfThick * nh[1],
+              liveRoi.centerG[2] + sgn * liveRoi.slabHalfThick * nh[2],
+            ];
+            drawCircle3D(cRim, rimR, e1, e2, liveRoi.zoneColor || "rgba(56, 189, 248, 0.55)", 1.2, [4, 3]);
+          }
+        } else {
+          drawCircle3D(liveRoi.centerG, liveRoi.radiusG, camRight, camUp, "rgba(56, 189, 248, 0.34)", 1.15, [4, 4]);
+          // Subtle center reticle when ROI is translated away from (0,0,0)
+          if (Math.hypot(liveRoi.centerG[0], liveRoi.centerG[1], liveRoi.centerG[2]) > 1e-5) {
+            const pC = projectPoint3D(liveRoi.centerG, Rtot, center, invScale, cx, cy, Rpx, zoom);
+            ctx.save();
+            ctx.strokeStyle = "rgba(56, 189, 248, 0.72)";
+            ctx.lineWidth = 1.1;
+            ctx.beginPath();
+            ctx.moveTo(pC[0] - 5, pC[1]); ctx.lineTo(pC[0] + 5, pC[1]);
+            ctx.moveTo(pC[0], pC[1] - 5); ctx.lineTo(pC[0], pC[1] + 5);
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
       } else {
-        drawWireSphere([0, 0, 0], sceneR, "rgba(56, 189, 248, 0.20)", [3, 4]);
+        drawCircle3D([0, 0, 0], sceneR, camRight, camUp, "rgba(56, 189, 248, 0.24)", 1.0, [4, 4]);
       }
 
       // 2. Active Laue Zone reciprocal planes (nodal planes G . t_uvw = 0) & zone-intersection lines
@@ -1746,17 +2297,14 @@ def get_nodal_surfaces_js() -> str:
       if (st.showZoneArcs && ub && Array.isArray(actZones) && actZones.length > 0) {
         const invUb = deps.mat3Inv(ub);
         if (invUb) {
-          const planeR = (nodalData && nodalData.roi && Number(nodalData.roi.radius_g) > 0)
-            ? Number(nodalData.roi.radius_g)
-            : sceneR * 0.92;
-          const planeCenter = (nodalData && nodalData.roi && nodalData.roi.center_g) || [0, 0, 0];
+          const planeR = (nodalData && nodalData.has_phases) ? liveRoi.radiusG : sceneR * 0.92;
+          const planeCenter = (nodalData && nodalData.has_phases) ? liveRoi.centerG : [0, 0, 0];
           const zNormals = [];
           ctx.save();
           for (let zi = 0; zi < Math.min(actZones.length, 6); zi++) {
             const z = actZones[zi];
             if (!Array.isArray(z.uvw) || z.uvw.length !== 3) continue;
             const u = z.uvw[0], v = z.uvw[1], ww = z.uvw[2];
-            // Direct lattice axis in sample frame: t = UB^(-T) * uvw
             const tx = invUb[0][0] * u + invUb[1][0] * v + invUb[2][0] * ww;
             const ty = invUb[0][1] * u + invUb[1][1] * v + invUb[2][1] * ww;
             const tz = invUb[0][2] * u + invUb[1][2] * v + invUb[2][2] * ww;
@@ -1764,7 +2312,6 @@ def get_nodal_surfaces_js() -> str:
             if (tn < 1e-8) continue;
             const nHat = [tx / tn, ty / tn, tz / tn];
             zNormals.push({ nHat, color: z.rainbow_color || "#38bdf8", label: z.label });
-            // Orthonormal basis (e1, e2) spanning the Laue reciprocal plane G . nHat = 0
             const ref = Math.abs(nHat[0]) < 0.85 ? [1, 0, 0] : [0, 1, 0];
             let e1x = nHat[1] * ref[2] - nHat[2] * ref[1];
             let e1y = nHat[2] * ref[0] - nHat[0] * ref[2];
@@ -1775,9 +2322,8 @@ def get_nodal_surfaces_js() -> str:
             const e2y = nHat[2] * e1x - nHat[0] * e1z;
             const e2z = nHat[0] * e1y - nHat[1] * e1x;
 
-            // Project plane disc clipped near planeCenter
             const dOff = planeCenter[0] * nHat[0] + planeCenter[1] * nHat[1] + planeCenter[2] * nHat[2];
-            if (Math.abs(dOff) < planeR * 0.95) {
+            if (Math.abs(dOff) < planeR * 0.96) {
               const discR = Math.sqrt(Math.max(0.0, planeR * planeR - dOff * dOff));
               const cx0 = planeCenter[0] - dOff * nHat[0];
               const cy0 = planeCenter[1] - dOff * nHat[1];
@@ -1819,8 +2365,8 @@ def get_nodal_surfaces_js() -> str:
                 const ln = Math.hypot(lx, ly, lz);
                 if (ln < 1e-4) continue;
                 const ux = (lx / ln) * planeR, uy = (ly / ln) * planeR, uz = (lz / ln) * planeR;
-                const pA = projectPoint3D([-ux, -uy, -uz], Rtot, center, invScale, cx, cy, Rpx, zoom);
-                const pB = projectPoint3D([ux, uy, uz], Rtot, center, invScale, cx, cy, Rpx, zoom);
+                const pA = projectPoint3D([planeCenter[0] - ux, planeCenter[1] - uy, planeCenter[2] - uz], Rtot, center, invScale, cx, cy, Rpx, zoom);
+                const pB = projectPoint3D([planeCenter[0] + ux, planeCenter[1] + uy, planeCenter[2] + uz], Rtot, center, invScale, cx, cy, Rpx, zoom);
                 ctx.beginPath();
                 ctx.moveTo(pA[0], pA[1]);
                 ctx.lineTo(pB[0], pB[1]);
@@ -1835,8 +2381,8 @@ def get_nodal_surfaces_js() -> str:
         }
       }
 
-      // 3. Two-color 2D Nodal Surfaces: Re(Z)=0 (Cyan) & Im(Z)=0 (Coral-Rose)
-      renderSurfacesWebGLOrFallback(ctx, w, h, dpr, Rtot, center, invScale, Rpx, zoom);
+      // 3. Depth-buffered Two-color 2D Nodal Surfaces (Re=0 Cyan & Im=0 Coral-Rose) + 1D Phase Vortices
+      renderSurfacesAndVortices3D(ctx, w, h, dpr, Rtot, center, invScale, Rpx, zoom, liveRoi, isExp);
 
       // 4. Reciprocal lattice basis axes {a*, b*, c*} through origin
       if (ub) {
@@ -1863,40 +2409,13 @@ def get_nodal_surfaces_js() -> str:
         ctx.restore();
       }
 
-      // 5. 1D Phase-Vortex Curves (Re=0 intersect Im=0) in 3D Reciprocal Space
-      if (nodalData && nodalData.has_phases && st.showPhaseVortices) {
-        const vList = Array.isArray(nodalData.roi_vortices) && nodalData.roi_vortices.length > 0
-          ? nodalData.roi_vortices
-          : (nodalData.vortices || []);
-        ctx.save();
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        for (let vi = 0; vi < vList.length; vi++) {
-          const pts = vList[vi].pts_g;
-          if (!Array.isArray(pts) || pts.length < 2) continue;
-          ctx.beginPath();
-          for (let pi = 0; pi < pts.length; pi++) {
-            const pr = projectPoint3D(pts[pi], Rtot, center, invScale, cx, cy, Rpx, zoom);
-            if (pi === 0) ctx.moveTo(pr[0], pr[1]);
-            else ctx.lineTo(pr[0], pr[1]);
-          }
-          ctx.strokeStyle = "rgba(7, 9, 19, 0.88)";
-          ctx.lineWidth = isExp ? 4.4 : 3.4;
-          ctx.stroke();
-          ctx.strokeStyle = "#fde047";
-          ctx.lineWidth = isExp ? 2.3 : 1.7;
-          ctx.stroke();
-        }
-        ctx.restore();
-      }
-
-      // 6. 3D Bragg Reflections at G = UB * hkl (depth-sorted, interactive hover/click!)
+      // 5. 3D Bragg Reflections at G = UB * hkl (depth-sorted, interactive hover/click!)
       screenPeakHits3D = [];
       if (ub) {
         const lodState = deps.getWulffVisiblePool(w, h);
         const peaks = lodState.visiblePeaks || [];
         const drawList = [];
-        const maxClipR = sceneR * 1.45;
+        const maxClipR = Math.max(sceneR * 1.45, liveRoi.radiusG * 1.35);
         for (let i = 0; i < peaks.length; i++) {
           const p = peaks[i];
           if (!Array.isArray(p.hkl) || p.hkl.length !== 3) continue;
@@ -1949,23 +2468,25 @@ def get_nodal_surfaces_js() -> str:
         ctx.restore();
       }
 
-      // 7. Legend & Status Pill Overlay in 3D View
+      // 6. Legend & Status Pill Overlay in 3D View
       ctx.save();
       ctx.font = isExp ? "bold 9.5px monospace" : "bold 8px monospace";
       const pills = [];
       if (nodalData && nodalData.has_phases) {
         const fLbl = nodalData.formula_label || "F(G)";
-        const nRe = (nodalData.re_surface && nodalData.re_surface.n_tris) || 0;
-        const nIm = (nodalData.im_surface && nodalData.im_surface.n_tris) || 0;
-        const nVor = Array.isArray(nodalData.roi_vortices) ? nodalData.roi_vortices.length : 0;
-        if (st.showNodalSurfacesRe) pills.push({ txt: `Re[${fLbl}]=0 (${nRe}Δ)`, col: "#22d3ee" });
+        const nVor = countLiveVortices(liveRoi);
+        const roiTag = liveRoi.slabActive
+          ? `Zone ${liveRoi.zoneLabel || "disk"}`
+          : `${liveRoi.mult.toFixed(1)}×a⋆`;
+        if (st.showNodalSurfacesRe) pills.push({ txt: `Re[${fLbl}]=0 • ${roiTag}`, col: "#22d3ee" });
         if (st.showNodalSurfacesIm) {
           pills.push({
-            txt: nodalData.is_real_only ? `Im[${fLbl}]≡0 (centric)` : `Im[${fLbl}]=0 (${nIm}Δ)`,
+            txt: nodalData.is_real_only ? `Im[${fLbl}]≡0 (centric)` : `Im[${fLbl}]=0`,
             col: "#fb7185",
           });
         }
-        if (st.showPhaseVortices) pills.push({ txt: `1D Vortices (${nVor})`, col: "#fde047" });
+        if (st.showPhaseVortices) pills.push({ txt: `1D Vortices (${nVor} in ROI)`, col: "#fde047" });
+        if (brickFetchInProgress) pills.push({ txt: "Streaming 3D brick…", col: "#94a3b8" });
       } else {
         pills.push({ txt: "3D Reciprocal Lattice (load phased .mtz for Re/Im surfaces & vortices)", col: "#94a3b8" });
       }
@@ -2007,13 +2528,15 @@ def get_nodal_surfaces_js() -> str:
       return best;
     }
 
-    // Project 1D phase vortices onto the Convex 3D Wulff Sphere (radial unit-vector projection G / |G|)
+    // Project 1D phase vortices onto the Convex 3D Wulff Sphere (radial unit-vector projection G / |G|),
+    // clipped live to the active 3D ROI sphere / Laue-zone disk!
     function renderWulffVortices(ctx, cx, cy, R, isExp) {
       const st = deps.state;
       if (!nodalData || !nodalData.has_phases || !st.showPhaseVortices) return;
       const vList = nodalData.vortices || nodalData.roi_vortices || [];
       if (!Array.isArray(vList) || vList.length === 0) return;
 
+      const liveRoi = resolveLiveRoi();
       const Rg = deps.getActiveGoniometerR();
       const ki = deps.getActiveIncidentBeam();
       const lMin = Number(st.lamMin) || 0.0;
@@ -2030,18 +2553,17 @@ def get_nodal_surfaces_js() -> str:
           const pts = vList[vi].pts_g;
           if (!Array.isArray(pts) || pts.length < 2) continue;
 
-          // Draw front-hemisphere segments brightly, back-hemisphere softly dashed
           for (let pass = 0; pass < 2; pass++) {
             const wantHemi = pass === 0 ? -1 : 1;
             ctx.beginPath();
             let penDown = false;
             for (let pi = 0; pi < pts.length; pi++) {
-              const g = [sgn * pts[pi][0], sgn * pts[pi][1], sgn * pts[pi][2]];
+              const rawPt = pts[pi];
+              if (!pointInsideLiveRoi(rawPt, liveRoi)) { penDown = false; continue; }
+              const g = [sgn * rawPt[0], sgn * rawPt[1], sgn * rawPt[2]];
               const gn = Math.hypot(g[0], g[1], g[2]);
               if (!(gn > 1e-6)) { penDown = false; continue; }
-              // Respect d_min slider
               if (1.0 / gn < (Number(st.dMin) || 0.5) * 0.98) { penDown = false; continue; }
-              // In 1-Frame scope, optionally gate by elastic wavelength bandpass [lamMin, lamMax]
               if (st.wulffScope !== "all_runs") {
                 const gLab = deps.mat3Vec(Rg, g);
                 const sinTh = -(ki[0] * gLab[0] + ki[1] * gLab[1] + ki[2] * gLab[2]) / gn;
@@ -2078,13 +2600,15 @@ def get_nodal_surfaces_js() -> str:
       ctx.restore();
     }
 
-    // Project 1D phase vortices onto the 2D Detector Panels via exact Laue Bragg raycasting
+    // Project 1D phase vortices onto the 2D Detector Panels via exact Laue Bragg raycasting,
+    // clipped live to the active 3D ROI sphere / Laue-zone disk!
     function renderDetectorVortices(ctx, w, h) {
       const st = deps.state;
       if (!nodalData || !nodalData.has_phases || !st.showPhaseVortices) return;
       const vList = nodalData.vortices || nodalData.roi_vortices || [];
       if (!Array.isArray(vList) || vList.length === 0) return;
 
+      const liveRoi = resolveLiveRoi();
       const Rg = deps.getActiveGoniometerR();
       const ki = deps.getActiveIncidentBeam();
       const sLab = deps.getActiveSampleOffsetLab();
@@ -2095,7 +2619,6 @@ def get_nodal_surfaces_js() -> str:
       const dMinCut = (Number(st.dMin) || 0.5) * 0.98;
       const azShifts = [-360.0, 0.0, 360.0];
 
-      // Both +G(s) and its Friedel mate -G(s) carry the same simultaneous zero |Z(-G)| = |Z(G)| = 0!
       const signs = [1.0, -1.0];
       const projectedSegs = [];
 
@@ -2108,7 +2631,13 @@ def get_nodal_surfaces_js() -> str:
           let prevAz = null;
           let prevBank = null;
           for (let pi = 0; pi < pts.length; pi++) {
-            const gx = sgn * pts[pi][0], gy = sgn * pts[pi][1], gz = sgn * pts[pi][2];
+            const rawPt = pts[pi];
+            if (!pointInsideLiveRoi(rawPt, liveRoi)) {
+              if (curSeg.length >= 2) projectedSegs.push({ pts: curSeg, isMate: sgn < 0 });
+              curSeg = []; prevAz = null; prevBank = null;
+              continue;
+            }
+            const gx = sgn * rawPt[0], gy = sgn * rawPt[1], gz = sgn * rawPt[2];
             const gn = Math.hypot(gx, gy, gz);
             if (!(gn > 1e-6) || (1.0 / gn) < dMinCut) {
               if (curSeg.length >= 2) projectedSegs.push({ pts: curSeg, isMate: sgn < 0 });
@@ -2188,9 +2717,36 @@ def get_nodal_surfaces_js() -> str:
       ctx.restore();
     }
 
+    function brickCoversRoi(nd, liveRoi) {
+      if (!nd || !nd.has_phases) return false;
+      const bc = (nd.brick && Array.isArray(nd.brick.center_g))
+        ? nd.brick.center_g
+        : ((nd.roi && Array.isArray(nd.roi.center_g)) ? nd.roi.center_g : [0, 0, 0]);
+      const br = (nd.brick && Number(nd.brick.radius_g) > 0)
+        ? Number(nd.brick.radius_g)
+        : ((nd.roi && Number(nd.roi.radius_g) > 0) ? Number(nd.roi.radius_g) : 0.0);
+      const d = Math.hypot(liveRoi.centerG[0] - bc[0], liveRoi.centerG[1] - bc[1], liveRoi.centerG[2] - bc[2]);
+      return (d + liveRoi.radiusG) <= br * 1.03;
+    }
+
+    function findCachedBrickCovering(liveRoi, wantRefName, wantHetMode) {
+      if (!nodalData || !nodalData.has_phases) return null;
+      const pName = nodalData.primary_name || "";
+      for (const cand of brickCache.values()) {
+        if (!cand || !cand.has_phases || (cand.primary_name || "") !== pName) continue;
+        const candRef = cand.ref_has_phases ? (cand.ref_name || "") : "";
+        if (candRef !== (wantRefName || "")) continue;
+        if ((cand.heterodyne_mode || "single") !== (wantHetMode || "single")) continue;
+        if (brickCoversRoi(cand, liveRoi)) return cand;
+      }
+      return null;
+    }
+
     async function requestNodalUpdate(extraBody) {
       const st = deps.state;
       const reqSeq = ++fetchInFlight;
+      brickFetchInProgress = true;
+      last3DRenderSig = "";
       const selPeak = st.selectedPeakObj;
       const actZones = deps.getActiveZoneObjects();
       const selZone = actZones.find(z => z.zone_id === st.selectedZoneId) || actZones[0] || null;
@@ -2198,6 +2754,7 @@ def get_nodal_surfaces_js() -> str:
         heterodyne_mode: st.heterodyneMode || "delta",
         roi_mode: st.nodalRoiMode || "origin",
         roi_center_hkl: (selPeak && Array.isArray(selPeak.hkl)) ? selPeak.hkl : null,
+        roi_center_g: st.nodalRoiMode === "pan" ? panCenterG.slice() : null,
         roi_zone_uvw: (selZone && Array.isArray(selZone.uvw)) ? selZone.uvw : null,
         roi_zone_order: 0,
         roi_radius_mult: Number(st.nodalRoiRadiusMult) || 2.5,
@@ -2210,6 +2767,7 @@ def get_nodal_surfaces_js() -> str:
         });
         const doc = await r.json().catch(() => null);
         if (reqSeq !== fetchInFlight) return doc;
+        brickFetchInProgress = false;
         if (r.ok && doc && doc.nodal_data) {
           setNodalData(doc.nodal_data);
           deps.onUpdated(doc.nodal_data);
@@ -2218,8 +2776,37 @@ def get_nodal_surfaces_js() -> str:
         }
         return doc;
       } catch (_err) {
+        if (reqSeq === fetchInFlight) brickFetchInProgress = false;
         return null;
       }
+    }
+
+    // Zero-lag client-side ROI/slider handler: clips cached GPU brick immediately,
+    // and only fetches a new 3D brick in the background if the user moves beyond cached bounds!
+    function onLiveRoiChanged() {
+      last3DRenderSig = "";
+      if (!nodalData || !nodalData.has_phases) return;
+      const liveRoi = resolveLiveRoi();
+      if (brickCoversRoi(nodalData, liveRoi)) {
+        if (roiDebounceTimer) {
+          clearTimeout(roiDebounceTimer);
+          roiDebounceTimer = null;
+        }
+        return;
+      }
+      const curRef = nodalData.ref_has_phases ? (nodalData.ref_name || "") : "";
+      const curHet = nodalData.heterodyne_mode || "single";
+      const hit = findCachedBrickCovering(liveRoi, curRef, curHet);
+      if (hit) {
+        if (roiDebounceTimer) {
+          clearTimeout(roiDebounceTimer);
+          roiDebounceTimer = null;
+        }
+        setNodalData(hit);
+        deps.onUpdated(hit);
+        return;
+      }
+      scheduleRoiRefresh(90);
     }
 
     function scheduleRoiRefresh(delayMs) {
@@ -2228,61 +2815,138 @@ def get_nodal_surfaces_js() -> str:
       roiDebounceTimer = setTimeout(() => {
         roiDebounceTimer = null;
         requestNodalUpdate();
-      }, typeof delayMs === "number" ? delayMs : 140);
+      }, typeof delayMs === "number" ? delayMs : 110);
     }
 
-    async function uploadAndSetRefMtz(file) {
+    // Translate 3D reciprocal-space ROI smoothly via Shift+drag / right-drag on the 3D canvas
+    function panByScreenDelta(dxPx, dyPx, canvasW, canvasH) {
+      const st = deps.state;
+      const curRoi = resolveLiveRoi();
+      if (st.nodalRoiMode !== "pan") {
+        panCenterG = [curRoi.centerG[0], curRoi.centerG[1], curRoi.centerG[2]];
+        st.nodalRoiMode = "pan";
+      }
+      const Rg = deps.getActiveGoniometerR();
+      const Rtot = buildCameraTransform(Rg);
+      const bounds = get3DSceneBounds(curRoi);
+      const Rpx = Math.min(canvasW, canvasH) * 0.41;
+      const zoom = st.wulffZoom || 1.0;
+      const D = 2.8;
+      const persp0 = Math.sqrt(D * D - 1.0) / D;
+      const pxPerNorm = Math.max(12.0, Rpx * zoom * persp0);
+      const dCamX = -dxPx / pxPerNorm;
+      const dCamY = dyPx / pxPerNorm;
+      const scaleG = bounds.radius;
+      // g_sample_delta = scaleG * Rtot^T * [dCamX, dCamY, 0]
+      panCenterG = [
+        panCenterG[0] + scaleG * (Rtot[0][0] * dCamX + Rtot[1][0] * dCamY),
+        panCenterG[1] + scaleG * (Rtot[0][1] * dCamX + Rtot[1][1] * dCamY),
+        panCenterG[2] + scaleG * (Rtot[0][2] * dCamX + Rtot[1][2] * dCamY),
+      ];
+      animCenterG = [panCenterG[0], panCenterG[1], panCenterG[2]];
+      onLiveRoiChanged();
+    }
+
+    function resetPanToOrigin() {
+      panCenterG = [0.0, 0.0, 0.0];
+      if (deps.state.nodalRoiMode === "pan") {
+        deps.state.nodalRoiMode = "origin";
+      }
+      onLiveRoiChanged();
+    }
+
+    // Instant client-side clear of Ref F₀ + server sync
+    async function clearRefMtz() {
+      const st = deps.state;
+      if (roiDebounceTimer) {
+        clearTimeout(roiDebounceTimer);
+        roiDebounceTimer = null;
+      }
+      st.heterodyneMode = "single";
+      // Immediately swap back to cached single-field brick in 0 ms if available!
+      if (lastSingleOriginData && nodalData && lastSingleOriginData.primary_name === nodalData.primary_name) {
+        setNodalData(lastSingleOriginData);
+        deps.onUpdated(lastSingleOriginData);
+      } else if (nodalData) {
+        const clearedLocal = Object.assign({}, nodalData, {
+          ref_name: null,
+          ref_has_phases: false,
+          ref_f_column: null,
+          ref_phi_column: null,
+          ref_warning: null,
+          heterodyne_mode: "single",
+          formula_label: "F(G)",
+        });
+        setNodalData(clearedLocal);
+        deps.onUpdated(clearedLocal);
+      }
+      const doc = await requestNodalUpdate({
+        heterodyne_mode: "single",
+        clear_ref_mtz: true,
+      });
+      return (doc && doc.nodal_data) ? doc.nodal_data : nodalData;
+    }
+
+    async function uploadAndSetRefMtz(file, onLoadingState) {
       if (!file) return;
+      if (typeof onLoadingState === "function") onLoadingState(true, file.name);
       if (typeof deps.setStatusLine === "function") {
         deps.setStatusLine("[REF F₀ MTZ]", `Loading heterodyne reference structure factors from <strong>${file.name}</strong>...`);
       }
-      let resolvedPath = null;
       try {
-        const rr = await fetch("api/pipeline/resolve_local_files", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ files: [{ name: file.name, size: file.size, lastModified: file.lastModified }] }),
-        });
-        if (rr.ok) {
-          const rdoc = await rr.json();
-          if (Array.isArray(rdoc.matched_paths) && rdoc.matched_paths.length === 1) {
-            resolvedPath = rdoc.matched_paths[0];
+        let resolvedPath = null;
+        try {
+          const rr = await fetch("api/pipeline/resolve_local_files", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ files: [{ name: file.name, size: file.size, lastModified: file.lastModified }] }),
+          });
+          if (rr.ok) {
+            const rdoc = await rr.json();
+            if (Array.isArray(rdoc.matched_paths) && rdoc.matched_paths.length === 1) {
+              resolvedPath = rdoc.matched_paths[0];
+            }
+          }
+        } catch (_e) {}
+
+        if (!resolvedPath) {
+          const fd = new FormData();
+          fd.append("files", file, file.name);
+          const ur = await fetch("api/pipeline/upload_h5", { method: "POST", body: fd });
+          if (ur.ok) {
+            const udoc = await ur.json();
+            const sp = udoc.saved_paths || udoc.uploaded_paths || [];
+            if (sp.length > 0) resolvedPath = sp[0];
           }
         }
-      } catch (_e) {}
-
-      if (!resolvedPath) {
-        const fd = new FormData();
-        fd.append("files", file, file.name);
-        const ur = await fetch("api/pipeline/upload_h5", { method: "POST", body: fd });
-        if (ur.ok) {
-          const udoc = await ur.json();
-          const sp = udoc.saved_paths || udoc.uploaded_paths || [];
-          if (sp.length > 0) resolvedPath = sp[0];
+        if (!resolvedPath) {
+          if (typeof deps.setStatusLine === "function") {
+            deps.setStatusLine("[REF F₀ MTZ]", `<span style="color:#f87171;">Could not stage ${file.name}</span>`);
+          }
+          return;
         }
-      }
-      if (!resolvedPath) {
-        if (typeof deps.setStatusLine === "function") {
-          deps.setStatusLine("[REF F₀ MTZ]", `<span style="color:#f87171;">Could not stage ${file.name}</span>`);
+        const doc = await requestNodalUpdate({ ref_mtz_path: resolvedPath, heterodyne_mode: "auto" });
+        if (doc && doc.nodal_data && typeof deps.setStatusLine === "function") {
+          const nd = doc.nodal_data;
+          if (nd.ref_warning) {
+            deps.setStatusLine("[REF F₀ MTZ]", `<span style="color:#fbbf24;">${nd.ref_warning}</span>`);
+          } else if (nd.ref_has_phases) {
+            deps.setStatusLine(
+              "[HETERODYNE F₀]",
+              `Loaded <strong>${nd.ref_name}</strong> (${nd.ref_f_column}, ${nd.ref_phi_column}) • Interference: <strong>${nd.formula_label}</strong>`
+            );
+          }
         }
-        return;
-      }
-      const doc = await requestNodalUpdate({ ref_mtz_path: resolvedPath });
-      if (doc && doc.nodal_data && typeof deps.setStatusLine === "function") {
-        const nd = doc.nodal_data;
-        if (nd.ref_warning) {
-          deps.setStatusLine("[REF F₀ MTZ]", `<span style="color:#fbbf24;">${nd.ref_warning}</span>`);
-        } else if (nd.ref_has_phases) {
-          deps.setStatusLine(
-            "[HETERODYNE F₀]",
-            `Loaded <strong>${nd.ref_name}</strong> (${nd.ref_f_column}, ${nd.ref_phi_column}) • Interference: <strong>${nd.formula_label}</strong>`
-          );
-        }
+      } finally {
+        if (typeof onLoadingState === "function") onLoadingState(false, file.name);
       }
     }
 
     function setNodalData(nextData) {
       nodalData = nextData || null;
+      if (nodalData && nodalData.has_phases) {
+        storeBrickInCache(nodalData);
+      }
       dataSeq += 1;
       decodedCacheSig = "";
       last3DRenderSig = "";
@@ -2295,6 +2959,11 @@ def get_nodal_surfaces_js() -> str:
       setNodalData,
       hasPhases: () => Boolean(nodalData && nodalData.has_phases),
       invalidate3D: () => { last3DRenderSig = ""; },
+      resolveLiveRoi,
+      onLiveRoiChanged,
+      panByScreenDelta,
+      resetPanToOrigin,
+      clearRefMtz,
       render3DReciprocalView,
       findNearestPeak3D,
       renderWulffVortices,
