@@ -750,6 +750,11 @@ def run_index(
             f.attrs["instrument"] = instrument_name
         elif "instrument" in input_data:
             f.attrs["instrument"] = input_data["instrument"]
+        # The image stack (or nexus file) the peaks were indexed against, as
+        # the predictor and integrator record theirs, so later steps and
+        # viewers can find the images behind this file.
+        if original_nexus_filename:
+            f.attrs["source"] = os.path.abspath(original_nexus_filename)
 
         for key, value in copied_data.items():
             f[key] = value

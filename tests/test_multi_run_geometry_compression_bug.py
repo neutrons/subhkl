@@ -156,3 +156,7 @@ def test_multi_run_geometry_compression_reproduction(tmp_path):
         # It should also correctly identify 4 unique rotation states
         unique_runs = len(np.unique(f["peaks/run_index"][()]))
         assert unique_runs == 4, f"Expected 4 runs, got {unique_runs}"
+
+        # The output records the file it was indexed against, as the
+        # predictor and integrator do, so later steps can find its images.
+        assert f.attrs["source"] == str(dummy_nexus.resolve())
