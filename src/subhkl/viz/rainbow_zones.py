@@ -1906,6 +1906,103 @@ def _raycast_hkl_on_detectors(
     }
 
 
+def _derive_f_sigf_from_i_sigi(
+    i_arr: np.ndarray,
+    sigi_arr: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Recover positive structure factor amplitudes ``(F, SigF)`` from ``(I, SigI)``.
+
+    Inverts Careless's ``I = F^2 + SigF^2`` and ``SigI ≈ sqrt(4 F^2 SigF^2 + 2 SigF^4)``
+    in the moderate/high-SNR regime with a smooth positive French-Wilson-style
+    floor when ``I <= sqrt(0.5) * SigI``.
+    """
+    i_v = np.asarray(i_arr, dtype=np.float64)
+    s_v = np.maximum(np.where(np.isfinite(sigi_arr), sigi_arr, 1.0), 1e-6)
+    i_pos = np.maximum(np.where(np.isfinite(i_v), i_v, 0.0), 0.0)
+    disc = np.maximum(0.0, i_pos * i_pos - 0.5 * s_v * s_v)
+    sigf2 = np.maximum(1e-12, i_pos - np.sqrt(disc))
+    low_m = i_pos <= (np.sqrt(0.5) * s_v)
+    f_out = np.sqrt(np.maximum(0.0, i_pos - np.where(low_m, 0.0, sigf2)))
+    sigf_out = np.sqrt(sigf2)
+    if np.any(low_m):
+        f_low = np.where(i_v > 0.0, np.sqrt(i_pos), 0.0)
+        sf_low = s_v / np.maximum(2.0 * np.maximum(f_low, np.sqrt(0.5 * s_v)), 1e-6)
+        f_out = np.where(low_m, f_low, f_out)
+        sigf_out = np.where(low_m, np.maximum(sf_low, 1e-6), sigf_out)
+    return f_out, np.maximum(sigf_out, 1e-6)
+
+
+def _interp_wavelength_profile_bins(
+    wavelength: float | None,
+    profile: dict[str, Any] | None,
+    series_key: str,
+    global_key: str,
+) -> float | None:
+    """Interpolate a positive wavelength-binned Careless profile series."""
+    if not isinstance(profile, dict):
+        return None
+    meds = profile.get(series_key)
+    step = float(profile.get("bin_step") or 0.05)
+    lo = float(profile.get("bin_lo") or 0.0)
+    g_med = profile.get(global_key)
+    g_val = (
+        float(g_med)
+        if isinstance(g_med, (int, float)) and np.isfinite(g_med) and g_med > 0.0
+        else None
+    )
+    if wavelength is None or not np.isfinite(wavelength) or not isinstance(meds, list):
+        return g_val
+    valid_pts: list[tuple[float, float]] = []
+    for idx_b, mv in enumerate(meds):
+        if isinstance(mv, (int, float)) and np.isfinite(mv) and mv > 0.0:
+            valid_pts.append((lo + (idx_b + 0.5) * step, float(mv)))
+    if not valid_pts:
+        return g_val
+    wl = float(wavelength)
+    if wl <= valid_pts[0][0]:
+        return valid_pts[0][1]
+    if wl >= valid_pts[-1][0]:
+        return valid_pts[-1][1]
+    for j in range(len(valid_pts) - 1):
+        x0, y0 = valid_pts[j]
+        x1, y1 = valid_pts[j + 1]
+        if x0 <= wl <= x1:
+            t = (wl - x0) / max(x1 - x0, 1e-9)
+            return float(y0 + t * (y1 - y0))
+    return g_val
+
+
+def _eval_careless_scale_profile(
+    wavelength: float | None,
+    profile: dict[str, Any] | None,
+) -> float | None:
+    """Interpolate the wavelength-dependent Careless scale factor ``Σ(λ)``."""
+    return _interp_wavelength_profile_bins(
+        wavelength, profile, "scale_med", "global_median"
+    )
+
+
+def _eval_careless_snr_scale_profile(
+    wavelength: float | None,
+    profile: dict[str, Any] | None,
+) -> float | None:
+    """Interpolate Careless instrument SNR scale ``Σ(λ) / σ_{I_obs}(λ)``."""
+    v = _interp_wavelength_profile_bins(
+        wavelength, profile, "snr_scale_med", "global_snr_scale_median"
+    )
+    if v is not None:
+        return v
+    scl = _interp_wavelength_profile_bins(
+        wavelength, profile, "scale_med", "global_median"
+    )
+    sig = _interp_wavelength_profile_bins(
+        wavelength, profile, "sigma_med", "global_sigma_median"
+    )
+    if scl is not None and sig is not None and sig > 1e-9:
+        return float(scl / sig)
+    return None
+
+
 def apply_mtz_to_payload(
     payload: dict[str, Any],
     mtz_path: str | os.PathLike,
@@ -1913,7 +2010,7 @@ def apply_mtz_to_payload(
     *,
     select_mtz_color: bool = True,
 ) -> dict[str, Any]:
-    """Attach external MTZ I/SIGI data columns onto active UB reflection peaks without modifying B or U."""
+    """Attach external MTZ structure-factor/intensity columns onto active UB reflection peaks without modifying B or U."""
     import gemmi
 
     from subhkl.core.crystallography import cartesian_matrix_metric_tensor
@@ -2020,68 +2117,252 @@ def apply_mtz_to_payload(
     asu = gemmi.ReciprocalAsu(mtz_sg)
     ops = mtz_sg.operations()
     cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}
+    col_types = {c.label: str(c.type) for c in mtz.columns}
+    col_order = [c.label for c in mtz.columns]
     if not all(k in cols for k in ("H", "K", "L")):
         raise ValueError("MTZ file does not contain H, K, L columns.")
 
     h_col = cols["H"].astype(int)
     k_col = cols["K"].astype(int)
     l_col = cols["L"].astype(int)
-    i_col = None
-    s_col = None
-    for ic, sc in (
+
+    _non_data_labels = {
+        "H",
+        "K",
+        "L",
+        "M/ISYM",
+        "BATCH",
+        "RUN",
+        "half",
+        "repeat",
+        "WAVEL",
+        "THETA",
+        "PHI",
+        "asu_id",
+        "image_id",
+        "file_id",
+        "test",
+        "FreeR_flag",
+        "FREE",
+        "R-free-flags",
+    }
+
+    def _find_matching_sigma_col(
+        val_lbl: str,
+        explicit_sig_lbl: str | None = None,
+    ) -> str | None:
+        if (
+            explicit_sig_lbl
+            and explicit_sig_lbl in cols
+            and col_types.get(explicit_sig_lbl) not in ("P", "W", "I", "B", "Y", "H")
+        ):
+            return explicit_sig_lbl
+        for cand_s in (
+            f"SIG{val_lbl}",
+            f"Sig{val_lbl}",
+            f"sig{val_lbl}",
+            f"STD{val_lbl}",
+            val_lbl.replace("F", "SIGF", 1) if val_lbl.startswith("F") else "",
+            val_lbl.replace("F", "SigF", 1) if val_lbl.startswith("F") else "",
+            val_lbl.replace("I", "SIGI", 1) if val_lbl.startswith("I") else "",
+            val_lbl.replace("I", "SigI", 1) if val_lbl.startswith("I") else "",
+        ):
+            if (
+                cand_s
+                and cand_s != val_lbl
+                and cand_s in cols
+                and col_types.get(cand_s) in ("Q", "L", "M", "R")
+            ):
+                return cand_s
+        idx_c = col_order.index(val_lbl) if val_lbl in col_order else -1
+        if 0 <= idx_c + 1 < len(col_order):
+            nxt = col_order[idx_c + 1]
+            if col_types.get(nxt) in ("Q", "L", "M") and nxt.upper().startswith(
+                ("SIG", "STD", "E_")
+            ):
+                return nxt
+        return None
+
+    # 1. Detect structure-factor amplitude column F (preferred for unscaled F/σ_F & Careless F_obs comparison)
+    f_col_label: str | None = None
+    sigf_col_label: str | None = None
+    for fc_cand, sfc_cand in (
+        ("F", "SIGF"),
+        ("F", "SigF"),
+        ("FP", "SIGFP"),
+        ("FOBS", "SIGFOBS"),
+        ("F-obs", "SIGF-obs"),
+        ("F_obs", "SIGF_obs"),
+        ("F(+)", "SIGF(+)"),
+        ("FC", "SIGFC"),
+        ("FC_ALL", "SIGFC_ALL"),
+        ("f_calc", None),
+        ("FCALC", None),
+        ("FWT", None),
+    ):
+        if fc_cand in cols and col_types.get(fc_cand) not in (
+            "P",
+            "W",
+            "I",
+            "B",
+            "Y",
+            "H",
+        ):
+            f_col_label = fc_cand
+            sigf_col_label = _find_matching_sigma_col(fc_cand, sfc_cand)
+            break
+    if f_col_label is None:
+        for lbl_c in col_order:
+            if lbl_c in _non_data_labels:
+                continue
+            if col_types.get(lbl_c) in ("F", "G"):
+                f_col_label = lbl_c
+                sigf_col_label = _find_matching_sigma_col(lbl_c)
+                break
+
+    # 2. Detect intensity column I (used directly when present, or synthesized from F^2 when absent)
+    i_col_label: str | None = None
+    sigi_col_label: str | None = None
+    for ic_cand, sic_cand in (
         ("I", "SIGI"),
         ("I", "SigI"),
         ("IMEAN", "SIGIMEAN"),
         ("Iobs", "SigIobs"),
         ("Ipred", "SigIpred"),
         ("I(+)", "SIGI(+)"),
-        ("FP", "SIGFP"),
-        ("F", "SIGF"),
     ):
-        if ic in cols:
-            i_col = cols[ic]
-            s_col = cols.get(sc, np.ones_like(i_col))
+        if ic_cand in cols and col_types.get(ic_cand) not in (
+            "P",
+            "W",
+            "I",
+            "B",
+            "Y",
+            "H",
+        ):
+            i_col_label = ic_cand
+            sigi_col_label = _find_matching_sigma_col(ic_cand, sic_cand)
             break
-    if i_col is None:
+    if i_col_label is None:
+        for lbl_c in col_order:
+            if lbl_c in _non_data_labels:
+                continue
+            if col_types.get(lbl_c) in ("J", "K"):
+                i_col_label = lbl_c
+                sigi_col_label = _find_matching_sigma_col(lbl_c)
+                break
+
+    has_f_col = f_col_label is not None
+    has_sigf_col = sigf_col_label is not None
+    has_i_col = i_col_label is not None
+
+    if has_f_col:
+        f_raw_all = np.asarray(cols[f_col_label], dtype=np.float64)
+        sigf_raw_all = (
+            np.asarray(cols[sigf_col_label], dtype=np.float64)
+            if sigf_col_label is not None
+            else None
+        )
+    else:
+        f_raw_all = None
+        sigf_raw_all = None
+
+    if has_i_col:
+        i_arr = np.asarray(cols[i_col_label], dtype=np.float64)
+        s_arr = (
+            np.asarray(cols[sigi_col_label], dtype=np.float64)
+            if sigi_col_label is not None
+            else np.ones_like(i_arr)
+        )
+    elif has_f_col and f_raw_all is not None:
+        f_clean_tmp = np.where(
+            np.isfinite(f_raw_all), np.maximum(f_raw_all, 0.0), np.nan
+        )
+        if sigf_raw_all is not None:
+            sf_clean_tmp = np.maximum(
+                np.where(np.isfinite(sigf_raw_all), sigf_raw_all, 1.0), 1e-6
+            )
+            i_arr = f_clean_tmp * f_clean_tmp + sf_clean_tmp * sf_clean_tmp
+            s_arr = sf_clean_tmp * np.sqrt(
+                np.maximum(
+                    4.0 * f_clean_tmp * f_clean_tmp + 2.0 * sf_clean_tmp * sf_clean_tmp,
+                    1e-12,
+                )
+            )
+        else:
+            i_arr = f_clean_tmp * f_clean_tmp
+            s_arr = np.ones_like(i_arr)
+    else:
+        # Generic non-phase, non-flag real data column fallback
         val_cols = [
             c.label
             for c in mtz.columns
-            if c.label
-            not in ("H", "K", "L", "M/ISYM", "BATCH", "half", "WAVEL", "THETA", "PHI")
+            if c.label not in _non_data_labels
+            and str(c.type) not in ("P", "W", "I", "B", "Y", "H", "A")
         ]
         if val_cols:
-            i_col = cols[val_cols[0]]
-            s_col = cols[val_cols[1]] if len(val_cols) > 1 else np.ones_like(i_col)
+            first_lbl = val_cols[0]
+            sig_lbl = _find_matching_sigma_col(first_lbl)
+            i_arr = np.asarray(cols[first_lbl], dtype=np.float64)
+            s_arr = (
+                np.asarray(cols[sig_lbl], dtype=np.float64)
+                if sig_lbl is not None
+                else np.ones_like(i_arr)
+            )
         else:
-            i_col = np.full(len(h_col), 100.0, dtype=np.float64)
-            s_col = np.ones(len(h_col), dtype=np.float64)
+            i_arr = np.full(len(h_col), 100.0, dtype=np.float64)
+            s_arr = np.ones(len(h_col), dtype=np.float64)
 
-    i_arr = np.asarray(i_col, dtype=np.float64)
-    s_arr = (
-        np.asarray(s_col, dtype=np.float64)
-        if s_col is not None
-        else np.ones_like(i_arr)
+    primary_finite = (
+        np.isfinite(f_raw_all)
+        if (has_f_col and f_raw_all is not None)
+        else np.isfinite(i_arr)
     )
-    valid_m = np.isfinite(i_arr) & ((h_col != 0) | (k_col != 0) | (l_col != 0))
+    valid_m = (
+        primary_finite
+        & np.isfinite(i_arr)
+        & ((h_col != 0) | (k_col != 0) | (l_col != 0))
+    )
     hkl_valid = np.column_stack((h_col[valid_m], k_col[valid_m], l_col[valid_m]))
     i_valid = i_arr[valid_m]
     s_raw = s_arr[valid_m]
-    s_valid = np.maximum(np.where(np.isfinite(s_raw), s_raw, 1.0), 1e-3)
+    s_valid = np.maximum(np.where(np.isfinite(s_raw), s_raw, 1.0), 1e-6)
+    if has_f_col and f_raw_all is not None:
+        f_valid = np.maximum(f_raw_all[valid_m], 0.0)
+        sigf_valid = (
+            np.maximum(
+                np.where(
+                    np.isfinite(sigf_raw_all[valid_m]), sigf_raw_all[valid_m], 1.0
+                ),
+                1e-6,
+            )
+            if sigf_raw_all is not None
+            else None
+        )
+    else:
+        f_valid, sigf_valid = _derive_f_sigf_from_i_sigi(i_valid, s_valid)
 
     if len(hkl_valid) > 0:
-        ord_abs = np.argsort(-np.abs(i_valid), kind="mergesort")
+        sort_mag = f_valid if has_f_col else np.abs(i_valid)
+        ord_abs = np.argsort(-sort_mag, kind="mergesort")
         hkl_s = hkl_valid[ord_abs]
         i_s = i_valid[ord_abs]
         s_s = s_valid[ord_abs]
+        f_s = f_valid[ord_abs]
+        sf_s = sigf_valid[ord_abs] if sigf_valid is not None else None
         lit_hkl, lit_first = np.unique(hkl_s, axis=0, return_index=True)
         lit_i = i_s[lit_first]
         lit_s = s_s[lit_first]
+        lit_f = f_s[lit_first]
+        lit_sf = sf_s[lit_first] if sf_s is not None else None
     else:
         lit_hkl = np.zeros((0, 3), dtype=int)
         lit_i = np.zeros(0, dtype=np.float64)
         lit_s = np.zeros(0, dtype=np.float64)
+        lit_f = np.zeros(0, dtype=np.float64)
+        lit_sf = np.zeros(0, dtype=np.float64) if sigf_valid is not None else None
 
     asu_map: dict[tuple[int, int, int], tuple[float, float]] = {}
+    asu_f_raw_map: dict[tuple[int, int, int], tuple[float, float | None]] = {}
     for u_idx in range(len(lit_hkl)):
         hh, kk, ll = (
             int(lit_hkl[u_idx, 0]),
@@ -2089,10 +2370,162 @@ def apply_mtz_to_payload(
             int(lit_hkl[u_idx, 2]),
         )
         iv, sv_clean = float(lit_i[u_idx]), float(lit_s[u_idx])
+        fv = float(lit_f[u_idx])
+        sfv = float(lit_sf[u_idx]) if lit_sf is not None else None
         asu_hkl, _ = asu.to_asu([hh, kk, ll], ops)
         key = (int(asu_hkl[0]), int(asu_hkl[1]), int(asu_hkl[2]))
         if key not in asu_map or abs(iv) > abs(asu_map[key][0]):
             asu_map[key] = (iv, sv_clean)
+            asu_f_raw_map[key] = (fv, sfv)
+
+    # Determine single global squared-structure-factor scale `mtz_global_i_scale`
+    # (`mtz_global_f_scale = sqrt(mtz_global_i_scale)`) so normalized |F̃_calc(h)|^2
+    # sits on the exact same scale as Careless's normalized merged |F_obs(h)|^2 (`merged_i`).
+    careless_i_ref: dict[tuple[int, int, int], float] = {}
+    raw_ci_lu = payload.get("careless_i_asu_lookup")
+    if isinstance(raw_ci_lu, dict):
+        for k_str, pair_ci in raw_ci_lu.items():
+            if isinstance(pair_ci, list) and len(pair_ci) >= 1:
+                parts_k = str(k_str).split(",")
+                if len(parts_k) == 3:
+                    with contextlib.suppress(ValueError, TypeError):
+                        iv_c = float(pair_ci[0])
+                        if np.isfinite(iv_c) and iv_c > 0.0:
+                            careless_i_ref[
+                                (int(parts_k[0]), int(parts_k[1]), int(parts_k[2]))
+                            ] = iv_c
+    raw_cf_lu = payload.get("careless_f_asu_lookup")
+    if not careless_i_ref and isinstance(raw_cf_lu, dict):
+        for k_str, pair_cf in raw_cf_lu.items():
+            if isinstance(pair_cf, list) and len(pair_cf) >= 1:
+                parts_k = str(k_str).split(",")
+                if len(parts_k) == 3:
+                    with contextlib.suppress(ValueError, TypeError):
+                        fv_c = float(pair_cf[0])
+                        if np.isfinite(fv_c) and fv_c > 0.0:
+                            careless_i_ref[
+                                (int(parts_k[0]), int(parts_k[1]), int(parts_k[2]))
+                            ] = fv_c * fv_c
+    if not careless_i_ref:
+        for pk_bucket_c in (
+            payload.get("integrated_sample_peaks"),
+            payload.get("integrated_peaks"),
+            payload.get("peaks"),
+        ):
+            if not isinstance(pk_bucket_c, list):
+                continue
+            for pk_c in pk_bucket_c:
+                if not isinstance(pk_c, dict):
+                    continue
+                if (
+                    pk_c.get("careless_residual") is None
+                    and pk_c.get("careless_scale") is None
+                    and pk_c.get("merged_f") is None
+                ):
+                    continue
+                asu_c = pk_c.get("asu_hkl")
+                if not (isinstance(asu_c, list) and len(asu_c) == 3):
+                    continue
+                ak_c = (int(asu_c[0]), int(asu_c[1]), int(asu_c[2]))
+                if ak_c in careless_i_ref:
+                    continue
+                mi_c = pk_c.get("merged_i")
+                if isinstance(mi_c, (int, float)) and np.isfinite(mi_c) and mi_c > 0.0:
+                    careless_i_ref[ak_c] = float(mi_c)
+                else:
+                    mf_c = pk_c.get("merged_f")
+                    if (
+                        isinstance(mf_c, (int, float))
+                        and np.isfinite(mf_c)
+                        and mf_c > 0.0
+                    ):
+                        careless_i_ref[ak_c] = float(mf_c) * float(mf_c)
+
+    def _raw_fsq_val(fv_r: float, iv_r: float) -> float:
+        return float(fv_r * fv_r) if has_f_col else float(iv_r)
+
+    shared_i_mtz: list[float] = []
+    shared_i_obs: list[float] = []
+    if same_sg and careless_i_ref:
+        for ak_m, (fv_m, _) in asu_f_raw_map.items():
+            iv_raw_m = _raw_fsq_val(fv_m, asu_map[ak_m][0])
+            if iv_raw_m > 0.0 and ak_m in careless_i_ref:
+                shared_i_mtz.append(iv_raw_m)
+                shared_i_obs.append(careless_i_ref[ak_m])
+
+    mtz_scale_basis = "unit_wilson_rms"
+    mtz_global_i_scale = 1.0
+    if len(shared_i_mtz) >= 3:
+        arr_im = np.asarray(shared_i_mtz, dtype=np.float64)
+        arr_io = np.asarray(shared_i_obs, dtype=np.float64)
+        q75_im = float(np.quantile(arr_im, 0.75))
+        q75_io = float(np.quantile(arr_io, 0.75))
+        if q75_im > 1e-9 and q75_io > 1e-9:
+            mtz_global_i_scale = q75_im / q75_io
+            mtz_scale_basis = "careless_shared_q75"
+    if mtz_scale_basis == "unit_wilson_rms":
+        all_pos_i = np.asarray(
+            [
+                _raw_fsq_val(asu_f_raw_map[k_m][0], asu_map[k_m][0])
+                for k_m in asu_map
+                if np.isfinite(_raw_fsq_val(asu_f_raw_map[k_m][0], asu_map[k_m][0]))
+                and _raw_fsq_val(asu_f_raw_map[k_m][0], asu_map[k_m][0]) > 0.0
+            ],
+            dtype=np.float64,
+        )
+        if len(all_pos_i) > 0:
+            i_cap = (
+                float(np.quantile(all_pos_i, 0.99))
+                if len(all_pos_i) >= 20
+                else float(np.max(all_pos_i))
+            )
+            i_win = np.minimum(all_pos_i, max(i_cap, 1e-9))
+            mean_i = float(np.mean(i_win))
+            if np.isfinite(mean_i) and mean_i > 1e-9:
+                mtz_global_i_scale = mean_i
+    mtz_global_f_scale = float(np.sqrt(max(mtz_global_i_scale, 1e-18)))
+
+    # Build normalized structure-factor lookup maps:
+    # (F̃_calc, σ̃_F_calc | None, F_mtz/σ_F (or F̃_calc), |F̃_calc|^2)
+    def _norm_f_entry(
+        fv_raw: float,
+        sfv_raw: float | None,
+        iv_raw: float,
+    ) -> tuple[float, float | None, float, float]:
+        f_n = float(fv_raw) / mtz_global_f_scale
+        if sfv_raw is not None and np.isfinite(sfv_raw) and sfv_raw > 0.0:
+            sf_n: float | None = float(sfv_raw) / mtz_global_f_scale
+            fsigf_v = float(fv_raw) / max(float(sfv_raw), 1e-6)
+        else:
+            sf_n = None
+            fsigf_v = f_n
+        i_n = _raw_fsq_val(fv_raw, iv_raw) / mtz_global_i_scale
+        return (f_n, sf_n, fsigf_v, i_n)
+
+    asu_f_norm_map: dict[
+        tuple[int, int, int], tuple[float, float | None, float, float]
+    ] = {
+        k: _norm_f_entry(
+            asu_f_raw_map[k][0],
+            asu_f_raw_map[k][1],
+            asu_map[k][0],
+        )
+        for k in asu_map
+    }
+    exact_f_norm_map: dict[
+        tuple[int, int, int], tuple[float, float | None, float, float]
+    ] = {}
+    for u_idx in range(len(lit_hkl)):
+        hk_u = (
+            int(lit_hkl[u_idx, 0]),
+            int(lit_hkl[u_idx, 1]),
+            int(lit_hkl[u_idx, 2]),
+        )
+        exact_f_norm_map[hk_u] = _norm_f_entry(
+            float(lit_f[u_idx]),
+            float(lit_sf[u_idx]) if lit_sf is not None else None,
+            float(lit_i[u_idx]),
+        )
 
     # Expand merged ASU MTZs across symmetry + Friedel mates carrying (I, SIGI) directly in NumPy.
     # Symmetry matrices operate purely on integer (H, K, L) indices; mtz.cell is never used to rescale B.
@@ -2501,8 +2934,48 @@ def apply_mtz_to_payload(
         elif not out.get("predicted_sample_peaks"):
             out["predicted_sample_peaks"] = list(out.get("predicted_peaks") or [])
 
-    # Annotate predicted & integrated peak sets with mtz_i / mtz_sigi / mtz_isigi data columns
+    # Annotate predicted & integrated peak sets with normalized MTZ |F̃_calc|² and I_pred/σ columns
     # (filtering to active_panel_banks when panel banks are known) without altering U, B, UB, cell, or zones.
+    scale_prof = out.get("careless_scale_profile")
+    if not isinstance(scale_prof, dict):
+        for _prof_bucket in (
+            out.get("integrated_sample_peaks"),
+            out.get("integrated_peaks"),
+            out.get("peaks"),
+        ):
+            if isinstance(_prof_bucket, list) and _prof_bucket:
+                _w_p, _s_p, _sig_p = [], [], []
+                for _item in _prof_bucket:
+                    if not isinstance(_item, dict):
+                        continue
+                    _wv = _item.get("wavelength")
+                    _sv = _item.get("careless_scale")
+                    if (
+                        isinstance(_wv, (int, float))
+                        and isinstance(_sv, (int, float))
+                        and np.isfinite(_wv)
+                        and np.isfinite(_sv)
+                        and _sv > 0.0
+                    ):
+                        _w_p.append(float(_wv))
+                        _s_p.append(float(_sv))
+                        _sgv = _item.get("sigma")
+                        _sig_p.append(
+                            float(_sgv)
+                            if isinstance(_sgv, (int, float))
+                            and np.isfinite(_sgv)
+                            and _sgv > 0.0
+                            else np.nan
+                        )
+                if _w_p:
+                    scale_prof = _compute_careless_scale_profile(
+                        np.asarray(_w_p, dtype=float),
+                        np.asarray(_s_p, dtype=float),
+                        sigma=np.asarray(_sig_p, dtype=float),
+                    )
+                    if scale_prof is not None:
+                        out["careless_scale_profile"] = scale_prof
+                        break
     asu_lookup_cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
     matched_counts: dict[str, int] = {}
     for list_key in (
@@ -2526,15 +2999,26 @@ def apply_mtz_to_payload(
             ):
                 continue
             pk_copy = dict(pk)
-            pk_copy.pop("mtz_i", None)
-            pk_copy.pop("mtz_sigi", None)
-            pk_copy.pop("mtz_isigi", None)
+            for _drop_m in (
+                "mtz_i",
+                "mtz_sigi",
+                "mtz_isigi",
+                "mtz_f",
+                "mtz_sigf",
+                "mtz_fsigf",
+                "mtz_i_norm",
+                "mtz_inst_i",
+                "mtz_ipred_isigi",
+            ):
+                pk_copy.pop(_drop_m, None)
             hit: tuple[float, float] | None = None
+            hit_f: tuple[float, float | None, float, float] | None = None
             hkl_v = pk_copy.get("hkl")
             if isinstance(hkl_v, list) and len(hkl_v) == 3:
                 hk_key = (int(hkl_v[0]), int(hkl_v[1]), int(hkl_v[2]))
                 hit = exact_hkl_map.get(hk_key)
-                if hit is None and not is_unmerged_mtz:
+                hit_f = exact_f_norm_map.get(hk_key)
+                if not is_unmerged_mtz and (hit is None or hit_f is None):
                     asu_pre = pk_copy.get("asu_hkl") if same_sg else None
                     if isinstance(asu_pre, list) and len(asu_pre) == 3:
                         ak_t = (int(asu_pre[0]), int(asu_pre[1]), int(asu_pre[2]))
@@ -2544,14 +3028,66 @@ def apply_mtz_to_payload(
                             asu_k, _ = asu.to_asu(list(hk_key), ops)
                             ak_t = (int(asu_k[0]), int(asu_k[1]), int(asu_k[2]))
                             asu_lookup_cache[hk_key] = ak_t
-                    hit = asu_map.get(ak_t)
+                    if hit is None:
+                        hit = asu_map.get(ak_t)
+                    if hit_f is None:
+                        hit_f = asu_f_norm_map.get(ak_t)
             if hit is not None:
                 iv_m, sv_m = float(hit[0]), max(float(hit[1]), 1e-6)
-                pk_copy["mtz_i"] = round(iv_m, 2)
-                pk_copy["mtz_sigi"] = round(sv_m, 2)
-                pk_copy["mtz_isigi"] = round(iv_m / sv_m, 3)
-                pk_copy["merged_i"] = round(iv_m, 2)
-                pk_copy["merged_sigi"] = round(sv_m, 2)
+                pk_copy["mtz_i"] = round(iv_m, 4 if abs(iv_m) < 10.0 else 2)
+                pk_copy["mtz_sigi"] = round(sv_m, 4 if abs(sv_m) < 10.0 else 2)
+                if has_i_col or not has_f_col:
+                    pk_copy["mtz_isigi"] = round(iv_m / sv_m, 3)
+                if hit_f is not None:
+                    f_n, sf_n, fsigf_v, i_n = hit_f
+                    pk_copy["mtz_f"] = round(float(f_n), 4)
+                    if sf_n is not None:
+                        pk_copy["mtz_sigf"] = round(float(sf_n), 4)
+                    pk_copy["mtz_fsigf"] = round(float(fsigf_v), 3)
+                    pk_copy["mtz_i_norm"] = round(float(i_n), 4)
+                    if not has_i_col and has_f_col:
+                        pk_copy["mtz_isigi"] = round(float(fsigf_v), 3)
+                    cs_val = pk_copy.get("careless_scale")
+                    sig_obs_val = pk_copy.get("sigma")
+                    if (
+                        isinstance(cs_val, (int, float))
+                        and np.isfinite(cs_val)
+                        and cs_val > 0.0
+                    ):
+                        pk_copy["mtz_inst_i"] = round(float(cs_val) * float(i_n), 3)
+                        if (
+                            isinstance(sig_obs_val, (int, float))
+                            and np.isfinite(sig_obs_val)
+                            and sig_obs_val > 0.0
+                        ):
+                            pk_copy["mtz_ipred_isigi"] = round(
+                                (float(cs_val) * float(i_n))
+                                / max(float(sig_obs_val), 1e-6),
+                                3,
+                            )
+                        else:
+                            snr_scl = _eval_careless_snr_scale_profile(
+                                pk_copy.get("wavelength"), scale_prof
+                            )
+                            if snr_scl is not None and snr_scl > 0.0:
+                                pk_copy["mtz_ipred_isigi"] = round(
+                                    float(snr_scl) * float(i_n), 3
+                                )
+                    else:
+                        cs_prof = _eval_careless_scale_profile(
+                            pk_copy.get("wavelength"), scale_prof
+                        )
+                        if cs_prof is not None and cs_prof > 0.0:
+                            pk_copy["mtz_inst_i"] = round(
+                                float(cs_prof) * float(i_n), 3
+                            )
+                        snr_scl = _eval_careless_snr_scale_profile(
+                            pk_copy.get("wavelength"), scale_prof
+                        )
+                        if snr_scl is not None and snr_scl > 0.0:
+                            pk_copy["mtz_ipred_isigi"] = round(
+                                float(snr_scl) * float(i_n), 3
+                            )
                 n_hit += 1
             new_list.append(pk_copy)
         out[list_key] = new_list
@@ -2577,9 +3113,19 @@ def apply_mtz_to_payload(
     out.pop("mtz_peaks", None)
     out.pop("mtz_sample_peaks", None)
     out["default_peak_source"] = active_src
+    preferred_mtz_mode = "mtz_fcalc"
     if select_mtz_color or not out.get("default_color_mode"):
-        out["default_color_mode"] = "mtz_isigi"
+        out["default_color_mode"] = preferred_mtz_mode
     out["mtz_fresh_overlay"] = bool(select_mtz_color)
+    out["mtz_is_external"] = True
+    out["mtz_has_f_column"] = bool(has_f_col)
+    out["mtz_has_sigf_column"] = bool(has_sigf_col)
+    out["mtz_has_i_column"] = bool(has_i_col)
+    out["mtz_f_column"] = f_col_label
+    out["mtz_sigf_column"] = sigf_col_label
+    out["mtz_global_f_scale"] = round(float(mtz_global_f_scale), 6)
+    out["mtz_global_i_scale"] = round(float(mtz_global_i_scale), 6)
+    out["mtz_scale_basis"] = mtz_scale_basis
     if active_src == "integrated":
         out["peaks"] = out.get("integrated_peaks") or []
         out["sample_peaks"] = out.get("integrated_sample_peaks") or out["peaks"]
@@ -2596,10 +3142,28 @@ def apply_mtz_to_payload(
             f"{k[0]},{k[1]},{k[2]}": [round(float(v[0]), 2), round(float(v[1]), 2)]
             for k, v in asu_map.items()
         }
+        out["mtz_f_asu_lookup"] = {
+            f"{k[0]},{k[1]},{k[2]}": [
+                round(float(v[0]), 4),
+                round(float(v[1]), 4) if v[1] is not None else None,
+                round(float(v[2]), 3),
+                round(float(v[3]), 4),
+            ]
+            for k, v in asu_f_norm_map.items()
+        }
     if is_unmerged_mtz and len(exact_hkl_map) <= 120000:
         out["mtz_exact_lookup"] = {
             f"{k[0]},{k[1]},{k[2]}": [round(float(v[0]), 2), round(float(v[1]), 2)]
             for k, v in exact_hkl_map.items()
+        }
+        out["mtz_f_exact_lookup"] = {
+            f"{k[0]},{k[1]},{k[2]}": [
+                round(float(v[0]), 4),
+                round(float(v[1]), 4) if v[1] is not None else None,
+                round(float(v[2]), 3),
+                round(float(v[3]), 4),
+            ]
+            for k, v in exact_f_norm_map.items()
         }
     out["mtz_overlay_matched"] = max(
         matched_counts.get("predicted_peaks", 0),
@@ -3407,6 +3971,27 @@ def _extract_from_h5(
         careless_scale = _read_pk_col("peaks/careless_scale", float)
         merged_i = _read_pk_col("peaks/merged_i", float)
         merged_sigi = _read_pk_col("peaks/merged_sigi", float)
+        merged_f = _read_pk_col("peaks/merged_f", float)
+        merged_sigf = _read_pk_col("peaks/merged_sigf", float)
+        if (
+            (merged_f is None or merged_sigf is None)
+            and merged_i is not None
+            and merged_sigi is not None
+            and len(merged_i) == len(merged_sigi)
+            and (
+                (
+                    careless_residual is not None
+                    and np.any(np.isfinite(careless_residual))
+                )
+                or (careless_scale is not None and np.any(np.isfinite(careless_scale)))
+                or "careless/metrics_json" in f
+            )
+        ):
+            merged_f, merged_sigf = _derive_f_sigf_from_i_sigi(merged_i, merged_sigi)
+            nan_m = ~(np.isfinite(merged_i) & np.isfinite(merged_sigi))
+            if np.any(nan_m):
+                merged_f = np.where(nan_m, np.nan, merged_f)
+                merged_sigf = np.where(nan_m, np.nan, merged_sigf)
 
         def _normalize_merge_metrics(doc_m: dict[str, Any]) -> dict[str, Any]:
             out = dict(doc_m)
@@ -4118,6 +4703,38 @@ def _extract_from_h5(
                         "sigma": None,
                     }
 
+        # Compute exact unfiltered wavelength bandpass quantile profile across ALL
+        # runs BEFORE SNR>=2.5 truncation (`all_runs_data`) or active-frame slicing.
+        wavelength_bandpass_profile = _compute_wavelength_bandpass_profile(
+            lam,
+            intensity,
+            sigma,
+            hkl=hkl,
+        )
+        careless_scale_profile = _compute_careless_scale_profile(
+            lam if lam is not None else _read_pk_col("peaks/wavelength", float),
+            careless_scale,
+            sigma=sigma,
+        )
+        if (
+            careless_scale_profile is None
+            and pk_slice != slice(None)
+            and "peaks/lambda" in f
+            and "peaks/careless_scale" in f
+        ):
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
+                careless_scale_profile = _compute_careless_scale_profile(
+                    np.asarray(f["peaks/lambda"][()], dtype=float),
+                    np.asarray(f["peaks/careless_scale"][()], dtype=float),
+                    sigma=(
+                        np.asarray(f["peaks/sigma"][()], dtype=float)
+                        if "peaks/sigma" in f
+                        else None
+                    ),
+                )
+
         # Capture all-runs sample-space peak arrays before filtering to active_frame
         all_runs_data: dict[str, Any] | None = None
         if (
@@ -4214,6 +4831,12 @@ def _extract_from_h5(
                 "merged_sigi": merged_sigi[idx_all]
                 if merged_sigi is not None and len(merged_sigi) == len(peaks_xyz)
                 else None,
+                "merged_f": merged_f[idx_all]
+                if merged_f is not None and len(merged_f) == len(peaks_xyz)
+                else None,
+                "merged_sigf": merged_sigf[idx_all]
+                if merged_sigf is not None and len(merged_sigf) == len(peaks_xyz)
+                else None,
                 "R_per_run": R_per_run,
                 "s_lab_per_run": s_lab_per_run_all,
             }
@@ -4258,6 +4881,10 @@ def _extract_from_h5(
                     merged_i = merged_i[mask_run]
                 if merged_sigi is not None and len(merged_sigi) == len(mask_run):
                     merged_sigi = merged_sigi[mask_run]
+                if merged_f is not None and len(merged_f) == len(mask_run):
+                    merged_f = merged_f[mask_run]
+                if merged_sigf is not None and len(merged_sigf) == len(mask_run):
+                    merged_sigf = merged_sigf[mask_run]
                 run_index = run_index[mask_run]
 
         # Filter out zero/noise predictions in integrated.h5 (keep significant reflections I/sigma >= 2.5)
@@ -4301,6 +4928,10 @@ def _extract_from_h5(
                     merged_i = merged_i[snr_mask]
                 if merged_sigi is not None and len(merged_sigi) == len(snr_mask):
                     merged_sigi = merged_sigi[snr_mask]
+                if merged_f is not None and len(merged_f) == len(snr_mask):
+                    merged_f = merged_f[snr_mask]
+                if merged_sigf is not None and len(merged_sigf) == len(snr_mask):
+                    merged_sigf = merged_sigf[snr_mask]
                 if run_index is not None and len(run_index) == len(snr_mask):
                     run_index = run_index[snr_mask]
 
@@ -4732,7 +5363,11 @@ def _extract_from_h5(
             "careless_scale": careless_scale,
             "merged_i": merged_i,
             "merged_sigi": merged_sigi,
+            "merged_f": merged_f,
+            "merged_sigf": merged_sigf,
             "merge_metrics": merge_metrics,
+            "wavelength_bandpass_profile": wavelength_bandpass_profile,
+            "careless_scale_profile": careless_scale_profile,
             "all_runs_data": all_runs_data,
             "predicted_frame_data": predicted_frame_data,
             "predicted_all_runs_data": predicted_all_runs_data,
@@ -4749,6 +5384,199 @@ def _extract_from_h5(
             "frames": frames_meta,
             "frame_index": active_frame,
         }
+
+
+def _compute_wavelength_bandpass_profile(
+    lam: np.ndarray | None,
+    intensity: np.ndarray | None,
+    sigma: np.ndarray | None,
+    *,
+    hkl: np.ndarray | None = None,
+    bin_step: float = 0.05,
+) -> dict[str, Any] | None:
+    """Compute unfiltered, outlier-robust per-bin wavelength I/σ quantiles.
+
+    Excludes higher harmonic orders (``gcd(|h|,|k|,|l|) > 1``) when enough
+    fundamental reflections exist so Laue harmonic spot overlaps do not leak
+    strong in-band intensities onto off-band wavelengths, and Winsorizes extreme
+    single-spot I/σ outliers at the 98.5th percentile.
+    """
+    if lam is None or intensity is None or sigma is None:
+        return None
+    lam_a = np.asarray(lam, dtype=float).ravel()
+    int_a = np.asarray(intensity, dtype=float).ravel()
+    sig_a = np.asarray(sigma, dtype=float).ravel()
+    n_tot = len(lam_a)
+    if n_tot < 6 or len(int_a) != n_tot or len(sig_a) != n_tot:
+        return None
+    valid = (
+        np.isfinite(lam_a)
+        & (lam_a > 0.05)
+        & np.isfinite(int_a)
+        & np.isfinite(sig_a)
+        & (sig_a > 0.0)
+    )
+    if int(np.sum(valid)) < 6:
+        return None
+    if hkl is not None:
+        hkl_a = np.asarray(hkl, dtype=np.int64)
+        if hkl_a.ndim == 2 and len(hkl_a) == n_tot and hkl_a.shape[1] >= 3:
+            gcds = np.gcd.reduce(np.abs(hkl_a[:, :3]), axis=1)
+            fund = valid & (gcds <= 1)
+            if int(np.sum(fund)) >= 20:
+                valid = fund
+    w = lam_a[valid]
+    s = int_a[valid] / sig_a[valid]
+    finite_s = np.isfinite(s)
+    if int(np.sum(finite_s)) < 6:
+        return None
+    w = w[finite_s]
+    s = s[finite_s]
+
+    step = max(0.01, float(bin_step))
+    q_cap = max(4.0, float(np.quantile(s, 0.985)))
+    s_win = np.minimum(s, q_cap)
+
+    lo_edge = round(float(np.floor(float(np.min(w)) / step) * step), 4)
+    hi_edge = round(float(np.ceil(float(np.max(w)) / step) * step), 4)
+    if hi_edge <= lo_edge + 1e-6:
+        hi_edge = round(lo_edge + step, 4)
+    n_bins = max(1, min(240, round((hi_edge - lo_edge) / step)))
+    edges = lo_edge + np.arange(n_bins + 1, dtype=float) * step
+
+    counts_out: list[int] = []
+    q50_out: list[float | None] = []
+    q75_out: list[float | None] = []
+    q90_out: list[float | None] = []
+    f_strong_out: list[float] = []
+
+    bin_idx = np.clip(
+        np.floor((w - lo_edge) / step).astype(np.int64),
+        0,
+        n_bins - 1,
+    )
+    for b_i in range(n_bins):
+        m = bin_idx == b_i
+        c = int(np.sum(m))
+        counts_out.append(c)
+        if c == 0:
+            q50_out.append(None)
+            q75_out.append(None)
+            q90_out.append(None)
+            f_strong_out.append(0.0)
+        elif c == 1:
+            v0 = round(float(s_win[m][0]), 3)
+            q50_out.append(v0)
+            q75_out.append(v0)
+            q90_out.append(v0)
+            f_strong_out.append(1.0 if float(s[m][0]) >= 4.0 else 0.0)
+        else:
+            sb = s_win[m]
+            q50_v, q75_v, q90_v = np.quantile(sb, [0.50, 0.75, 0.90])
+            q50_out.append(round(float(q50_v), 3))
+            q75_out.append(round(float(q75_v), 3))
+            q90_out.append(round(float(q90_v), 3))
+            f_strong_out.append(round(float(np.mean(s[m] >= 4.0)), 4))
+
+    return {
+        "bin_lo": lo_edge,
+        "bin_step": round(step, 4),
+        "edges": [round(float(x), 4) for x in edges],
+        "n": counts_out,
+        "q50": q50_out,
+        "q75": q75_out,
+        "q90": q90_out,
+        "f_strong": f_strong_out,
+    }
+
+
+def _compute_careless_scale_profile(
+    lam: np.ndarray | None,
+    careless_scale: np.ndarray | None,
+    sigma: np.ndarray | None = None,
+    *,
+    bin_step: float = 0.05,
+) -> dict[str, Any] | None:
+    """Compute wavelength-binned median Careless scale ``Σ(λ)`` and SNR scale ``Σ(λ)/σ_{I_obs}(λ)``.
+
+    Allows mapping normalized structure-factor intensities ``|F̃_calc(hkl)|^2`` back
+    into expected instrument SNR ``I_pred / σ_{I_obs} = Σ(λ) · |F̃_calc(hkl)|^2 / σ_{I_obs}(λ)``
+    across goniometer frames for any predicted or re-oriented reflection.
+    """
+    if lam is None or careless_scale is None:
+        return None
+    lam_a = np.asarray(lam, dtype=float).ravel()
+    scl_a = np.asarray(careless_scale, dtype=float).ravel()
+    n_tot = len(lam_a)
+    if n_tot < 1 or len(scl_a) != n_tot:
+        return None
+    sig_a: np.ndarray | None = None
+    if sigma is not None:
+        cand_sig = np.asarray(sigma, dtype=float).ravel()
+        if len(cand_sig) == n_tot:
+            sig_a = cand_sig
+    valid = np.isfinite(lam_a) & (lam_a > 0.05) & np.isfinite(scl_a) & (scl_a > 0.0)
+    if not np.any(valid):
+        return None
+    w = lam_a[valid]
+    s = scl_a[valid]
+    sig_v = sig_a[valid] if sig_a is not None else None
+    global_med = round(float(np.median(s)), 4)
+    global_sig_med: float | None = None
+    global_snr_scl_med: float | None = None
+    if sig_v is not None:
+        m_sig = np.isfinite(sig_v) & (sig_v > 1e-6)
+        if np.any(m_sig):
+            global_sig_med = round(float(np.median(sig_v[m_sig])), 4)
+            global_snr_scl_med = round(float(np.median(s[m_sig] / sig_v[m_sig])), 4)
+    step = max(0.01, float(bin_step))
+    lo_edge = round(float(np.floor(float(np.min(w)) / step) * step), 4)
+    hi_edge = round(float(np.ceil(float(np.max(w)) / step) * step), 4)
+    if hi_edge <= lo_edge + 1e-6:
+        hi_edge = round(lo_edge + step, 4)
+    n_bins = max(1, min(240, round((hi_edge - lo_edge) / step)))
+    bin_idx = np.clip(
+        np.floor((w - lo_edge) / step).astype(np.int64),
+        0,
+        n_bins - 1,
+    )
+    counts_out: list[int] = []
+    med_out: list[float | None] = []
+    sig_med_out: list[float | None] = []
+    snr_scl_out: list[float | None] = []
+    for b_i in range(n_bins):
+        m = bin_idx == b_i
+        c = int(np.sum(m))
+        counts_out.append(c)
+        if c == 0:
+            med_out.append(None)
+            sig_med_out.append(None)
+            snr_scl_out.append(None)
+        else:
+            med_out.append(round(float(np.median(s[m])), 4))
+            if sig_v is not None:
+                sb = sig_v[m]
+                ms = np.isfinite(sb) & (sb > 1e-6)
+                if np.any(ms):
+                    sig_med_out.append(round(float(np.median(sb[ms])), 4))
+                    snr_scl_out.append(round(float(np.median(s[m][ms] / sb[ms])), 4))
+                else:
+                    sig_med_out.append(None)
+                    snr_scl_out.append(None)
+            else:
+                sig_med_out.append(None)
+                snr_scl_out.append(None)
+    return {
+        "bin_lo": lo_edge,
+        "bin_step": round(step, 4),
+        "n": counts_out,
+        "scale_med": med_out,
+        "sigma_med": sig_med_out,
+        "snr_scale_med": snr_scl_out,
+        "global_median": global_med,
+        "global_sigma_median": global_sig_med,
+        "global_snr_scale_median": global_snr_scl_med,
+    }
 
 
 def _h5_has_tof_data(*candidates: str | os.PathLike[str] | None) -> bool:
@@ -8109,6 +8937,8 @@ def _serialize_peak_entries(
     careless_scale_arr: np.ndarray | None = None,
     merged_i_arr: np.ndarray | None = None,
     merged_sigi_arr: np.ndarray | None = None,
+    merged_f_arr: np.ndarray | None = None,
+    merged_sigf_arr: np.ndarray | None = None,
     ub_matrix: np.ndarray | None,
     R_gonio: np.ndarray | None,
     ki_hat: np.ndarray,
@@ -8173,6 +9003,10 @@ def _serialize_peak_entries(
             merged_i_arr = merged_i_arr[order]
         if merged_sigi_arr is not None and len(merged_sigi_arr) == n_raw:
             merged_sigi_arr = merged_sigi_arr[order]
+        if merged_f_arr is not None and len(merged_f_arr) == n_raw:
+            merged_f_arr = merged_f_arr[order]
+        if merged_sigf_arr is not None and len(merged_sigf_arr) == n_raw:
+            merged_sigf_arr = merged_sigf_arr[order]
         if spot_ang_err_arr is not None and len(spot_ang_err_arr) == n_raw:
             spot_ang_err_arr = spot_ang_err_arr[order]
         if (
@@ -8554,6 +9388,24 @@ def _serialize_peak_entries(
             and np.isfinite(merged_sigi_arr[i])
         ):
             pk_entry["merged_sigi"] = round(float(merged_sigi_arr[i]), 2)
+        if (
+            merged_f_arr is not None
+            and i < len(merged_f_arr)
+            and np.isfinite(merged_f_arr[i])
+        ):
+            pk_entry["merged_f"] = round(float(merged_f_arr[i]), 4)
+        if (
+            merged_sigf_arr is not None
+            and i < len(merged_sigf_arr)
+            and np.isfinite(merged_sigf_arr[i])
+            and merged_sigf_arr[i] > 0.0
+        ):
+            pk_entry["merged_sigf"] = round(float(merged_sigf_arr[i]), 4)
+            if "merged_f" in pk_entry:
+                pk_entry["merged_fsigf"] = round(
+                    float(merged_f_arr[i]) / max(float(merged_sigf_arr[i]), 1e-6),
+                    3,
+                )
         if i in ellipse_cyl_by_idx:
             s_maj = sigma_major_by_idx[i]
             s_min = sigma_minor_by_idx[i]
@@ -8584,6 +9436,8 @@ def _serialize_sample_peaks(
     ub_matrix: np.ndarray | None = None,
     merged_i_arr: np.ndarray | None = None,
     merged_sigi_arr: np.ndarray | None = None,
+    merged_f_arr: np.ndarray | None = None,
+    merged_sigf_arr: np.ndarray | None = None,
     peak_source: str = "predicted",
     d_min: float = 0.0,
     sample_offset_lab: Any = None,
@@ -8607,6 +9461,8 @@ def _serialize_sample_peaks(
     scl_all = all_runs_data.get("careless_scale")
     m_i_all = all_runs_data.get("merged_i")
     m_sigi_all = all_runs_data.get("merged_sigi")
+    m_f_all = all_runs_data.get("merged_f")
+    m_sigf_all = all_runs_data.get("merged_sigf")
     if (
         m_i_all is None
         and merged_i_arr is not None
@@ -8619,6 +9475,18 @@ def _serialize_sample_peaks(
         and len(merged_sigi_arr) == len(pts_all)
     ):
         m_sigi_all = merged_sigi_arr
+    if (
+        m_f_all is None
+        and merged_f_arr is not None
+        and len(merged_f_arr) == len(pts_all)
+    ):
+        m_f_all = merged_f_arr
+    if (
+        m_sigf_all is None
+        and merged_sigf_arr is not None
+        and len(merged_sigf_arr) == len(pts_all)
+    ):
+        m_sigf_all = merged_sigf_arr
     R_per_run = all_runs_data.get("R_per_run") or {}
     s_per_run = all_runs_data.get("s_lab_per_run") or {}
     s_default = (
@@ -8779,6 +9647,19 @@ def _serialize_sample_peaks(
             and np.isfinite(m_sigi_all[j])
         ):
             sp_item["merged_sigi"] = round(float(m_sigi_all[j]), 2)
+        if m_f_all is not None and j < len(m_f_all) and np.isfinite(m_f_all[j]):
+            sp_item["merged_f"] = round(float(m_f_all[j]), 4)
+        if (
+            m_sigf_all is not None
+            and j < len(m_sigf_all)
+            and np.isfinite(m_sigf_all[j])
+            and m_sigf_all[j] > 0.0
+        ):
+            sp_item["merged_sigf"] = round(float(m_sigf_all[j]), 4)
+            if "merged_f" in sp_item:
+                sp_item["merged_fsigf"] = round(
+                    float(m_f_all[j]) / max(float(m_sigf_all[j]), 1e-6), 3
+                )
         sample_peaks.append(sp_item)
     return sample_peaks
 
@@ -8838,7 +9719,11 @@ def build_rainbow_zone_payload(
     careless_scale_arr = None
     merged_i_arr = None
     merged_sigi_arr = None
+    merged_f_arr = None
+    merged_sigf_arr = None
     merge_metrics: dict[str, Any] | None = None
+    wavelength_bandpass_profile: dict[str, Any] | None = None
+    careless_scale_profile: dict[str, Any] | None = None
     all_runs_data: dict[str, Any] | None = None
     predicted_frame_data: dict[str, np.ndarray] | None = None
     predicted_all_runs_data: dict[str, Any] | None = None
@@ -8897,7 +9782,11 @@ def build_rainbow_zone_payload(
         careless_scale_arr = extracted.get("careless_scale")
         merged_i_arr = extracted.get("merged_i")
         merged_sigi_arr = extracted.get("merged_sigi")
+        merged_f_arr = extracted.get("merged_f")
+        merged_sigf_arr = extracted.get("merged_sigf")
         merge_metrics = extracted.get("merge_metrics")
+        wavelength_bandpass_profile = extracted.get("wavelength_bandpass_profile")
+        careless_scale_profile = extracted.get("careless_scale_profile")
         all_runs_data = extracted.get("all_runs_data")
         predicted_frame_data = extracted.get("predicted_frame_data")
         predicted_all_runs_data = extracted.get("predicted_all_runs_data")
@@ -9063,6 +9952,8 @@ def build_rainbow_zone_payload(
         careless_scale_arr=careless_scale_arr,
         merged_i_arr=merged_i_arr,
         merged_sigi_arr=merged_sigi_arr,
+        merged_f_arr=merged_f_arr,
+        merged_sigf_arr=merged_sigf_arr,
         ub_matrix=ub_matrix,
         R_gonio=R_gonio,
         ki_hat=ki_hat,
@@ -9109,6 +10000,8 @@ def build_rainbow_zone_payload(
             ub_matrix=ub_matrix,
             merged_i_arr=merged_i_arr,
             merged_sigi_arr=merged_sigi_arr,
+            merged_f_arr=merged_f_arr,
+            merged_sigf_arr=merged_sigf_arr,
             peak_source=primary_source,
             d_min=d_min_use,
             sample_offset_lab=s_lab_single,
@@ -9736,6 +10629,7 @@ def build_rainbow_zone_payload(
             beamline_detectors[_inst_k] = inst_entries
 
     careless_mtz_asu_lookup: dict[str, list[float]] | None = None
+    careless_f_asu_lookup: dict[str, list[float]] | None = None
     if (
         include_all_runs_peaks
         and replay_h5 is not None
@@ -9754,6 +10648,11 @@ def build_rainbow_zone_payload(
                 c_asu = np.asarray(cf_lu["careless/asu_hkl"][()], dtype=int)
                 c_mi = np.asarray(cf_lu["careless/merged_i"][()], dtype=float)
                 c_ms = np.asarray(cf_lu["careless/merged_sigi"][()], dtype=float)
+                if "careless/merged_f" in cf_lu and "careless/merged_sigf" in cf_lu:
+                    c_mf = np.asarray(cf_lu["careless/merged_f"][()], dtype=float)
+                    c_msf = np.asarray(cf_lu["careless/merged_sigf"][()], dtype=float)
+                else:
+                    c_mf, c_msf = _derive_f_sigf_from_i_sigi(c_mi, c_ms)
                 if (
                     c_asu.ndim == 2
                     and c_asu.shape[1] == 3
@@ -9768,6 +10667,17 @@ def build_rainbow_zone_payload(
                         for j in range(len(c_asu))
                         if np.isfinite(c_mi[j]) and np.isfinite(c_ms[j])
                     }
+                    if len(c_mf) == len(c_asu) and len(c_msf) == len(c_asu):
+                        careless_f_asu_lookup = {
+                            f"{int(c_asu[j, 0])},{int(c_asu[j, 1])},{int(c_asu[j, 2])}": [
+                                round(float(c_mf[j]), 4),
+                                round(float(c_msf[j]), 4),
+                            ]
+                            for j in range(len(c_asu))
+                            if np.isfinite(c_mf[j])
+                            and np.isfinite(c_msf[j])
+                            and c_msf[j] > 0.0
+                        }
 
     out_payload: dict[str, Any] = {
         "subhkl_version": get_subhkl_version(),
@@ -9825,6 +10735,21 @@ def build_rainbow_zone_payload(
             else None
         ),
         "merge_metrics": merge_metrics,
+        "wavelength_bandpass_profile": (
+            wavelength_bandpass_profile
+            if wavelength_bandpass_profile is not None
+            else _compute_wavelength_bandpass_profile(
+                lam_arr,
+                intensity_arr,
+                sigma_arr,
+                hkl=hkl_arr,
+            )
+        ),
+        "careless_scale_profile": (
+            careless_scale_profile
+            if careless_scale_profile is not None
+            else _compute_careless_scale_profile(lam_arr, careless_scale_arr)
+        ),
         "peaks": peaks_list,
         "sample_peaks": sample_peaks,
         "predicted_peaks": predicted_peaks,
@@ -9836,7 +10761,29 @@ def build_rainbow_zone_payload(
         "ladder_steps": ladder_steps,
         "pipeline_stages": pipeline_stages,
     }
+    if careless_f_asu_lookup:
+        out_payload["careless_f_asu_lookup"] = careless_f_asu_lookup
+        for _pk_bucket in (
+            peaks_list,
+            sample_peaks,
+            predicted_peaks,
+            predicted_sample_peaks,
+            integrated_peaks,
+            integrated_sample_peaks,
+        ):
+            for _pk in _pk_bucket:
+                if not isinstance(_pk, dict) or _pk.get("merged_fsigf") is not None:
+                    continue
+                _orb = _pk.get("asu_orbit_id")
+                _fpair = careless_f_asu_lookup.get(_orb) if _orb else None
+                if _fpair is not None and len(_fpair) >= 2:
+                    _mf, _msf = float(_fpair[0]), float(_fpair[1])
+                    _pk["merged_f"] = _mf
+                    _pk["merged_sigf"] = _msf
+                    if _msf > 0.0 and np.isfinite(_mf / _msf):
+                        _pk["merged_fsigf"] = round(float(_mf / _msf), 3)
     if careless_mtz_asu_lookup:
+        out_payload["careless_i_asu_lookup"] = careless_mtz_asu_lookup
         out_payload["mtz_asu_lookup"] = careless_mtz_asu_lookup
         for _pk_bucket in (
             peaks_list,
@@ -9847,16 +10794,20 @@ def build_rainbow_zone_payload(
             integrated_sample_peaks,
         ):
             for _pk in _pk_bucket:
-                if not isinstance(_pk, dict) or _pk.get("mtz_isigi") is not None:
+                if not isinstance(_pk, dict):
                     continue
                 _orb = _pk.get("asu_orbit_id")
                 _pair = careless_mtz_asu_lookup.get(_orb) if _orb else None
                 if _pair is not None and len(_pair) >= 2:
                     _mi, _ms = float(_pair[0]), float(_pair[1])
-                    _pk["mtz_i"] = _mi
-                    _pk["mtz_sigi"] = _ms
-                    if _ms > 0.0 and np.isfinite(_mi / _ms):
-                        _pk["mtz_isigi"] = round(float(_mi / _ms), 2)
+                    if _pk.get("merged_i") is None:
+                        _pk["merged_i"] = _mi
+                        _pk["merged_sigi"] = _ms
+                    if _pk.get("mtz_isigi") is None:
+                        _pk["mtz_i"] = _mi
+                        _pk["mtz_sigi"] = _ms
+                        if _ms > 0.0 and np.isfinite(_mi / _ms):
+                            _pk["mtz_isigi"] = round(float(_mi / _ms), 2)
         out_payload["mtz_overlay_name"] = "merged.mtz"
     return out_payload
 
@@ -9875,18 +10826,38 @@ def merge_frame_only_payload(
         "sample_peaks",
         "predicted_sample_peaks",
         "integrated_sample_peaks",
+    ):
+        prev_val = prev_payload.get(keep_key)
+        if prev_val is not None and not frame_payload.get(keep_key):
+            frame_payload[keep_key] = prev_val
+    for keep_key in (
+        "wavelength_bandpass_profile",
+        "careless_scale_profile",
+        "careless_i_asu_lookup",
+        "careless_f_asu_lookup",
         "pixel_mask_bits",
+        "mtz_is_external",
         "mtz_overlay_name",
         "mtz_overlay_reflections",
         "mtz_overlay_matched",
         "mtz_overlay_space_group",
         "mtz_overlay_cell",
         "mtz_overlay_warning",
+        "mtz_has_f_column",
+        "mtz_has_sigf_column",
+        "mtz_has_i_column",
+        "mtz_f_column",
+        "mtz_sigf_column",
+        "mtz_global_f_scale",
+        "mtz_global_i_scale",
+        "mtz_scale_basis",
         "mtz_asu_lookup",
         "mtz_exact_lookup",
+        "mtz_f_asu_lookup",
+        "mtz_f_exact_lookup",
     ):
         prev_val = prev_payload.get(keep_key)
-        if prev_val is not None and not frame_payload.get(keep_key):
+        if prev_val is not None and frame_payload.get(keep_key) is None:
             frame_payload[keep_key] = prev_val
     return frame_payload
 
@@ -9899,6 +10870,10 @@ def build_frame_only_response(payload: dict[str, Any]) -> dict[str, Any]:
         "sample_peaks",
         "predicted_sample_peaks",
         "integrated_sample_peaks",
+        "wavelength_bandpass_profile",
+        "careless_scale_profile",
+        "careless_i_asu_lookup",
+        "careless_f_asu_lookup",
         "pixel_mask_bits",
         "merge_metrics",
         "beamline_detectors",
@@ -9906,6 +10881,8 @@ def build_frame_only_response(payload: dict[str, Any]) -> dict[str, Any]:
         "space_group_ops",
         "mtz_asu_lookup",
         "mtz_exact_lookup",
+        "mtz_f_asu_lookup",
+        "mtz_f_exact_lookup",
     ):
         out.pop(drop_key, None)
     # Avoid JSON-serializing the primary peak list twice (`peaks` aliases `integrated_peaks` or `predicted_peaks`)
@@ -9940,9 +10917,10 @@ def render_rainbow_html(
         if projection in ("cylindrical", "spherical")
         else payload.get("default_projection", default_projection_for_instrument(inst))
     )
-    init_wl = payload.get("wavelength_range") or [2.8, 4.5]
-    init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
-    init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
+    def_wl_init = _get_instrument_default_wavelength(inst)
+    init_wl = payload.get("wavelength_range") or [def_wl_init[0], def_wl_init[1]]
+    init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else float(def_wl_init[0])
+    init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else float(def_wl_init[1])
     init_wl_dom_min = min(0.20, max(0.05, math.floor(init_wl_min * 20.0) / 20.0))
     init_wl_dom_max = max(
         6.0, math.ceil(max(init_wl_max * 1.35, init_wl_max + 0.5) * 2.0) / 2.0
@@ -10497,7 +11475,26 @@ def render_rainbow_html(
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 6px;
+    min-width: 0;
     font-size: 0.66rem;
+  }}
+
+  #sel-spot-color {{
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 158px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+
+  #sel-wulff-color {{
+    min-width: 0;
+    max-width: 138px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }}
 
   input[type="range"] {{
@@ -11276,7 +12273,13 @@ def render_rainbow_html(
     cursor: ew-resize;
   }}
 
-  /* Dual-bracket [ and ] wavelength interval slider */
+  .controls-section-divider {{
+    height: 1px;
+    margin: 4px 0 3px 0;
+    background: rgba(38, 49, 79, 0.85);
+  }}
+
+  /* Dual-bracket [ and ] wavelength interval slider (monochrome/sky-blue physical parameter rail) */
   .wl-interval-slider {{
     position: relative;
     height: 18px;
@@ -11301,27 +12304,48 @@ def render_rainbow_html(
     position: absolute;
     left: 0;
     right: 0;
-    height: 6px;
-    border-radius: 3px;
-    background: rgba(15, 23, 42, 0.88);
+    height: 10px;
+    border-radius: 4px;
+    background: #0b1120;
     border: 1px solid rgba(148, 163, 184, 0.36);
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.52);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.58);
+    overflow: hidden;
+    pointer-events: none;
+  }}
+
+  .wl-carpet-canvas {{
+    display: block;
+    width: 100%;
+    height: 100%;
     pointer-events: none;
   }}
 
   .wl-track-fill {{
     position: absolute;
-    height: 6px;
-    border-radius: 2px;
+    height: 10px;
+    border-radius: 3px;
     background: linear-gradient(
       90deg,
-      hsla(265, 92%, 62%, 0.88) 0%,
-      hsla(195, 95%, 56%, 0.88) 34%,
-      hsla(120, 82%, 52%, 0.88) 68%,
-      hsla(12, 92%, 58%, 0.90) 100%
+      rgba(56, 189, 248, 0.34) 0%,
+      rgba(14, 165, 233, 0.48) 100%
     );
-    box-shadow: 0 0 6px rgba(56, 189, 248, 0.25);
+    border-top: 1px solid rgba(125, 211, 252, 0.55);
+    border-bottom: 1px solid rgba(125, 211, 252, 0.55);
+    box-shadow: 0 0 5px rgba(56, 189, 248, 0.18);
     pointer-events: none;
+  }}
+
+  .wl-track-fill.has-carpet {{
+    background: rgba(148, 163, 184, 0.10);
+    border-top: 1px solid rgba(226, 232, 240, 0.68);
+    border-bottom: 1px solid rgba(226, 232, 240, 0.68);
+    box-shadow: 0 0 5px rgba(56, 189, 248, 0.22);
+  }}
+
+  .wl-bracket-knob.snapped-band-edge {{
+    border-color: #38bdf8;
+    color: #7dd3fc;
+    box-shadow: 0 0 6px rgba(56, 189, 248, 0.72);
   }}
 
   .wl-bracket-knob {{
@@ -11616,11 +12640,13 @@ def render_rainbow_html(
             <div class="stereo-toolbar">
               <button id="btn-wulff-scope" type="button" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
               <button id="btn-wulff-friedel" type="button" class="active-btn" title="Show antipodal Friedel mates (-h,-k,-l) on the Wulff sphere (fills the θ vs 2θ hemisphere; violet symmetry links vs gold proper rotations)">±Friedel</button>
-              <select id="sel-wulff-color" title="Color reflections on Wulff Net &amp; Detector by Wavelength, ASU Symmetry Orbit, Divergent Quantile I/σ, .mtz I/σ, or Careless Merge Residual">
+              <select id="sel-wulff-color" title="Color reflections on Wulff Net &amp; Detector by Wavelength, ASU Orbit, I/σ, post-merge |F_obs|², normalized .mtz |F_calc|², post-merge I_pred/σ, or Careless Merge Residual/Scale">
                 <option value="wavelength">Color: λ/Zone</option>
                 <option value="orbit">Color: ASU Orbit</option>
                 <option value="isigi">Color: I/σ</option>
-                <option value="mtz_isigi">Color: .mtz I/σ</option>
+                <option value="fobs">Color: |F_obs|²</option>
+                <option value="mtz_fcalc">Color: |F_calc|²</option>
+                <option value="ipred_isigi">Color: I_pred/σ</option>
                 <option value="residual">Color: ΔI/σ Residual</option>
                 <option value="scale">Color: Scale</option>
               </select>
@@ -11649,11 +12675,27 @@ def render_rainbow_html(
           </div>
           <input type="range" id="slider-det-alpha" min="0.0" max="1.0" step="0.05" value="0.85" />
 
-          <div class="slider-row">
-            <span>Colorscale Crossover</span>
+          <div class="slider-row" style="margin-top:2px;">
+            <span>Spot Color</span>
+            <select id="sel-spot-color" title="Color reflections on Detector &amp; Wulff Net by Wavelength, ASU Orbit, I/σ, post-merge |F_obs|², normalized .mtz |F_calc|², post-merge I_pred/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
+              <option value="wavelength">Color: λ/Zone</option>
+              <option value="orbit">Color: ASU Orbit</option>
+              <option value="isigi">Color: I/σ</option>
+              <option value="fobs">Color: |F_obs|²</option>
+              <option value="mtz_fcalc">Color: |F_calc|²</option>
+              <option value="ipred_isigi">Color: I_pred/σ</option>
+              <option value="residual">Color: ΔI/σ Residual</option>
+              <option value="scale">Color: Scale</option>
+            </select>
+          </div>
+
+          <div class="slider-row" id="colorscale-slider-row">
+            <span id="lbl-colorscale-title">Colorscale Crossover</span>
             <span id="lbl-color-emphasis" style="white-space:nowrap;">-3.0 · 3.0 · 20.0</span>
           </div>
           <input type="range" id="slider-color-emphasis" min="0.05" max="0.95" step="0.01" value="0.38" title="Drag knob to tune colorscale contrast / midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
+
+          <div class="controls-section-divider" role="separator" aria-hidden="true"></div>
 
           <div class="slider-row">
             <span>Wavelength λ [Å]</span>
@@ -11662,7 +12704,9 @@ def render_rainbow_html(
           <div class="wl-interval-slider" id="wl-interval-slider" title="Active wavelength interval [λ_min, λ_max] in Å — drag [ and ] brackets (double-click to reset)">
             <input type="range" id="slider-wl-min" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_min:.2f}" aria-label="Minimum wavelength λ_min [Å]" />
             <input type="range" id="slider-wl-max" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_max:.2f}" aria-label="Maximum wavelength λ_max [Å]" />
-            <div class="wl-track-rail"></div>
+            <div class="wl-track-rail">
+              <canvas id="canvas-wl-carpet" class="wl-carpet-canvas" aria-hidden="true"></canvas>
+            </div>
             <div class="wl-track-fill" id="wl-track-fill" style="left:{init_wl_pct_lo:.2f}%;width:{init_wl_pct_w:.2f}%;"></div>
             <button type="button" class="wl-bracket-knob wl-knob-min" id="wl-knob-min" style="left:{init_wl_pct_lo:.2f}%;" title="Minimum wavelength λ_min [Å] (drag or Left/Right arrows)">[</button>
             <button type="button" class="wl-bracket-knob wl-knob-max" id="wl-knob-max" style="left:{init_wl_pct_hi:.2f}%;" title="Maximum wavelength λ_max [Å] (drag or Left/Right arrows)">]</button>
@@ -11673,18 +12717,6 @@ def render_rainbow_html(
             <span id="lbl-dmin-val" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact resolution cutoff d_min [Å]">{init_dmin:.2f} Å</span>
           </div>
           <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å] (0.05 Å slider steps; click value for 0.01 Å input)" />
-
-          <div class="slider-row" style="margin-top:2px;">
-            <span>Spot Color</span>
-            <select id="sel-spot-color" title="Color reflections on Detector & Wulff Net by Wavelength, ASU Orbit, Divergent Quantile I/σ, .mtz I/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
-              <option value="wavelength">Color: λ/Zone</option>
-              <option value="orbit">Color: ASU Orbit</option>
-              <option value="isigi">Color: I/σ</option>
-              <option value="mtz_isigi">Color: .mtz I/σ</option>
-              <option value="residual">Color: ΔI/σ Residual</option>
-              <option value="scale">Color: Scale</option>
-            </select>
-          </div>
           <div id="mask-legend-row" class="slider-row" style="display:none;margin-top:3px;padding-top:3px;border-top:1px solid rgba(38,49,79,0.75);font-size:0.61rem;gap:6px;flex-wrap:wrap;">
             <span style="display:inline-flex;align-items:center;gap:4px;" title="Dead detector banks and cryostat/panel shadows ignored during solve, prediction &amp; integration">
               <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(56,189,248,0.62);border:1px solid #38bdf8;"></span>
@@ -12103,6 +13135,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         if (dst.sigma == null && typeof src.sigma === "number") dst.sigma = src.sigma;
         if (dst.merged_i == null && typeof src.merged_i === "number") dst.merged_i = src.merged_i;
         if (dst.merged_sigi == null && typeof src.merged_sigi === "number") dst.merged_sigi = src.merged_sigi;
+        if (dst.merged_f == null && typeof src.merged_f === "number") dst.merged_f = src.merged_f;
+        if (dst.merged_sigf == null && typeof src.merged_sigf === "number") dst.merged_sigf = src.merged_sigf;
+        if (dst.merged_fsigf == null && typeof src.merged_fsigf === "number") dst.merged_fsigf = src.merged_fsigf;
         if (dst.careless_scale == null && typeof src.careless_scale === "number") dst.careless_scale = src.careless_scale;
         if (dst.careless_residual == null && typeof src.careless_residual === "number") dst.careless_residual = src.careless_residual;
       }};
@@ -12136,8 +13171,19 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           const psmp = predSample[i];
           if (!psmp || !Array.isArray(psmp.hkl)) continue;
           const hk = psmp.hkl.join(",");
-          const match = sampByRunHkl.get(`${{psmp.run_index ?? 0}}|${{hk}}`) || sampByHkl.get(hk);
-          if (match) copyMeasFields(psmp, match);
+          const exactRunMatch = sampByRunHkl.get(`${{psmp.run_index ?? 0}}|${{hk}}`);
+          if (exactRunMatch) {{
+            copyMeasFields(psmp, exactRunMatch);
+          }} else {{
+            const hklMatch = sampByHkl.get(hk);
+            if (hklMatch) {{
+              if (psmp.merged_i == null && typeof hklMatch.merged_i === "number") psmp.merged_i = hklMatch.merged_i;
+              if (psmp.merged_sigi == null && typeof hklMatch.merged_sigi === "number") psmp.merged_sigi = hklMatch.merged_sigi;
+              if (psmp.merged_f == null && typeof hklMatch.merged_f === "number") psmp.merged_f = hklMatch.merged_f;
+              if (psmp.merged_sigf == null && typeof hklMatch.merged_sigf === "number") psmp.merged_sigf = hklMatch.merged_sigf;
+              if (psmp.merged_fsigf == null && typeof hklMatch.merged_fsigf === "number") psmp.merged_fsigf = hklMatch.merged_fsigf;
+            }}
+          }}
         }}
       }}
     }}
@@ -12182,6 +13228,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     byOrbit: new Map(),
     mtzAsuLookup: null,
     mtzExactLookup: null,
+    mtzFAsuLookup: null,
+    mtzFExactLookup: null,
+    carelessIAsuLookup: null,
+    carelessFAsuLookup: null,
     minIntegD: Infinity,
   }};
   const _detBvhCache = {{
@@ -12212,8 +13262,16 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   const _MEAS_KEYS = [
     "intensity", "sigma", "merged_i", "merged_sigi",
+    "merged_f", "merged_sigf", "merged_fsigf",
     "careless_residual", "careless_scale",
     "mtz_i", "mtz_sigi", "mtz_isigi", "mtz_col_val",
+    "mtz_f", "mtz_sigf", "mtz_fsigf", "mtz_i_norm", "mtz_inst_i", "mtz_ipred_isigi",
+  ];
+  const _HKL_INVARIANT_MEAS_KEYS = [
+    "merged_i", "merged_sigi",
+    "merged_f", "merged_sigf", "merged_fsigf",
+    "mtz_i", "mtz_sigi", "mtz_isigi", "mtz_col_val",
+    "mtz_f", "mtz_sigf", "mtz_fsigf", "mtz_i_norm",
   ];
   const _FRAME_ERR_KEYS = ["angular_error_deg", "has_angular_error"];
   const _SHAPE_KEYS = [
@@ -12264,6 +13322,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const isFrameOnly = Boolean(payloadObj && payloadObj.frame_only);
     const prevAsu = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzAsuLookup : null;
     const prevEx = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzExactLookup : null;
+    const prevFAsu = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzFAsuLookup : null;
+    const prevFEx = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzFExactLookup : null;
+    const prevCiAsu = isFrameOnly ? _baselineMeasCache.carelessIAsuLookup : null;
+    const prevCfAsu = isFrameOnly ? _baselineMeasCache.carelessFAsuLookup : null;
     _baselineMeasCache.byBankHkl.clear();
     if (!isFrameOnly) {{
       _baselineMeasCache.byRunHkl.clear();
@@ -12273,6 +13335,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }}
     _baselineMeasCache.mtzAsuLookup = (payloadObj && payloadObj.mtz_asu_lookup) || prevAsu || null;
     _baselineMeasCache.mtzExactLookup = (payloadObj && payloadObj.mtz_exact_lookup) || prevEx || null;
+    _baselineMeasCache.mtzFAsuLookup = (payloadObj && payloadObj.mtz_f_asu_lookup) || prevFAsu || null;
+    _baselineMeasCache.mtzFExactLookup = (payloadObj && payloadObj.mtz_f_exact_lookup) || prevFEx || null;
+    _baselineMeasCache.carelessIAsuLookup = (payloadObj && payloadObj.careless_i_asu_lookup) || prevCiAsu || null;
+    _baselineMeasCache.carelessFAsuLookup = (payloadObj && payloadObj.careless_f_asu_lookup) || prevCfAsu || null;
 
     const wlArr = payloadObj && Array.isArray(payloadObj.wavelength_range) ? payloadObj.wavelength_range : DATA.wavelength_range;
     if (Array.isArray(wlArr) && wlArr.length >= 2) {{
@@ -12311,15 +13377,33 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         }}
         const noShape = _extractMeasSnapshot(p, false, false);
         if (noShape) {{
-          _baselineMeasCache.byHkl.set(hk, _mergeMeasSnapshot(_baselineMeasCache.byHkl.get(hk), noShape));
-          if (p.asu_orbit_id && (typeof noShape.mtz_i === "number" || typeof noShape.merged_i === "number")) {{
+          const hklSnap = {{}};
+          let hasHklSnap = false;
+          for (let m = 0; m < _HKL_INVARIANT_MEAS_KEYS.length; m++) {{
+            const hkKeyName = _HKL_INVARIANT_MEAS_KEYS[m];
+            if (typeof noShape[hkKeyName] === "number") {{
+              hklSnap[hkKeyName] = noShape[hkKeyName];
+              hasHklSnap = true;
+            }}
+          }}
+          if (hasHklSnap) {{
+            _baselineMeasCache.byHkl.set(hk, _mergeMeasSnapshot(_baselineMeasCache.byHkl.get(hk), hklSnap));
+          }}
+          if (p.asu_orbit_id && (typeof noShape.mtz_i === "number" || typeof noShape.mtz_f === "number" || typeof noShape.merged_i === "number" || typeof noShape.merged_f === "number")) {{
             const orbSnap = {{}};
             if (typeof noShape.mtz_i === "number") orbSnap.mtz_i = noShape.mtz_i;
             if (typeof noShape.mtz_sigi === "number") orbSnap.mtz_sigi = noShape.mtz_sigi;
             if (typeof noShape.mtz_isigi === "number") orbSnap.mtz_isigi = noShape.mtz_isigi;
             if (typeof noShape.mtz_col_val === "number") orbSnap.mtz_col_val = noShape.mtz_col_val;
+            if (typeof noShape.mtz_f === "number") orbSnap.mtz_f = noShape.mtz_f;
+            if (typeof noShape.mtz_sigf === "number") orbSnap.mtz_sigf = noShape.mtz_sigf;
+            if (typeof noShape.mtz_fsigf === "number") orbSnap.mtz_fsigf = noShape.mtz_fsigf;
+            if (typeof noShape.mtz_i_norm === "number") orbSnap.mtz_i_norm = noShape.mtz_i_norm;
             if (typeof noShape.merged_i === "number") orbSnap.merged_i = noShape.merged_i;
             if (typeof noShape.merged_sigi === "number") orbSnap.merged_sigi = noShape.merged_sigi;
+            if (typeof noShape.merged_f === "number") orbSnap.merged_f = noShape.merged_f;
+            if (typeof noShape.merged_sigf === "number") orbSnap.merged_sigf = noShape.merged_sigf;
+            if (typeof noShape.merged_fsigf === "number") orbSnap.merged_fsigf = noShape.merged_fsigf;
             _baselineMeasCache.byOrbit.set(p.asu_orbit_id, _mergeMeasSnapshot(_baselineMeasCache.byOrbit.get(p.asu_orbit_id), orbSnap));
           }}
         }}
@@ -13199,6 +14283,35 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           pk[k] = snap[k];
         }}
       }}
+      if (pk.merged_i === undefined || pk.merged_i === null) {{
+        const ciHit = _baselineMeasCache.carelessIAsuLookup && _baselineMeasCache.carelessIAsuLookup[orbitId];
+        if (Array.isArray(ciHit) && ciHit.length >= 2) {{
+          pk.merged_i = Number(ciHit[0]);
+          pk.merged_sigi = Number(ciHit[1]);
+        }}
+      }}
+      if (pk.merged_f === undefined || pk.merged_f === null) {{
+        const cfHit = _baselineMeasCache.carelessFAsuLookup && _baselineMeasCache.carelessFAsuLookup[orbitId];
+        if (Array.isArray(cfHit) && cfHit.length >= 2) {{
+          const mfC = Number(cfHit[0]), msfC = Math.max(Number(cfHit[1]) || 0, 1e-6);
+          pk.merged_f = mfC;
+          pk.merged_sigf = msfC;
+          pk.merged_fsigf = Number((mfC / msfC).toFixed(3));
+        }}
+      }}
+      if (pk.mtz_f === undefined || pk.mtz_f === null) {{
+        const fHit = (_baselineMeasCache.mtzFExactLookup && _baselineMeasCache.mtzFExactLookup[hkStr]) ||
+                     (_baselineMeasCache.mtzFAsuLookup && _baselineMeasCache.mtzFAsuLookup[orbitId]) ||
+                     null;
+        if (Array.isArray(fHit) && fHit.length >= 4) {{
+          pk.mtz_f = Number(fHit[0]);
+          if (fHit[1] !== null && fHit[1] !== undefined && Number.isFinite(Number(fHit[1]))) {{
+            pk.mtz_sigf = Number(fHit[1]);
+          }}
+          pk.mtz_fsigf = Number(fHit[2]);
+          pk.mtz_i_norm = Number(fHit[3]);
+        }}
+      }}
       if (pk.mtz_i === undefined || pk.mtz_i === null) {{
         const mtzHit = (_baselineMeasCache.mtzExactLookup && _baselineMeasCache.mtzExactLookup[hkStr]) ||
                        (_baselineMeasCache.mtzAsuLookup && _baselineMeasCache.mtzAsuLookup[orbitId]) ||
@@ -13207,11 +14320,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           const ivM = Number(mtzHit[0]), svM = Math.max(Number(mtzHit[1]) || 0, 1e-6);
           pk.mtz_i = ivM;
           pk.mtz_sigi = Number(mtzHit[1]);
-          pk.mtz_isigi = Number((ivM / svM).toFixed(3));
-          if (pk.merged_i === undefined || pk.merged_i === null) {{
-            pk.merged_i = ivM;
-            pk.merged_sigi = Number(mtzHit[1]);
-          }}
+          pk.mtz_isigi = (DATA.mtz_has_f_column && !DATA.mtz_has_i_column && typeof pk.mtz_fsigf === "number")
+            ? pk.mtz_fsigf
+            : Number((ivM / svM).toFixed(3));
         }}
       }}
 
@@ -13752,6 +14863,35 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           pk[k] = snap[k];
         }}
       }}
+      if (pk.merged_i === undefined || pk.merged_i === null) {{
+        const ciHit = _baselineMeasCache.carelessIAsuLookup && _baselineMeasCache.carelessIAsuLookup[orbitId];
+        if (Array.isArray(ciHit) && ciHit.length >= 2) {{
+          pk.merged_i = Number(ciHit[0]);
+          pk.merged_sigi = Number(ciHit[1]);
+        }}
+      }}
+      if (pk.merged_f === undefined || pk.merged_f === null) {{
+        const cfHit = _baselineMeasCache.carelessFAsuLookup && _baselineMeasCache.carelessFAsuLookup[orbitId];
+        if (Array.isArray(cfHit) && cfHit.length >= 2) {{
+          const mfC = Number(cfHit[0]), msfC = Math.max(Number(cfHit[1]) || 0, 1e-6);
+          pk.merged_f = mfC;
+          pk.merged_sigf = msfC;
+          pk.merged_fsigf = Number((mfC / msfC).toFixed(3));
+        }}
+      }}
+      if (pk.mtz_f === undefined || pk.mtz_f === null) {{
+        const fHit = (_baselineMeasCache.mtzFExactLookup && _baselineMeasCache.mtzFExactLookup[hkStr]) ||
+                     (_baselineMeasCache.mtzFAsuLookup && _baselineMeasCache.mtzFAsuLookup[orbitId]) ||
+                     null;
+        if (Array.isArray(fHit) && fHit.length >= 4) {{
+          pk.mtz_f = Number(fHit[0]);
+          if (fHit[1] !== null && fHit[1] !== undefined && Number.isFinite(Number(fHit[1]))) {{
+            pk.mtz_sigf = Number(fHit[1]);
+          }}
+          pk.mtz_fsigf = Number(fHit[2]);
+          pk.mtz_i_norm = Number(fHit[3]);
+        }}
+      }}
       if (pk.mtz_i === undefined || pk.mtz_i === null) {{
         const mtzHit = (_baselineMeasCache.mtzExactLookup && _baselineMeasCache.mtzExactLookup[hkStr]) ||
                        (_baselineMeasCache.mtzAsuLookup && _baselineMeasCache.mtzAsuLookup[orbitId]) ||
@@ -13760,11 +14900,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           const ivM = Number(mtzHit[0]), svM = Math.max(Number(mtzHit[1]) || 0, 1e-6);
           pk.mtz_i = ivM;
           pk.mtz_sigi = Number(mtzHit[1]);
-          pk.mtz_isigi = Number((ivM / svM).toFixed(3));
-          if (pk.merged_i === undefined || pk.merged_i === null) {{
-            pk.merged_i = ivM;
-            pk.merged_sigi = Number(mtzHit[1]);
-          }}
+          pk.mtz_isigi = (DATA.mtz_has_f_column && !DATA.mtz_has_i_column && typeof pk.mtz_fsigf === "number")
+            ? pk.mtz_fsigf
+            : Number((ivM / svM).toFixed(3));
         }}
       }}
       peaks.push(pk);
@@ -13984,7 +15122,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           state.wulffColorMode === "scale"
         )
       ) {{
-        state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
+        state.wulffColorMode = hasIpredIsigi()
+          ? "ipred_isigi"
+          : (hasMtzFcalcSq() ? "mtz_fcalc" : (hasFobsSq() ? "fobs" : "wavelength"));
       }}
       PEAKS.length = 0;
       for (let i = 0; i < PREDICTED_PEAKS.length; i++) PEAKS.push(PREDICTED_PEAKS[i]);
@@ -14190,10 +15330,20 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   const isMergedInit = String(DATA.artifact_kind || "").toLowerCase() === "merged_careless" &&
     Array.isArray(PEAKS) &&
     PEAKS.some(p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual));
-  const hasInitMtz = Array.isArray(PEAKS) && PEAKS.some(p => p && typeof p.mtz_isigi === "number" && Number.isFinite(p.mtz_isigi));
-  const initColorMode = (DATA.default_color_mode === "mtz_isigi" && hasInitMtz)
-    ? "mtz_isigi"
-    : (isMergedInit ? "residual" : "wavelength");
+  const hasInitExternalMtz = Boolean(
+    (DATA.mtz_is_external || (DATA.mtz_overlay_name && DATA.mtz_overlay_name !== "merged.mtz") || DATA.mtz_scale_basis) &&
+    Array.isArray(PEAKS) &&
+    PEAKS.some(p => p && (
+      (typeof p.mtz_i_norm === "number" && Number.isFinite(p.mtz_i_norm)) ||
+      (typeof p.mtz_f === "number" && Number.isFinite(p.mtz_f)) ||
+      (typeof p.mtz_i === "number" && Number.isFinite(p.mtz_i))
+    ))
+  );
+  const initColorMode = (DATA.default_color_mode === "mtz_fcalc" && hasInitExternalMtz)
+    ? "mtz_fcalc"
+    : ((DATA.default_color_mode === "ipred_isigi" && isMergedInit && hasInitExternalMtz)
+      ? "ipred_isigi"
+      : (isMergedInit ? "residual" : "wavelength"));
   const state = {{
     projection: "{initial_proj}", // "cylindrical" (CG4D) | "spherical" (MANDI)
     maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
@@ -14213,7 +15363,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     showWulffFriedel: true,       // plot antipodal Friedel mates (-h,-k,-l) on Wulff sphere with distinct link color
     wulffFrame: "sample",         // always project in Sample frame (coupled via goniometer R)
     wulffCoupled: true,           // 360° periodic detector pan <-> Wulff yaw always coupled
-    wulffColorMode: initColorMode, // "wavelength" | "orbit" | "isigi" | "mtz_isigi" | "residual" | "scale"
+    wulffColorMode: initColorMode, // "wavelength" | "orbit" | "isigi" | "fobs" | "mtz_fcalc" | "ipred_isigi" | "residual" | "scale"
     colorCrossover: 0.38,         // 0.05 (boost all/weak peaks) .. 0.38 (default log crossover) .. 0.95 (strong peaks only)
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
@@ -14910,15 +16060,459 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   const wlKnobMax = document.getElementById("wl-knob-max");
   const MIN_WL_SPAN = 0.05;
 
+  const _lambdaSnrCarpetCache = {{ sig: "", bins: [], hasSnr: false, domLo: 0, domHi: 0, peakSignal: 0 }};
+
+  function _getIntegratedCarpetPeakPool() {{
+    const samp = (typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" && Array.isArray(INTEGRATED_SAMPLE_PEAKS))
+      ? INTEGRATED_SAMPLE_PEAKS
+      : [];
+    const frm = (typeof INTEGRATED_PEAKS !== "undefined" && Array.isArray(INTEGRATED_PEAKS))
+      ? INTEGRATED_PEAKS
+      : [];
+    if (samp.length > 0 && frm.length >= 20 && typeof peakUnscaledIsigi === "function") {{
+      // `INTEGRATED_SAMPLE_PEAKS` (`all_runs_data`) is pre-filtered to I/σ >= 2.5 for Wulff payload compactness;
+      // if no backend `wavelength_bandpass_profile` is present, prefer unfiltered `INTEGRATED_PEAKS` when available.
+      let sampHasSub2 = false;
+      for (let i = 0; i < Math.min(samp.length, 200); i++) {{
+        const v = peakUnscaledIsigi(samp[i]);
+        if (Number.isFinite(v) && v < 2.0) {{ sampHasSub2 = true; break; }}
+      }}
+      if (!sampHasSub2) {{
+        let frmHasSub2 = false;
+        for (let i = 0; i < Math.min(frm.length, 200); i++) {{
+          const v = peakUnscaledIsigi(frm[i]);
+          if (Number.isFinite(v) && v < 2.0) {{ frmHasSub2 = true; break; }}
+        }}
+        if (frmHasSub2) return frm;
+      }}
+    }}
+    if (samp.length > 0) return samp;
+    if (frm.length > 0) return frm;
+    return [];
+  }}
+
   function getWavelengthSliderBounds() {{
     const defWl = getDefaultWavelengthForInstrument(DATA.instrument);
     const baseLo = Number(_payloadBaseParams.lamMin) || defWl[0] || 2.0;
     const baseHi = Number(_payloadBaseParams.lamMax) || defWl[1] || 4.5;
     const curLo = (Number.isFinite(state.lamMin) && state.lamMin > 0) ? state.lamMin : baseLo;
     const curHi = (Number.isFinite(state.lamMax) && state.lamMax > curLo) ? state.lamMax : Math.max(curLo + MIN_WL_SPAN, baseHi);
-    const domMin = Math.min(0.20, Math.max(0.05, Math.floor(Math.min(defWl[0] || 0.20, baseLo, curLo) * 20) / 20));
-    const domMax = Math.max(6.0, Math.ceil(Math.max((defWl[1] || 4.5) * 1.35, baseHi * 1.15, curHi) * 2) / 2);
+    let minPool = curLo;
+    let maxPool = curHi;
+    const prof = (typeof DATA !== "undefined" && DATA && DATA.wavelength_bandpass_profile && typeof DATA.wavelength_bandpass_profile === "object")
+      ? DATA.wavelength_bandpass_profile
+      : null;
+    if (prof && Array.isArray(prof.n) && prof.n.length > 0 && Number.isFinite(Number(prof.bin_lo)) && Number.isFinite(Number(prof.bin_step))) {{
+      const pLo = Number(prof.bin_lo);
+      const pHi = pLo + prof.n.length * Number(prof.bin_step);
+      if (pLo > 0.05 && pLo < minPool) minPool = pLo;
+      if (pHi > maxPool) maxPool = pHi;
+    }} else {{
+      const pool = typeof _getIntegratedCarpetPeakPool === "function" ? _getIntegratedCarpetPeakPool() : [];
+      for (let i = 0; i < pool.length; i++) {{
+        const wl = pool[i] && pool[i].wavelength;
+        if (typeof wl === "number" && Number.isFinite(wl) && wl > 0.05) {{
+          if (wl < minPool) minPool = wl;
+          if (wl > maxPool) maxPool = wl;
+        }}
+      }}
+    }}
+    const domMin = Math.min(0.20, Math.max(0.05, Math.floor(Math.min(defWl[0] || 0.20, baseLo, curLo, minPool) * 20) / 20));
+    const domMax = Math.max(6.0, Math.ceil(Math.max((defWl[1] || 4.5) * 1.35, baseHi * 1.15, curHi, maxPool) * 2) / 2);
     return [domMin, domMax];
+  }}
+
+  function _linearQuantileSorted(sortedArr, q) {{
+    const n = sortedArr.length;
+    if (n === 0) return NaN;
+    if (n === 1) return sortedArr[0];
+    const pos = Math.max(0.0, Math.min(1.0, q)) * (n - 1);
+    const loIdx = Math.floor(pos);
+    const frac = pos - loIdx;
+    return sortedArr[loIdx] + frac * (sortedArr[Math.min(n - 1, loIdx + 1)] - sortedArr[loIdx]);
+  }}
+
+  function _hklGcdOrder(p) {{
+    if (p && typeof p.harmonic_order === "number" && p.harmonic_order >= 1) return p.harmonic_order;
+    if (!p || !Array.isArray(p.hkl) || p.hkl.length < 3) return 1;
+    const gcd2 = (a, b) => {{
+      let x = Math.abs(Math.trunc(a));
+      let y = Math.abs(Math.trunc(b));
+      while (y !== 0) {{ const t = x % y; x = y; y = t; }}
+      return x;
+    }};
+    const g = gcd2(gcd2(p.hkl[0], p.hkl[1]), p.hkl[2]);
+    return g >= 1 ? g : 1;
+  }}
+
+  function computeLambdaSnrCarpetBins(domLo, domHi, nBins = 64) {{
+    const prof = (typeof DATA !== "undefined" && DATA && DATA.wavelength_bandpass_profile && typeof DATA.wavelength_bandpass_profile === "object")
+      ? DATA.wavelength_bandpass_profile
+      : null;
+    const hasProf = Boolean(
+      prof &&
+      Array.isArray(prof.n) &&
+      Array.isArray(prof.q90) &&
+      Array.isArray(prof.f_strong) &&
+      prof.n.length > 0 &&
+      Number.isFinite(Number(prof.bin_lo)) &&
+      Number.isFinite(Number(prof.bin_step)) &&
+      Number(prof.bin_step) > 0
+    );
+    const pool = hasProf ? [] : _getIntegratedCarpetPeakPool();
+    const epoch = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
+    const profSig = hasProf ? `prof:${{prof.bin_lo}}:${{prof.bin_step}}:${{prof.n.length}}:${{prof.n[0]}}:${{prof.n[prof.n.length - 1]}}` : `pool:${{pool.length}}`;
+    const sig = `${{epoch}}|${{profSig}}|${{domLo.toFixed(3)}}|${{domHi.toFixed(3)}}|${{nBins}}`;
+    if (_lambdaSnrCarpetCache.sig === sig) {{
+      return _lambdaSnrCarpetCache;
+    }}
+
+    const span = Math.max(MIN_WL_SPAN, domHi - domLo);
+    const binW = span / nBins;
+    let bins = [];
+    let totalObs = 0;
+
+    if (hasProf) {{
+      const pLo0 = Number(prof.bin_lo);
+      const pStep = Number(prof.bin_step);
+      const pLen = prof.n.length;
+      // 3-bin running median at physical 0.05 Å resolution rejects isolated single-bin
+      // cosmic-ray / sparse-bin spikes before resampling onto arbitrary canvas pixel widths.
+      const med3Prof = (srcArr) => {{
+        const out = new Array(pLen).fill(NaN);
+        for (let j = 0; j < pLen; j++) {{
+          if ((Number(prof.n[j]) || 0) <= 0 || !Number.isFinite(Number(srcArr[j]))) continue;
+          const c = Number(srcArr[j]);
+          const p = (j > 0 && (Number(prof.n[j - 1]) || 0) > 0 && Number.isFinite(Number(srcArr[j - 1]))) ? Number(srcArr[j - 1]) : 0.0;
+          const nx = (j < pLen - 1 && (Number(prof.n[j + 1]) || 0) > 0 && Number.isFinite(Number(srcArr[j + 1]))) ? Number(srcArr[j + 1]) : 0.0;
+          out[j] = Math.max(Math.min(p, c), Math.min(Math.max(p, c), nx));
+        }}
+        return out;
+      }};
+      const pQ90Med = med3Prof(prof.q90);
+      const pFStrongMed = med3Prof(prof.f_strong);
+      for (let bIdx = 0; bIdx < nBins; bIdx++) {{
+        const bLo = domLo + bIdx * binW;
+        const bHi = bLo + binW;
+        const lamMid = 0.5 * (bLo + bHi);
+        const j0 = Math.max(0, Math.floor((bLo - pLo0) / pStep));
+        const j1 = Math.min(pLen - 1, Math.ceil((bHi - pLo0) / pStep) - 1);
+        let wCount = 0.0;
+        let wSum = 0.0;
+        let q50Acc = 0.0;
+        let q75Acc = 0.0;
+        let q90Acc = 0.0;
+        let fStrongAcc = 0.0;
+        for (let j = j0; j <= j1; j++) {{
+          const nj = Number(prof.n[j]) || 0;
+          if (nj <= 0) continue;
+          const segLo = pLo0 + j * pStep;
+          const segHi = segLo + pStep;
+          const ov = Math.max(0.0, Math.min(bHi, segHi) - Math.max(bLo, segLo));
+          if (ov <= 0.0) continue;
+          const fracOv = ov / pStep;
+          const wt = nj * fracOv;
+          wCount += wt;
+          const q90j = pQ90Med[j];
+          if (Number.isFinite(q90j)) {{
+            wSum += wt;
+            q50Acc += wt * (Number.isFinite(Number(prof.q50 && prof.q50[j])) ? Number(prof.q50[j]) : 0.0);
+            q75Acc += wt * (Number.isFinite(Number(prof.q75 && prof.q75[j])) ? Number(prof.q75[j]) : q90j);
+            q90Acc += wt * q90j;
+            fStrongAcc += wt * (Number.isFinite(pFStrongMed[j]) ? pFStrongMed[j] : 0.0);
+          }}
+        }}
+        const nEff = Math.round(wCount);
+        totalObs += nEff;
+        if (nEff <= 0 || wSum <= 0.0) {{
+          bins.push({{ lamMid, n: 0, obsFrac: 0.0, sig: 0.0, medSnr: NaN, q75Snr: NaN, q90Snr: NaN }});
+        }} else {{
+          bins.push({{
+            lamMid,
+            n: nEff,
+            obsFrac: fStrongAcc / wSum,
+            sig: 0.0,
+            medSnr: q50Acc / wSum,
+            q75Snr: q75Acc / wSum,
+            q90Snr: q90Acc / wSum,
+          }});
+        }}
+      }}
+    }} else {{
+      // Fallback: compute Winsorized per-bin quantiles from unscaled measured integrated I/σ
+      // (never `mtz_isigi`, and excluding higher harmonic multiples gcd(|h|,|k|,|l|) > 1 when >= 20 fundamentals exist).
+      const candAll = [];
+      const candFund = [];
+      for (let i = 0; i < pool.length; i++) {{
+        const p = pool[i];
+        if (!p || typeof p.wavelength !== "number" || !Number.isFinite(p.wavelength)) continue;
+        if (p.wavelength < domLo || p.wavelength > domHi) continue;
+        const snr = typeof peakUnscaledIsigi === "function"
+          ? peakUnscaledIsigi(p)
+          : ((typeof p.unscaled_isigi === "number" && Number.isFinite(p.unscaled_isigi))
+            ? p.unscaled_isigi
+            : ((typeof p.intensity === "number" && typeof p.sigma === "number" && p.sigma > 0) ? (p.intensity / p.sigma) : NaN));
+        if (!Number.isFinite(snr)) continue;
+        const entry = {{ wl: p.wavelength, snr }};
+        candAll.push(entry);
+        if (_hklGcdOrder(p) <= 1) candFund.push(entry);
+      }}
+      const chosen = candFund.length >= 20 ? candFund : candAll;
+      totalObs = chosen.length;
+      const allSnrSorted = chosen.map((e) => e.snr).sort((a, b) => a - b);
+      const qCap = Math.max(4.0, Number.isFinite(_linearQuantileSorted(allSnrSorted, 0.985)) ? _linearQuantileSorted(allSnrSorted, 0.985) : 4.0);
+
+      const rawLists = Array.from({{ length: nBins }}, () => []);
+      const rawStrong = new Array(nBins).fill(0);
+      for (let i = 0; i < chosen.length; i++) {{
+        const e = chosen[i];
+        const idx = Math.max(0, Math.min(nBins - 1, Math.floor(((e.wl - domLo) / span) * nBins)));
+        rawLists[idx].push(Math.min(e.snr, qCap));
+        if (e.snr >= 4.0) rawStrong[idx]++;
+      }}
+      bins = rawLists.map((arr, bIdx) => {{
+        arr.sort((a, b) => a - b);
+        const n = arr.length;
+        const lamMid = domLo + ((bIdx + 0.5) / nBins) * span;
+        if (n === 0) {{
+          return {{ lamMid, n: 0, obsFrac: 0.0, sig: 0.0, medSnr: NaN, q75Snr: NaN, q90Snr: NaN }};
+        }}
+        return {{
+          lamMid,
+          n,
+          obsFrac: rawStrong[bIdx] / n,
+          sig: 0.0,
+          medSnr: _linearQuantileSorted(arr, 0.50),
+          q75Snr: _linearQuantileSorted(arr, 0.75),
+          q90Snr: _linearQuantileSorted(arr, 0.90),
+        }};
+      }});
+    }}
+
+    // Quantile noise-floor subtraction across populated bins + Bayesian count shrinkage:
+    // Off-band noise/harmonic leakage has q90(I/σ) <= ~2.0 and P(I/σ >= 4) <= ~1.8%.
+    let popBins = bins.filter((b) => b.n >= 4 && Number.isFinite(b.q90Snr));
+    if (popBins.length < 6) {{
+      popBins = bins.filter((b) => b.n >= 2 && Number.isFinite(b.q90Snr));
+    }}
+    const popCountsSorted = popBins.map((b) => b.n).sort((a, b) => a - b);
+    const medPopCount = popCountsSorted.length > 0 ? _linearQuantileSorted(popCountsSorted, 0.50) : 4.0;
+    const kShrink = Math.min(4.0, Math.max(1.0, 0.15 * medPopCount));
+
+    let q90Floor = 1.85;
+    let fStrongFloor = 0.010;
+    if (popBins.length >= 8) {{
+      const q90Sorted = popBins.map((b) => b.q90Snr).sort((a, b) => a - b);
+      const fSorted = popBins.map((b) => b.obsFrac).sort((a, b) => a - b);
+      q90Floor = Math.min(2.05, Math.max(1.35, _linearQuantileSorted(q90Sorted, 0.12)));
+      fStrongFloor = Math.min(0.018, Math.max(0.002, _linearQuantileSorted(fSorted, 0.12)));
+    }}
+
+    const rawExcQ = new Array(bins.length).fill(0.0);
+    const rawExcF = new Array(bins.length).fill(0.0);
+    for (let i = 0; i < bins.length; i++) {{
+      const b = bins[i];
+      if (b.n <= 0 || !Number.isFinite(b.q90Snr)) continue;
+      const shrink = b.n / (b.n + kShrink);
+      rawExcQ[i] = Math.max(0.0, b.q90Snr - q90Floor) * shrink;
+      rawExcF[i] = Math.max(0.0, b.obsFrac - fStrongFloor) * shrink;
+    }}
+
+    const smoothPopulated = (arr) => {{
+      // 3-bin running median rejects isolated single-bin cosmic-ray / sparse-bin spikes
+      // while preserving genuine multi-bin physical bandpasses (>= 0.15 Å).
+      const med = new Array(arr.length).fill(0.0);
+      for (let i = 0; i < arr.length; i++) {{
+        if (bins[i].n <= 0) continue;
+        const p = (i > 0 && bins[i - 1].n > 0) ? arr[i - 1] : 0.0;
+        const c = arr[i];
+        const nx = (i < arr.length - 1 && bins[i + 1].n > 0) ? arr[i + 1] : 0.0;
+        med[i] = Math.max(Math.min(p, c), Math.min(Math.max(p, c), nx));
+      }}
+      const out = new Array(arr.length).fill(0.0);
+      for (let i = 0; i < arr.length; i++) {{
+        if (bins[i].n <= 0) continue;
+        const p = (i > 0 && bins[i - 1].n > 0) ? med[i - 1] : med[i];
+        const nx = (i < arr.length - 1 && bins[i + 1].n > 0) ? med[i + 1] : med[i];
+        out[i] = 0.25 * p + 0.50 * med[i] + 0.25 * nx;
+      }}
+      return out;
+    }};
+
+    const smQ = smoothPopulated(rawExcQ);
+    const smF = smoothPopulated(rawExcF);
+    const maxQ = smQ.reduce((m, v) => (v > m ? v : m), 0.0);
+    const maxF = smF.reduce((m, v) => (v > m ? v : m), 0.0);
+    const hasRealSignal = totalObs >= 6 && (maxQ > 0.20 || maxF > 0.012);
+
+    let maxCombined = 0.0;
+    const combined = new Array(bins.length).fill(0.0);
+    if (hasRealSignal) {{
+      for (let i = 0; i < bins.length; i++) {{
+        if (bins[i].n <= 0) continue;
+        const nq = maxQ > 0.20 ? (smQ[i] / maxQ) : 0.0;
+        const nf = maxF > 0.012 ? (smF[i] / maxF) : 0.0;
+        combined[i] = 0.55 * nq + 0.45 * nf;
+        if (combined[i] > maxCombined) maxCombined = combined[i];
+      }}
+    }}
+    for (let i = 0; i < bins.length; i++) {{
+      if (!hasRealSignal || maxCombined <= 1e-6 || bins[i].n <= 0) {{
+        bins[i].sig = 0.0;
+      }} else {{
+        const normSig = combined[i] / maxCombined;
+        bins[i].sig = normSig >= 0.08 ? Math.min(1.0, normSig) : 0.0;
+      }}
+    }}
+
+    _lambdaSnrCarpetCache.sig = sig;
+    _lambdaSnrCarpetCache.bins = bins;
+    _lambdaSnrCarpetCache.hasSnr = totalObs >= 6 && maxCombined > 1e-6;
+    _lambdaSnrCarpetCache.domLo = domLo;
+    _lambdaSnrCarpetCache.domHi = domHi;
+    _lambdaSnrCarpetCache.peakSignal = maxQ;
+    return _lambdaSnrCarpetCache;
+  }}
+
+  function detectBandpassFromIsigi() {{
+    const [domLo, domHi] = getWavelengthSliderBounds();
+    const span = Math.max(MIN_WL_SPAN, domHi - domLo);
+    const nBins = Math.max(16, Math.min(160, Math.round(span / 0.05)));
+    const carpet = computeLambdaSnrCarpetBins(domLo, domHi, nBins);
+    if (!carpet.hasSnr || !carpet.bins.length) {{
+      return {{ valid: false, lo: state.lamMin, hi: state.lamMax }};
+    }}
+    const bins = carpet.bins;
+    let totalMass = 0.0;
+    for (let i = 0; i < bins.length; i++) {{
+      totalMass += bins[i].sig;
+    }}
+    if (totalMass <= 1e-6) {{
+      return {{ valid: false, lo: state.lamMin, hi: state.lamMax }};
+    }}
+    // 1%..99% quantiles of the baseline-subtracted density spectrum exclude edge outliers
+    // while avoiding 1/λ^4 Ewald-sphere candidate-count skew.
+    const binW = span / nBins;
+    const interpCdfAt = (targetQ) => {{
+      let acc = 0.0;
+      for (let i = 0; i < bins.length; i++) {{
+        const wMass = bins[i].sig;
+        if (wMass <= 0.0) continue;
+        const nextAcc = acc + wMass;
+        const c0 = acc / totalMass;
+        const c1 = nextAcc / totalMass;
+        if (targetQ <= c1 || i === bins.length - 1) {{
+          const t = c1 > c0 ? Math.max(0.0, Math.min(1.0, (targetQ - c0) / (c1 - c0))) : 0.0;
+          return domLo + (i + t) * binW;
+        }}
+        acc = nextAcc;
+      }}
+      return domHi;
+    }};
+    const rawLo = interpCdfAt(0.01);
+    const rawHi = interpCdfAt(0.99);
+    const lo = Math.max(domLo, Math.round(rawLo * 20) / 20);
+    const hi = Math.min(domHi, Math.max(lo + MIN_WL_SPAN, Math.round(rawHi * 20) / 20));
+    return {{ valid: true, lo, hi }};
+  }}
+
+  function renderLambdaSnrCarpets() {{
+    const wlCanvas = typeof document !== "undefined" && document ? document.getElementById("canvas-wl-carpet") : null;
+    const [domLo, domHi] = getWavelengthSliderBounds();
+    const band = detectBandpassFromIsigi();
+    if (wlKnobMin && wlKnobMin.classList) {{
+      const snappedMin = Boolean(band.valid && Math.abs(state.lamMin - band.lo) < 0.015);
+      wlKnobMin.classList.toggle("snapped-band-edge", snappedMin);
+    }}
+    if (wlKnobMax && wlKnobMax.classList) {{
+      const snappedMax = Boolean(band.valid && Math.abs(state.lamMax - band.hi) < 0.015);
+      wlKnobMax.classList.toggle("snapped-band-edge", snappedMax);
+    }}
+    if (!wlCanvas || typeof wlCanvas.getContext !== "function") return;
+    const rect = typeof wlCanvas.getBoundingClientRect === "function" ? wlCanvas.getBoundingClientRect() : {{ width: 220, height: 11 }};
+    const w = Math.max(80, Math.round(rect.width || wlCanvas.clientWidth || 220));
+    const h = Math.max(6, Math.round(rect.height || wlCanvas.clientHeight || 11));
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+    const targetW = Math.max(80, Math.round(w * dpr));
+    const targetH = Math.max(6, Math.round(h * dpr));
+    if (wlCanvas.width !== targetW) wlCanvas.width = targetW;
+    if (wlCanvas.height !== targetH) wlCanvas.height = targetH;
+    const ctx = wlCanvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const nBins = Math.max(48, Math.min(120, Math.round(w / 2.2)));
+    const carpet = computeLambdaSnrCarpetBins(domLo, domHi, nBins);
+    if (wlTrackFill && wlTrackFill.classList) {{
+      wlTrackFill.classList.toggle("has-carpet", Boolean(carpet.hasSnr));
+    }}
+    if (!carpet.hasSnr) return;
+
+    const span = Math.max(MIN_WL_SPAN, domHi - domLo);
+    const winLo = state.lamMin;
+    const winHi = state.lamMax;
+    const bins = carpet.bins;
+
+    for (let i = 0; i < bins.length; i++) {{
+      const b = bins[i];
+      const x0 = (i / bins.length) * w;
+      const bw = Math.max(1.0, (w / bins.length) + 0.45);
+      const lam = b ? b.lamMid : (domLo + ((i + 0.5) / bins.length) * span);
+      const inWin = lam >= winLo - 1e-6 && lam <= winHi + 1e-6;
+      const sig = b ? b.sig : 0.0;
+      if (inWin) {{
+        // Subtle slate physical window backdrop across [λ_min, λ_max], overlaid by
+        // strictly proportional sky-cyan bars showing measured quantile signal.
+        ctx.fillStyle = "rgba(148, 163, 184, 0.14)";
+        ctx.fillRect(x0, 0, bw, h);
+        if (sig > 0.06) {{
+          const barH = Math.max(1.2, sig * 0.90 * h);
+          ctx.fillStyle = `rgba(56, 189, 248, ${{(0.42 + 0.54 * sig).toFixed(3)}})`;
+          ctx.fillRect(x0, h - barH, bw, barH);
+        }}
+      }} else if (sig > 0.06) {{
+        // Unselected measured WL band outside [ ]: proportional cerulean-blue bar.
+        const barH = Math.max(1.2, sig * 0.90 * h);
+        ctx.fillStyle = `hsla(204.0, 94%, 52%, ${{(0.38 + 0.54 * sig).toFixed(3)}})`;
+        ctx.fillRect(x0, h - barH, bw, barH);
+      }}
+    }}
+
+    // Crisp sky-blue upper signal contour across the measured WL band
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < bins.length; i++) {{
+      const b = bins[i];
+      if (!b || b.sig <= 0.06) {{
+        started = false;
+        continue;
+      }}
+      const cx = ((i + 0.5) / bins.length) * w;
+      const cy = Math.max(1.0, Math.min(h - 1.0, h * (1.0 - 0.90 * b.sig)));
+      if (!started) {{
+        ctx.moveTo(cx, cy);
+        started = true;
+      }} else {{
+        ctx.lineTo(cx, cy);
+      }}
+    }}
+    ctx.strokeStyle = "rgba(56, 189, 248, 0.92)";
+    ctx.lineWidth = 1.25;
+    ctx.stroke();
+
+    // Vertical sky-blue snap-edge markers at 1%..99% quantile bandpass [lo, hi]
+    if (band.valid) {{
+      ctx.strokeStyle = "rgba(56, 189, 248, 0.95)";
+      ctx.lineWidth = 1.5;
+      [band.lo, band.hi].forEach((edgeLam) => {{
+        const ex = Math.max(0.75, Math.min(w - 0.75, ((edgeLam - domLo) / span) * w));
+        ctx.beginPath();
+        ctx.moveTo(ex, 0);
+        ctx.lineTo(ex, h);
+        ctx.stroke();
+      }});
+    }}
   }}
 
   function updateWavelengthLabels() {{
@@ -14963,11 +16557,14 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }}
     if (wlKnobMin) {{
       wlKnobMin.style.left = `${{pctLo.toFixed(2)}}%`;
-      wlKnobMin.title = `Minimum wavelength λ_min = ${{lo.toFixed(2)}} Å (drag [ or use Left/Right arrows)`;
+      wlKnobMin.title = `Minimum wavelength λ_min = ${{lo.toFixed(2)}} Å (drag [ to snap to integrated band edge, or Left/Right arrows)`;
     }}
     if (wlKnobMax) {{
       wlKnobMax.style.left = `${{pctHi.toFixed(2)}}%`;
-      wlKnobMax.title = `Maximum wavelength λ_max = ${{hi.toFixed(2)}} Å (drag ] or use Left/Right arrows)`;
+      wlKnobMax.title = `Maximum wavelength λ_max = ${{hi.toFixed(2)}} Å (drag ] to snap to integrated band edge, or Left/Right arrows)`;
+    }}
+    if (typeof renderLambdaSnrCarpets === "function") {{
+      renderLambdaSnrCarpets();
     }}
     if (typeof updateColorscaleSliderGradient === "function") {{
       updateColorscaleSliderGradient();
@@ -15840,9 +17437,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     return Math.pow(u, gamma);
   }}
 
-  // Vibrant spectral color preset for wavelength / zone highlights (crossover knob shifts spectral midpoint)
+  // Vibrant spectral color preset for wavelength / zone highlights:
+  // Limits [lamMin, lamMax] come from Wavelength λ [Å]; Colorscale Crossover shifts the spectral hue midpoint.
   function wavelengthToColor(lam, alpha = 1.0) {{
-    const u = Math.max(0, Math.min(1, (lam - state.lamMin) / Math.max(0.05, state.lamMax - state.lamMin)));
+    const lMin = (Number.isFinite(state.lamMin) && state.lamMin > 0) ? state.lamMin : 1.0;
+    const lMax = (Number.isFinite(state.lamMax) && state.lamMax > lMin) ? state.lamMax : (lMin + 1.0);
+    const u = Math.max(0, Math.min(1, (lam - lMin) / Math.max(0.05, lMax - lMin)));
     const t = applyCrossoverCurve(u);
     const hue = (1.0 - t) * 265;
     return `hsla(${{hue.toFixed(1)}}, 95%, 60%, ${{alpha}})`;
@@ -15920,6 +17520,291 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     return NaN;
   }}
 
+  function hasExternalMtzOverlay() {{
+    if (!DATA) return false;
+    if (DATA.mtz_is_external || DATA.mtz_scale_basis) return true;
+    const nm = String(DATA.mtz_overlay_name || "").trim();
+    return Boolean(nm && nm !== "merged.mtz");
+  }}
+
+  function hasCarelessMergedState() {{
+    if (!DATA) return false;
+    if (String(DATA.artifact_kind || "").toLowerCase() === "merged_careless") return true;
+    if (_baselineMeasCache.carelessIAsuLookup || _baselineMeasCache.carelessFAsuLookup) return true;
+    if (DATA.careless_i_asu_lookup || DATA.careless_f_asu_lookup || DATA.careless_scale_profile) return true;
+    if (DATA.merge_metrics && Number(DATA.merge_metrics.n_merged_asu) > 0) return true;
+    return false;
+  }}
+
+  function peakFobsFsigf(p) {{
+    if (!p) return NaN;
+    if (typeof p.merged_fsigf === "number" && Number.isFinite(p.merged_fsigf)) {{
+      return p.merged_fsigf;
+    }}
+    if (
+      typeof p.merged_f === "number" &&
+      Number.isFinite(p.merged_f) &&
+      typeof p.merged_sigf === "number" &&
+      Number.isFinite(p.merged_sigf) &&
+      p.merged_sigf > 0
+    ) {{
+      return p.merged_f / Math.max(p.merged_sigf, 1e-6);
+    }}
+    return NaN;
+  }}
+
+  function peakFobsSqRaw(p) {{
+    if (!p) return NaN;
+    if (typeof p.merged_i === "number" && Number.isFinite(p.merged_i)) {{
+      return p.merged_i;
+    }}
+    if (typeof p.merged_f === "number" && Number.isFinite(p.merged_f)) {{
+      return p.merged_f * p.merged_f;
+    }}
+    return NaN;
+  }}
+
+  function peakFobsSq(p) {{
+    if (!p) return NaN;
+    if (
+      !hasCarelessMergedState() &&
+      !(typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)) &&
+      !(typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale))
+    ) {{
+      return NaN;
+    }}
+    return peakFobsSqRaw(p);
+  }}
+
+  function peakMtzFsigf(p) {{
+    if (!p) return NaN;
+    if (typeof p.mtz_fsigf === "number" && Number.isFinite(p.mtz_fsigf)) {{
+      return p.mtz_fsigf;
+    }}
+    if (
+      typeof p.mtz_f === "number" &&
+      Number.isFinite(p.mtz_f) &&
+      typeof p.mtz_sigf === "number" &&
+      Number.isFinite(p.mtz_sigf) &&
+      p.mtz_sigf > 0
+    ) {{
+      return p.mtz_f / Math.max(p.mtz_sigf, 1e-6);
+    }}
+    if (DATA && DATA.mtz_has_sigf_column === false && typeof p.mtz_f === "number" && Number.isFinite(p.mtz_f)) {{
+      return p.mtz_f;
+    }}
+    return NaN;
+  }}
+
+  let _jsCarelessProfileCache = {{ sig: "", prof: null }};
+  function getEffectiveCarelessScaleProfile() {{
+    if (DATA && DATA.careless_scale_profile && typeof DATA.careless_scale_profile === "object") {{
+      return DATA.careless_scale_profile;
+    }}
+    const src = (Array.isArray(INTEGRATED_SAMPLE_PEAKS) && INTEGRATED_SAMPLE_PEAKS.length > 0)
+      ? INTEGRATED_SAMPLE_PEAKS
+      : ((Array.isArray(INTEGRATED_PEAKS) && INTEGRATED_PEAKS.length > 0) ? INTEGRATED_PEAKS : PEAKS);
+    if (!Array.isArray(src) || src.length === 0) return null;
+    const p0 = src[0];
+    const sig = `${{src.length}}|${{p0 ? (p0.careless_scale ?? "") : ""}}|${{p0 ? (p0.sigma ?? "") : ""}}`;
+    if (_jsCarelessProfileCache.sig === sig) return _jsCarelessProfileCache.prof;
+    const scales = [], snrRatios = [];
+    for (let i = 0; i < src.length; i++) {{
+      const p = src[i];
+      if (!p || typeof p.careless_scale !== "number" || !Number.isFinite(p.careless_scale) || p.careless_scale <= 0) continue;
+      scales.push(p.careless_scale);
+      if (typeof p.sigma === "number" && Number.isFinite(p.sigma) && p.sigma > 1e-6) {{
+        snrRatios.push(p.careless_scale / p.sigma);
+      }}
+    }}
+    if (scales.length === 0) {{
+      _jsCarelessProfileCache = {{ sig, prof: null }};
+      return null;
+    }}
+    scales.sort((a, b) => a - b);
+    snrRatios.sort((a, b) => a - b);
+    const prof = {{
+      bin_lo: 0.0,
+      bin_step: 0.05,
+      scale_med: [],
+      snr_scale_med: [],
+      global_median: scales[Math.floor(0.5 * (scales.length - 1))],
+      global_snr_scale_median: snrRatios.length > 0 ? snrRatios[Math.floor(0.5 * (snrRatios.length - 1))] : null,
+    }};
+    _jsCarelessProfileCache = {{ sig, prof }};
+    return prof;
+  }}
+
+  function interpCarelessProfileSeries(wavelength, prof, seriesKey, globalKey) {{
+    if (!prof || typeof prof !== "object") return NaN;
+    const meds = prof[seriesKey];
+    const step = Math.max(0.01, Number(prof.bin_step) || 0.05);
+    const lo = Number(prof.bin_lo) || 0.0;
+    const gRaw = prof[globalKey];
+    const gMed = (typeof gRaw === "number" && Number.isFinite(gRaw) && gRaw > 0) ? gRaw : NaN;
+    if (!Array.isArray(meds) || meds.length === 0 || typeof wavelength !== "number" || !Number.isFinite(wavelength)) {{
+      return gMed;
+    }}
+    let prevX = NaN, prevY = NaN;
+    for (let i = 0; i < meds.length; i++) {{
+      const mv = meds[i];
+      if (typeof mv !== "number" || !Number.isFinite(mv) || mv <= 0) continue;
+      const cx = lo + (i + 0.5) * step;
+      if (wavelength <= cx) {{
+        if (!Number.isFinite(prevX)) return mv;
+        const t = (wavelength - prevX) / Math.max(cx - prevX, 1e-9);
+        return prevY + t * (mv - prevY);
+      }}
+      prevX = cx;
+      prevY = mv;
+    }}
+    return Number.isFinite(prevY) ? prevY : gMed;
+  }}
+
+  function estimateCarelessScaleForPeak(p) {{
+    if (!p) return NaN;
+    if (typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale) && p.careless_scale > 0) {{
+      return p.careless_scale;
+    }}
+    const prof = getEffectiveCarelessScaleProfile();
+    return interpCarelessProfileSeries(p.wavelength, prof, "scale_med", "global_median");
+  }}
+
+  function estimateCarelessSnrScaleForPeak(p) {{
+    if (!p) return NaN;
+    if (
+      typeof p.careless_scale === "number" &&
+      Number.isFinite(p.careless_scale) &&
+      p.careless_scale > 0 &&
+      typeof p.sigma === "number" &&
+      Number.isFinite(p.sigma) &&
+      p.sigma > 0
+    ) {{
+      return p.careless_scale / Math.max(p.sigma, 1e-6);
+    }}
+    const prof = getEffectiveCarelessScaleProfile();
+    const snrScl = interpCarelessProfileSeries(p.wavelength, prof, "snr_scale_med", "global_snr_scale_median");
+    if (Number.isFinite(snrScl) && snrScl > 0) return snrScl;
+    const scl = estimateCarelessScaleForPeak(p);
+    const sigMed = interpCarelessProfileSeries(p.wavelength, prof, "sigma_med", "global_sigma_median");
+    if (Number.isFinite(scl) && scl > 0 && Number.isFinite(sigMed) && sigMed > 1e-6) {{
+      return scl / sigMed;
+    }}
+    return NaN;
+  }}
+
+  let _mtzCarelessAlignCache = {{ sig: "", kI: 1.0 }};
+  function getMtzToCarelessIScaleFactor() {{
+    if (!DATA || DATA.mtz_scale_basis === "careless_shared_q75") return 1.0;
+    const ciLu = _baselineMeasCache.carelessIAsuLookup || DATA.careless_i_asu_lookup;
+    const cfLu = _baselineMeasCache.carelessFAsuLookup || DATA.careless_f_asu_lookup;
+    const mfLu = _baselineMeasCache.mtzFAsuLookup || DATA.mtz_f_asu_lookup;
+    if ((!ciLu && !cfLu) || !mfLu) return 1.0;
+    const nCareless = ciLu ? Object.keys(ciLu).length : Object.keys(cfLu).length;
+    const sig = `${{DATA.mtz_overlay_name || ""}}|${{DATA.mtz_global_i_scale || DATA.mtz_global_f_scale || 1}}|${{nCareless}}`;
+    if (_mtzCarelessAlignCache.sig === sig) return _mtzCarelessAlignCache.kI;
+    const imShared = [], ioShared = [];
+    const keys = Object.keys(mfLu);
+    for (let i = 0; i < keys.length; i++) {{
+      const k = keys[i];
+      const mEntry = mfLu[k];
+      if (!Array.isArray(mEntry)) continue;
+      const mSq = (typeof mEntry[3] === "number" && Number.isFinite(mEntry[3]))
+        ? Number(mEntry[3])
+        : (Number(mEntry[0]) * Number(mEntry[0]));
+      let cSq = NaN;
+      if (ciLu && Array.isArray(ciLu[k])) cSq = Number(ciLu[k][0]);
+      else if (cfLu && Array.isArray(cfLu[k]) && cfLu[k][0] > 0) cSq = Number(cfLu[k][0]) * Number(cfLu[k][0]);
+      if (mSq > 0 && Number.isFinite(cSq) && cSq > 0) {{
+        imShared.push(mSq);
+        ioShared.push(cSq);
+      }}
+    }}
+    let kI = 1.0;
+    if (imShared.length >= 3) {{
+      imShared.sort((a, b) => a - b);
+      ioShared.sort((a, b) => a - b);
+      const qIdx = Math.min(imShared.length - 1, Math.floor(0.75 * (imShared.length - 1)));
+      if (imShared[qIdx] > 1e-9 && ioShared[qIdx] > 1e-9) {{
+        kI = ioShared[qIdx] / imShared[qIdx];
+      }}
+    }}
+    _mtzCarelessAlignCache = {{ sig, kI }};
+    return kI;
+  }}
+
+  function peakMtzNormalizedF(p) {{
+    if (!p || typeof p.mtz_f !== "number" || !Number.isFinite(p.mtz_f)) return NaN;
+    return p.mtz_f * Math.sqrt(Math.max(getMtzToCarelessIScaleFactor(), 0.0));
+  }}
+
+  function peakMtzFcalcSq(p) {{
+    if (!p || !hasExternalMtzOverlay()) return NaN;
+    const kI = getMtzToCarelessIScaleFactor();
+    if (typeof p.mtz_i_norm === "number" && Number.isFinite(p.mtz_i_norm)) {{
+      return p.mtz_i_norm * kI;
+    }}
+    if (typeof p.mtz_f === "number" && Number.isFinite(p.mtz_f)) {{
+      return p.mtz_f * p.mtz_f * kI;
+    }}
+    return NaN;
+  }}
+
+  function peakMtzNormalizedIntensity(p) {{
+    return peakMtzFcalcSq(p);
+  }}
+
+  function peakMtzScaledInstIntensity(p) {{
+    if (!p || !hasExternalMtzOverlay()) return NaN;
+    const scl = estimateCarelessScaleForPeak(p);
+    if (!Number.isFinite(scl) || scl <= 0) return NaN;
+    const iNorm = peakMtzFcalcSq(p);
+    if (!Number.isFinite(iNorm)) return NaN;
+    return scl * iNorm;
+  }}
+
+  function peakIpredIsigi(p) {{
+    if (!p || !hasExternalMtzOverlay()) return NaN;
+    if (
+      !hasCarelessMergedState() &&
+      !(typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale) && p.careless_scale > 0) &&
+      !(typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual))
+    ) {{
+      return NaN;
+    }}
+    if (
+      typeof p.wavelength === "number" &&
+      Number.isFinite(p.wavelength) &&
+      ((Number.isFinite(state.lamMin) && p.wavelength < state.lamMin - 1e-6) ||
+       (Number.isFinite(state.lamMax) && p.wavelength > state.lamMax + 1e-6))
+    ) {{
+      return NaN;
+    }}
+    const fcalcSq = peakMtzFcalcSq(p);
+    if (!Number.isFinite(fcalcSq)) return NaN;
+    const snrScl = estimateCarelessSnrScaleForPeak(p);
+    if (Number.isFinite(snrScl) && snrScl > 0) {{
+      return snrScl * fcalcSq;
+    }}
+    if (typeof p.mtz_ipred_isigi === "number" && Number.isFinite(p.mtz_ipred_isigi)) {{
+      return p.mtz_ipred_isigi * getMtzToCarelessIScaleFactor();
+    }}
+    return NaN;
+  }}
+
+  function isMtzColorMode(mode) {{
+    return mode === "mtz_fcalc" || mode === "ipred_isigi";
+  }}
+
+  function isQuantileSnrColorMode(mode) {{
+    return (
+      mode === "isigi" ||
+      mode === "fobs" ||
+      mode === "mtz_fcalc" ||
+      mode === "ipred_isigi"
+    );
+  }}
+
   function computeQuantileScaleBounds(rawVals, defLo = -3.0, defMid = 3.0, defHi = 20.0) {{
     if (!Array.isArray(rawVals) || rawVals.length === 0) {{
       return {{
@@ -15988,10 +17873,19 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const dynEp = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
     const r0 = p0 && typeof p0.careless_residual === "number" && Number.isFinite(p0.careless_residual) ? p0.careless_residual.toFixed(3) : "";
     const rs0 = s0 && typeof s0.careless_residual === "number" && Number.isFinite(s0.careless_residual) ? s0.careless_residual.toFixed(3) : "";
+    const evalFobsSq = typeof peakFobsSqRaw === "function" ? peakFobsSqRaw : (() => NaN);
+    const evalMtzFcalc = typeof peakMtzFcalcSq === "function" ? peakMtzFcalcSq : (() => NaN);
+    const evalIpredIsigi = typeof peakIpredIsigi === "function" ? peakIpredIsigi : (() => NaN);
+    const evalCarelessMerged = typeof hasCarelessMergedState === "function" ? hasCarelessMergedState : (() => false);
+    const evalExternalMtz = typeof hasExternalMtzOverlay === "function" ? hasExternalMtzOverlay : (() => false);
     const i0 = p0 && Number.isFinite(peakUnscaledIsigi(p0)) ? peakUnscaledIsigi(p0).toFixed(3) : "";
     const m0 = p0 && Number.isFinite(peakMtzIsigi(p0)) ? peakMtzIsigi(p0).toFixed(3) : "";
+    const mf0 = p0 && Number.isFinite(evalMtzFcalc(p0)) ? evalMtzFcalc(p0).toFixed(3) : "";
+    const fo0 = p0 && Number.isFinite(evalFobsSq(p0)) ? evalFobsSq(p0).toFixed(3) : "";
     const dSig = `${{Number(state.dMin || 0).toFixed(3)}},${{Number(state.lamMin || 0).toFixed(3)}},${{Number(state.lamMax || 0).toFixed(3)}}`;
-    const sig = `${{dynEp}}|${{dSig}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}|${{i0}}|${{m0}}`;
+    const mergedFlag = evalCarelessMerged() ? "1" : "0";
+    const extMtzFlag = evalExternalMtz() ? "1" : "0";
+    const sig = `${{dynEp}}|${{dSig}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{mergedFlag}}|${{extMtzFlag}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}|${{i0}}|${{m0}}|${{mf0}}|${{fo0}}`;
     if (
       _peakDataAvailabilitySig === sig &&
       _peakDataAvailability._p0 === p0 &&
@@ -15999,11 +17893,17 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     ) {{
       return _peakDataAvailability;
     }}
-    let hasIsigi = false, hasMtz = false, hasRes = false, hasScl = false;
+    let hasIsigi = false, hasRawFobs = false, hasMtz = false, hasMtzFcalc = false, hasIpred = false, hasRes = false, hasScl = false;
     const peaksIsigiSamples = [], allPeaksIsigiSamples = [];
     const sampleIsigiSamples = [], allSampleIsigiSamples = [];
+    const peaksFobsSamples = [], allPeaksFobsSamples = [];
+    const sampleFobsSamples = [], allSampleFobsSamples = [];
     const peaksMtzSamples = [], allPeaksMtzSamples = [];
     const sampleMtzSamples = [], allSampleMtzSamples = [];
+    const peaksMtzFcalcSamples = [], allPeaksMtzFcalcSamples = [];
+    const sampleMtzFcalcSamples = [], allSampleMtzFcalcSamples = [];
+    const peaksIpredSamples = [], allPeaksIpredSamples = [];
+    const sampleIpredSamples = [], allSampleIpredSamples = [];
     const peaksResSamples = [], allPeaksResSamples = [];
     const sampleResSamples = [], allSampleResSamples = [];
     const scanArr = (arr, isSamplePool) => {{
@@ -16026,6 +17926,19 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
             }}
           }}
         }}
+        const fov = evalFobsSq(p);
+        if (Number.isFinite(fov)) {{
+          hasRawFobs = true;
+          if (i % sampleStep === 0) {{
+            if (isSamplePool) {{
+              allSampleFobsSamples.push(fov);
+              if (vis) sampleFobsSamples.push(fov);
+            }} else {{
+              allPeaksFobsSamples.push(fov);
+              if (vis) peaksFobsSamples.push(fov);
+            }}
+          }}
+        }}
         const mv = peakMtzIsigi(p);
         if (Number.isFinite(mv)) {{
           hasMtz = true;
@@ -16036,6 +17949,32 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
             }} else {{
               allPeaksMtzSamples.push(mv);
               if (vis) peaksMtzSamples.push(mv);
+            }}
+          }}
+        }}
+        const mfv = evalMtzFcalc(p);
+        if (Number.isFinite(mfv)) {{
+          hasMtzFcalc = true;
+          if (i % sampleStep === 0) {{
+            if (isSamplePool) {{
+              allSampleMtzFcalcSamples.push(mfv);
+              if (vis) sampleMtzFcalcSamples.push(mfv);
+            }} else {{
+              allPeaksMtzFcalcSamples.push(mfv);
+              if (vis) peaksMtzFcalcSamples.push(mfv);
+            }}
+          }}
+        }}
+        const ipv = evalIpredIsigi(p);
+        if (Number.isFinite(ipv)) {{
+          hasIpred = true;
+          if (i % sampleStep === 0) {{
+            if (isSamplePool) {{
+              allSampleIpredSamples.push(ipv);
+              if (vis) sampleIpredSamples.push(ipv);
+            }} else {{
+              allPeaksIpredSamples.push(ipv);
+              if (vis) peaksIpredSamples.push(ipv);
             }}
           }}
         }}
@@ -16056,6 +17995,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }};
     scanArr(PEAKS, false);
     if (SAMPLE_PEAKS !== PEAKS) scanArr(SAMPLE_PEAKS, true);
+    const isPostMerge = evalCarelessMerged() || hasRes || hasScl;
+    const hasFobs = Boolean(isPostMerge && hasRawFobs);
+    const hasIpredIsigiFlag = Boolean(isPostMerge && evalExternalMtz() && hasIpred);
     const quantileSorted = (sorted, q) => {{
       if (sorted.length === 0) return NaN;
       if (sorted.length === 1) return sorted[0];
@@ -16106,30 +18048,55 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       ? allSampleMtzSamples
       : allPeaksMtzSamples;
     const mtzVals = visMtzVals.length > 0 ? visMtzVals : fallbackMtzVals;
+    const pickPool = (sampVis, pkVis, sampAll, pkAll) => {{
+      const vis = sampVis.length >= pkVis.length && sampVis.length > 0 ? sampVis : pkVis;
+      if (vis.length > 0) return vis;
+      return sampAll.length >= pkAll.length && sampAll.length > 0 ? sampAll : pkAll;
+    }};
+    const fobsVals = pickPool(sampleFobsSamples, peaksFobsSamples, allSampleFobsSamples, allPeaksFobsSamples);
+    const mtzFcalcVals = pickPool(sampleMtzFcalcSamples, peaksMtzFcalcSamples, allSampleMtzFcalcSamples, allPeaksMtzFcalcSamples);
+    const ipredVals = pickPool(sampleIpredSamples, peaksIpredSamples, allSampleIpredSamples, allPeaksIpredSamples);
     const isigiBounds = computeQuantileScaleBounds(isigiVals, -3.0, 3.0, 20.0);
+    const rawFobsBounds = computeQuantileScaleBounds(fobsVals, 0.0, 1.0, 8.0);
+    const rawMtzFcalcBounds = computeQuantileScaleBounds(mtzFcalcVals, 0.0, 1.0, 8.0);
+    const rawIpredBounds = computeQuantileScaleBounds(ipredVals, 0.0, 3.0, 20.0);
+    // Lock paired colorscales onto identical bounds whenever both sides exist so
+    // toggling |F_obs|² <-> |F_calc|² and I/σ <-> I_pred/σ compares 1-to-1!
+    const fobsBounds = rawFobsBounds;
+    const mtzFcalcBounds = (hasFobs && fobsVals.length > 0) ? rawFobsBounds : rawMtzFcalcBounds;
+    const ipredIsigiBounds = (hasIsigi && isigiVals.length > 0) ? isigiBounds : rawIpredBounds;
     const mtzIsigiBounds = computeQuantileScaleBounds(mtzVals, -3.0, 3.0, 20.0);
     _peakDataAvailabilitySig = sig;
     _peakDataAvailability = {{
       _p0: p0,
       _s0: s0,
       hasIsigi,
+      hasFobsSq: hasFobs,
       hasMtzIsigi: hasMtz,
+      hasMtzFcalcSq: hasMtzFcalc,
+      hasIpredIsigi: hasIpredIsigiFlag,
       hasResiduals: hasRes,
       hasScales: hasScl,
       isigiTop: Math.max(12.0, isigiBounds.max),
+      fobsTop: Math.max(4.0, fobsBounds.max),
       mtzIsigiTop: Math.max(12.0, mtzIsigiBounds.max),
+      mtzFcalcTop: Math.max(4.0, mtzFcalcBounds.max),
+      ipredIsigiTop: Math.max(12.0, ipredIsigiBounds.max),
       isigiMin: isigiBounds.min,
       isigiQ25: isigiBounds.q25,
       isigiMedian: isigiBounds.median,
       isigiQ75: isigiBounds.q75,
       isigiMax: isigiBounds.max,
       isigiBounds,
+      fobsBounds,
       mtzIsigiMin: mtzIsigiBounds.min,
       mtzIsigiQ25: mtzIsigiBounds.q25,
       mtzIsigiMedian: mtzIsigiBounds.median,
       mtzIsigiQ75: mtzIsigiBounds.q75,
       mtzIsigiMax: mtzIsigiBounds.max,
       mtzIsigiBounds,
+      mtzFcalcBounds,
+      ipredIsigiBounds,
       resMin,
       resMax,
       resMedian,
@@ -16165,7 +18132,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       b = {{ min: -3.0, q25: 0.0, median: 3.0, q75: 0.30 * topHi, max: topHi }};
     }} else {{
       const av = getPeakDataAvailability();
-      b = state.wulffColorMode === "mtz_isigi" ? av.mtzIsigiBounds : av.isigiBounds;
+      if (state.wulffColorMode === "fobs") b = av.fobsBounds;
+      else if (state.wulffColorMode === "mtz_fcalc") b = av.mtzFcalcBounds;
+      else if (state.wulffColorMode === "ipred_isigi") b = av.ipredIsigiBounds;
+      else b = av.isigiBounds;
     }}
     const lo = Number.isFinite(b && b.min) ? b.min : -3.0;
     const hi = Number.isFinite(b && b.max) ? b.max : 20.0;
@@ -16234,8 +18204,27 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     return getPeakDataAvailability().hasIsigi;
   }}
 
+  function hasFobsSq() {{
+    return getPeakDataAvailability().hasFobsSq;
+  }}
+
   function hasMtzIsigi() {{
     return getPeakDataAvailability().hasMtzIsigi;
+  }}
+
+  function hasMtzFcalcSq() {{
+    return getPeakDataAvailability().hasMtzFcalcSq;
+  }}
+
+  function hasIpredIsigi() {{
+    return getPeakDataAvailability().hasIpredIsigi;
+  }}
+
+  function preferredFallbackColorMode() {{
+    if (hasIpredIsigi()) return "ipred_isigi";
+    if (hasMtzFcalcSq()) return "mtz_fcalc";
+    if (hasFobsSq()) return "fobs";
+    return "wavelength";
   }}
 
   function hasCarelessResiduals() {{
@@ -16294,8 +18283,14 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const effA = peakEmphasisAlphaForCategorical(p, alpha);
       return hexToRgba(ORBIT_PALETTE[idx], effA);
     }}
-    if (mode === "mtz_isigi") {{
-      return isigiToColor(peakMtzIsigi(p), alpha, avail.mtzIsigiBounds);
+    if (mode === "fobs") {{
+      return isigiToColor(peakFobsSq(p), alpha, avail.fobsBounds);
+    }}
+    if (mode === "mtz_fcalc") {{
+      return isigiToColor(peakMtzFcalcSq(p), alpha, avail.mtzFcalcBounds);
+    }}
+    if (mode === "ipred_isigi") {{
+      return isigiToColor(peakIpredIsigi(p), alpha, avail.ipredIsigiBounds);
     }}
     if (mode === "isigi") {{
       return isigiToColor(peakUnscaledIsigi(p), alpha, avail.isigiBounds);
@@ -16325,23 +18320,27 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       if (absV >= 100) return clean.toFixed(0);
       return clean.toFixed(1);
     }};
-    if (mode === "isigi" || mode === "mtz_isigi") {{
+    const isQuantMode = typeof isQuantileSnrColorMode === "function"
+      ? isQuantileSnrColorMode(mode)
+      : (mode === "isigi" || mode === "fobs" || mode === "mtz_fcalc" || mode === "ipred_isigi");
+    if (isQuantMode) {{
       const bulkFrac = 0.28;
-      const b = mode === "mtz_isigi"
-        ? (avail.mtzIsigiBounds || {{
-            min: Number.isFinite(avail.mtzIsigiMin) ? avail.mtzIsigiMin : -3.0,
-            q25: Number.isFinite(avail.mtzIsigiQ25) ? avail.mtzIsigiQ25 : 0.0,
-            median: Number.isFinite(avail.mtzIsigiMedian) ? avail.mtzIsigiMedian : 3.0,
-            q75: Number.isFinite(avail.mtzIsigiQ75) ? avail.mtzIsigiQ75 : 7.0,
-            max: Number.isFinite(avail.mtzIsigiMax) ? avail.mtzIsigiMax : 20.0,
-          }})
-        : (avail.isigiBounds || {{
-            min: Number.isFinite(avail.isigiMin) ? avail.isigiMin : -3.0,
-            q25: Number.isFinite(avail.isigiQ25) ? avail.isigiQ25 : 0.0,
-            median: Number.isFinite(avail.isigiMedian) ? avail.isigiMedian : 3.0,
-            q75: Number.isFinite(avail.isigiQ75) ? avail.isigiQ75 : 7.0,
-            max: Number.isFinite(avail.isigiMax) ? avail.isigiMax : 20.0,
-          }});
+      let b = null;
+      if (mode === "fobs") {{
+        b = avail.fobsBounds || {{ min: 0.0, q25: 0.5, median: 1.0, q75: 2.5, max: 8.0 }};
+      }} else if (mode === "mtz_fcalc") {{
+        b = avail.mtzFcalcBounds || {{ min: 0.0, q25: 0.5, median: 1.0, q75: 2.5, max: 8.0 }};
+      }} else if (mode === "ipred_isigi") {{
+        b = avail.ipredIsigiBounds || {{ min: 0.0, q25: 1.0, median: 3.0, q75: 7.0, max: 20.0 }};
+      }} else {{
+        b = avail.isigiBounds || {{
+          min: Number.isFinite(avail.isigiMin) ? avail.isigiMin : -3.0,
+          q25: Number.isFinite(avail.isigiQ25) ? avail.isigiQ25 : 0.0,
+          median: Number.isFinite(avail.isigiMedian) ? avail.isigiMedian : 3.0,
+          q75: Number.isFinite(avail.isigiQ75) ? avail.isigiQ75 : 7.0,
+          max: Number.isFinite(avail.isigiMax) ? avail.isigiMax : 20.0,
+        }};
+      }}
       const lo = Number.isFinite(b.min) ? b.min : -3.0;
       const hi = Number.isFinite(b.max) ? b.max : 20.0;
       const mid = Math.max(lo, Math.min(hi, Number.isFinite(b.median) ? b.median : 0.5 * (lo + hi)));
@@ -16363,7 +18362,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         }}
         stops.push(`${{isigiToColor(snr, 1.0, b)}} ${{(u * 100).toFixed(1)}}%`);
       }}
-      const prefix = mode === "mtz_isigi" ? ".mtz I/σ" : "I/σ";
+      const prefix = mode === "fobs"
+        ? "|F_obs|²"
+        : (mode === "mtz_fcalc"
+          ? "|F_calc|²"
+          : (mode === "ipred_isigi" ? "I_pred/σ (Σ·|F_calc|²/σ_obs)" : "I/σ"));
       label = `${{fmtCompactMetric(lo)}} · ${{fmtCompactMetric(mid)}} · ${{fmtCompactMetric(hi)}}`;
       tooltip = `${{prefix}} quantile-normalized range [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at median ${{fmtCompactMetric(mid)}} (bulk IQR [${{fmtCompactMetric(q25)}}, ${{fmtCompactMetric(q75)}}])`;
     }} else if (mode === "residual") {{
@@ -16407,6 +18410,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       }}
       const crossLam = lMin + c * Math.max(0.05, lMax - lMin);
       label = `λ ~ ${{crossLam.toFixed(2)}} Å`;
+      tooltip = `Spectral hue midpoint λ ~ ${{crossLam.toFixed(2)}} Å across [${{lMin.toFixed(2)}}, ${{lMax.toFixed(2)}}] Å (limits set by Wavelength λ [Å] slider)`;
     }}
     state.colorCrossover = prevC;
     return {{
@@ -16417,15 +18421,22 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   }}
 
   function updateColorscaleSliderGradient() {{
+    const activeMode = state.wulffColorMode || "wavelength";
     const c = getColorCrossover();
-    const spec = buildColorscaleGradientSpec(state.wulffColorMode || "wavelength", c);
+    const spec = buildColorscaleGradientSpec(activeMode, c);
     if (slColorEmphasis) {{
+      slColorEmphasis.disabled = false;
+      slColorEmphasis.setAttribute("aria-disabled", "false");
       slColorEmphasis.style.setProperty("--cs-gradient", spec.gradient);
+      slColorEmphasis.title = spec.tooltip || "Drag knob to tune colorscale contrast / midpoint crossover (double-click to reset)";
     }}
-    const lbl = document.getElementById("lbl-color-emphasis");
+    const lbl = typeof document !== "undefined" && document ? document.getElementById("lbl-color-emphasis") : null;
     if (lbl) {{
       lbl.textContent = spec.label;
       lbl.title = spec.tooltip || "";
+    }}
+    if (typeof renderLambdaSnrCarpets === "function") {{
+      renderLambdaSnrCarpets();
     }}
   }}
 
@@ -16439,16 +18450,22 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const selSpotColor = document.getElementById("sel-spot-color");
     const titleEl = document.getElementById("stereo-title");
     const hasIsigi = hasIntegratedIsigi();
-    const hasMtz = hasMtzIsigi();
+    const hasFobs = typeof hasFobsSq === "function" ? hasFobsSq() : false;
+    const hasMtzFcalc = typeof hasMtzFcalcSq === "function" ? hasMtzFcalcSq() : false;
+    const hasIpred = typeof hasIpredIsigi === "function" ? hasIpredIsigi() : false;
     const hasRes = hasCarelessResiduals();
     const hasScl = hasCarelessScales();
     if (
       (state.wulffColorMode === "isigi" && !hasIsigi) ||
-      (state.wulffColorMode === "mtz_isigi" && !hasMtz) ||
+      (state.wulffColorMode === "fobs" && !hasFobs) ||
+      (state.wulffColorMode === "mtz_fcalc" && !hasMtzFcalc) ||
+      (state.wulffColorMode === "ipred_isigi" && !hasIpred) ||
       (state.wulffColorMode === "residual" && !hasRes) ||
       (state.wulffColorMode === "scale" && !hasScl)
     ) {{
-      state.wulffColorMode = hasMtz ? "mtz_isigi" : "wavelength";
+      state.wulffColorMode = typeof preferredFallbackColorMode === "function"
+        ? preferredFallbackColorMode()
+        : (hasMtzFcalc ? "mtz_fcalc" : (hasIsigi ? "isigi" : "wavelength"));
     }}
     if (stereoEl) {{
       stereoEl.classList.toggle("hidden", !state.showStereo);
@@ -16483,19 +18500,35 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       _cachedPlotBox = null;
       _cachedPlotBoxKey = "";
     }}
-    const mtzOptLabel = DATA.mtz_overlay_name
-      ? `Color: .mtz I/σ (${{String(DATA.mtz_overlay_name).slice(0, 18)}})`
-      : "Color: .mtz I/σ";
+    const mtzFullName = (typeof hasExternalMtzOverlay === "function" && hasExternalMtzOverlay())
+      ? String(DATA.mtz_overlay_name || "")
+      : "";
     [selColor, selSpotColor].forEach(sel => {{
       if (!sel) return;
       Array.from(sel.options).forEach(opt => {{
         if (opt.value === "isigi") {{
           opt.disabled = !hasIsigi;
+          opt.title = "Instrument measured I_obs / σ_{{I_obs}}";
           opt.style.color = hasIsigi ? "" : "#64748b";
-        }} else if (opt.value === "mtz_isigi") {{
-          opt.disabled = !hasMtz;
-          opt.textContent = mtzOptLabel;
-          opt.style.color = hasMtz ? "" : "#64748b";
+        }} else if (opt.value === "fobs") {{
+          opt.disabled = !hasFobs;
+          opt.textContent = "Color: |F_obs|²";
+          opt.title = "Post-merge Careless wavelength-normalized intensity |F_obs|² (no σ division)";
+          opt.style.color = hasFobs ? "" : "#64748b";
+        }} else if (opt.value === "mtz_fcalc") {{
+          opt.disabled = !hasMtzFcalc;
+          opt.textContent = "Color: |F_calc|²";
+          opt.title = mtzFullName
+            ? `Globally scaled |F_calc|² from ${{mtzFullName}} (same scale as |F_obs|²)`
+            : "Globally scaled |F_calc|² from .mtz (same scale as |F_obs|²)";
+          opt.style.color = hasMtzFcalc ? "" : "#64748b";
+        }} else if (opt.value === "ipred_isigi") {{
+          opt.disabled = !hasIpred;
+          opt.textContent = "Color: I_pred/σ";
+          opt.title = mtzFullName
+            ? `Post-merge expected SNR Σ(λ)·|F_calc|² / σ_{{I_obs}} within [λ_min, λ_max] (${{mtzFullName}})`
+            : "Post-merge expected SNR Σ(λ)·|F_calc|² / σ_{{I_obs}} within [λ_min, λ_max] (requires Careless merge + .mtz)";
+          opt.style.color = hasIpred ? "" : "#64748b";
         }} else if (opt.value === "residual") {{
           opt.disabled = !hasRes;
           opt.style.color = hasRes ? "" : "#64748b";
@@ -16505,6 +18538,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         }}
       }});
       sel.value = state.wulffColorMode || "wavelength";
+      if (mtzFullName && (state.wulffColorMode === "mtz_fcalc" || state.wulffColorMode === "ipred_isigi")) {{
+        sel.title = `Spot Color (${{mtzFullName}})`;
+      }}
     }});
     if (titleEl) {{
       const scopeLbl = state.wulffScope === "all_runs"
@@ -16839,19 +18875,24 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       }}
     }}
     let mergeStr = "";
-    if (typeof p.careless_residual === "number") {{
-      const rCol = p.careless_residual >= 0 ? "#f43f5e" : "#38bdf8";
-      mergeStr = ` • ΔI/σ=<strong style="color:${{rCol}};">${{p.careless_residual >= 0 ? "+" : ""}}${{p.careless_residual.toFixed(2)}}σ</strong>`;
-      if (typeof p.merged_i === "number" && typeof p.merged_sigi === "number" && p.merged_sigi > 0) {{
-        mergeStr += ` (I_asu=${{p.merged_i.toFixed(1)}}±${{p.merged_sigi.toFixed(1)}})`;
+    const fobsSqVal = peakFobsSq(p);
+    if (Number.isFinite(fobsSqVal)) {{
+      mergeStr += ` • |F_obs|²=<strong style="color:#38bdf8;">${{fobsSqVal.toFixed(2)}}</strong>`;
+      if (typeof p.merged_sigi === "number" && p.merged_sigi > 0) {{
+        mergeStr += ` (±${{p.merged_sigi.toFixed(2)}})`;
       }}
     }}
+    if (typeof p.careless_residual === "number") {{
+      const rCol = p.careless_residual >= 0 ? "#f43f5e" : "#38bdf8";
+      mergeStr += ` • ΔI/σ=<strong style="color:${{rCol}};">${{p.careless_residual >= 0 ? "+" : ""}}${{p.careless_residual.toFixed(2)}}σ</strong>`;
+    }}
     let mtzStr = "";
-    const mtzSnr = peakMtzIsigi(p);
-    if (Number.isFinite(mtzSnr)) {{
-      mtzStr = ` • MTZ I/σ=<strong style="color:#a3e635;">${{mtzSnr.toFixed(1)}}</strong>`;
-      if (typeof p.mtz_i === "number" && typeof p.mtz_sigi === "number") {{
-        mtzStr += ` (${{p.mtz_i.toFixed(1)}}±${{p.mtz_sigi.toFixed(1)}})`;
+    const fcalcSqVal = peakMtzFcalcSq(p);
+    const ipredSnrVal = peakIpredIsigi(p);
+    if (Number.isFinite(fcalcSqVal) && hasExternalMtzOverlay()) {{
+      mtzStr = ` • |F_calc|²=<strong style="color:#a3e635;">${{fcalcSqVal.toFixed(2)}}</strong>`;
+      if (Number.isFinite(ipredSnrVal)) {{
+        mtzStr += ` • I_pred/σ=<strong style="color:#fbbf24;">${{ipredSnrVal.toFixed(1)}}</strong>`;
       }}
     }}
     const detXVal = typeof p.det_x === "number" ? p.det_x : 0.0;
@@ -16906,9 +18947,14 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   }}
 
   function isPeakVisible(p) {{
-    if (p.mtz_only && state.wulffColorMode !== "mtz_isigi") return false;
-    if (state.wulffColorMode === "mtz_isigi" && !Number.isFinite(peakMtzIsigi(p))) return false;
+    const isMtzMode = typeof isMtzColorMode === "function"
+      ? isMtzColorMode(state.wulffColorMode)
+      : (state.wulffColorMode === "mtz_fcalc" || state.wulffColorMode === "ipred_isigi");
+    if (p.mtz_only && !isMtzMode) return false;
     if (p.wavelength < state.lamMin || p.wavelength > state.lamMax) return false;
+    if (state.wulffColorMode === "fobs" && (typeof peakFobsSq !== "function" || !Number.isFinite(peakFobsSq(p)))) return false;
+    if (state.wulffColorMode === "mtz_fcalc" && (typeof peakMtzFcalcSq !== "function" || !Number.isFinite(peakMtzFcalcSq(p)))) return false;
+    if (state.wulffColorMode === "ipred_isigi" && (typeof peakIpredIsigi !== "function" || !Number.isFinite(peakIpredIsigi(p)))) return false;
     if (typeof p.d_spacing === "number" && p.d_spacing > 0 && typeof state.dMin === "number" && state.dMin > 0) {{
       if (p.d_spacing < state.dMin - 1e-4) return false;
     }}
@@ -17940,12 +19986,19 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.selectedPeakObj = null;
       state.activeOrbitId = null;
     }}
+    const fallbackMode = () => (typeof preferredFallbackColorMode === "function"
+      ? preferredFallbackColorMode()
+      : (hasMtzFcalcSq() ? "mtz_fcalc" : "wavelength"));
     if ((state.wulffColorMode === "residual" || state.wulffColorMode === "scale") && !hasMergedCarelessData()) {{
-      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
-    }} else if (state.wulffColorMode === "mtz_isigi" && !hasMtzIsigi()) {{
-      state.wulffColorMode = "wavelength";
+      state.wulffColorMode = fallbackMode();
+    }} else if (state.wulffColorMode === "fobs" && (typeof hasFobsSq !== "function" || !hasFobsSq())) {{
+      state.wulffColorMode = fallbackMode();
+    }} else if (state.wulffColorMode === "mtz_fcalc" && (typeof hasMtzFcalcSq !== "function" || !hasMtzFcalcSq())) {{
+      state.wulffColorMode = fallbackMode();
+    }} else if (state.wulffColorMode === "ipred_isigi" && (typeof hasIpredIsigi !== "function" || !hasIpredIsigi())) {{
+      state.wulffColorMode = fallbackMode();
     }} else if (state.wulffColorMode === "isigi" && !hasIntegratedIsigi()) {{
-      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
+      state.wulffColorMode = fallbackMode();
     }}
     syncPeakSourceButtons();
     if (shouldRender) {{
@@ -19419,8 +21472,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const hasActiveZones = Boolean(state.showZoneArcs && state.activeZones && state.activeZones.size > 0);
     const useSnr = (
       state.peakSource === "integrated" ||
-      state.wulffColorMode === "isigi" ||
-      state.wulffColorMode === "mtz_isigi" ||
+      (typeof isQuantileSnrColorMode === "function"
+        ? isQuantileSnrColorMode(state.wulffColorMode)
+        : (state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi")) ||
       state.wulffColorMode === "residual"
     );
 
@@ -20390,7 +22444,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
         const r = isHovered ? baseR + 1.8 : (isBijvoetMate ? baseR + 1.6 : (isOrbitMate ? baseR + 1.2 : baseR));
         const isUncertain = !isHovered && !isOrbitMate && isPeakUncertainForScope(p);
-        const isIsigiMode = state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi";
+        const isIsigiMode = typeof isQuantileSnrColorMode === "function"
+          ? isQuantileSnrColorMode(state.wulffColorMode)
+          : (state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi");
         const strokeAlpha = isUncertain
           ? (captured ? 0.20 : 0.09)
           : (captured ? (isIsigiMode ? 1.0 : 0.95) : (isIsigiMode ? 0.55 : 0.42));
@@ -20786,9 +22842,17 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const mid = Number.isFinite(av.resMedian) ? av.resMedian : (av.resMean || 0.0);
       return Math.abs(p.careless_residual - mid);
     }}
-    if (state.wulffColorMode === "mtz_isigi") {{
-      const mv = peakMtzIsigi(p);
-      if (Number.isFinite(mv)) return Math.abs(mv);
+    if (state.wulffColorMode === "fobs") {{
+      const fv = peakFobsSq(p);
+      if (Number.isFinite(fv)) return Math.abs(fv);
+    }}
+    if (state.wulffColorMode === "mtz_fcalc") {{
+      const mfv = peakMtzFcalcSq(p);
+      if (Number.isFinite(mfv)) return Math.abs(mfv);
+    }}
+    if (state.wulffColorMode === "ipred_isigi") {{
+      const ipv = peakIpredIsigi(p);
+      if (Number.isFinite(ipv)) return Math.abs(ipv);
     }}
     if (typeof p.merged_i === "number" && typeof p.merged_sigi === "number" && p.merged_sigi > 0) {{
       return Math.abs(p.merged_i) / p.merged_sigi;
@@ -20887,8 +22951,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const hasActiveZones = Boolean(state.showZoneArcs && state.activeZones && state.activeZones.size > 0);
     const useSnr = (
       state.peakSource === "integrated" ||
-      state.wulffColorMode === "isigi" ||
-      state.wulffColorMode === "mtz_isigi" ||
+      (typeof isQuantileSnrColorMode === "function"
+        ? isQuantileSnrColorMode(state.wulffColorMode)
+        : (state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi")) ||
       state.wulffColorMode === "residual"
     );
 
@@ -21581,7 +23646,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
       const baseDot = (isExp ? (captured ? 3.8 : 2.6) : (captured ? 2.5 : 1.75)) * dotScale;
       const rDot = isHovered ? baseDot + (isFriedelGhost ? 2.2 : 2.8) : (isOrbitMate ? baseDot + 1.5 : baseDot);
-      const isIsigiModeW = state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi";
+      const isIsigiModeW = typeof isQuantileSnrColorMode === "function"
+        ? isQuantileSnrColorMode(state.wulffColorMode)
+        : (state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi");
       const alphaBase = isFriedelGhost
         ? (hemi >= 0 ? (captured ? 0.78 : 0.42) : (captured ? 0.38 : 0.20))
         : (hemi >= 0 ? (captured ? (isIsigiModeW ? 1.0 : 0.94) : 0.52) : (captured ? 0.58 : 0.28));
@@ -22234,11 +24301,13 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   if (slColorEmphasis) {{
     slColorEmphasis.addEventListener("input", () => {{
+      if (slColorEmphasis.disabled) return;
       const v = parseFloat(slColorEmphasis.value);
       state.colorCrossover = Number.isFinite(v) ? Math.max(0.05, Math.min(0.95, v)) : DEFAULT_COLOR_CROSSOVER;
       updateColorscaleSliderGradient();
     }});
     slColorEmphasis.addEventListener("dblclick", () => {{
+      if (slColorEmphasis.disabled) return;
       slColorEmphasis.value = DEFAULT_COLOR_CROSSOVER.toFixed(2);
       state.colorCrossover = DEFAULT_COLOR_CROSSOVER;
       updateColorscaleSliderGradient();
@@ -22518,17 +24587,29 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   if (wlSliderWrap) {{
     let activeWlDragEnd = null;
-    const clientXToSnappedWl = (clientX) => {{
+    const SNAP_WL_TOL_ANG = 0.12;
+    const clientXToSnappedWl = (clientX, dragEnd = null, bypassSnap = false) => {{
       const rect = wlSliderWrap.getBoundingClientRect();
       const width = Math.max(1, rect.width);
       const frac = Math.max(0, Math.min(1, (clientX - rect.left) / width));
       const [domMin, domMax] = getWavelengthSliderBounds();
       const raw = domMin + frac * (domMax - domMin);
+      if (!bypassSnap && typeof detectBandpassFromIsigi === "function") {{
+        const band = detectBandpassFromIsigi();
+        if (band && band.valid) {{
+          if (dragEnd === "min" && Math.abs(raw - band.lo) <= SNAP_WL_TOL_ANG && band.lo <= state.lamMax - MIN_WL_SPAN) {{
+            return band.lo;
+          }}
+          if (dragEnd === "max" && Math.abs(raw - band.hi) <= SNAP_WL_TOL_ANG && band.hi >= state.lamMin + MIN_WL_SPAN) {{
+            return band.hi;
+          }}
+        }}
+      }}
       return Math.round(raw * 20) / 20;
     }};
-    const applyDraggedWl = (clientX) => {{
+    const applyDraggedWl = (clientX, bypassSnap = false) => {{
       if (!activeWlDragEnd) return;
-      const snapped = clientXToSnappedWl(clientX);
+      const snapped = clientXToSnappedWl(clientX, activeWlDragEnd, bypassSnap);
       const prevLo = state.lamMin;
       const prevHi = state.lamMax;
       if (activeWlDragEnd === "min") {{
@@ -22542,27 +24623,46 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }};
     wlSliderWrap.addEventListener("pointerdown", (ev) => {{
       if (ev.button !== undefined && ev.button !== 0) return;
-      if (ev.target === wlKnobMin || (wlKnobMin && wlKnobMin.contains(ev.target))) {{
+      const bypassSnap = Boolean(ev.shiftKey || ev.altKey);
+      if (ev.target === wlKnobMin || (wlKnobMin && typeof wlKnobMin.contains === "function" && wlKnobMin.contains(ev.target))) {{
         activeWlDragEnd = "min";
-      }} else if (ev.target === wlKnobMax || (wlKnobMax && wlKnobMax.contains(ev.target))) {{
+      }} else if (ev.target === wlKnobMax || (wlKnobMax && typeof wlKnobMax.contains === "function" && wlKnobMax.contains(ev.target))) {{
         activeWlDragEnd = "max";
       }} else {{
-        const clickWl = clientXToSnappedWl(ev.clientX);
+        const clickWl = clientXToSnappedWl(ev.clientX, null, true);
         const dLo = Math.abs(clickWl - state.lamMin);
         const dHi = Math.abs(clickWl - state.lamMax);
         activeWlDragEnd = (dLo < dHi || (dLo === dHi && clickWl < state.lamMin)) ? "min" : "max";
-        applyDraggedWl(ev.clientX);
+        applyDraggedWl(ev.clientX, bypassSnap);
       }}
       if (wlKnobMin) wlKnobMin.classList.toggle("dragging", activeWlDragEnd === "min");
       if (wlKnobMax) wlKnobMax.classList.toggle("dragging", activeWlDragEnd === "max");
       if (typeof wlSliderWrap.setPointerCapture === "function" && ev.pointerId !== undefined) {{
         try {{ wlSliderWrap.setPointerCapture(ev.pointerId); }} catch (_e) {{}}
       }}
-      ev.preventDefault();
+      if (typeof ev.preventDefault === "function") ev.preventDefault();
     }});
     wlSliderWrap.addEventListener("pointermove", (ev) => {{
-      if (!activeWlDragEnd) return;
-      applyDraggedWl(ev.clientX);
+      if (activeWlDragEnd) {{
+        applyDraggedWl(ev.clientX, Boolean(ev.shiftKey || ev.altKey));
+        return;
+      }}
+      if (typeof wlSliderWrap.getBoundingClientRect === "function" && Number.isFinite(ev.clientX)) {{
+        const rect = wlSliderWrap.getBoundingClientRect();
+        const frac = Math.max(0, Math.min(1, (ev.clientX - rect.left) / Math.max(1, rect.width)));
+        const [domLo, domHi] = getWavelengthSliderBounds();
+        const carpet = computeLambdaSnrCarpetBins(domLo, domHi, 64);
+        if (carpet.hasSnr && carpet.bins.length > 0) {{
+          const bIdx = Math.min(carpet.bins.length - 1, Math.floor(frac * carpet.bins.length));
+          const b = carpet.bins[bIdx];
+          const band = detectBandpassFromIsigi();
+          const bandNote = band.valid ? ` · Q[1..99%] band ≈ [${{band.lo.toFixed(2)}}, ${{band.hi.toFixed(2)}}] Å` : "";
+          if (b && b.n > 0) {{
+            const q90Txt = Number.isFinite(b.q90Snr) ? b.q90Snr.toFixed(1) : "–";
+            wlSliderWrap.title = `λ ≈ ${{b.lamMid.toFixed(2)}} Å · n=${{b.n}} · q90(I/σ)=${{q90Txt}} · P(I/σ≥4)=${{Math.round(100 * b.obsFrac)}}%${{bandNote}}`;
+          }}
+        }}
+      }}
     }});
     const stopWlDrag = (ev) => {{
       if (!activeWlDragEnd) return;
@@ -22923,11 +25023,15 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   function applySpotColorMode(nextMode) {{
     if ((nextMode === "residual" || nextMode === "scale") && !hasMergedCarelessData()) {{
-      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
-    }} else if (nextMode === "mtz_isigi" && !hasMtzIsigi()) {{
-      state.wulffColorMode = "wavelength";
+      state.wulffColorMode = preferredFallbackColorMode();
+    }} else if (nextMode === "fobs" && !hasFobsSq()) {{
+      state.wulffColorMode = preferredFallbackColorMode();
+    }} else if (nextMode === "mtz_fcalc" && !hasMtzFcalcSq()) {{
+      state.wulffColorMode = preferredFallbackColorMode();
+    }} else if (nextMode === "ipred_isigi" && !hasIpredIsigi()) {{
+      state.wulffColorMode = preferredFallbackColorMode();
     }} else if (nextMode === "isigi" && !hasIntegratedIsigi()) {{
-      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
+      state.wulffColorMode = preferredFallbackColorMode();
     }} else {{
       state.wulffColorMode = nextMode || "wavelength";
     }}
@@ -23485,6 +25589,33 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     DATA.mtz_overlay_warning = newPayload.mtz_overlay_warning || null;
     DATA.mtz_asu_lookup = newPayload.mtz_asu_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_asu_lookup : null);
     DATA.mtz_exact_lookup = newPayload.mtz_exact_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_exact_lookup : null);
+    DATA.mtz_f_asu_lookup = newPayload.mtz_f_asu_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_f_asu_lookup : null);
+    DATA.mtz_f_exact_lookup = newPayload.mtz_f_exact_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_f_exact_lookup : null);
+    DATA.careless_i_asu_lookup = newPayload.careless_i_asu_lookup !== undefined
+      ? (newPayload.careless_i_asu_lookup || null)
+      : (isFrameSwitch ? DATA.careless_i_asu_lookup : null);
+    DATA.careless_f_asu_lookup = newPayload.careless_f_asu_lookup !== undefined
+      ? (newPayload.careless_f_asu_lookup || null)
+      : (isFrameSwitch ? DATA.careless_f_asu_lookup : null);
+    if (newPayload.careless_scale_profile !== undefined) {{
+      DATA.careless_scale_profile = newPayload.careless_scale_profile || null;
+    }} else if (!isFrameSwitch) {{
+      DATA.careless_scale_profile = null;
+    }}
+    if (newPayload.mtz_is_external !== undefined) DATA.mtz_is_external = Boolean(newPayload.mtz_is_external);
+    else if (!isFrameSwitch) DATA.mtz_is_external = false;
+    if (newPayload.mtz_has_f_column !== undefined) DATA.mtz_has_f_column = Boolean(newPayload.mtz_has_f_column);
+    else if (!isFrameSwitch) DATA.mtz_has_f_column = false;
+    if (newPayload.mtz_has_sigf_column !== undefined) DATA.mtz_has_sigf_column = Boolean(newPayload.mtz_has_sigf_column);
+    else if (!isFrameSwitch) DATA.mtz_has_sigf_column = true;
+    if (newPayload.mtz_has_i_column !== undefined) DATA.mtz_has_i_column = Boolean(newPayload.mtz_has_i_column);
+    else if (!isFrameSwitch) DATA.mtz_has_i_column = false;
+    if (newPayload.mtz_global_f_scale !== undefined) DATA.mtz_global_f_scale = newPayload.mtz_global_f_scale;
+    if (newPayload.mtz_global_i_scale !== undefined) DATA.mtz_global_i_scale = newPayload.mtz_global_i_scale;
+    if (newPayload.mtz_scale_basis !== undefined) DATA.mtz_scale_basis = newPayload.mtz_scale_basis;
+    else if (!isFrameSwitch) DATA.mtz_scale_basis = null;
+    _mtzCarelessAlignCache = {{ sig: "", kI: 1.0 }};
+    _jsCarelessProfileCache = {{ sig: "", prof: null }};
     DATA.default_peak_source = newPayload.default_peak_source || null;
     renderFrameSelector();
 
@@ -23522,6 +25653,13 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     _dynViewportPatchCache.sig = "";
     INTEGRATED_PEAKS = nextBuckets.integPeaks;
     INTEGRATED_SAMPLE_PEAKS = nextBuckets.integSample;
+    if (newPayload.wavelength_bandpass_profile !== undefined) {{
+      DATA.wavelength_bandpass_profile = newPayload.wavelength_bandpass_profile || null;
+    }} else if (!isFrameSwitch && INTEGRATED_PEAKS.length === 0 && INTEGRATED_SAMPLE_PEAKS.length === 0) {{
+      DATA.wavelength_bandpass_profile = null;
+    }}
+    _lambdaSnrCarpetCache.sig = "";
+    updateWavelengthLabels();
     if (newPayload.merge_metrics !== undefined) {{
       DATA.merge_metrics = newPayload.merge_metrics || null;
     }} else if (!isFrameSwitch) {{
@@ -23539,8 +25677,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       ? state.peakSource
       : (newPayload.default_peak_source || state.peakSource);
     applyPeakSource(preferredSrc, false);
-    if (!isFrameSwitch && hasMtzIsigi() && (newPayload.mtz_fresh_overlay || state.wulffColorMode === "mtz_isigi" || newPayload.default_color_mode === "mtz_isigi")) {{
-      state.wulffColorMode = "mtz_isigi";
+    if (!isFrameSwitch && (newPayload.mtz_fresh_overlay || isMtzColorMode(state.wulffColorMode) || isMtzColorMode(newPayload.default_color_mode))) {{
+      if (state.wulffColorMode === "ipred_isigi" && hasIpredIsigi()) {{
+        state.wulffColorMode = "ipred_isigi";
+      }} else if (hasMtzFcalcSq()) {{
+        state.wulffColorMode = "mtz_fcalc";
+      }}
     }}
     ZONES.length = 0;
     nextZones.forEach(z => ZONES.push(z));

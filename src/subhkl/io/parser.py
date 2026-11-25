@@ -1379,12 +1379,11 @@ def integrator(
     tof_max_variance_inflation: Annotated[
         float,
         typer.Option(
-            help="Censor a gated reflection (sigI = 0, dropped from the "
-            "export) when overlapping neighbours in the same time window "
-            "inflate the variance of its intensity by more than this factor "
-            "relative to an isolated reflection. Such a reflection cannot "
-            "be told apart from its neighbours: only their sum is "
-            "determined. 0 keeps every row."
+            help="Limit on how much overlapping neighbours may inflate the "
+            "variance of a reflection's intensity, relative to an isolated "
+            "reflection. Beyond it the reflections cannot be told apart: "
+            "only their sum is determined, and they are censored (sigI = 0, "
+            "dropped from the export). 0 keeps every row."
         ),
     ] = 1000.0,
     tof_amplitude_ridge: Annotated[
@@ -1394,9 +1393,21 @@ def integrator(
             "reflections. 'fixed' is a prior of 1000 photons on every "
             "reflection; 'counts' sets it to the gross counts under the "
             "reflection's own profile, which gives unresolved reflections a "
-            "meaningful sigma but also shrinks weak, partly overlapped ones."
+            "meaningful sigma but also shrinks weak, partly overlapped ones. "
+            "Only used with --tof-fit gated."
         ),
     ] = "fixed",
+    tof_fit: Annotated[
+        str,
+        typer.Option(
+            help="How events are fitted. 'joint' (default) fits all "
+            "reflections of a detector image at once in position and "
+            "time, using the measured time profile, so reflections that "
+            "share pixels are told apart by their arrival times. 'gated' "
+            "is the earlier method: one tile per reflection, summed over "
+            "the time gate, with sideband background."
+        ),
+    ] = "joint",
 ):
     """
     Integrates predicted peaks using the Dense Sparse RBF network approach on GPU.
@@ -1453,6 +1464,7 @@ def integrator(
         tof_sideband_measure=tof_sideband_measure,
         tof_max_variance_inflation=tof_max_variance_inflation,
         tof_amplitude_ridge=tof_amplitude_ridge,
+        tof_fit=tof_fit,
     )
     _copy_scan_provenance_to_derived_h5(
         resolved_scan,

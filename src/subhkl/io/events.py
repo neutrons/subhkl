@@ -16,6 +16,12 @@ histogram of its own events over pixels, so the per-pixel offsets are
 contiguous slice, already sorted in time.
 """
 
+import ctypes
+import os
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import h5py
 import numpy as np
 
@@ -25,6 +31,35 @@ ANGSTROM_M_PER_US = 3.956034e-3
 EVENTS_TOF = "events/tof"
 EVENTS_OFFSETS = "events/image_offsets"
 L1_KEY = "instrument/L1"
+
+_H5Z_FILTER_SHUFFLE = 2
+_H5Z_FILTER_LZF = 32000
+_LZF_DECOMPRESS = None
+_LZF_PROBED = False
+
+
+def _get_lzf_decompress():
+    """Return h5py's bundled C ``lzf_decompress`` function (GIL-free), or None."""
+    global _LZF_DECOMPRESS, _LZF_PROBED
+    if _LZF_PROBED:
+        return _LZF_DECOMPRESS
+    _LZF_PROBED = True
+    try:
+        import h5py.h5z
+
+        lib = ctypes.CDLL(h5py.h5z.__file__)
+        fn = lib.lzf_decompress
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        fn.restype = ctypes.c_uint
+        _LZF_DECOMPRESS = fn
+    except (ImportError, OSError, AttributeError, TypeError):
+        _LZF_DECOMPRESS = None
+    return _LZF_DECOMPRESS
 
 
 def sort_bank_events(local_id, tof, m, n, y_fast):
@@ -135,6 +170,8 @@ class EventStore:
 
     def __init__(self, filename, rdcc_nbytes: int = 64 * 1024 * 1024):
         self.filename = filename
+        self._io_lock = threading.Lock()
+        self._decode_pool: ThreadPoolExecutor | None = None
         self._f = h5py.File(
             filename,
             "r",
@@ -148,8 +185,59 @@ class EventStore:
         self.offsets = self._f[EVENTS_OFFSETS][()]
         self.l1 = float(self._f[L1_KEY][()]) if L1_KEY in self._f else None
 
+        self._fast_lzf = False
+        self._chunk_len = 0
+        self._shuf_bit = 0
+        self._lzf_bit = 0
+        self._init_fast_chunk_decoder()
+
+    def _init_fast_chunk_decoder(self) -> None:
+        """Enable GIL-free parallel LZF+shuffle chunk decoding when supported."""
+        dset = self._f[EVENTS_TOF]
+        native_order = "<" if sys.byteorder == "little" else ">"
+        if (
+            dset.dtype.kind != "f"
+            or dset.dtype.itemsize != 4
+            or dset.dtype.byteorder not in ("=", "|", native_order)
+            or dset.chunks is None
+            or len(dset.chunks) != 1
+            or dset.chunks[0] <= 0
+        ):
+            return
+        plist = dset.id.get_create_plist()
+        nfilt = plist.get_nfilters()
+        if nfilt == 0:
+            return
+        shuf_bit = 0
+        lzf_bit = 0
+        seen_lzf = False
+        for idx in range(nfilt):
+            fid, _flags, cd_values, _name = plist.get_filter(idx)
+            if fid == _H5Z_FILTER_SHUFFLE and not seen_lzf and shuf_bit == 0:
+                if len(cd_values) >= 1 and int(cd_values[0]) != 4:
+                    return
+                shuf_bit = 1 << idx
+            elif fid == _H5Z_FILTER_LZF and lzf_bit == 0:
+                lzf_bit = 1 << idx
+                seen_lzf = True
+            else:
+                return
+        if lzf_bit and _get_lzf_decompress() is None:
+            return
+        self._chunk_len = int(dset.chunks[0])
+        self._shuf_bit = shuf_bit
+        self._lzf_bit = lzf_bit
+        self._fast_lzf = True
+        n_workers = min(8, max(1, os.cpu_count() or 1))
+        if n_workers > 1:
+            self._decode_pool = ThreadPoolExecutor(max_workers=n_workers)
+
     def close(self):
-        self._f.close()
+        if self._decode_pool is not None:
+            self._decode_pool.shutdown(wait=True)
+            self._decode_pool = None
+        with self._io_lock:
+            self._f.close()
 
     def __enter__(self):
         return self
@@ -169,7 +257,8 @@ class EventStore:
             offsets [H * W + 1] into it
         """
         lo, hi = int(self.offsets[img_idx]), int(self.offsets[img_idx + 1])
-        tof = self._f[EVENTS_TOF][lo:hi]
+        with self._io_lock:
+            tof = self._f[EVENTS_TOF][lo:hi]
         counts = np.rint(np.asarray(image, dtype=np.float64)).astype(np.int64).ravel()
         pix_offsets = np.concatenate([[0], np.cumsum(counts)])
         if pix_offsets[-1] != hi - lo:
@@ -184,6 +273,86 @@ class EventStore:
         """Number of stored events in ``img_idx`` without reading ``events/tof``."""
         return int(self.offsets[int(img_idx) + 1]) - int(self.offsets[int(img_idx)])
 
+    def _read_runs(self, out_tof: np.ndarray, runs: list[tuple[int, int, int]]) -> None:
+        """Read ``[(run_lo, run_hi, dst), ...]`` into ``out_tof``."""
+        if not runs:
+            return
+        if not self._fast_lzf:
+            with self._io_lock:
+                dset = self._f[EVENTS_TOF]
+                for run_lo, run_hi, dst in runs:
+                    dset.read_direct(
+                        out_tof,
+                        np.s_[run_lo:run_hi],
+                        np.s_[dst : dst + (run_hi - run_lo)],
+                    )
+            return
+
+        chunk_len = self._chunk_len
+        chunk_targets: dict[int, list[tuple[int, int, int, int]]] = {}
+        for run_lo, run_hi, dst in runs:
+            c_first = run_lo // chunk_len
+            c_last = (run_hi - 1) // chunk_len
+            for c in range(c_first, c_last + 1):
+                c_start = c * chunk_len
+                s_lo = max(run_lo, c_start) - c_start
+                s_hi = min(run_hi, c_start + chunk_len) - c_start
+                d_lo = dst + max(run_lo, c_start) - run_lo
+                d_hi = d_lo + (s_hi - s_lo)
+                chunk_targets.setdefault(c, []).append((s_lo, s_hi, d_lo, d_hi))
+
+        raw_chunks = []
+        try:
+            with self._io_lock:
+                dset_id = self._f[EVENTS_TOF].id
+                for c in sorted(chunk_targets):
+                    mask, raw = dset_id.read_direct_chunk((c * chunk_len,))
+                    raw_chunks.append((c, mask, raw, chunk_targets[c]))
+        except OSError:
+            with self._io_lock:
+                dset = self._f[EVENTS_TOF]
+                for run_lo, run_hi, dst in runs:
+                    dset.read_direct(
+                        out_tof,
+                        np.s_[run_lo:run_hi],
+                        np.s_[dst : dst + (run_hi - run_lo)],
+                    )
+            return
+
+        lzf_fn = _get_lzf_decompress()
+        lzf_bit = self._lzf_bit
+        shuf_bit = self._shuf_bit
+        nbytes = chunk_len * 4
+
+        def _decode_chunk(item) -> None:
+            _c, mask, raw, targets = item
+            if lzf_bit and not (mask & lzf_bit):
+                buf = np.empty(nbytes, dtype=np.uint8)
+                got = lzf_fn(raw, len(raw), buf.ctypes.data, nbytes)
+                if got != nbytes:
+                    raise RuntimeError(
+                        f"LZF chunk decompression returned {got} bytes, expected {nbytes}"
+                    )
+            else:
+                buf = np.frombuffer(raw, dtype=np.uint8, count=nbytes)
+
+            if shuf_bit and not (mask & shuf_bit):
+                planes_all = buf.reshape(4, chunk_len)
+                for s_lo, s_hi, d_lo, d_hi in targets:
+                    out_tof[d_lo:d_hi].view(np.uint8).reshape(s_hi - s_lo, 4)[:] = (
+                        planes_all[:, s_lo:s_hi].T
+                    )
+            else:
+                f32_all = buf.view(np.float32)
+                for s_lo, s_hi, d_lo, d_hi in targets:
+                    out_tof[d_lo:d_hi] = f32_all[s_lo:s_hi]
+
+        if len(raw_chunks) < 2 or self._decode_pool is None:
+            for item in raw_chunks:
+                _decode_chunk(item)
+        else:
+            list(self._decode_pool.map(_decode_chunk, raw_chunks))
+
     def read_slab(
         self,
         img_indices,
@@ -193,9 +362,10 @@ class EventStore:
     ) -> tuple[np.ndarray, np.ndarray, int]:
         """Coalesced multi-image event read into preallocated slab buffers.
 
-        Adjacent images in ``events/tof`` are read with a single ``read_direct``
-        slice so LZF chunks straddling image boundaries are decompressed once,
-        and per-pixel offsets are shifted into slab-global ``int32`` coordinates.
+        Adjacent images in ``events/tof`` are read with a single contiguous
+        chunk pass so LZF chunks straddling image boundaries are decompressed
+        once, and per-pixel offsets are shifted into slab-global ``int32``
+        coordinates.
         """
         idx_arr = np.asarray(img_indices, dtype=np.int64)
         m_imgs = len(idx_arr)
@@ -208,7 +378,11 @@ class EventStore:
                 if out_pix_offsets is not None
                 else np.zeros((1, n_pix + 1), dtype=np.int32)
             )
-            return tof_buf, off_buf, 0
+            return (
+                tof_buf,
+                out_pix_offsets if out_pix_offsets is not None else off_buf,
+                0,
+            )
 
         los = self.offsets[idx_arr].astype(np.int64, copy=False)
         his = self.offsets[idx_arr + 1].astype(np.int64, copy=False)
@@ -224,7 +398,7 @@ class EventStore:
         ):
             out_pix_offsets = np.zeros((m_imgs, n_pix + 1), dtype=np.int32)
 
-        dset = self._f[EVENTS_TOF]
+        runs: list[tuple[int, int, int]] = []
         dst = 0
         i = 0
         while i < m_imgs:
@@ -236,13 +410,10 @@ class EventStore:
                 j += 1
             n_run = run_hi - run_lo
             if n_run > 0:
-                dset.read_direct(
-                    out_tof,
-                    np.s_[run_lo:run_hi],
-                    np.s_[dst : dst + n_run],
-                )
+                runs.append((run_lo, run_hi, dst))
                 dst += n_run
             i = j
+        self._read_runs(out_tof, runs)
 
         counts_2d = np.rint(images_arr[:m_imgs]).astype(np.int64).reshape(m_imgs, n_pix)
         cum_counts = np.cumsum(counts_2d, axis=1, dtype=np.int64)

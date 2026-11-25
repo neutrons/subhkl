@@ -6,6 +6,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.7.3]
 
+### Added
+
+- **Quantile wavelength bandpass histogram and separated visualization controls (`rainbow_zones`, `nova_rainbow_view`)**:
+  - Added an empirical wavelength profile from fundamental reflections before
+    Wulff-sample intensity filtering, with smoothing and baseline rejection to
+    suppress cosmic-ray and harmonic outliers. The histogram distinguishes
+    in-band and out-of-band signal and supports snapping wavelength limits to
+    the measured bandpass.
+  - Separated visualization controls from physical wavelength and resolution
+    parameters. The `λ/Zone` colorscale crossover now adjusts the spectral
+    midpoint independently, while CG4D starts with a wide `[2.8, 4.5] Å`
+    integration window for interactive bandpass inspection.
+- **Post-merge structure-factor and predicted `I/σ` spot colorscales (`rainbow_zones`, `nova_rainbow_view`)**:
+  - Added `|F_obs|²` and globally scaled external `.mtz` `|F_calc|²` colorscales
+    with matched bounds, plus a post-merge predicted `I_pred/σ` colorscale
+    evaluated at each frame's diffracted wavelength.
+  - The predicted scale is restricted to the active wavelength bandpass and
+    unavailable before Careless merge; run- and frame-specific observations
+    remain isolated.
+
+### Changed
+
+- **Time-of-flight integration fits each detector image once, in position and time (`tof_joint`, `integrator --tof-fit`)**:
+  - With events present, all reflections of an image are now fitted together
+    as spot profile × measured time profile on a background taken from the
+    voxels no reflection touches. Reflections that share pixels are told apart
+    by when their neutrons arrive. Previously each reflection was fitted on its
+    own tile, summed over the time gate, with up to seven neighbours; two
+    reflections on the same pixels and inside one another's gate were then
+    indistinguishable and were censored.
+  - The reported intensity is the reflection's whole flux, not the 95% inside
+    a gate.
+  - `--tof-max-variance-inflation` keeps its meaning. Where neighbours inflate
+    a variance beyond it, the image is refitted without the directions the data
+    do not determine, and only reflections with a share in those directions are
+    censored.
+  - `--tof-fit gated` selects the earlier method. `--tof-sideband-factor`,
+    `--tof-sideband-measure` and `--tof-amplitude-ridge` apply only to it.
+  - On MANDI IPTS-30763 runs 11324–11338 (1.89 million predictions to 1.41 Å):
+    half-dataset CC of the `careless mono` merge rises from 0.949 to 0.975 at
+    4.0–3.0 Å, 0.803 to 0.884 at 3.0–2.5 Å, 0.628 to 0.774 at 2.5–2.2 Å and
+    0.352 to 0.447 at 2.2–2.0 Å; it is 0.968 against 0.982 below 4 Å. 1.85
+    million reflections are fitted (1.74 million before) and none is censored
+    as unresolved. The overall CC½ of the merge to 1.41 Å falls from 0.900 to
+    0.759, because the added observations lie beyond 2 Å where this crystal
+    does not diffract; cut the merge at the resolution the shells support. The
+    integrator takes about three minutes on one GPU.
+  - The fit relies on the spot shape: with the nominal one-pixel spot
+    (no `--anisotropic` shape fit) the 2.5–2.2 Å shell drops to 0.19.
 ### Fixed
 
 - **Galaxy History derived-HDF5 (`...integrated.h5` / `...solve.h5`) background frame hydration completion (`rainbow_zones`, `nova_rainbow_view`, `nova_app`)**:
@@ -47,13 +96,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     in Pro mode).
   - Implemented a two-phase `/api/pipeline/exit` lifecycle (`prepare` on modal
     open, `confirm` on **`CLOSE TAB`** / tab unload):
-    - In **Galaxy/NDIP** mode, `prepare` immediately sweeps Tier 1 staging and
-      Tier 2 shared intermediates (locally or via `imaginex_subhkl_cleanup_shared`)
-      while keeping the Trame/HTTP server alive so **`GO BACK`** restores the
-      previous step and hydrates reduced detector frames on the fly from Galaxy
-      History.
-    - In **Local** mode, intermediate file deletion is deferred until `confirm`
-      or process finalization so **`GO BACK`** preserves local state intact.
+  - In **Galaxy/NDIP** mode, `prepare` immediately sweeps Tier 1 staging and
+    Tier 2 shared intermediates (locally or via `imaginex_subhkl_cleanup_shared`)
+    while keeping the Trame/HTTP server alive so **`GO BACK`** restores the
+    previous step and hydrates reduced detector frames on the fly from Galaxy
+    History.
+  - In **Local** mode, intermediate file deletion is deferred until `confirm`
+    or process finalization so **`GO BACK`** preserves local state intact.
 - **Execution host reporting for Careless variational merge (`nova_rainbow_view`, `rainbow_zones`)**:
   - Surfaced the active execution host (`runner_host`, resolved from local
     container headers, `[pulsar] Runner host:` console output, or Galaxy
@@ -90,21 +139,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Separated intermediate and persistent data across three storage tiers so
     interactive `subhkl-nova-app` sessions release GPUs to job runners without
     moving multi-GB HDF5 files through Galaxy/Pulsar object-storage caches:
-    - **Tier 1 (`SUBHKL_STAGING_DIR` / `TMPDIR`)**: fast node-local NVMe scratch
-      for step-local work (`reduce-batch` per-run files, local HDF5 assembly,
-      and Careless scratch).
-    - **Tier 2 (`SUBHKL_SHARED_DIR`, mandatory when `SUBHKL_EXEC_MODE=galaxy`)**:
-      network filesystem exchanging compact `subhkl_shared_pointer/v1` JSON
-      sideband pointers (`--shared-pointer-out`) for large cross-step HDF5
-      artifacts (`merged.h5`, `predictor.h5`, `integrated.h5`), with automatic
-      `/proc/self/mountinfo` canonical network-path translation across
-      heterogeneous runner mounts (e.g. `/scratch` on `imaginex-{1,2}` vs.
-      `/gpfs/neutronsfs/scratch` on `analysis.sns.gov`) and deterministic
-      cleanup (`subhkl cleanup-shared` and app exit hooks).
-    - **Tier 3 (Galaxy Object Storage / History)**: persists thin crystallography
-      artifacts (`solve.h5`, `reflections.mtz`, `merged.mtz`, `xval.mtz`,
-      `careless_metrics.json`, `merge_table.{csv,html}`), reconstructing reduced
-      detector data on the fly when restarting from a History `solve.h5`.
+  - **Tier 1 (`SUBHKL_STAGING_DIR` / `TMPDIR`)**: fast node-local NVMe scratch
+    for step-local work (`reduce-batch` per-run files, local HDF5 assembly,
+    and Careless scratch).
+  - **Tier 2 (`SUBHKL_SHARED_DIR`, mandatory when `SUBHKL_EXEC_MODE=galaxy`)**:
+    network filesystem exchanging compact `subhkl_shared_pointer/v1` JSON
+    sideband pointers (`--shared-pointer-out`) for large cross-step HDF5
+    artifacts (`merged.h5`, `predictor.h5`, `integrated.h5`), with automatic
+    `/proc/self/mountinfo` canonical network-path translation across
+    heterogeneous runner mounts (e.g. `/scratch` on `imaginex-{1,2}` vs.
+    `/gpfs/neutronsfs/scratch` on `analysis.sns.gov`) and deterministic
+    cleanup (`subhkl cleanup-shared` and app exit hooks).
+  - **Tier 3 (Galaxy Object Storage / History)**: persists thin crystallography
+    artifacts (`solve.h5`, `reflections.mtz`, `merged.mtz`, `xval.mtz`,
+    `careless_metrics.json`, `merge_table.{csv,html}`), reconstructing reduced
+    detector data on the fly when restarting from a History `solve.h5`.
   - Hardened Tier 2 sideband publication for lockless/non-atomic NFS mounts:
     allocates fresh 128-bit UUIDv4 filenames (`subhkl_shared_<32hex>_<artifact>`)
     opened via `O_WRONLY | O_CREAT | O_EXCL` with zero pre-creation `stat`
