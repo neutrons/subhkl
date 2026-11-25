@@ -2009,6 +2009,9 @@ def apply_mtz_to_payload(
     ds_info: dict[str, Any] | None = None,
     *,
     select_mtz_color: bool = True,
+    ref_mtz_path: str | os.PathLike | None = None,
+    heterodyne_mode: str = "delta",
+    compute_nodal: bool = True,
 ) -> dict[str, Any]:
     """Attach external MTZ structure-factor/intensity columns onto active UB reflection peaks without modifying B or U."""
     import gemmi
@@ -3172,6 +3175,30 @@ def apply_mtz_to_payload(
     out["mtz_overlay_space_group"] = mtz_sg_label
     out["mtz_overlay_cell"] = mtz_cell_vals
     out["mtz_overlay_warning"] = mtz_overlay_warning
+
+    from subhkl.viz.nodal_surfaces import (
+        compute_nodal_surfaces_payload,
+        detect_mtz_f_and_phase_columns,
+    )
+
+    _f_ph, _phi_ph = detect_mtz_f_and_phase_columns(mtz)
+    has_phases = bool(_f_ph is not None and _phi_ph is not None)
+    out["mtz_has_phases"] = has_phases
+    out["mtz_phi_column"] = _phi_ph.label if _phi_ph is not None else None
+    if compute_nodal and has_phases:
+        nodal_doc = compute_nodal_surfaces_payload(
+            mtz_path,
+            UB_curr,
+            d_min=float(out.get("d_min") or 1.5),
+            space_group_override=active_sg.hm,
+            ref_mtz_path=ref_mtz_path,
+            heterodyne_mode=heterodyne_mode,
+        )
+        out["nodal_data"] = nodal_doc
+        out["ref_mtz_overlay_name"] = nodal_doc.get("ref_name")
+    else:
+        out["nodal_data"] = None
+        out["ref_mtz_overlay_name"] = None
     return out
 
 
@@ -10855,6 +10882,10 @@ def merge_frame_only_payload(
         "mtz_exact_lookup",
         "mtz_f_asu_lookup",
         "mtz_f_exact_lookup",
+        "mtz_has_phases",
+        "mtz_phi_column",
+        "ref_mtz_overlay_name",
+        "nodal_data",
     ):
         prev_val = prev_payload.get(keep_key)
         if prev_val is not None and frame_payload.get(keep_key) is None:
@@ -10883,6 +10914,7 @@ def build_frame_only_response(payload: dict[str, Any]) -> dict[str, Any]:
         "mtz_exact_lookup",
         "mtz_f_asu_lookup",
         "mtz_f_exact_lookup",
+        "nodal_data",
     ):
         out.pop(drop_key, None)
     # Avoid JSON-serializing the primary peak list twice (`peaks` aliases `integrated_peaks` or `predicted_peaks`)
@@ -10956,9 +10988,11 @@ def render_rainbow_html(
         ARCADE_PIXEL_FONT_DATA_URI,
         build_arcade_exit_quips_json,
     )
+    from subhkl.viz.nodal_surfaces import get_nodal_surfaces_js
 
     arcade_exit_quips_json = build_arcade_exit_quips_json()
     arcade_pixel_font_uri = ARCADE_PIXEL_FONT_DATA_URI
+    nodal_surfaces_js = get_nodal_surfaces_js()
     ep_env = os.environ.get("EP_PATH", "").strip().rstrip("/")
     base_tag_html = (
         f'<base href="{ep_env}/" />\n' if ep_env and ep_env.startswith("/") else ""
@@ -11407,6 +11441,96 @@ def render_rainbow_html(
     flex: 0 0 96px;
     width: 96px;
     max-width: 96px;
+  }}
+
+  .stereo-mode-switch {{
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }}
+
+  .stereo-mode-switch button {{
+    border: none !important;
+    border-radius: 0 !important;
+    padding: 1px 5px;
+    font-size: 0.56rem;
+    background: var(--bg-card);
+    color: var(--text-dim);
+  }}
+
+  .stereo-mode-switch button.active-btn {{
+    background: rgba(6, 182, 212, 0.25);
+    color: var(--accent-cyan);
+    font-weight: 700;
+  }}
+
+  .stereo-nodal-bar {{
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 3px;
+    padding: 3px 6px;
+    background: rgba(8, 12, 24, 0.94);
+    border-bottom: 1px solid var(--border-color);
+    font-family: var(--font-display);
+    font-size: 0.56rem;
+  }}
+
+  .stereo-nodal-bar.hidden {{
+    display: none;
+  }}
+
+  .stereo-nodal-bar button, .stereo-nodal-bar select {{
+    font-size: 0.55rem;
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: var(--bg-card);
+    color: var(--text-dim);
+    border: 1px solid var(--border-color);
+    font-family: var(--font-display);
+    cursor: pointer;
+    white-space: nowrap;
+  }}
+
+  .stereo-nodal-bar button.nodal-re-pill.active-btn {{
+    border-color: #22d3ee;
+    color: #22d3ee;
+    background: rgba(34, 211, 238, 0.14);
+  }}
+
+  .stereo-nodal-bar button.nodal-im-pill.active-btn {{
+    border-color: #fb7185;
+    color: #fb7185;
+    background: rgba(251, 113, 133, 0.14);
+  }}
+
+  .stereo-nodal-bar button.nodal-vortex-pill.active-btn {{
+    border-color: #fde047;
+    color: #fde047;
+    background: rgba(253, 224, 71, 0.14);
+  }}
+
+  .stereo-nodal-bar button.nodal-ref-active {{
+    border-color: #c084fc;
+    color: #e9d5ff;
+    background: rgba(192, 132, 252, 0.16);
+    max-width: 96px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+
+  #slider-nodal-roi {{
+    width: 48px;
+    height: 10px;
+    accent-color: var(--accent-cyan);
+    cursor: pointer;
+  }}
+
+  .stereo-nodal-bar .hidden {{
+    display: none !important;
   }}
 
   .stereo-merge-bar {{
@@ -12633,11 +12757,15 @@ def render_rainbow_html(
           </div>
         </div>
 
-        <!-- Interactive Stereogram Wulff Net (Corner Inset or Side-by-Side Split View) -->
+        <!-- Interactive Stereogram Wulff Net / 3D Reciprocal Space (Corner Inset or Side-by-Side Split View) -->
         <div class="stereo-inset hidden" id="stereo-inset">
           <div class="stereo-inset-header">
             <span id="stereo-title" style="color:var(--accent-cyan);font-weight:700;">WULFF NET</span>
             <div class="stereo-toolbar">
+              <div class="stereo-mode-switch" role="group" aria-label="Switch between Wulff Net and 3D Reciprocal Space">
+                <button id="btn-view-wulff" type="button" class="active-btn" title="Wulff Stereogram (projected plane normals Ĝ &amp; 1D vortices)">Wulff</button>
+                <button id="btn-view-recip3d" type="button" title="3D Reciprocal Space (Bragg lattice G, Laue planes, Re=0 / Im=0 nodal surfaces &amp; 1D vortices)">3D</button>
+              </div>
               <button id="btn-wulff-scope" type="button" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
               <button id="btn-wulff-friedel" type="button" class="active-btn" title="Show antipodal Friedel mates (-h,-k,-l) on the Wulff sphere (fills the θ vs 2θ hemisphere; violet symmetry links vs gold proper rotations)">±Friedel</button>
               <select id="sel-wulff-color" title="Color reflections on Wulff Net &amp; Detector by Wavelength, ASU Orbit, I/σ, post-merge |F_obs|², normalized .mtz |F_calc|², post-merge I_pred/σ, or Careless Merge Residual/Scale">
@@ -12655,6 +12783,25 @@ def render_rainbow_html(
               <button id="btn-wulff-expand" type="button" data-caret="up" aria-label="Magnify Wulff Net to side-by-side Split View" title="Magnify Wulff Net to side-by-side Split View"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3.5 10.5 8 6 12.5 10.5"/></svg></button>
               <button id="btn-wulff-close" type="button" aria-label="Hide Wulff Net" title="Hide Wulff Net">X</button>
             </div>
+          </div>
+          <div class="stereo-nodal-bar hidden" id="stereo-nodal-bar">
+            <button id="btn-nodal-re" type="button" class="active-btn nodal-re-pill" title="Toggle simulated Re=0 nodal surface in 3D Reciprocal Space">Re=0</button>
+            <button id="btn-nodal-im" type="button" class="active-btn nodal-im-pill" title="Toggle simulated Im=0 nodal surface in 3D Reciprocal Space">Im=0</button>
+            <button id="btn-nodal-vortices" type="button" class="active-btn nodal-vortex-pill" title="Toggle 1D phase vortices (Re=0 ∩ Im=0) across 3D Reciprocal Space, Wulff Net, and Detector Panels">Vortices</button>
+            <select id="sel-nodal-roi" title="3D Nodal Surface Region of Interest (Origin sphere, Selected Bragg Peak, or Active Laue Zone slab)">
+              <option value="origin">ROI: Origin</option>
+              <option value="peak">ROI: Peak</option>
+              <option value="zone">ROI: Zone</option>
+            </select>
+            <input type="range" id="slider-nodal-roi" min="1.2" max="5.5" step="0.3" value="2.5" title="Adjust 3D nodal surface ROI radius (2.5× a⋆)" />
+            <button id="btn-load-ref-mtz" type="button" title="Load heterodyne reference F₀ .mtz (with phase, e.g. heavy-atom / reference structure factor) for interference nodal surfaces &amp; vortices">Ref F₀</button>
+            <button id="btn-clear-ref-mtz" type="button" class="hidden" title="Clear heterodyne reference F₀ .mtz">×</button>
+            <select id="sel-heterodyne-mode" class="hidden" title="Heterodyne interference term with Reference F₀">
+              <option value="delta">F₀*·(F−F₀)</option>
+              <option value="product">F₀*·F</option>
+              <option value="single">Single F</option>
+            </select>
+            <input type="file" id="inp-ref-mtz-file" accept=".mtz" style="display:none;" />
           </div>
           <canvas id="canvas-stereo" style="flex:1;width:100%;min-height:0;cursor:grab;"></canvas>
           <div class="stereo-merge-bar" id="wulff-merge-bar"></div>
@@ -15368,6 +15515,14 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
+    stereoViewMode: "wulff",       // "wulff" | "recip3d"
+    showNodalSurfacesRe: true,     // Cyan Re(Z)=0 nodal surface in 3D Reciprocal Space
+    showNodalSurfacesIm: true,     // Coral-Rose Im(Z)=0 nodal surface in 3D Reciprocal Space
+    showPhaseVortices: true,       // 1D phase vortices (Re=0 ∩ Im=0) on 3D, Wulff & Detector
+    nodalSurfaceAlpha: 0.56,
+    nodalRoiMode: "origin",        // "origin" | "peak" | "zone"
+    nodalRoiRadiusMult: 2.5,
+    heterodyneMode: "delta",       // "delta" [F0*(F-F0)] | "product" [F0*F] | "single" [F]
     histMetric: "cc_half",        // "cc_half" | "completeness" | "isigi"
     hoveredHistBin: null,         // 0..nBins-1 when hovering #canvas-hist resolution bar
     lamMin: Number(wlRange[0]),
@@ -18546,7 +18701,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const scopeLbl = state.wulffScope === "all_runs"
         ? (snrCutActive ? `ALL-RUNS · I/σ ≥ ${{WULFF_ALL_RUNS_MIN_ISIGI}}` : "ALL-RUNS")
         : "1-FRAME";
-      titleEl.textContent = `WULFF NET · ${{scopeLbl}}`;
+      const modeTitle = state.stereoViewMode === "recip3d" ? "3D RECIPROCAL SPACE" : "WULFF NET";
+      titleEl.textContent = `${{modeTitle}} · ${{scopeLbl}}`;
+    }}
+    if (typeof syncNodalUI === "function") {{
+      syncNodalUI();
     }}
     updateColorscaleSliderGradient();
     updateMergeScoreboard();
@@ -18689,6 +18848,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         updateZoneInspector(z);
         renderZoneList();
         updateHUD();
+        if (typeof maybeRefreshNodalRoiOnSelection === "function") {{
+          maybeRefreshNodalRoiOnSelection("zone");
+        }}
       }});
       container.appendChild(item);
     }});
@@ -22395,6 +22557,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       }});
     }}
 
+    // 3b. 1D PHASE VORTICES: Re(Z)=0 ∩ Im(Z)=0 projected onto Detector Panels via polychromatic Laue condition
+    if (typeof nodalCtrl !== "undefined" && nodalCtrl) {{
+      nodalCtrl.renderDetectorVortices(ctx, w, h);
+    }}
+
     // 4. FOREGROUND LAYER: Predicted Bragg Rings / Integrated 2σ Ellipses hovering together with Laue zone circles
     const detLod = getDetectorLodState(w, h);
     const visiblePeaks = detLod.visiblePeaks;
@@ -23352,9 +23519,142 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     return resVal;
   }}
 
-  // Render Convex 3D Wulff Sphere (Corner Inset or Expanded Popout)
+  // --- Complex Structure Factor Nodal Surfaces & 1D Phase Vortices Controller ---
+  {nodal_surfaces_js}
+
+  const nodalCtrl = typeof createNodalSurfacesController === "function"
+    ? createNodalSurfacesController({{
+        initialNodalData: (DATA && DATA.nodal_data) ? DATA.nodal_data : null,
+        state,
+        mat3Mul,
+        mat3Inv,
+        mat3Vec,
+        getActiveGoniometerR,
+        getActiveUbMatrix,
+        getActiveIncidentBeam,
+        getActiveSampleOffsetLab,
+        buildFullFaceDetectorRaycastPanels,
+        projectRayToDetectorWithGap,
+        isSphericalDetectorView: () => state.projection === "spherical",
+        detToScreen,
+        projectToWulff,
+        getColorCrossover,
+        getActiveZoneObjects: () => getActiveZoneObjectsCached(),
+        getWulffVisiblePool: () => getWulffLodState(Boolean(state.wulffExpanded)),
+        getWulffPeakColor: (p) => peakStrokeColor(p, 0.92),
+        isSameReflection,
+        setStatusLine,
+        onUpdated: (nd) => {{
+          DATA.nodal_data = nd || null;
+          DATA.ref_mtz_overlay_name = (nd && nd.ref_name) ? nd.ref_name : null;
+          syncNodalUI();
+          _lastWulffRenderSig = "";
+          renderStereoInset(true);
+          renderDetector();
+        }},
+      }})
+    : null;
+
+  if (nodalCtrl && DATA && DATA.nodal_data) {{
+    nodalCtrl.setNodalData(DATA.nodal_data);
+  }}
+
+  function syncNodalUI() {{
+    const btnWulff = document.getElementById("btn-view-wulff");
+    const btn3D = document.getElementById("btn-view-recip3d");
+    const is3D = state.stereoViewMode === "recip3d";
+    if (btnWulff) btnWulff.classList.toggle("active-btn", !is3D);
+    if (btn3D) btn3D.classList.toggle("active-btn", is3D);
+
+    const bar = document.getElementById("stereo-nodal-bar");
+    if (!bar) return;
+    const nd = nodalCtrl ? nodalCtrl.getNodalData() : null;
+    const hasPhasedMtz = Boolean(
+      (DATA && DATA.mtz_has_phases) ||
+      (nd && nd.has_phases)
+    );
+    bar.classList.toggle("hidden", !(hasPhasedMtz || is3D));
+
+    const btnRe = document.getElementById("btn-nodal-re");
+    const btnIm = document.getElementById("btn-nodal-im");
+    const btnVor = document.getElementById("btn-nodal-vortices");
+    const selRoi = document.getElementById("sel-nodal-roi");
+    const slRoi = document.getElementById("slider-nodal-roi");
+    const btnRef = document.getElementById("btn-load-ref-mtz");
+    const btnClearRef = document.getElementById("btn-clear-ref-mtz");
+    const selHet = document.getElementById("sel-heterodyne-mode");
+
+    if (btnRe) {{
+      btnRe.disabled = !hasPhasedMtz;
+      btnRe.classList.toggle("active-btn", hasPhasedMtz && Boolean(state.showNodalSurfacesRe));
+    }}
+    if (btnIm) {{
+      const isCentricZero = Boolean(nd && nd.is_real_only);
+      btnIm.disabled = !hasPhasedMtz || isCentricZero;
+      btnIm.classList.toggle("active-btn", hasPhasedMtz && !isCentricZero && Boolean(state.showNodalSurfacesIm));
+      btnIm.title = isCentricZero
+        ? "Centric / real-valued field (Im ≡ 0 identically)"
+        : "Toggle simulated Im=0 nodal surface in 3D Reciprocal Space";
+    }}
+    if (btnVor) {{
+      btnVor.disabled = !hasPhasedMtz;
+      btnVor.classList.toggle("active-btn", hasPhasedMtz && Boolean(state.showPhaseVortices));
+    }}
+    if (selRoi) {{
+      selRoi.disabled = !hasPhasedMtz;
+      selRoi.value = state.nodalRoiMode || "origin";
+    }}
+    if (slRoi) {{
+      slRoi.disabled = !hasPhasedMtz;
+      const mult = Number(state.nodalRoiRadiusMult) || 2.5;
+      slRoi.value = String(mult);
+      slRoi.title = `Adjust 3D nodal surface ROI radius (${{mult.toFixed(1)}}× a⋆)`;
+    }}
+    const refName = (nd && nd.ref_name) || (DATA && DATA.ref_mtz_overlay_name) || "";
+    const hasRef = Boolean((nd && nd.ref_has_phases) || refName);
+    if (btnRef) {{
+      btnRef.disabled = !hasPhasedMtz;
+      btnRef.textContent = hasRef ? `F₀: ${{refName || "Loaded"}}` : "Ref F₀";
+      btnRef.classList.toggle("nodal-ref-active", hasRef);
+      btnRef.title = hasRef
+        ? `Heterodyne Reference F₀ (${{refName}}) — click to replace`
+        : "Load heterodyne reference F₀ .mtz (with phase, e.g. heavy-atom / reference structure factor) for interference nodal surfaces & vortices";
+    }}
+    if (btnClearRef) {{
+      btnClearRef.classList.toggle("hidden", !hasRef);
+    }}
+    if (selHet) {{
+      selHet.classList.toggle("hidden", !hasRef);
+      if (nd && nd.heterodyne_mode) {{
+        state.heterodyneMode = nd.heterodyne_mode;
+      }}
+      selHet.value = state.heterodyneMode || "delta";
+    }}
+  }}
+
+  async function refreshNodalSurfacesFromServer(extraBody = {{}}) {{
+    if (!nodalCtrl) return null;
+    const doc = await nodalCtrl.requestNodalUpdate(extraBody);
+    return (doc && doc.nodal_data) ? doc.nodal_data : null;
+  }}
+
+  function maybeRefreshNodalRoiOnSelection(kind) {{
+    if (!nodalCtrl || !nodalCtrl.hasPhases()) return;
+    if (kind === "peak" && state.nodalRoiMode === "peak") {{
+      nodalCtrl.scheduleRoiRefresh(60);
+    }} else if (kind === "zone" && state.nodalRoiMode === "zone") {{
+      nodalCtrl.scheduleRoiRefresh(60);
+    }}
+  }}
+
+  // Render Convex 3D Wulff Sphere or 3D Reciprocal Space (Corner Inset or Expanded Popout)
   function renderStereoInset(forceRedraw) {{
     if (!state.showStereo) return;
+    const hasNodalCtrl = typeof nodalCtrl !== "undefined" && nodalCtrl;
+    if (state.stereoViewMode === "recip3d" && hasNodalCtrl) {{
+      nodalCtrl.render3DReciprocalView(stereoCanvas, forceRedraw);
+      return;
+    }}
     const rect = stereoCanvas.getBoundingClientRect();
     if (rect.width < 20 || rect.height < 20) return;
     const dpr = window.devicePixelRatio || 1;
@@ -23374,6 +23674,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       (state.wulffPitchDeg || 0).toFixed(3),
       (state.wulffZoom || 1).toFixed(4),
       state.wulffExpanded ? 1 : 0,
+      state.stereoViewMode || "wulff",
+      state.showNodalSurfacesRe ? 1 : 0,
+      state.showNodalSurfacesIm ? 1 : 0,
+      state.showPhaseVortices ? 1 : 0,
+      hasNodalCtrl ? nodalCtrl.getDataSeq() : 0,
       state.wulffScope,
       state.wulffColorMode,
       getColorCrossover().toFixed(3),
@@ -23417,12 +23722,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const h = rect.height;
     ctx.clearRect(0, 0, w, h);
 
+    const isExp = Boolean(state.wulffExpanded);
     const cx = w * 0.5;
     const cy = h * 0.5;
     const R = Math.min(w, h) * 0.43;
     const zoom = state.wulffZoom || 1.0;
     const rSphere = R * Math.min(zoom, 1.35);
-    const isExp = Boolean(state.wulffExpanded);
     const RgT = mat3T(Rg);
 
     ctx.save();
@@ -23567,6 +23872,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         }}
       }}
       ctx.restore();
+    }}
+
+    // Draw 1D phase vortices (Re=0 ∩ Im=0) projected onto the Wulff Sphere
+    if (hasNodalCtrl) {{
+      nodalCtrl.renderWulffVortices(ctx, cx, cy, R, isExp);
     }}
 
     const lodState = getWulffLodState(isExp);
@@ -24204,6 +24514,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.selectedPeakObj = hit;
       state.activeOrbitId = hit.asu_orbit_id || null;
       updatePeakInspector(hit);
+      maybeRefreshNodalRoiOnSelection("peak");
     }} else if (nodalHit) {{
       state.selectedPeakId = null;
       state.selectedPeakObj = null;
@@ -24218,6 +24529,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         state.selectedZoneId = arcHit.zone.zone_id;
         renderZoneList();
         updateZoneInspector(arcHit.zone, arcHit.holzN || 0);
+        maybeRefreshNodalRoiOnSelection("zone");
       }}
     }}
   }});
@@ -24254,7 +24566,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         setDetectorCenterAzimuthDeg(wulffAzimuthToDetectorChiDeg(state.wulffYawDeg));
         return;
       }}
-      const hit = findNearestPeakWulff(mx, my);
+      const hit = (state.stereoViewMode === "recip3d" && nodalCtrl)
+        ? nodalCtrl.findNearestPeak3D(mx, my)
+        : findNearestPeakWulff(mx, my);
       const hoverChanged = hit !== state.hoveredPeakObj;
       state.hoveredPeakId = hit ? hit.id : null;
       state.hoveredPeakObj = hit || null;
@@ -24283,12 +24597,17 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }}, {{ passive: false }});
     stereoCanvas.addEventListener("click", (ev) => {{
       const rect = stereoCanvas.getBoundingClientRect();
-      const hit = findNearestPeakWulff(ev.clientX - rect.left, ev.clientY - rect.top);
+      const mx = ev.clientX - rect.left;
+      const my = ev.clientY - rect.top;
+      const hit = (state.stereoViewMode === "recip3d" && nodalCtrl)
+        ? nodalCtrl.findNearestPeak3D(mx, my)
+        : findNearestPeakWulff(mx, my);
       if (hit) {{
         state.selectedPeakId = hit.id;
         state.selectedPeakObj = hit;
         state.activeOrbitId = hit.asu_orbit_id || null;
         updatePeakInspector(hit);
+        maybeRefreshNodalRoiOnSelection("peak");
       }}
     }});
   }}
@@ -25070,6 +25389,115 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }});
   }}
 
+  // Wulff <-> 3D Reciprocal Space Mode Switch & Nodal Surface Controls
+  const btnViewWulff = document.getElementById("btn-view-wulff");
+  const btnViewRecip3d = document.getElementById("btn-view-recip3d");
+  if (btnViewWulff) {{
+    btnViewWulff.addEventListener("click", () => {{
+      state.stereoViewMode = "wulff";
+      syncWulffUI();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+    }});
+  }}
+  if (btnViewRecip3d) {{
+    btnViewRecip3d.addEventListener("click", () => {{
+      state.stereoViewMode = "recip3d";
+      syncWulffUI();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+    }});
+  }}
+
+  const btnNodalRe = document.getElementById("btn-nodal-re");
+  if (btnNodalRe) {{
+    btnNodalRe.addEventListener("click", () => {{
+      state.showNodalSurfacesRe = !state.showNodalSurfacesRe;
+      syncNodalUI();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+    }});
+  }}
+  const btnNodalIm = document.getElementById("btn-nodal-im");
+  if (btnNodalIm) {{
+    btnNodalIm.addEventListener("click", () => {{
+      state.showNodalSurfacesIm = !state.showNodalSurfacesIm;
+      syncNodalUI();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+    }});
+  }}
+  const btnNodalVortices = document.getElementById("btn-nodal-vortices");
+  if (btnNodalVortices) {{
+    btnNodalVortices.addEventListener("click", () => {{
+      state.showPhaseVortices = !state.showPhaseVortices;
+      syncNodalUI();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      renderDetector();
+    }});
+  }}
+  const selNodalRoi = document.getElementById("sel-nodal-roi");
+  if (selNodalRoi) {{
+    selNodalRoi.addEventListener("change", () => {{
+      state.nodalRoiMode = selNodalRoi.value || "origin";
+      syncNodalUI();
+      refreshNodalSurfacesFromServer({{ roi_mode: state.nodalRoiMode }});
+    }});
+  }}
+  const slNodalRoi = document.getElementById("slider-nodal-roi");
+  if (slNodalRoi) {{
+    slNodalRoi.addEventListener("input", () => {{
+      const v = parseFloat(slNodalRoi.value);
+      if (Number.isFinite(v)) state.nodalRoiRadiusMult = v;
+      syncNodalUI();
+      if (nodalCtrl) nodalCtrl.scheduleRoiRefresh(180);
+    }});
+  }}
+
+  const btnLoadRefMtz = document.getElementById("btn-load-ref-mtz");
+  const btnClearRefMtz = document.getElementById("btn-clear-ref-mtz");
+  const inpRefMtzFile = document.getElementById("inp-ref-mtz-file");
+  const selHetMode = document.getElementById("sel-heterodyne-mode");
+  if (btnLoadRefMtz && inpRefMtzFile) {{
+    btnLoadRefMtz.addEventListener("click", () => {{
+      inpRefMtzFile.value = "";
+      inpRefMtzFile.click();
+    }});
+    inpRefMtzFile.addEventListener("change", async () => {{
+      const f = inpRefMtzFile.files && inpRefMtzFile.files[0];
+      if (!f || !nodalCtrl) return;
+      state.heterodyneMode = "delta";
+      await nodalCtrl.uploadAndSetRefMtz(f);
+    }});
+  }}
+  if (btnClearRefMtz) {{
+    btnClearRefMtz.addEventListener("click", async () => {{
+      if (!nodalCtrl) return;
+      state.heterodyneMode = "single";
+      const nd = await refreshNodalSurfacesFromServer({{
+        heterodyne_mode: "single",
+        clear_ref_mtz: true,
+      }});
+      if (nd) {{
+        setStatusLine("[NODAL SURFACES]", "Cleared heterodyne reference F₀; restored single-field structure factor F(G).");
+      }}
+    }});
+  }}
+  if (selHetMode) {{
+    selHetMode.addEventListener("change", async () => {{
+      state.heterodyneMode = selHetMode.value || "delta";
+      syncNodalUI();
+      const nd = await refreshNodalSurfacesFromServer({{ heterodyne_mode: state.heterodyneMode }});
+      if (nd) {{
+        setStatusLine(
+          "[HETERODYNE MODE]",
+          `Switched complex nodal field to <strong>${{nd.formula_label || state.heterodyneMode}}</strong>.`
+        );
+      }}
+    }});
+  }}
+
   document.getElementById("btn-reset-view").addEventListener("click", () => {{
     state.detZoom = 1.0;
     state.detPanX = 0.0;
@@ -25671,6 +26099,20 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       DATA.em_mask_summary = newPayload.em_mask_summary || {{ available: false }};
     }} else if (!isFrameSwitch) {{
       DATA.em_mask_summary = {{ available: false }};
+    }}
+    if (newPayload.mtz_has_phases !== undefined) {{
+      DATA.mtz_has_phases = Boolean(newPayload.mtz_has_phases);
+      DATA.mtz_phi_column = newPayload.mtz_phi_column || null;
+      DATA.ref_mtz_overlay_name = newPayload.ref_mtz_overlay_name || null;
+    }} else if (!isFrameSwitch && !newPayload.mtz_overlay_name) {{
+      DATA.mtz_has_phases = false;
+      DATA.mtz_phi_column = null;
+      DATA.ref_mtz_overlay_name = null;
+    }}
+    if (!isFrameSwitch) {{
+      DATA.nodal_data = newPayload.nodal_data || null;
+      if (nodalCtrl) nodalCtrl.setNodalData(DATA.nodal_data);
+      syncNodalUI();
     }}
     DATA.default_color_mode = newPayload.default_color_mode || null;
     const preferredSrc = isFrameSwitch

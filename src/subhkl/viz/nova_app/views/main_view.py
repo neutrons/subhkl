@@ -370,7 +370,11 @@ class MainApp:
                             ds_info_mtz = {"name": os.path.basename(local_fp_raw)}
                             sub_model = self.view_model.model.subhkl
                             sub_model.payload = apply_mtz_to_payload(
-                                sub_model.payload or {}, local_fp_raw, ds_info_mtz
+                                sub_model.payload or {},
+                                local_fp_raw,
+                                ds_info_mtz,
+                                ref_mtz_path=sub_model.ref_mtz_overlay_path,
+                                heterodyne_mode=sub_model.heterodyne_mode,
                             )
                             sub_model.mtz_overlay_path = local_fp_raw
                             sub_model.mtz_overlay_info = ds_info_mtz
@@ -394,6 +398,7 @@ class MainApp:
                             if is_reduce_file:
                                 self.view_model.model.subhkl.mtz_overlay_path = None
                                 self.view_model.model.subhkl.mtz_overlay_info = None
+                                self.view_model.model.subhkl.ref_mtz_overlay_path = None
                             if is_reduce_file:
                                 _, local_h5 = (
                                     self.pipeline_runner._resolve_work_dir_and_merged(
@@ -513,7 +518,11 @@ class MainApp:
                         if ingest_kind == "mtz_overlay":
                             sub_model = self.view_model.model.subhkl
                             sub_model.payload = apply_mtz_to_payload(
-                                cur_p, local_h5, ds_info
+                                cur_p,
+                                local_h5,
+                                ds_info,
+                                ref_mtz_path=sub_model.ref_mtz_overlay_path,
+                                heterodyne_mode=sub_model.heterodyne_mode,
                             )
                             sub_model.mtz_overlay_path = local_h5
                             sub_model.mtz_overlay_info = ds_info
@@ -521,6 +530,7 @@ class MainApp:
                         if ingest_kind == "raw_nexus":
                             self.view_model.model.subhkl.mtz_overlay_path = None
                             self.view_model.model.subhkl.mtz_overlay_info = None
+                            self.view_model.model.subhkl.ref_mtz_overlay_path = None
                             return (
                                 {
                                     "status": "raw_nexus",
@@ -540,6 +550,7 @@ class MainApp:
                         if is_reduce_ds:
                             self.view_model.model.subhkl.mtz_overlay_path = None
                             self.view_model.model.subhkl.mtz_overlay_info = None
+                            self.view_model.model.subhkl.ref_mtz_overlay_path = None
                             work_d_ds, local_h5 = (
                                 self.pipeline_runner._resolve_work_dir_and_merged(
                                     local_h5
@@ -825,6 +836,51 @@ class MainApp:
                 dumps=lambda obj: json.dumps(obj, separators=(",", ":")),
             )
 
+        def _compute_nodal_surfaces_response(
+            body: dict[str, Any],
+        ) -> tuple[dict[str, Any], int]:
+            try:
+                from subhkl.viz.nodal_surfaces import (
+                    process_nodal_surfaces_api_request,
+                )
+
+                sub_model = self.view_model.model.subhkl
+                res_doc, code, next_ref, next_het = process_nodal_surfaces_api_request(
+                    body,
+                    mtz_path=sub_model.mtz_overlay_path,
+                    ref_mtz_path=sub_model.ref_mtz_overlay_path,
+                    heterodyne_mode=sub_model.heterodyne_mode,
+                    payload=sub_model.payload,
+                )
+                sub_model.ref_mtz_overlay_path = next_ref
+                sub_model.heterodyne_mode = next_het
+                return (res_doc, code)
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ) as exc:
+                return ({"ok": False, "error": str(exc)}, 400)
+
+        async def handle_nodal_surfaces(request: web.Request) -> web.Response:
+            try:
+                body = await request.json()
+                if not isinstance(body, dict):
+                    body = {}
+            except (OSError, RuntimeError, ValueError, TypeError):
+                body = {}
+            res_doc, status_code = await asyncio.to_thread(
+                _compute_nodal_surfaces_response, body
+            )
+            return web.json_response(
+                res_doc,
+                status=status_code,
+                dumps=lambda obj: json.dumps(obj, separators=(",", ":")),
+            )
+
         async def handle_dataset_display(request: web.Request) -> web.Response:
             ds_id = request.match_info.get("ds_id", "")
             try:
@@ -899,6 +955,7 @@ class MainApp:
                     if is_reduce_out:
                         self.view_model.model.subhkl.mtz_overlay_path = None
                         self.view_model.model.subhkl.mtz_overlay_info = None
+                        self.view_model.model.subhkl.ref_mtz_overlay_path = None
 
                     with contextlib.suppress(
                         ValueError, TypeError, KeyError, AttributeError
@@ -1055,6 +1112,7 @@ class MainApp:
                     sp = saved_paths[0]
                     self.view_model.model.subhkl.mtz_overlay_path = None
                     self.view_model.model.subhkl.mtz_overlay_info = None
+                    self.view_model.model.subhkl.ref_mtz_overlay_path = None
                     if (
                         "merged" in os.path.basename(sp).lower()
                         or "scan" in os.path.basename(sp).lower()
@@ -1170,6 +1228,7 @@ class MainApp:
                 web.get("/api/artifacts/download", handle_artifact_download),
                 web.get("/api/payload", handle_payload),
                 web.post("/api/tof_delta_theta", handle_tof_delta_theta),
+                web.post("/api/nodal_surfaces", handle_nodal_surfaces),
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
                 web.post("/api/pipeline/cancel", handle_cancel),

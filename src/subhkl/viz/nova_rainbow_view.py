@@ -10398,6 +10398,8 @@ class RainbowZonesViewModel:
         self.pipeline_runner = NovaGalaxyPipelineRunner()
         self.mtz_overlay_path: str | None = None
         self.mtz_overlay_info: dict[str, Any] | None = None
+        self.ref_mtz_overlay_path: str | None = None
+        self.heterodyne_mode: str = "delta"
         if payload is not None:
             self.payload = payload
         elif self.replay_h5 is not None:
@@ -10449,6 +10451,9 @@ class RainbowZonesViewModel:
                     self.mtz_overlay_path,
                     self.mtz_overlay_info,
                     select_mtz_color=False,
+                    ref_mtz_path=self.ref_mtz_overlay_path,
+                    heterodyne_mode=self.heterodyne_mode,
+                    compute_nodal=bool(include_all),
                 )
         if prev_payload is not None:
             self.payload = merge_frame_only_payload(prev_payload, self.payload)
@@ -10612,7 +10617,11 @@ def serve_rainbow_zones(
 
                         ds_info_mtz = {"name": os.path.basename(fp_raw)}
                         vm.payload = apply_mtz_to_payload(
-                            vm.payload or {}, fp_raw, ds_info_mtz
+                            vm.payload or {},
+                            fp_raw,
+                            ds_info_mtz,
+                            ref_mtz_path=vm.ref_mtz_overlay_path,
+                            heterodyne_mode=vm.heterodyne_mode,
                         )
                         vm.mtz_overlay_path = fp_raw
                         vm.mtz_overlay_info = ds_info_mtz
@@ -10648,6 +10657,7 @@ def serve_rainbow_zones(
                         if is_reduce_file:
                             vm.mtz_overlay_path = None
                             vm.mtz_overlay_info = None
+                            vm.ref_mtz_overlay_path = None
                             _, fp = vm.pipeline_runner._resolve_work_dir_and_merged(fp)
                             vm.payload_kwargs["images_h5"] = fp
                             vm.payload_kwargs.pop("d_min", None)
@@ -10730,7 +10740,13 @@ def serve_rainbow_zones(
                         has_active_geometry=has_active_geom,
                     )
                     if ingest_kind == "mtz_overlay":
-                        vm.payload = apply_mtz_to_payload(cur_p, local_h5, ds_info)
+                        vm.payload = apply_mtz_to_payload(
+                            cur_p,
+                            local_h5,
+                            ds_info,
+                            ref_mtz_path=vm.ref_mtz_overlay_path,
+                            heterodyne_mode=vm.heterodyne_mode,
+                        )
                         vm.mtz_overlay_path = local_h5
                         vm.mtz_overlay_info = ds_info
                         body = json.dumps(vm.payload).encode("utf-8")
@@ -10745,6 +10761,7 @@ def serve_rainbow_zones(
                     if ingest_kind == "raw_nexus":
                         vm.mtz_overlay_path = None
                         vm.mtz_overlay_info = None
+                        vm.ref_mtz_overlay_path = None
                         raw_body = json.dumps(
                             {
                                 "status": "raw_nexus",
@@ -10770,6 +10787,7 @@ def serve_rainbow_zones(
                     ):
                         vm.mtz_overlay_path = None
                         vm.mtz_overlay_info = None
+                        vm.ref_mtz_overlay_path = None
                         work_d_ds, local_h5 = (
                             vm.pipeline_runner._resolve_work_dir_and_merged(local_h5)
                         )
@@ -11358,6 +11376,38 @@ def serve_rainbow_zones(
                 self.wfile.write(body)
                 return
 
+            if req_path == "/api/nodal_surfaces":
+                content_len = int(self.headers.get("Content-Length", "0") or 0)
+                raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+                try:
+                    from subhkl.viz.nodal_surfaces import (
+                        process_nodal_surfaces_api_request,
+                    )
+
+                    req_json = json.loads(raw_body.decode("utf-8") or "{}")
+                    with vm_lock:
+                        result, code, next_ref, next_het = (
+                            process_nodal_surfaces_api_request(
+                                req_json,
+                                mtz_path=vm.mtz_overlay_path,
+                                ref_mtz_path=vm.ref_mtz_overlay_path,
+                                heterodyne_mode=vm.heterodyne_mode,
+                                payload=vm.payload,
+                            )
+                        )
+                        vm.ref_mtz_overlay_path = next_ref
+                        vm.heterodyne_mode = next_het
+                except _NOVA_RECOVERABLE_ERRORS as exc:
+                    result = {"ok": False, "error": str(exc)}
+                    code = 400
+                body = json.dumps(result).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             if req_path == "/api/pipeline/run":
                 content_len = int(self.headers.get("Content-Length", "0") or 0)
                 raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
@@ -11429,6 +11479,7 @@ def serve_rainbow_zones(
                             prev_kwargs = dict(vm.payload_kwargs)
                             prev_mtz_path = vm.mtz_overlay_path
                             prev_mtz_info = vm.mtz_overlay_info
+                            prev_ref_mtz = vm.ref_mtz_overlay_path
                             new_base_low = os.path.basename(new_h5_path).lower()
                             is_reduce_out = stage_id == "reduce" or (
                                 "merged" in new_base_low
@@ -11437,6 +11488,7 @@ def serve_rainbow_zones(
                             if is_reduce_out:
                                 vm.mtz_overlay_path = None
                                 vm.mtz_overlay_info = None
+                                vm.ref_mtz_overlay_path = None
                                 vm.payload_kwargs["images_h5"] = new_h5_path
                                 vm.payload_kwargs["frame_index"] = 0
                                 vm.payload_kwargs.pop("wavelength_range", None)
@@ -11455,6 +11507,7 @@ def serve_rainbow_zones(
                                 vm.payload_kwargs = prev_kwargs
                                 vm.mtz_overlay_path = prev_mtz_path
                                 vm.mtz_overlay_info = prev_mtz_info
+                                vm.ref_mtz_overlay_path = prev_ref_mtz
                                 raise
                             if stage_id != "reduce":
                                 if params.get("wavelength_range"):
@@ -11519,6 +11572,7 @@ def serve_rainbow_zones(
                         sp = saved_paths[0]
                         vm.mtz_overlay_path = None
                         vm.mtz_overlay_info = None
+                        vm.ref_mtz_overlay_path = None
                         if "merged" in os.path.basename(sp).lower():
                             vm.payload_kwargs["images_h5"] = sp
                         vm.replay_h5 = sp

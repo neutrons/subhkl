@@ -196,6 +196,8 @@ class SubhklGalaxyModel:
         self.render_binning: int = 4
         self.mtz_overlay_path: str | None = None
         self.mtz_overlay_info: dict[str, Any] | None = None
+        self.ref_mtz_overlay_path: str | None = None
+        self.heterodyne_mode: str = "delta"
         self.last_job_result: dict[str, Any] = {}
         self.refresh_payload()
 
@@ -329,6 +331,9 @@ class SubhklGalaxyModel:
                 self.mtz_overlay_path,
                 self.mtz_overlay_info,
                 select_mtz_color=False,
+                ref_mtz_path=self.ref_mtz_overlay_path,
+                heterodyne_mode=self.heterodyne_mode,
+                compute_nodal=bool(include_all_runs_peaks),
             )
         if prev_payload is not None:
             self.payload = merge_frame_only_payload(prev_payload, self.payload)
