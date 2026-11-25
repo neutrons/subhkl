@@ -192,8 +192,10 @@ def _collect_predicted_peaks(f):
         return None
 
     bank_ids = _get(f, "bank_ids")
-    rows_r, rows_c, hs, ks, ls, wls, banks, runs = [], [], [], [], [], [], [], []
-    for run_idx, key in enumerate(sorted(f["banks"].keys(), key=lambda s: int(s))):
+    rows_r, rows_c, hs, ks, ls, wls, banks, images = [], [], [], [], [], [], [], []
+    # Each ``banks/<img>`` group is one panel image of the stack, not a frame;
+    # hdf5_to_dials maps images to frames from the stack's run boundaries.
+    for key in sorted(f["banks"].keys(), key=lambda s: int(s)):
         grp = f[f"banks/{key}"]
         i = grp["i"][()]
         j = grp["j"][()]
@@ -208,7 +210,7 @@ def _collect_predicted_peaks(f):
         img_key = int(key)
         bank_id = int(bank_ids[img_key]) if bank_ids is not None else img_key
         banks.append(np.full(count, bank_id, dtype=np.int64))
-        runs.append(np.full(count, run_idx, dtype=np.int64))
+        images.append(np.full(count, img_key, dtype=np.int64))
 
     if not rows_r:
         return None
@@ -227,8 +229,8 @@ def _collect_predicted_peaks(f):
         "two_theta": None,
         "azimuthal": None,
         "bank": np.concatenate(banks),
-        "run_index": np.concatenate(runs),
-        "image_index": None,
+        "run_index": None,
+        "image_index": np.concatenate(images),
         "predicted": True,
     }
 
@@ -310,6 +312,46 @@ def _read_sample_offset(f):
     return off
 
 
+def _image_frames(f, layout):
+    """Map each stack image index to its frame (goniometer setting).
+
+    Uses the image stack layout when there is one, otherwise the file's own
+    ``file_offsets`` run boundaries, otherwise groups images by identical
+    per-image ``goniometer/R`` (or ``goniometer/angles``) rows in order of first
+    appearance. Returns ``None`` when none of these is available.
+    """
+    if layout is not None and "frame_of" in layout:
+        return np.asarray(layout["frame_of"], dtype=int)
+
+    offsets = _get(f, "file_offsets")
+    n_images = None
+    for key in ("bank_ids", "goniometer/R", "goniometer/angles"):
+        if key in f:
+            n_images = int(f[key].shape[0])
+            break
+    if offsets is not None and len(offsets) and n_images is not None:
+        offsets = np.asarray(offsets, dtype=int)
+        return np.searchsorted(offsets, np.arange(n_images), side="right") - 1
+
+    for key in ("goniometer/R", "goniometer/angles"):
+        rows = _get(f, key)
+        if rows is None:
+            continue
+        rows = np.asarray(rows, dtype=float).reshape(len(rows), -1)
+        frames = np.empty(len(rows), dtype=int)
+        seen = []
+        for i, row in enumerate(rows):
+            for fr, ref in enumerate(seen):
+                if np.allclose(row, ref, atol=1e-6):
+                    frames[i] = fr
+                    break
+            else:
+                frames[i] = len(seen)
+                seen.append(row)
+        return frames
+    return None
+
+
 def _frame_rotations(f, peaks, frame_ids):
     """Build a ``{frame_id: 3x3 rotation}`` map reproducing subhkl's per-frame R.
 
@@ -320,6 +362,7 @@ def _frame_rotations(f, peaks, frame_ids):
     """
     n_peaks = peaks["n"] if peaks else 0
     run_index = peaks["run_index"] if peaks else None
+    image_index = peaks["image_index"] if peaks else None
 
     R_data = _get(f, "goniometer/R")
     axes = _get(f, "goniometer/axes")
@@ -336,22 +379,50 @@ def _frame_rotations(f, peaks, frame_ids):
 
     R_data = np.asarray(R_data) if R_data is not None else None
     per_peak_R = R_data is not None and R_data.ndim == 3 and R_data.shape[0] == n_peaks
+    ang_data = np.asarray(angles) if angles is not None else None
+
+    def first_image(frame_id):
+        # The stack image of this frame's first peak, so a per-image R or
+        # angles table (one row per panel image) is read at that frame's
+        # images rather than at row ``frame_id``.
+        if run_index is None or image_index is None:
+            return None
+        idx = np.where(np.asarray(run_index) == frame_id)[0]
+        return int(np.asarray(image_index)[idx[0]]) if idx.size else None
 
     for frame_id in frame_ids:
         R = None
+        img = first_image(frame_id)
         if per_peak_R and run_index is not None:
             idx = np.where(run_index == frame_id)[0]
             if idx.size:
                 R = R_data[idx[0]]
+        elif (
+            R_data is not None
+            and R_data.ndim == 3
+            and img is not None
+            and img < R_data.shape[0]
+        ):
+            R = R_data[img]
         elif R_data is not None and R_data.ndim == 3 and frame_id < R_data.shape[0]:
             R = R_data[frame_id]
         elif R_data is not None and R_data.ndim == 2 and R_data.shape == (3, 3):
             R = R_data
 
         if R is None and axes is not None and angles is not None:
-            ang = np.asarray(angles)
+            ang = ang_data
             row = None
-            if ang.ndim == 2 and frame_id < ang.shape[0]:
+            if (
+                ang.ndim == 2
+                and ang.shape[0] not in (1, n_peaks)
+                and img is not None
+                and img < ang.shape[0]
+            ):
+                row = ang[img]
+            elif ang.ndim == 2 and ang.shape[0] == n_peaks and run_index is not None:
+                idx = np.where(np.asarray(run_index) == frame_id)[0]
+                row = ang[idx[0]] if idx.size else None
+            elif ang.ndim == 2 and frame_id < ang.shape[0]:
                 row = ang[frame_id]
             elif ang.ndim == 2 and ang.shape[0] == 1:
                 row = ang[0]
@@ -685,6 +756,14 @@ def hdf5_to_dials(
                     except Exception:  # noqa: BLE001 - bad row -> identity
                         stack_rotations[fr] = np.eye(3)
 
+        # Outputs that record only each peak's stack image (the predictor) get
+        # its frame from the stack's run boundaries.
+        if peaks and peaks["run_index"] is None and peaks["image_index"] is not None:
+            image_frame = _image_frames(f, layout)
+            if image_frame is not None:
+                img = np.asarray(peaks["image_index"], dtype=int)
+                peaks["run_index"] = image_frame[img]
+
         # Determine frames and detector banks. Peak-bearing outputs drive these
         # from the reflections; a bare image stack (reduce/merge) drives them from
         # the stack layout so each goniometer setting becomes an experiment.
@@ -945,7 +1024,13 @@ def _build_reflection_table(
     if peaks.get("predicted"):
         table.set_flags(flex.bool(n, True), table.flags.predicted)
     if peaks["h"] is not None:
-        table.set_flags(flex.bool(n, True), table.flags.indexed)
+        # subhkl writes (0, 0, 0) for peaks it could not index.
+        has_hkl = (
+            (np.asarray(peaks["h"]) != 0)
+            | (np.asarray(peaks["k"]) != 0)
+            | (np.asarray(peaks["l"]) != 0)
+        )
+        table.set_flags(flex.bool([bool(x) for x in has_hkl]), table.flags.indexed)
     if peaks["intensity"] is not None:
         table.set_flags(flex.bool(n, True), table.flags.integrated_sum)
 

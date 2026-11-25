@@ -195,7 +195,10 @@ def test_collect_predicted_peaks(tmp_path):
         peaks = dx._collect_predicted_peaks(f)
     assert peaks["n"] == 3
     assert peaks["bank"].tolist() == [11, 11, 12]
-    assert peaks["run_index"].tolist() == [0, 0, 1]
+    # Each banks/<img> group is a stack image, not a frame; the frame comes
+    # from the stack's run boundaries when exporting.
+    assert peaks["image_index"].tolist() == [0, 0, 1]
+    assert peaks["run_index"] is None
     assert peaks["predicted"] is True
 
 
@@ -683,6 +686,130 @@ def test_roundtrip_sparse_peaks_keep_the_imageset(tmp_path):
         experiments[1].goniometer.get_setting_rotation(),
         bare[1].goniometer.get_setting_rotation(),
     )
+
+
+def _rot_y_deg(R_a, R_b):
+    """Rotation angle (degrees) between two 3x3 rotations."""
+    a = np.asarray(R_a).reshape(3, 3)
+    b = np.asarray(R_b).reshape(3, 3)
+    return np.degrees(np.arccos(np.clip((np.trace(b @ a.T) - 1) / 2, -1, 1)))
+
+
+def _write_merged_predictor(path):
+    """Predictor output over the merged stack: one banks/<img> group per image,
+    with a per-image goniometer/R (images 0-1 frame 0, images 2-3 frame 1)."""
+    from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
+
+    axes = np.array([[0, 1, 0, 1]], dtype=float)
+    R = np.array(
+        [calc_goniometer_rotation_matrix(axes, [a]) for a in (0.0, 0.0, 10.0, 10.0)]
+    )
+    with h5py.File(path, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f["instrument/wavelength"] = [2.0, 10.0]
+        f["bank_ids"] = np.array([11, 12, 11, 12], dtype=np.int32)
+        f["goniometer/R"] = R
+        f["goniometer/axes"] = axes
+        f["goniometer/angles"] = np.array([[0.0], [0.0], [10.0], [10.0]])
+        for img in range(4):
+            g = f.create_group(f"banks/{img}")
+            g["i"] = np.array([1.0])
+            g["j"] = np.array([2.0])
+            g["h"] = np.array([1])
+            g["k"] = np.array([img])
+            g["l"] = np.array([1])
+            g["wavelength"] = np.array([3.0])
+
+
+def test_roundtrip_predictor_images_map_to_stack_frames(tmp_path):
+    """Predictor groups are stack images: four images over two frames export
+    as two experiments with the images attached, not four geometry-only ones."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+    from dxtbx.model.experiment_list import ExperimentListFactory
+
+    stack = tmp_path / "merged.h5"
+    _write_merged_stack(str(stack))
+    pred = tmp_path / "pred.h5"
+    _write_merged_predictor(str(pred))
+    expt_path = str(tmp_path / "pred.expt")
+    refl_path = str(tmp_path / "pred.refl")
+    dx.hdf5_to_dials(
+        str(pred), expt_path, refl_path, instrument="CG4D", image_source=str(stack)
+    )
+
+    experiments = ExperimentListFactory.from_json_file(expt_path, check_format=True)
+    assert len(experiments) == 2
+    assert all(expt.imageset is not None for expt in experiments)
+    refl = flex.reflection_table.from_file(refl_path)
+    assert list(refl["id"]) == [0, 0, 1, 1]
+    assert list(refl["panel"]) == [0, 1, 0, 1]
+    step = _rot_y_deg(
+        experiments[0].goniometer.get_setting_rotation(),
+        experiments[1].goniometer.get_setting_rotation(),
+    )
+    assert step == pytest.approx(10.0)
+
+
+def test_image_frames_without_a_stack_groups_by_rotation(tmp_path):
+    """With no stack to hand, images group into frames by identical R rows."""
+    pred = tmp_path / "pred.h5"
+    _write_merged_predictor(str(pred))
+    with h5py.File(pred, "r") as f:
+        assert dx._image_frames(f, None).tolist() == [0, 0, 1, 1]
+
+
+def test_roundtrip_per_image_rotation_is_read_at_the_frames_images(tmp_path):
+    """A per-image goniometer/R (one row per stack image) gives frame 1 the
+    rotation of its own images, not row 1 (an image of frame 0)."""
+    pytest.importorskip("dxtbx")
+    from dxtbx.model.experiment_list import ExperimentListFactory
+
+    from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
+
+    h5 = tmp_path / "indexed.h5"
+    _write_indexed(str(h5))
+    axes = np.array([[0, 1, 0, 1]], dtype=float)
+    R = np.array(
+        [calc_goniometer_rotation_matrix(axes, [a]) for a in (0.0, 0.0, 10.0, 10.0)]
+    )
+    with h5py.File(h5, "a") as f:
+        # Peaks on images 0, 1 (frame 0) and 2 (frame 1) of a 4-image stack.
+        f["peaks/image_index"] = np.array([0, 1, 2])
+        f["goniometer/R"] = R
+        del f["goniometer/axes"], f["goniometer/angles"]
+        f["goniometer/axes"] = axes
+        f["goniometer/angles"] = np.array([[0.0], [0.0], [10.0], [10.0]])
+
+    expt_path = str(tmp_path / "indexed.expt")
+    dx.hdf5_to_dials(
+        str(h5), expt_path, str(tmp_path / "indexed.refl"), instrument="CG4D"
+    )
+    experiments = ExperimentListFactory.from_json_file(expt_path, check_format=False)
+    assert len(experiments) == 2
+    assert np.allclose(experiments[0].goniometer.get_setting_rotation(), R[0].ravel())
+    assert np.allclose(experiments[1].goniometer.get_setting_rotation(), R[2].ravel())
+
+
+def test_roundtrip_indexed_flag_skips_unindexed_peaks(tmp_path):
+    """subhkl writes hkl (0, 0, 0) for peaks it could not index; those rows
+    must not carry DIALS' indexed flag."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+
+    h5 = tmp_path / "indexed.h5"
+    _write_indexed(str(h5))
+    with h5py.File(h5, "a") as f:
+        for key, vals in (("h", [1, 0, -1]), ("k", [0, 0, 1]), ("l", [1, 0, 2])):
+            del f[f"peaks/{key}"]
+            f[f"peaks/{key}"] = np.array(vals)
+
+    refl_path = str(tmp_path / "indexed.refl")
+    dx.hdf5_to_dials(
+        str(h5), str(tmp_path / "indexed.expt"), refl_path, instrument="CG4D"
+    )
+    refl = flex.reflection_table.from_file(refl_path)
+    assert list(refl.get_flags(refl.flags.indexed)) == [True, False, True]
 
 
 def test_experiment_identifier_is_a_reproducible_unique_uuid(tmp_path, monkeypatch):

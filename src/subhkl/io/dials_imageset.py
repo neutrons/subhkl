@@ -71,6 +71,7 @@ def read_image_stack_layout(f):
         "bank_to_panel": bank_to_panel,
         "row_of": row_of,
         "frame_first_row": frame_first_row,
+        "frame_of": frame_of,
     }
 
 
