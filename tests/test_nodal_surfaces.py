@@ -620,3 +620,75 @@ def test_heterodyne_physical_scale_cancellation_and_onlyh_auto_mode(tmp_path: Pa
     )
     assert nd_same["heterodyne_active"] is False
     assert nd_same["re_surface"]["n_tris"] > 10
+
+
+def test_single_proton_his31_delta_auto_mode_and_pure_diff_mode(tmp_path: Path):
+    """'HIS31_delta' residue filenames must default to 'delta' (not 'product'), and 'diff' isolates pure F - F0."""
+    from subhkl.viz.nodal_surfaces import infer_default_heterodyne_mode
+
+    assert infer_default_heterodyne_mode("5vnq_no_HIS31_delta.mtz") == "delta"
+    assert infer_default_heterodyne_mode("5vnq_no_HIS31_epsilon.mtz") == "delta"
+
+    full_mtz = tmp_path / "5vnq.mtz"
+    no_his_delta_mtz = tmp_path / "5vnq_no_HIS31_delta.mtz"
+
+    # Large multi-atom macromolecular host + tiny single-proton perturbation (~1.2% of |F0|)
+    host_atoms = [
+        ((0.11, 0.23, 0.07), 95.0),
+        ((0.42, 0.17, 0.31), 88.0),
+        ((0.29, 0.61, 0.44), 76.0),
+        ((0.67, 0.38, 0.19), 82.0),
+    ]
+    his_proton = [((0.25, 0.0, 0.0), -3.74)]
+    ub, _ = _write_synthetic_phased_mtz(
+        full_mtz,
+        spacegroup_name="P 1",
+        cell_params=(12.0, 12.0, 12.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=[*host_atoms, *his_proton],
+        d_min=2.5,
+    )
+    _write_synthetic_phased_mtz(
+        no_his_delta_mtz,
+        spacegroup_name="P 1",
+        cell_params=(12.0, 12.0, 12.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=host_atoms,
+        d_min=2.5,
+    )
+
+    payload = {"ub_matrix": ub.tolist(), "d_min": 2.5}
+    res_auto, code_a, next_ref, next_het = process_nodal_surfaces_api_request(
+        {"ref_mtz_path": str(full_mtz), "heterodyne_mode": "auto"},
+        mtz_path=str(no_his_delta_mtz),
+        ref_mtz_path=None,
+        heterodyne_mode="delta",
+        payload=payload,
+    )
+    assert code_a == 200
+    assert next_het == "delta"
+    nd_auto = res_auto["nodal_data"]
+    assert nd_auto["heterodyne_mode"] == "delta"
+    assert nd_auto["formula_label"] == "F₀*·(F − F₀)"
+    assert nd_auto["re_surface"]["n_tris"] > 20
+
+    # Switch to pure complex difference mode ΔF = F - F0 (strips out F0* phase winding)
+    res_diff, code_d, _, next_het_d = process_nodal_surfaces_api_request(
+        {"heterodyne_mode": "diff"},
+        mtz_path=str(no_his_delta_mtz),
+        ref_mtz_path=next_ref,
+        heterodyne_mode=next_het,
+        payload=payload,
+    )
+    assert code_d == 200
+    assert next_het_d == "diff"
+    nd_diff = res_diff["nodal_data"]
+    assert nd_diff["heterodyne_mode"] == "diff"
+    assert nd_diff["formula_label"] == "ΔF = F − F₀"
+    assert nd_diff["re_surface"]["n_tris"] > 10
+
+    # Verify rendered UI includes ΔF = F−F₀ option and syncNodalUI does not clobber state.heterodyneMode
+    base_payload = build_rainbow_zone_payload()
+    base_payload["nodal_data"] = nd_auto
+    html = render_rainbow_html(base_payload)
+    assert '<option value="diff">ΔF = F−F₀</option>' in html
+    assert "const chosenMode = selHetMode.value ||" in html
+    assert "nodalCtrl.applyCachedHeterodyneMode(chosenMode)" in html

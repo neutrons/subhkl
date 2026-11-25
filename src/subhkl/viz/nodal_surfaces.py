@@ -64,12 +64,27 @@ _BRICK_PAYLOAD_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict
 _MAX_FIELD_CACHE_ENTRIES = 10
 _MAX_BRICK_CACHE_ENTRIES = 16
 _SUBSTRUCTURE_NAME_RE = re.compile(
-    r"(?:only[_-]?h|[_-]h[_-]|diff|delta|fofc|delfwt|substruct)", re.IGNORECASE
+    r"(?:only[_-]?h|[_-]h[_-]|substruct|fofc|delfwt|diff[_-]?map)", re.IGNORECASE
 )
+_VALID_HETERODYNE_MODES = ("delta", "diff", "product", "single")
 
 
-def infer_default_heterodyne_mode(primary_name: str | None) -> str:
-    """Return 'product' when primary .mtz filename denotes an isolated substructure/difference map, else 'delta'."""
+def infer_default_heterodyne_mode(
+    primary_name: str | None,
+    *,
+    primary_field: dict[str, Any] | None = None,
+    ref_field: dict[str, Any] | None = None,
+) -> str:
+    """Return 'product' when primary .mtz is an isolated substructure map, else 'delta' [F0*(F - F0)]."""
+    if primary_field is not None and ref_field is not None:
+        q75_f = float(primary_field.get("q75_f") or 0.0)
+        q75_0 = float(ref_field.get("q75_f") or 0.0)
+        if q75_f > 1e-9 and q75_0 > 1e-9:
+            ratio = q75_f / q75_0
+            # Two full-structure models on comparable scale (e.g. 5vnq_no_HIS31_delta vs 5vnq)
+            # must subtract F_0 first; otherwise |F_0|^2 > 0 dominates Re(F_0* F) everywhere.
+            if 0.65 <= ratio <= 1.50:
+                return "delta"
     if primary_name and _SUBSTRUCTURE_NAME_RE.search(str(primary_name)):
         return "product"
     return "delta"
@@ -409,8 +424,11 @@ def evaluate_combined_complex_grid(
     mode = str(heterodyne_mode or "delta").lower()
     if mode == "product":
         return np.conj(F0_grid) * F_grid
+    diff_grid = float(f_to_f0_scale) * F_grid - F0_grid
+    if mode == "diff":
+        return diff_grid
     # Default "delta": F_0*(G) * (s * F(G) - F_0(G))
-    return np.conj(F0_grid) * (float(f_to_f0_scale) * F_grid - F0_grid)
+    return np.conj(F0_grid) * diff_grid
 
 
 def _refine_bilinear_zero(
@@ -941,19 +959,27 @@ def compute_nodal_surfaces_payload(
 
     req_het = str(heterodyne_mode or "delta").lower()
     if req_het == "auto":
-        req_het = infer_default_heterodyne_mode(primary.get("name"))
+        req_het = infer_default_heterodyne_mode(
+            primary.get("name"),
+            primary_field=primary,
+            ref_field=ref_field,
+        )
     het_active = bool(ref_field is not None and req_het != "single")
     eff_het_mode = req_het if het_active else "single"
-    if eff_het_mode not in ("single", "delta", "product"):
+    if eff_het_mode not in _VALID_HETERODYNE_MODES:
         eff_het_mode = (
-            infer_default_heterodyne_mode(primary.get("name"))
+            infer_default_heterodyne_mode(
+                primary.get("name"),
+                primary_field=primary,
+                ref_field=ref_field,
+            )
             if het_active
             else "single"
         )
 
     f_to_f0_scale = (
         compute_shared_scale_ratio(primary, ref_field)
-        if (ref_field is not None and eff_het_mode == "delta")
+        if (ref_field is not None and eff_het_mode in ("delta", "diff"))
         else 1.0
     )
 
@@ -1028,7 +1054,7 @@ def compute_nodal_surfaces_payload(
         ref_field.get("path") if ref_field is not None else None,
         ref_field.get("q75_f") if ref_field is not None else None,
         eff_het_mode,
-        round(float(f_to_f0_scale), 5),
+        round(float(f_to_f0_scale), 8),
         round(float(g_max), 4),
         tuple(np.round(ub.ravel(), 5).tolist()),
         tuple(np.round(brick_center_hkl, 2).tolist()),
@@ -1178,11 +1204,14 @@ def compute_nodal_surfaces_payload(
             while len(_GLOBAL_VORTEX_CACHE) > _MAX_FIELD_CACHE_ENTRIES:
                 _GLOBAL_VORTEX_CACHE.popitem(last=False)
 
-    formula_label = (
-        "F₀*·(F − F₀)"
-        if eff_het_mode == "delta"
-        else ("F₀*·F" if eff_het_mode == "product" else "F(G)")
-    )
+    if eff_het_mode == "delta":
+        formula_label = "F₀*·(F − F₀)"
+    elif eff_het_mode == "diff":
+        formula_label = "ΔF = F − F₀"
+    elif eff_het_mode == "product":
+        formula_label = "F₀*·F"
+    else:
+        formula_label = "F(G)"
 
     return {
         "has_phases": True,
@@ -1270,12 +1299,10 @@ def process_nodal_surfaces_api_request(
     if req_json.get("clear_ref_mtz") or not next_ref:
         next_het = "single"
     elif raw_req_het == "auto" or (is_new_ref and not raw_req_het):
-        next_het = infer_default_heterodyne_mode(
-            os.path.basename(mtz_path) if mtz_path else None
-        )
+        next_het = "auto"
     else:
-        next_het = str(raw_req_het or heterodyne_mode or "delta")
-        if next_het not in ("delta", "product", "single"):
+        next_het = str(raw_req_het or heterodyne_mode or "delta").lower()
+        if next_het not in _VALID_HETERODYNE_MODES:
             next_het = "delta"
 
     if not mtz_path or not os.path.isfile(mtz_path):
@@ -1328,6 +1355,9 @@ def process_nodal_surfaces_api_request(
         payload["ref_mtz_overlay_name"] = (
             os.path.basename(next_ref) if next_ref else None
         )
+    resolved_het = str(nodal_data.get("heterodyne_mode") or next_het)
+    if resolved_het not in _VALID_HETERODYNE_MODES:
+        resolved_het = "delta"
     if not nodal_data.get("has_phases"):
         return (
             {
@@ -1338,13 +1368,13 @@ def process_nodal_surfaces_api_request(
             },
             400,
             next_ref,
-            next_het,
+            resolved_het,
         )
     return (
         {"ok": True, "nodal_data": nodal_data},
         200,
         next_ref,
-        next_het,
+        resolved_het,
     )
 
 
@@ -2814,7 +2844,19 @@ def get_nodal_surfaces_js() -> str:
       }
     }
 
-    // Zero-lag client-side ROI/slider handler: clips cached GPU brick immediately,
+    // Swap immediately to a cached heterodyne brick if available before/during server sync
+    function applyCachedHeterodyneMode(wantMode) {
+      if (!nodalData || !nodalData.has_phases) return null;
+      const curRef = nodalData.ref_has_phases ? (nodalData.ref_name || "") : "";
+      const liveRoi = resolveLiveRoi();
+      const hit = findCachedBrickCovering(liveRoi, curRef, wantMode);
+      if (hit) {
+        setNodalData(hit);
+        deps.onUpdated(hit);
+        return hit;
+      }
+      return null;
+    }
     // and only fetches a new 3D brick in the background if the user moves beyond cached bounds!
     function onLiveRoiChanged() {
       last3DRenderSig = "";
@@ -3022,6 +3064,7 @@ def get_nodal_surfaces_js() -> str:
       hasPhases: () => Boolean(nodalData && nodalData.has_phases),
       invalidate3D: () => { last3DRenderSig = ""; },
       resolveLiveRoi,
+      applyCachedHeterodyneMode,
       onLiveRoiChanged,
       panByScreenDelta,
       resetPanToOrigin,

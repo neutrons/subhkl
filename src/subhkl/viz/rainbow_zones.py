@@ -12834,8 +12834,9 @@ def render_rainbow_html(
             <input type="range" id="slider-nodal-roi" min="0.8" max="5.5" step="0.1" value="2.5" title="Adjust 3D nodal surface ROI radius (2.5× a⋆)" />
             <button id="btn-load-ref-mtz" type="button" title="Load heterodyne reference F₀ .mtz (with phase, e.g. heavy-atom / reference structure factor) for interference nodal surfaces &amp; vortices">Ref F₀</button>
             <button id="btn-clear-ref-mtz" type="button" class="hidden" title="Clear heterodyne reference F₀ .mtz">×</button>
-            <select id="sel-heterodyne-mode" class="hidden" title="Heterodyne interference term with Reference F₀">
+            <select id="sel-heterodyne-mode" class="hidden" title="Heterodyne interference or difference term with Reference F₀">
               <option value="delta">F₀*·(F−F₀)</option>
+              <option value="diff">ΔF = F−F₀</option>
               <option value="product">F₀*·F</option>
               <option value="single">Single F</option>
             </select>
@@ -15563,7 +15564,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     nodalSurfaceAlpha: 0.56,
     nodalRoiMode: "origin",        // "origin" | "peak" | "zone"
     nodalRoiRadiusMult: 2.5,
-    heterodyneMode: "delta",       // "delta" [F0*(F-F0)] | "product" [F0*F] | "single" [F]
+    heterodyneMode: (DATA && DATA.nodal_data && DATA.nodal_data.heterodyne_mode)
+      ? String(DATA.nodal_data.heterodyne_mode)
+      : "delta",                   // "delta" [F0*(F-F0)] | "diff" [F-F0] | "product" [F0*F] | "single" [F]
     histMetric: "cc_half",        // "cc_half" | "completeness" | "isigi"
     hoveredHistBin: null,         // 0..nBins-1 when hovering #canvas-hist resolution bar
     lamMin: Number(wlRange[0]),
@@ -23588,6 +23591,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         onUpdated: (nd) => {{
           DATA.nodal_data = nd || null;
           DATA.ref_mtz_overlay_name = (nd && nd.ref_name) ? nd.ref_name : null;
+          if (nd && nd.heterodyne_mode) {{
+            state.heterodyneMode = String(nd.heterodyne_mode);
+          }}
           syncNodalUI();
           _lastWulffRenderSig = "";
           renderStereoInset(true);
@@ -23713,10 +23719,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }}
     if (selHet) {{
       selHet.classList.toggle("hidden", !hasRef);
-      if (nd && nd.heterodyne_mode) {{
-        state.heterodyneMode = nd.heterodyne_mode;
-      }}
-      selHet.value = state.heterodyneMode || "delta";
+      const wantHet = state.heterodyneMode || (nd && nd.heterodyne_mode) || "delta";
+      selHet.value = wantHet;
     }}
   }}
 
@@ -25659,13 +25663,17 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   }}
   if (selHetMode) {{
     selHetMode.addEventListener("change", async () => {{
-      state.heterodyneMode = selHetMode.value || "delta";
+      const chosenMode = selHetMode.value || "delta";
+      state.heterodyneMode = chosenMode;
       syncNodalUI();
-      const nd = await refreshNodalSurfacesFromServer({{ heterodyne_mode: state.heterodyneMode }});
+      if (nodalCtrl && typeof nodalCtrl.applyCachedHeterodyneMode === "function") {{
+        nodalCtrl.applyCachedHeterodyneMode(chosenMode);
+      }}
+      const nd = await refreshNodalSurfacesFromServer({{ heterodyne_mode: chosenMode }});
       if (nd) {{
         setStatusLine(
           "[HETERODYNE MODE]",
-          `Switched complex nodal field to <strong>${{nd.formula_label || state.heterodyneMode}}</strong>.`
+          `Switched complex nodal field to <strong>${{nd.formula_label || chosenMode}}</strong>.`
         );
       }}
     }});
@@ -26307,6 +26315,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }}
     if (!isFrameSwitch) {{
       DATA.nodal_data = newPayload.nodal_data || null;
+      if (DATA.nodal_data && DATA.nodal_data.heterodyne_mode) {{
+        state.heterodyneMode = String(DATA.nodal_data.heterodyne_mode);
+      }}
       if (nodalCtrl) nodalCtrl.setNodalData(DATA.nodal_data);
       syncNodalUI();
     }}
