@@ -1309,7 +1309,7 @@ def process_nodal_surfaces_api_request(
         return (
             {
                 "ok": False,
-                "error": "Load a phased primary .mtz structure factor file first before computing nodal surfaces.",
+                "error": "Load a primary .mtz file first before loading Reference F₀ or computing nodal surfaces.",
             },
             400,
             next_ref,
@@ -1317,8 +1317,49 @@ def process_nodal_surfaces_api_request(
         )
 
     cur_p = payload or {}
+    ref_asu_lu: dict[str, list[float]] | None = None
+    ref_ex_lu: dict[str, list[float]] | None = None
+    ref_n_refl = 0
+    if next_ref and os.path.isfile(next_ref):
+        try:
+            from subhkl.viz.rainbow_zones import extract_ref_mtz_intensity_lookup
+
+            ref_asu_lu, ref_ex_lu, ref_n_refl = extract_ref_mtz_intensity_lookup(
+                next_ref,
+                str(cur_p.get("space_group") or "P 1"),
+                mtz_global_i_scale=float(cur_p.get("mtz_global_i_scale") or 1.0),
+                prefer_i_col=bool(
+                    cur_p.get("mtz_has_i_column") and not cur_p.get("mtz_has_f_column")
+                ),
+            )
+            if not ref_asu_lu:
+                ref_asu_lu = None
+        except (OSError, ValueError, RuntimeError):
+            ref_asu_lu = None
+            ref_ex_lu = None
+
+    ref_base_name = os.path.basename(next_ref) if next_ref else None
+    if isinstance(payload, dict):
+        payload["ref_mtz_overlay_name"] = ref_base_name
+        payload["ref_mtz_i_asu_lookup"] = ref_asu_lu
+        payload["ref_mtz_i_exact_lookup"] = ref_ex_lu
+
     ub_raw = req_json.get("ub_matrix") or cur_p.get("ub_matrix")
     if ub_raw is None:
+        if req_json.get("ref_mtz_path") or req_json.get("clear_ref_mtz"):
+            return (
+                {
+                    "ok": True,
+                    "nodal_data": None,
+                    "ref_mtz_overlay_name": ref_base_name,
+                    "ref_mtz_reflections": ref_n_refl,
+                    "ref_mtz_i_asu_lookup": ref_asu_lu,
+                    "ref_mtz_i_exact_lookup": ref_ex_lu,
+                },
+                200,
+                next_ref,
+                next_het,
+            )
         return (
             {
                 "ok": False,
@@ -1352,13 +1393,25 @@ def process_nodal_surfaces_api_request(
     )
     if isinstance(payload, dict):
         payload["nodal_data"] = nodal_data
-        payload["ref_mtz_overlay_name"] = (
-            os.path.basename(next_ref) if next_ref else None
-        )
+        payload["ref_mtz_overlay_name"] = ref_base_name
     resolved_het = str(nodal_data.get("heterodyne_mode") or next_het)
     if resolved_het not in _VALID_HETERODYNE_MODES:
         resolved_het = "delta"
     if not nodal_data.get("has_phases"):
+        if req_json.get("ref_mtz_path") or req_json.get("clear_ref_mtz"):
+            return (
+                {
+                    "ok": True,
+                    "nodal_data": nodal_data,
+                    "ref_mtz_overlay_name": ref_base_name,
+                    "ref_mtz_reflections": ref_n_refl,
+                    "ref_mtz_i_asu_lookup": ref_asu_lu,
+                    "ref_mtz_i_exact_lookup": ref_ex_lu,
+                },
+                200,
+                next_ref,
+                resolved_het,
+            )
         return (
             {
                 "ok": False,
@@ -1371,7 +1424,14 @@ def process_nodal_surfaces_api_request(
             resolved_het,
         )
     return (
-        {"ok": True, "nodal_data": nodal_data},
+        {
+            "ok": True,
+            "nodal_data": nodal_data,
+            "ref_mtz_overlay_name": ref_base_name,
+            "ref_mtz_reflections": ref_n_refl,
+            "ref_mtz_i_asu_lookup": ref_asu_lu,
+            "ref_mtz_i_exact_lookup": ref_ex_lu,
+        },
         200,
         next_ref,
         resolved_het,
@@ -2258,6 +2318,7 @@ def get_nodal_surfaces_js() -> str:
       const hovRef = st.hoveredPeakObj ? `${st.hoveredPeakObj.id}:${(st.hoveredPeakObj.hkl || []).join(",")}` : String(st.hoveredPeakId);
       const selRef = st.selectedPeakObj ? `${st.selectedPeakObj.id}:${(st.selectedPeakObj.hkl || []).join(",")}` : String(st.selectedPeakId);
       const zonesKey = st.showZoneArcs ? `${st.selectedZoneId || ""}:${Array.from(st.activeZones || []).join(",")}` : "off";
+      const mtzOverlaySig = typeof deps.getMtzOverlaySig === "function" ? deps.getMtzOverlaySig() : "";
       const sig = [
         targetW, targetH,
         (st.wulffYawDeg || 0).toFixed(3),
@@ -2266,6 +2327,7 @@ def get_nodal_surfaces_js() -> str:
         st.wulffExpanded ? 1 : 0,
         st.wulffScope,
         st.wulffColorMode,
+        st.colorFullRange ? 1 : 0,
         deps.getColorCrossover().toFixed(3),
         st.showWulffFriedel ? 1 : 0,
         st.showNodalPoints ? 1 : 0,
@@ -2280,6 +2342,8 @@ def get_nodal_surfaces_js() -> str:
         brickFetchInProgress ? 1 : 0,
         st.dMin, st.lamMin, st.lamMax,
         zonesKey, hovRef, selRef,
+        dataSeq,
+        mtzOverlaySig,
         decodedCacheSig,
         Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[2][0].toFixed(5), Rg[2][2].toFixed(5),
       ].join("|");
@@ -2863,9 +2927,13 @@ def get_nodal_surfaces_js() -> str:
         const doc = await r.json().catch(() => null);
         if (reqSeq !== fetchInFlight) return doc;
         brickFetchInProgress = false;
-        if (r.ok && doc && doc.nodal_data) {
-          setNodalData(doc.nodal_data);
-          deps.onUpdated(doc.nodal_data);
+        if (r.ok && doc) {
+          if (doc.nodal_data !== undefined) {
+            setNodalData(doc.nodal_data);
+          } else {
+            last3DRenderSig = "";
+          }
+          deps.onUpdated(doc.nodal_data !== undefined ? doc.nodal_data : nodalData, doc);
         } else if (doc && doc.error && typeof deps.setStatusLine === "function") {
           deps.setStatusLine("[NODAL SURFACES]", `<span style="color:#f87171;">${doc.error}</span>`);
         }
@@ -2999,10 +3067,16 @@ def get_nodal_surfaces_js() -> str:
         roiDebounceTimer = null;
       }
       st.heterodyneMode = "single";
+      const clearedMeta = {
+        clear_ref_mtz: true,
+        ref_mtz_overlay_name: null,
+        ref_mtz_i_asu_lookup: null,
+        ref_mtz_i_exact_lookup: null,
+      };
       // Immediately swap back to cached single-field brick in 0 ms if available!
       if (lastSingleOriginData && nodalData && lastSingleOriginData.primary_name === nodalData.primary_name) {
         setNodalData(lastSingleOriginData);
-        deps.onUpdated(lastSingleOriginData);
+        deps.onUpdated(lastSingleOriginData, clearedMeta);
       } else if (nodalData) {
         const clearedLocal = Object.assign({}, nodalData, {
           ref_name: null,
@@ -3014,7 +3088,10 @@ def get_nodal_surfaces_js() -> str:
           formula_label: "F(G)",
         });
         setNodalData(clearedLocal);
-        deps.onUpdated(clearedLocal);
+        deps.onUpdated(clearedLocal, clearedMeta);
+      } else {
+        setNodalData(null);
+        deps.onUpdated(null, clearedMeta);
       }
       const doc = await requestNodalUpdate({
         heterodyne_mode: "single",
@@ -3027,7 +3104,7 @@ def get_nodal_surfaces_js() -> str:
       if (!file) return;
       if (typeof onLoadingState === "function") onLoadingState(true, file.name);
       if (typeof deps.setStatusLine === "function") {
-        deps.setStatusLine("[REF F₀ MTZ]", `Loading heterodyne reference structure factors from <strong>${file.name}</strong>...`);
+        deps.setStatusLine("[REF F₀ MTZ]", `Loading reference <strong>${file.name}</strong>...`);
       }
       try {
         let resolvedPath = null;
@@ -3062,15 +3139,22 @@ def get_nodal_surfaces_js() -> str:
           return;
         }
         const doc = await requestNodalUpdate({ ref_mtz_path: resolvedPath, heterodyne_mode: "auto" });
-        if (doc && doc.nodal_data && typeof deps.setStatusLine === "function") {
+        if (doc && doc.ok && typeof deps.setStatusLine === "function") {
           const nd = doc.nodal_data;
-          if (nd.ref_warning) {
-            deps.setStatusLine("[REF F₀ MTZ]", `<span style="color:#fbbf24;">${nd.ref_warning}</span>`);
-          } else if (nd.ref_has_phases) {
+          if (nd && nd.has_phases && nd.ref_has_phases) {
             deps.setStatusLine(
               "[HETERODYNE F₀]",
-              `Loaded <strong>${nd.ref_name}</strong> (${nd.ref_f_column}, ${nd.ref_phi_column}) • Interference: <strong>${nd.formula_label}</strong>`
+              `Loaded <strong>${nd.ref_name}</strong> (${nd.ref_f_column}, ${nd.ref_phi_column}) • Interference: <strong>${nd.formula_label}</strong> (Spot Color: <strong>ΔI (F−F₀)</strong> also available)`
             );
+          } else if (doc.ref_mtz_i_asu_lookup) {
+            const refNm = doc.ref_mtz_overlay_name || file.name;
+            const nRefl = Number(doc.ref_mtz_reflections || Object.keys(doc.ref_mtz_i_asu_lookup).length).toLocaleString();
+            deps.setStatusLine(
+              "[REF F₀ CONTRAST]",
+              `Loaded <strong>${refNm}</strong> (${nRefl} ASU reflections) • Coloring spots by <strong>ΔI (F − F₀)</strong>`
+            );
+          } else if (nd && nd.ref_warning) {
+            deps.setStatusLine("[REF F₀ MTZ]", `<span style="color:#fbbf24;">${nd.ref_warning}</span>`);
           }
         }
       } finally {

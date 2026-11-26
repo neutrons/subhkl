@@ -2003,6 +2003,140 @@ def _eval_careless_snr_scale_profile(
     return None
 
 
+def extract_ref_mtz_intensity_lookup(
+    ref_mtz_path: str | os.PathLike,
+    active_sg_hm: str | None,
+    mtz_global_i_scale: float = 1.0,
+    prefer_i_col: bool = False,
+) -> tuple[
+    dict[str, list[float]],
+    dict[str, list[float]] | None,
+    int,
+]:
+    """Extract raw & primary-scale-normalized intensities `[I_raw, I_norm]` from a reference `.mtz`."""
+    import gemmi
+
+    mtz = gemmi.read_mtz_file(str(ref_mtz_path))
+    active_sg = (
+        gemmi.find_spacegroup_by_name(str(active_sg_hm or "P 1"))
+        or mtz.spacegroup
+        or gemmi.SpaceGroup("P 1")
+    )
+    mtz_sg = mtz.spacegroup or active_sg
+    asu = gemmi.ReciprocalAsu(mtz_sg)
+    ops = mtz_sg.operations()
+    cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}
+    col_types = {c.label: str(c.type) for c in mtz.columns}
+    if not all(k in cols for k in ("H", "K", "L")):
+        return {}, None, 0
+
+    h_col = cols["H"].astype(int)
+    k_col = cols["K"].astype(int)
+    l_col = cols["L"].astype(int)
+    is_unmerged = any(lbl in cols for lbl in ("M/ISYM", "BATCH"))
+
+    f_lbl: str | None = None
+    for cand in ("F", "FP", "FC", "FWT", "f_calc", "F_calc", "F-model", "FMODEL"):
+        if cand in cols and col_types.get(cand) == "F":
+            f_lbl = cand
+            break
+    if f_lbl is None:
+        f_cands = [c.label for c in mtz.columns if str(c.type) == "F"]
+        if f_cands:
+            f_lbl = f_cands[0]
+
+    i_lbl: str | None = None
+    for cand in ("I", "IMEAN", "IOBS", "I-obs", "I_obs", "IC", "i_calc", "I_calc"):
+        if cand in cols and col_types.get(cand) in ("J", "K"):
+            i_lbl = cand
+            break
+    if i_lbl is None:
+        j_cands = [c.label for c in mtz.columns if str(c.type) in ("J", "K")]
+        if j_cands:
+            i_lbl = j_cands[0]
+
+    if i_lbl is not None and (prefer_i_col or f_lbl is None):
+        raw_i = np.asarray(cols[i_lbl], dtype=np.float64)
+    elif f_lbl is not None:
+        f_pos = np.maximum(np.asarray(cols[f_lbl], dtype=np.float64), 0.0)
+        raw_i = f_pos * f_pos
+    else:
+        non_data = {
+            "H",
+            "K",
+            "L",
+            "M/ISYM",
+            "BATCH",
+            "RUN",
+            "WAVEL",
+            "THETA",
+            "PHI",
+            "FreeR_flag",
+            "FREE",
+            "R-free-flags",
+            "test",
+        }
+        fb_cands = [
+            c.label
+            for c in mtz.columns
+            if c.label not in non_data
+            and str(c.type) not in ("P", "W", "I", "B", "Y", "H", "A")
+        ]
+        if not fb_cands:
+            return {}, None, 0
+        raw_i = np.asarray(cols[fb_cands[0]], dtype=np.float64)
+
+    valid = np.isfinite(raw_i) & ((h_col != 0) | (k_col != 0) | (l_col != 0))
+    if not np.any(valid):
+        return {}, None, 0
+
+    hkl_v = np.column_stack((h_col[valid], k_col[valid], l_col[valid]))
+    iv_v = raw_i[valid]
+    ord_abs = np.argsort(-np.abs(iv_v), kind="mergesort")
+    lit_hkl, lit_first = np.unique(hkl_v[ord_abs], axis=0, return_index=True)
+    lit_i = iv_v[ord_abs][lit_first]
+
+    eff_scale = (
+        float(mtz_global_i_scale)
+        if (
+            isinstance(mtz_global_i_scale, (int, float))
+            and np.isfinite(mtz_global_i_scale)
+            and mtz_global_i_scale > 1e-12
+        )
+        else 1.0
+    )
+
+    asu_raw: dict[tuple[int, int, int], float] = {}
+    exact_lookup: dict[str, list[float]] = {}
+    for idx in range(len(lit_hkl)):
+        hh, kk, ll = int(lit_hkl[idx, 0]), int(lit_hkl[idx, 1]), int(lit_hkl[idx, 2])
+        iv = float(lit_i[idx])
+        if is_unmerged and len(lit_hkl) <= 120000:
+            exact_lookup[f"{hh},{kk},{ll}"] = [
+                round(iv, 4 if abs(iv) < 10.0 else 2),
+                round(iv / eff_scale, 5),
+            ]
+        asu_hkl, _ = asu.to_asu([hh, kk, ll], ops)
+        ak = (int(asu_hkl[0]), int(asu_hkl[1]), int(asu_hkl[2]))
+        if ak not in asu_raw or abs(iv) > abs(asu_raw[ak]):
+            asu_raw[ak] = iv
+
+    asu_lookup: dict[str, list[float]] = {}
+    if len(asu_raw) <= 120000:
+        asu_lookup = {
+            f"{k[0]},{k[1]},{k[2]}": [
+                round(v, 4 if abs(v) < 10.0 else 2),
+                round(v / eff_scale, 5),
+            ]
+            for k, v in asu_raw.items()
+        }
+    return (
+        asu_lookup,
+        (exact_lookup if is_unmerged and exact_lookup else None),
+        len(asu_raw),
+    )
+
+
 def apply_mtz_to_payload(
     payload: dict[str, Any],
     mtz_path: str | os.PathLike,
@@ -2448,9 +2582,21 @@ def apply_mtz_to_payload(
     def _raw_fsq_val(fv_r: float, iv_r: float) -> float:
         return float(fv_r * fv_r) if has_f_col else float(iv_r)
 
+    all_raw_fsq = np.asarray(
+        [
+            _raw_fsq_val(asu_f_raw_map[k_m][0], asu_map[k_m][0])
+            for k_m in asu_map
+            if np.isfinite(_raw_fsq_val(asu_f_raw_map[k_m][0], asu_map[k_m][0]))
+        ],
+        dtype=np.float64,
+    )
+    mtz_is_signed_i = bool(
+        not has_f_col and len(all_raw_fsq) > 0 and np.any(all_raw_fsq < -1e-6)
+    )
+
     shared_i_mtz: list[float] = []
     shared_i_obs: list[float] = []
-    if same_sg and careless_i_ref:
+    if same_sg and careless_i_ref and not mtz_is_signed_i:
         for ak_m, (fv_m, _) in asu_f_raw_map.items():
             iv_raw_m = _raw_fsq_val(fv_m, asu_map[ak_m][0])
             if iv_raw_m > 0.0 and ak_m in careless_i_ref:
@@ -2468,22 +2614,18 @@ def apply_mtz_to_payload(
             mtz_global_i_scale = q75_im / q75_io
             mtz_scale_basis = "careless_shared_q75"
     if mtz_scale_basis == "unit_wilson_rms":
-        all_pos_i = np.asarray(
-            [
-                _raw_fsq_val(asu_f_raw_map[k_m][0], asu_map[k_m][0])
-                for k_m in asu_map
-                if np.isfinite(_raw_fsq_val(asu_f_raw_map[k_m][0], asu_map[k_m][0]))
-                and _raw_fsq_val(asu_f_raw_map[k_m][0], asu_map[k_m][0]) > 0.0
-            ],
-            dtype=np.float64,
+        mag_i = (
+            np.abs(all_raw_fsq)[np.abs(all_raw_fsq) > 0.0]
+            if mtz_is_signed_i
+            else all_raw_fsq[all_raw_fsq > 0.0]
         )
-        if len(all_pos_i) > 0:
+        if len(mag_i) > 0:
             i_cap = (
-                float(np.quantile(all_pos_i, 0.99))
-                if len(all_pos_i) >= 20
-                else float(np.max(all_pos_i))
+                float(np.quantile(mag_i, 0.99))
+                if len(mag_i) >= 20
+                else float(np.max(mag_i))
             )
-            i_win = np.minimum(all_pos_i, max(i_cap, 1e-9))
+            i_win = np.minimum(mag_i, max(i_cap, 1e-9))
             mean_i = float(np.mean(i_win))
             if np.isfinite(mean_i) and mean_i > 1e-9:
                 mtz_global_i_scale = mean_i
@@ -3062,7 +3204,7 @@ def apply_mtz_to_payload(
                     if sf_n is not None:
                         pk_copy["mtz_sigf"] = round(float(sf_n), 4)
                     pk_copy["mtz_fsigf"] = round(float(fsigf_v), 3)
-                    pk_copy["mtz_i_norm"] = round(float(i_n), 4)
+                    pk_copy["mtz_i_norm"] = round(float(i_n), 5)
                     if not has_i_col and has_f_col:
                         pk_copy["mtz_isigi"] = round(float(fsigf_v), 3)
                     cs_val = pk_copy.get("careless_scale")
@@ -3139,6 +3281,7 @@ def apply_mtz_to_payload(
     out["mtz_has_f_column"] = bool(has_f_col)
     out["mtz_has_sigf_column"] = bool(has_sigf_col)
     out["mtz_has_i_column"] = bool(has_i_col)
+    out["mtz_is_signed_i"] = bool(mtz_is_signed_i)
     out["mtz_f_column"] = f_col_label
     out["mtz_sigf_column"] = sigf_col_label
     out["mtz_global_f_scale"] = round(float(mtz_global_f_scale), 6)
@@ -3165,7 +3308,7 @@ def apply_mtz_to_payload(
                 round(float(v[0]), 4),
                 round(float(v[1]), 4) if v[1] is not None else None,
                 round(float(v[2]), 3),
-                round(float(v[3]), 4),
+                round(float(v[3]), 5),
             ]
             for k, v in asu_f_norm_map.items()
         }
@@ -3179,7 +3322,7 @@ def apply_mtz_to_payload(
                 round(float(v[0]), 4),
                 round(float(v[1]), 4) if v[1] is not None else None,
                 round(float(v[2]), 3),
-                round(float(v[3]), 4),
+                round(float(v[3]), 5),
             ]
             for k, v in exact_f_norm_map.items()
         }
@@ -3210,10 +3353,36 @@ def apply_mtz_to_payload(
             heterodyne_mode=heterodyne_mode,
         )
         out["nodal_data"] = nodal_doc
-        out["ref_mtz_overlay_name"] = nodal_doc.get("ref_name")
+        out["ref_mtz_overlay_name"] = nodal_doc.get("ref_name") or (
+            os.path.basename(str(ref_mtz_path)) if ref_mtz_path else None
+        )
     else:
         out["nodal_data"] = None
-        out["ref_mtz_overlay_name"] = None
+        out["ref_mtz_overlay_name"] = (
+            os.path.basename(str(ref_mtz_path))
+            if (ref_mtz_path and os.path.isfile(str(ref_mtz_path)))
+            else None
+        )
+
+    if ref_mtz_path and os.path.isfile(str(ref_mtz_path)):
+        if not compute_nodal and out.get("ref_mtz_i_asu_lookup") is not None:
+            pass
+        else:
+            try:
+                ref_asu_lu, ref_ex_lu, _ = extract_ref_mtz_intensity_lookup(
+                    ref_mtz_path,
+                    active_sg.hm,
+                    mtz_global_i_scale=mtz_global_i_scale,
+                    prefer_i_col=bool(has_i_col and not has_f_col),
+                )
+                out["ref_mtz_i_asu_lookup"] = ref_asu_lu or None
+                out["ref_mtz_i_exact_lookup"] = ref_ex_lu
+            except (OSError, ValueError, RuntimeError):
+                out["ref_mtz_i_asu_lookup"] = None
+                out["ref_mtz_i_exact_lookup"] = None
+    else:
+        out["ref_mtz_i_asu_lookup"] = None
+        out["ref_mtz_i_exact_lookup"] = None
     return out
 
 
@@ -10888,6 +11057,7 @@ def merge_frame_only_payload(
         "mtz_has_f_column",
         "mtz_has_sigf_column",
         "mtz_has_i_column",
+        "mtz_is_signed_i",
         "mtz_f_column",
         "mtz_sigf_column",
         "mtz_global_f_scale",
@@ -10900,6 +11070,8 @@ def merge_frame_only_payload(
         "mtz_has_phases",
         "mtz_phi_column",
         "ref_mtz_overlay_name",
+        "ref_mtz_i_asu_lookup",
+        "ref_mtz_i_exact_lookup",
         "nodal_data",
     ):
         prev_val = prev_payload.get(keep_key)
@@ -10929,6 +11101,8 @@ def build_frame_only_response(payload: dict[str, Any]) -> dict[str, Any]:
         "mtz_exact_lookup",
         "mtz_f_asu_lookup",
         "mtz_f_exact_lookup",
+        "ref_mtz_i_asu_lookup",
+        "ref_mtz_i_exact_lookup",
         "nodal_data",
     ):
         out.pop(drop_key, None)
@@ -12407,6 +12581,31 @@ def render_rainbow_html(
     box-shadow: 0 0 6px rgba(0, 229, 255, 0.32);
   }}
 
+  .cs-range-pill {{
+    font-family: var(--font-display);
+    font-size: 0.56rem;
+    line-height: 1.1;
+    padding: 1px 5px;
+    border-radius: 3px;
+    border: 1px solid rgba(148, 163, 184, 0.42);
+    background: rgba(15, 23, 42, 0.72);
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+  }}
+
+  .cs-range-pill:hover {{
+    border-color: var(--accent-cyan);
+    color: #e2e8f0;
+  }}
+
+  .cs-range-pill.active-btn {{
+    border-color: var(--accent-cyan);
+    background: rgba(6, 182, 212, 0.22);
+    color: var(--accent-cyan);
+    font-weight: 700;
+  }}
+
   /* Photoshop-checkerboard + live active-colorscale gradient slider with crossover knob */
   #slider-color-emphasis {{
     -webkit-appearance: none;
@@ -12820,12 +13019,13 @@ def render_rainbow_html(
               </div>
               <button id="btn-wulff-scope" type="button" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
               <button id="btn-wulff-friedel" type="button" class="active-btn" title="Show antipodal Friedel mates (-h,-k,-l) on the Wulff sphere (fills the θ vs 2θ hemisphere; violet symmetry links vs gold proper rotations)">±Friedel</button>
-              <select id="sel-wulff-color" title="Color reflections on Wulff Net &amp; Detector by Wavelength, ASU Orbit, I/σ, post-merge |F_obs|², normalized .mtz |F_calc|², post-merge I_pred/σ, or Careless Merge Residual/Scale">
+              <select id="sel-wulff-color" title="Color reflections on Wulff Net &amp; Detector by Wavelength, ASU Orbit, I/σ, post-merge |F_obs|², normalized .mtz |F_calc|², ΔI (F−F₀) contrast, post-merge I_pred/σ, or Careless Merge Residual/Scale">
                 <option value="wavelength">Color: λ/Zone</option>
                 <option value="orbit">Color: ASU Orbit</option>
                 <option value="isigi">Color: I/σ</option>
                 <option value="fobs">Color: |F_obs|²</option>
                 <option value="mtz_fcalc">Color: |F_calc|²</option>
+                <option value="mtz_delta_i">Color: ΔI (F−F₀)</option>
                 <option value="ipred_isigi">Color: I_pred/σ</option>
                 <option value="residual">Color: ΔI/σ Residual</option>
                 <option value="scale">Color: Scale</option>
@@ -12879,12 +13079,13 @@ def render_rainbow_html(
 
           <div class="slider-row" style="margin-top:2px;">
             <span>Spot Color</span>
-            <select id="sel-spot-color" title="Color reflections on Detector &amp; Wulff Net by Wavelength, ASU Orbit, I/σ, post-merge |F_obs|², normalized .mtz |F_calc|², post-merge I_pred/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
+            <select id="sel-spot-color" title="Color reflections on Detector &amp; Wulff Net by Wavelength, ASU Orbit, I/σ, post-merge |F_obs|², normalized .mtz |F_calc|², ΔI (F−F₀) contrast, post-merge I_pred/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
               <option value="wavelength">Color: λ/Zone</option>
               <option value="orbit">Color: ASU Orbit</option>
               <option value="isigi">Color: I/σ</option>
               <option value="fobs">Color: |F_obs|²</option>
               <option value="mtz_fcalc">Color: |F_calc|²</option>
+              <option value="mtz_delta_i">Color: ΔI (F−F₀)</option>
               <option value="ipred_isigi">Color: I_pred/σ</option>
               <option value="residual">Color: ΔI/σ Residual</option>
               <option value="scale">Color: Scale</option>
@@ -12892,10 +13093,13 @@ def render_rainbow_html(
           </div>
 
           <div class="slider-row" id="colorscale-slider-row">
-            <span id="lbl-colorscale-title">Colorscale Crossover</span>
-            <span id="lbl-color-emphasis" style="white-space:nowrap;">-3.0 · 3.0 · 20.0</span>
+            <span style="display:inline-flex;align-items:center;gap:4px;">
+              <span id="lbl-colorscale-title">Colorscale</span>
+              <button id="btn-colorscale-fullrange" type="button" class="cs-range-pill" title="Toggle colorbar endpoints between outlier-clipped (P1.5–98.5 / ±5σ) and full 0%–100% min/max range (no clipping)">P1.5–98.5</button>
+            </span>
+            <span id="lbl-color-emphasis" style="white-space:nowrap;cursor:pointer;" title="Click to toggle P1.5–98.5 vs 0%–100% full colorbar range">-3.0 · 3.0 · 20.0</span>
           </div>
-          <input type="range" id="slider-color-emphasis" min="0.05" max="0.95" step="0.01" value="0.38" title="Drag knob to tune colorscale contrast / midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
+          <input type="range" id="slider-color-emphasis" min="0.01" max="0.99" step="0.01" value="0.38" title="Drag knob across [1%, 99%] to tune colorscale contrast / midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
 
           <div class="controls-section-divider" role="separator" aria-hidden="true"></div>
 
@@ -13433,6 +13637,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     mtzExactLookup: null,
     mtzFAsuLookup: null,
     mtzFExactLookup: null,
+    refMtzIAsuLookup: null,
+    refMtzIExactLookup: null,
     carelessIAsuLookup: null,
     carelessFAsuLookup: null,
     minIntegD: Infinity,
@@ -13527,6 +13733,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const prevEx = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzExactLookup : null;
     const prevFAsu = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzFAsuLookup : null;
     const prevFEx = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzFExactLookup : null;
+    const prevRefIAsu = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.refMtzIAsuLookup : null;
+    const prevRefIEx = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.refMtzIExactLookup : null;
     const prevCiAsu = isFrameOnly ? _baselineMeasCache.carelessIAsuLookup : null;
     const prevCfAsu = isFrameOnly ? _baselineMeasCache.carelessFAsuLookup : null;
     _baselineMeasCache.byBankHkl.clear();
@@ -13540,6 +13748,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     _baselineMeasCache.mtzExactLookup = (payloadObj && payloadObj.mtz_exact_lookup) || prevEx || null;
     _baselineMeasCache.mtzFAsuLookup = (payloadObj && payloadObj.mtz_f_asu_lookup) || prevFAsu || null;
     _baselineMeasCache.mtzFExactLookup = (payloadObj && payloadObj.mtz_f_exact_lookup) || prevFEx || null;
+    _baselineMeasCache.refMtzIAsuLookup = (payloadObj && payloadObj.ref_mtz_i_asu_lookup) || prevRefIAsu || null;
+    _baselineMeasCache.refMtzIExactLookup = (payloadObj && payloadObj.ref_mtz_i_exact_lookup) || prevRefIEx || null;
     _baselineMeasCache.carelessIAsuLookup = (payloadObj && payloadObj.careless_i_asu_lookup) || prevCiAsu || null;
     _baselineMeasCache.carelessFAsuLookup = (payloadObj && payloadObj.careless_f_asu_lookup) || prevCfAsu || null;
 
@@ -15566,8 +15776,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     showWulffFriedel: true,       // plot antipodal Friedel mates (-h,-k,-l) on Wulff sphere with distinct link color
     wulffFrame: "sample",         // always project in Sample frame (coupled via goniometer R)
     wulffCoupled: true,           // 360° periodic detector pan <-> Wulff yaw always coupled
-    wulffColorMode: initColorMode, // "wavelength" | "orbit" | "isigi" | "fobs" | "mtz_fcalc" | "ipred_isigi" | "residual" | "scale"
-    colorCrossover: 0.38,         // 0.05 (boost all/weak peaks) .. 0.38 (default log crossover) .. 0.95 (strong peaks only)
+    wulffColorMode: initColorMode, // "wavelength" | "orbit" | "isigi" | "fobs" | "mtz_fcalc" | "mtz_delta_i" | "ipred_isigi" | "residual" | "scale"
+    colorCrossover: 0.38,         // 0.01 (boost weak/small diffs) .. 0.38 (default) .. 0.99 (extreme tail)
+    colorFullRange: false,        // false: robust P1.5–98.5 (±5σ) | true: full 0%–100% min/max extrema
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
@@ -17637,7 +17848,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   function getColorCrossover() {{
     const raw = Number(state.colorCrossover);
-    return Number.isFinite(raw) ? Math.max(0.05, Math.min(0.95, raw)) : DEFAULT_COLOR_CROSSOVER;
+    return Number.isFinite(raw) ? Math.max(0.01, Math.min(0.99, raw)) : DEFAULT_COLOR_CROSSOVER;
   }}
 
   // Monotone power crossover curve t(u) = u^(ln(0.5)/ln(c)):
@@ -17909,7 +18120,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   let _mtzCarelessAlignCache = {{ sig: "", kI: 1.0 }};
   function getMtzToCarelessIScaleFactor() {{
-    if (!DATA || DATA.mtz_scale_basis === "careless_shared_q75") return 1.0;
+    if (!DATA || DATA.mtz_scale_basis === "careless_shared_q75" || DATA.mtz_is_signed_i) return 1.0;
     const ciLu = _baselineMeasCache.carelessIAsuLookup || DATA.careless_i_asu_lookup;
     const cfLu = _baselineMeasCache.carelessFAsuLookup || DATA.careless_f_asu_lookup;
     const mfLu = _baselineMeasCache.mtzFAsuLookup || DATA.mtz_f_asu_lookup;
@@ -18006,8 +18217,55 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     return NaN;
   }}
 
+  function peakMtzRefEntry(p) {{
+    if (!p || !hasExternalMtzOverlay()) return null;
+    const bm = typeof _baselineMeasCache !== "undefined" ? _baselineMeasCache : null;
+    const refEx = (bm && bm.refMtzIExactLookup) || (DATA && DATA.ref_mtz_i_exact_lookup) || null;
+    const refAsu = (bm && bm.refMtzIAsuLookup) || (DATA && DATA.ref_mtz_i_asu_lookup) || null;
+    if (!refEx && !refAsu) return null;
+    if (refEx && Array.isArray(p.hkl) && p.hkl.length === 3) {{
+      const hkStr = `${{p.hkl[0]}},${{p.hkl[1]}},${{p.hkl[2]}}`;
+      if (Array.isArray(refEx[hkStr]) && refEx[hkStr].length >= 2) return refEx[hkStr];
+    }}
+    if (refAsu) {{
+      const orbKey = (typeof p.asu_orbit_id === "string" && p.asu_orbit_id)
+        ? p.asu_orbit_id
+        : (Array.isArray(p.asu_hkl) && p.asu_hkl.length === 3 ? `${{p.asu_hkl[0]}},${{p.asu_hkl[1]}},${{p.asu_hkl[2]}}` : "");
+      if (orbKey && Array.isArray(refAsu[orbKey]) && refAsu[orbKey].length >= 2) return refAsu[orbKey];
+    }}
+    return null;
+  }}
+
+  function peakMtzRefFcalcSq(p) {{
+    const ent = peakMtzRefEntry(p);
+    if (!ent) return NaN;
+    const vNorm = Number(ent[1]);
+    if (!Number.isFinite(vNorm)) return NaN;
+    return vNorm * getMtzToCarelessIScaleFactor();
+  }}
+
+  function peakMtzDeltaI(p) {{
+    const curV = peakMtzFcalcSq(p);
+    if (!Number.isFinite(curV)) return NaN;
+    const refV = peakMtzRefFcalcSq(p);
+    if (!Number.isFinite(refV)) return NaN;
+    return curV - refV;
+  }}
+
+  function peakMtzRawDeltaI(p) {{
+    if (!p) return NaN;
+    const ent = peakMtzRefEntry(p);
+    if (!ent) return NaN;
+    const rawRef = Number(ent[0]);
+    if (!Number.isFinite(rawRef)) return NaN;
+    if (typeof p.mtz_i === "number" && Number.isFinite(p.mtz_i)) {{
+      return p.mtz_i - rawRef;
+    }}
+    return NaN;
+  }}
+
   function isMtzColorMode(mode) {{
-    return mode === "mtz_fcalc" || mode === "ipred_isigi";
+    return mode === "mtz_fcalc" || mode === "mtz_delta_i" || mode === "ipred_isigi";
   }}
 
   function isQuantileSnrColorMode(mode) {{
@@ -18015,11 +18273,14 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       mode === "isigi" ||
       mode === "fobs" ||
       mode === "mtz_fcalc" ||
+      mode === "mtz_delta_i" ||
       mode === "ipred_isigi"
     );
   }}
 
-  function computeQuantileScaleBounds(rawVals, defLo = -3.0, defMid = 3.0, defHi = 20.0) {{
+  function computeQuantileScaleBounds(rawVals, defLo = -3.0, defMid = 3.0, defHi = 20.0, opts = null) {{
+    const fullRange = Boolean(opts && opts.fullRange);
+    const zeroCentered = Boolean(opts && opts.zeroCentered);
     if (!Array.isArray(rawVals) || rawVals.length === 0) {{
       return {{
         min: defLo,
@@ -18038,22 +18299,71 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const next = sorted[Math.min(sorted.length - 1, base + 1)];
       return sorted[base] + rest * (next - sorted[base]);
     }};
+    const trueMin = (opts && typeof opts.exactMin === "number" && Number.isFinite(opts.exactMin))
+      ? Math.min(opts.exactMin, sorted[0])
+      : sorted[0];
+    const trueMax = (opts && typeof opts.exactMax === "number" && Number.isFinite(opts.exactMax))
+      ? Math.max(opts.exactMax, sorted[sorted.length - 1])
+      : sorted[sorted.length - 1];
+
+    if (zeroCentered) {{
+      const absSorted = sorted.map((v) => Math.abs(v)).sort((a, b) => a - b);
+      const qAbsAt = (q) => {{
+        if (absSorted.length === 1) return absSorted[0];
+        const pos = Math.max(0.0, Math.min(1.0, q)) * (absSorted.length - 1);
+        const base = Math.floor(pos);
+        const rest = pos - base;
+        const next = absSorted[Math.min(absSorted.length - 1, base + 1)];
+        return absSorted[base] + rest * (next - absSorted[base]);
+      }};
+      const absMed = qAbsAt(0.5);
+      let maxAbs;
+      if (fullRange) {{
+        maxAbs = Math.max(Math.abs(trueMin), Math.abs(trueMax));
+      }} else {{
+        maxAbs = absSorted.length >= 20 ? qAbsAt(0.985) : absSorted[absSorted.length - 1];
+        if (absSorted.length >= 4) {{
+          const sigmaAbs = 1.4826 * absMed;
+          const q75Abs = qAbsAt(0.75);
+          const spreadAbs = Math.max(sigmaAbs, q75Abs / 1.15);
+          if (spreadAbs > 1e-6) {{
+            maxAbs = Math.min(maxAbs, 5.5 * spreadAbs);
+          }}
+        }}
+      }}
+      if (!(maxAbs > 1e-6)) maxAbs = 1.0;
+      const qBulk = Math.max(0.05 * maxAbs, Math.min(0.95 * maxAbs, absMed > 1e-9 ? absMed : 0.25 * maxAbs));
+      return {{
+        min: -maxAbs,
+        q25: -qBulk,
+        median: 0.0,
+        q75: qBulk,
+        max: maxAbs,
+      }};
+    }}
+
     const med = qAt(0.5);
     const q25Raw = qAt(0.25);
     const q75Raw = qAt(0.75);
-    let lo = sorted.length >= 20 ? qAt(0.015) : sorted[0];
-    let hi = sorted.length >= 20 ? qAt(0.985) : sorted[sorted.length - 1];
-    if (sorted.length >= 4) {{
-      const iqr = Math.max(0.0, q75Raw - q25Raw);
-      const absDevs = sorted.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
-      const mPos = 0.5 * (absDevs.length - 1);
-      const mBase = Math.floor(mPos);
-      const mad = absDevs[mBase] + (mPos - mBase) * (absDevs[Math.min(absDevs.length - 1, mBase + 1)] - absDevs[mBase]);
-      const sigmaMad = 1.4826 * mad;
-      const spread = Math.max(sigmaMad, iqr / 1.349);
-      if (spread > 1e-6) {{
-        lo = Math.max(lo, med - 5.0 * spread);
-        hi = Math.min(hi, med + 5.0 * spread);
+    let lo, hi;
+    if (fullRange) {{
+      lo = trueMin;
+      hi = trueMax;
+    }} else {{
+      lo = sorted.length >= 20 ? qAt(0.015) : sorted[0];
+      hi = sorted.length >= 20 ? qAt(0.985) : sorted[sorted.length - 1];
+      if (sorted.length >= 4) {{
+        const iqr = Math.max(0.0, q75Raw - q25Raw);
+        const absDevs = sorted.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+        const mPos = 0.5 * (absDevs.length - 1);
+        const mBase = Math.floor(mPos);
+        const mad = absDevs[mBase] + (mPos - mBase) * (absDevs[Math.min(absDevs.length - 1, mBase + 1)] - absDevs[mBase]);
+        const sigmaMad = 1.4826 * mad;
+        const spread = Math.max(sigmaMad, iqr / 1.349);
+        if (spread > 1e-6) {{
+          lo = Math.max(lo, med - 5.0 * spread);
+          hi = Math.min(hi, med + 5.0 * spread);
+        }}
       }}
     }}
     let minV = Math.min(lo, med);
@@ -18061,9 +18371,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     if (maxV - minV < 1e-6) {{
       minV = med - 1.0;
       maxV = med + 1.0;
-    }} else if (med - minV < 1e-6) {{
+    }} else if (!fullRange && med - minV < 1e-6) {{
       minV = med - Math.max(1.0, 0.25 * (maxV - med));
-    }} else if (maxV - med < 1e-6) {{
+    }} else if (!fullRange && maxV - med < 1e-6) {{
       maxV = med + Math.max(1.0, 0.25 * (med - minV));
     }}
     const negSpan = Math.max(1e-6, med - minV);
@@ -18089,17 +18399,24 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const rs0 = s0 && typeof s0.careless_residual === "number" && Number.isFinite(s0.careless_residual) ? s0.careless_residual.toFixed(3) : "";
     const evalFobsSq = typeof peakFobsSqRaw === "function" ? peakFobsSqRaw : (() => NaN);
     const evalMtzFcalc = typeof peakMtzFcalcSq === "function" ? peakMtzFcalcSq : (() => NaN);
+    const evalMtzDeltaI = typeof peakMtzDeltaI === "function" ? peakMtzDeltaI : (() => NaN);
     const evalIpredIsigi = typeof peakIpredIsigi === "function" ? peakIpredIsigi : (() => NaN);
     const evalCarelessMerged = typeof hasCarelessMergedState === "function" ? hasCarelessMergedState : (() => false);
     const evalExternalMtz = typeof hasExternalMtzOverlay === "function" ? hasExternalMtzOverlay : (() => false);
     const i0 = p0 && Number.isFinite(peakUnscaledIsigi(p0)) ? peakUnscaledIsigi(p0).toFixed(3) : "";
     const m0 = p0 && Number.isFinite(peakMtzIsigi(p0)) ? peakMtzIsigi(p0).toFixed(3) : "";
     const mf0 = p0 && Number.isFinite(evalMtzFcalc(p0)) ? evalMtzFcalc(p0).toFixed(3) : "";
+    const md0 = p0 && Number.isFinite(evalMtzDeltaI(p0)) ? evalMtzDeltaI(p0).toFixed(4) : "";
     const fo0 = p0 && Number.isFinite(evalFobsSq(p0)) ? evalFobsSq(p0).toFixed(3) : "";
     const dSig = `${{Number(state.dMin || 0).toFixed(3)}},${{Number(state.lamMin || 0).toFixed(3)}},${{Number(state.lamMax || 0).toFixed(3)}}`;
     const mergedFlag = evalCarelessMerged() ? "1" : "0";
     const extMtzFlag = evalExternalMtz() ? "1" : "0";
-    const sig = `${{dynEp}}|${{dSig}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{mergedFlag}}|${{extMtzFlag}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}|${{i0}}|${{m0}}|${{mf0}}|${{fo0}}`;
+    const fullRangeFlag = state.colorFullRange ? "1" : "0";
+    const signedMtzFlag = DATA && DATA.mtz_is_signed_i ? "1" : "0";
+    const bmCache = typeof _baselineMeasCache !== "undefined" ? _baselineMeasCache : null;
+    const refLuObj = (bmCache && bmCache.refMtzIAsuLookup) || (DATA && DATA.ref_mtz_i_asu_lookup) || null;
+    const hasRefLuFlag = refLuObj ? "1" : "0";
+    const sig = `${{dynEp}}|${{dSig}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{DATA.ref_mtz_overlay_name || ""}}|${{hasRefLuFlag}}|${{signedMtzFlag}}|${{fullRangeFlag}}|${{mergedFlag}}|${{extMtzFlag}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}|${{i0}}|${{m0}}|${{mf0}}|${{md0}}|${{fo0}}`;
     if (
       _peakDataAvailabilitySig === sig &&
       _peakDataAvailability._p0 === p0 &&
@@ -18107,19 +18424,46 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     ) {{
       return _peakDataAvailability;
     }}
-    let hasIsigi = false, hasRawFobs = false, hasMtz = false, hasMtzFcalc = false, hasIpred = false, hasRes = false, hasScl = false;
-    const peaksIsigiSamples = [], allPeaksIsigiSamples = [];
-    const sampleIsigiSamples = [], allSampleIsigiSamples = [];
-    const peaksFobsSamples = [], allPeaksFobsSamples = [];
-    const sampleFobsSamples = [], allSampleFobsSamples = [];
-    const peaksMtzSamples = [], allPeaksMtzSamples = [];
-    const sampleMtzSamples = [], allSampleMtzSamples = [];
-    const peaksMtzFcalcSamples = [], allPeaksMtzFcalcSamples = [];
-    const sampleMtzFcalcSamples = [], allSampleMtzFcalcSamples = [];
-    const peaksIpredSamples = [], allPeaksIpredSamples = [];
-    const sampleIpredSamples = [], allSampleIpredSamples = [];
-    const peaksResSamples = [], allPeaksResSamples = [];
-    const sampleResSamples = [], allSampleResSamples = [];
+    let hasIsigi = false, hasRawFobs = false, hasMtz = false, hasMtzFcalc = false, hasMtzDelta = false, hasIpred = false, hasRes = false, hasScl = false;
+    const mkTracker = () => ({{
+      visPeaks: [], allPeaks: [], visSample: [], allSample: [],
+      visPeaksMin: Infinity, visPeaksMax: -Infinity,
+      allPeaksMin: Infinity, allPeaksMax: -Infinity,
+      visSampleMin: Infinity, visSampleMax: -Infinity,
+      allSampleMin: Infinity, allSampleMax: -Infinity,
+    }});
+    const recVal = (tr, val, isSamplePool, vis, takeSample) => {{
+      if (isSamplePool) {{
+        if (val < tr.allSampleMin) tr.allSampleMin = val;
+        if (val > tr.allSampleMax) tr.allSampleMax = val;
+        if (vis) {{
+          if (val < tr.visSampleMin) tr.visSampleMin = val;
+          if (val > tr.visSampleMax) tr.visSampleMax = val;
+        }}
+        if (takeSample) {{
+          tr.allSample.push(val);
+          if (vis) tr.visSample.push(val);
+        }}
+      }} else {{
+        if (val < tr.allPeaksMin) tr.allPeaksMin = val;
+        if (val > tr.allPeaksMax) tr.allPeaksMax = val;
+        if (vis) {{
+          if (val < tr.visPeaksMin) tr.visPeaksMin = val;
+          if (val > tr.visPeaksMax) tr.visPeaksMax = val;
+        }}
+        if (takeSample) {{
+          tr.allPeaks.push(val);
+          if (vis) tr.visPeaks.push(val);
+        }}
+      }}
+    }};
+    const trIsigi = mkTracker();
+    const trFobs = mkTracker();
+    const trMtz = mkTracker();
+    const trMtzFcalc = mkTracker();
+    const trMtzDelta = mkTracker();
+    const trIpred = mkTracker();
+    const trRes = mkTracker();
     const scanArr = (arr, isSamplePool) => {{
       if (!Array.isArray(arr)) return;
       const sampleStep = arr.length > 16384 ? Math.ceil(arr.length / 16384) : 1;
@@ -18127,82 +18471,40 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         const p = arr[i];
         if (!p) continue;
         const vis = typeof isPeakVisible === "function" ? isPeakVisible(p) : true;
+        const take = (i % sampleStep === 0);
         const iv = peakUnscaledIsigi(p);
         if (Number.isFinite(iv)) {{
           hasIsigi = true;
-          if (i % sampleStep === 0) {{
-            if (isSamplePool) {{
-              allSampleIsigiSamples.push(iv);
-              if (vis) sampleIsigiSamples.push(iv);
-            }} else {{
-              allPeaksIsigiSamples.push(iv);
-              if (vis) peaksIsigiSamples.push(iv);
-            }}
-          }}
+          recVal(trIsigi, iv, isSamplePool, vis, take);
         }}
         const fov = evalFobsSq(p);
         if (Number.isFinite(fov)) {{
           hasRawFobs = true;
-          if (i % sampleStep === 0) {{
-            if (isSamplePool) {{
-              allSampleFobsSamples.push(fov);
-              if (vis) sampleFobsSamples.push(fov);
-            }} else {{
-              allPeaksFobsSamples.push(fov);
-              if (vis) peaksFobsSamples.push(fov);
-            }}
-          }}
+          recVal(trFobs, fov, isSamplePool, vis, take);
         }}
         const mv = peakMtzIsigi(p);
         if (Number.isFinite(mv)) {{
           hasMtz = true;
-          if (i % sampleStep === 0) {{
-            if (isSamplePool) {{
-              allSampleMtzSamples.push(mv);
-              if (vis) sampleMtzSamples.push(mv);
-            }} else {{
-              allPeaksMtzSamples.push(mv);
-              if (vis) peaksMtzSamples.push(mv);
-            }}
-          }}
+          recVal(trMtz, mv, isSamplePool, vis, take);
         }}
         const mfv = evalMtzFcalc(p);
         if (Number.isFinite(mfv)) {{
           hasMtzFcalc = true;
-          if (i % sampleStep === 0) {{
-            if (isSamplePool) {{
-              allSampleMtzFcalcSamples.push(mfv);
-              if (vis) sampleMtzFcalcSamples.push(mfv);
-            }} else {{
-              allPeaksMtzFcalcSamples.push(mfv);
-              if (vis) peaksMtzFcalcSamples.push(mfv);
-            }}
-          }}
+          recVal(trMtzFcalc, mfv, isSamplePool, vis, take);
+        }}
+        const mdv = evalMtzDeltaI(p);
+        if (Number.isFinite(mdv)) {{
+          hasMtzDelta = true;
+          recVal(trMtzDelta, mdv, isSamplePool, vis, take);
         }}
         const ipv = evalIpredIsigi(p);
         if (Number.isFinite(ipv)) {{
           hasIpred = true;
-          if (i % sampleStep === 0) {{
-            if (isSamplePool) {{
-              allSampleIpredSamples.push(ipv);
-              if (vis) sampleIpredSamples.push(ipv);
-            }} else {{
-              allPeaksIpredSamples.push(ipv);
-              if (vis) peaksIpredSamples.push(ipv);
-            }}
-          }}
+          recVal(trIpred, ipv, isSamplePool, vis, take);
         }}
         if (typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)) {{
           hasRes = true;
-          if (i % sampleStep === 0) {{
-            if (isSamplePool) {{
-              allSampleResSamples.push(p.careless_residual);
-              if (vis) sampleResSamples.push(p.careless_residual);
-            }} else {{
-              allPeaksResSamples.push(p.careless_residual);
-              if (vis) peaksResSamples.push(p.careless_residual);
-            }}
-          }}
+          recVal(trRes, p.careless_residual, isSamplePool, vis, take);
         }}
         if (!hasScl && typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale)) hasScl = true;
       }}
@@ -18212,6 +18514,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const isPostMerge = evalCarelessMerged() || hasRes || hasScl;
     const hasFobs = Boolean(isPostMerge && hasRawFobs);
     const hasIpredIsigiFlag = Boolean(isPostMerge && evalExternalMtz() && hasIpred);
+    const fullRange = Boolean(state.colorFullRange);
     const quantileSorted = (sorted, q) => {{
       if (sorted.length === 0) return NaN;
       if (sorted.length === 1) return sorted[0];
@@ -18221,23 +18524,49 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const next = sorted[Math.min(sorted.length - 1, base + 1)];
       return sorted[base] + rest * (next - sorted[base]);
     }};
+    const pickTracker = (tr, preferFrame20 = false) => {{
+      if (preferFrame20) {{
+        if (tr.visPeaks.length >= 20) return {{ vals: tr.visPeaks, min: tr.visPeaksMin, max: tr.visPeaksMax }};
+        if (tr.visSample.length > tr.visPeaks.length) return {{ vals: tr.visSample, min: tr.visSampleMin, max: tr.visSampleMax }};
+        if (tr.visPeaks.length > 0) return {{ vals: tr.visPeaks, min: tr.visPeaksMin, max: tr.visPeaksMax }};
+        if (tr.allPeaks.length >= 20) return {{ vals: tr.allPeaks, min: tr.allPeaksMin, max: tr.allPeaksMax }};
+        if (tr.allSample.length > tr.allPeaks.length) return {{ vals: tr.allSample, min: tr.allSampleMin, max: tr.allSampleMax }};
+        return {{ vals: tr.allPeaks, min: tr.allPeaksMin, max: tr.allPeaksMax }};
+      }}
+      if (tr.visSample.length >= tr.visPeaks.length && tr.visSample.length > 0) {{
+        return {{ vals: tr.visSample, min: tr.visSampleMin, max: tr.visSampleMax }};
+      }}
+      if (tr.visPeaks.length > 0) {{
+        return {{ vals: tr.visPeaks, min: tr.visPeaksMin, max: tr.visPeaksMax }};
+      }}
+      if (tr.allSample.length >= tr.allPeaks.length && tr.allSample.length > 0) {{
+        return {{ vals: tr.allSample, min: tr.allSampleMin, max: tr.allSampleMax }};
+      }}
+      return {{ vals: tr.allPeaks, min: tr.allPeaksMin, max: tr.allPeaksMax }};
+    }};
+
     let resMin = -3.0, resMax = 3.0, resMedian = 0.0;
-    const visResVals = sampleResSamples.length > 0 ? sampleResSamples : peaksResSamples;
-    const fallbackResVals = allSampleResSamples.length > 0 ? allSampleResSamples : allPeaksResSamples;
-    const resVals = visResVals.length > 0 ? visResVals : fallbackResVals;
+    const resPick = pickTracker(trRes, false);
+    const resVals = resPick.vals.slice();
     if (hasRes && resVals.length > 0) {{
       resVals.sort((a, b) => a - b);
       resMedian = quantileSorted(resVals, 0.5);
-      let lo = resVals.length >= 20 ? quantileSorted(resVals, 0.015) : resVals[0];
-      let hi = resVals.length >= 20 ? quantileSorted(resVals, 0.985) : resVals[resVals.length - 1];
-      if (resVals.length >= 4) {{
-        const iqr = Math.max(0.0, quantileSorted(resVals, 0.75) - quantileSorted(resVals, 0.25));
-        const absDevs = resVals.map((v) => Math.abs(v - resMedian)).sort((a, b) => a - b);
-        const sigmaMad = 1.4826 * quantileSorted(absDevs, 0.5);
-        const spread = Math.max(sigmaMad, iqr / 1.349);
-        if (spread > 1e-6) {{
-          lo = Math.max(lo, resMedian - 5.0 * spread);
-          hi = Math.min(hi, resMedian + 5.0 * spread);
+      let lo, hi;
+      if (fullRange) {{
+        lo = Number.isFinite(resPick.min) ? Math.min(resPick.min, resVals[0]) : resVals[0];
+        hi = Number.isFinite(resPick.max) ? Math.max(resPick.max, resVals[resVals.length - 1]) : resVals[resVals.length - 1];
+      }} else {{
+        lo = resVals.length >= 20 ? quantileSorted(resVals, 0.015) : resVals[0];
+        hi = resVals.length >= 20 ? quantileSorted(resVals, 0.985) : resVals[resVals.length - 1];
+        if (resVals.length >= 4) {{
+          const iqr = Math.max(0.0, quantileSorted(resVals, 0.75) - quantileSorted(resVals, 0.25));
+          const absDevs = resVals.map((v) => Math.abs(v - resMedian)).sort((a, b) => a - b);
+          const sigmaMad = 1.4826 * quantileSorted(absDevs, 0.5);
+          const spread = Math.max(sigmaMad, iqr / 1.349);
+          if (spread > 1e-6) {{
+            lo = Math.max(lo, resMedian - 5.0 * spread);
+            hi = Math.min(hi, resMedian + 5.0 * spread);
+          }}
         }}
       }}
       resMin = Math.min(lo, resMedian);
@@ -18247,39 +18576,56 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         resMax = resMedian + 1.0;
       }}
     }}
-    // Prefer visible active-frame PEAKS for I/σ when >=20 visible peaks exist, else visible SAMPLE_PEAKS, else unfiltered
-    const visIsigiVals = peaksIsigiSamples.length >= 20
-      ? peaksIsigiSamples
-      : (sampleIsigiSamples.length > peaksIsigiSamples.length ? sampleIsigiSamples : peaksIsigiSamples);
-    const fallbackIsigiVals = allPeaksIsigiSamples.length >= 20
-      ? allPeaksIsigiSamples
-      : (allSampleIsigiSamples.length > allPeaksIsigiSamples.length ? allSampleIsigiSamples : allPeaksIsigiSamples);
-    const isigiVals = visIsigiVals.length > 0 ? visIsigiVals : fallbackIsigiVals;
-    const visMtzVals = sampleMtzSamples.length >= peaksMtzSamples.length && sampleMtzSamples.length > 0
-      ? sampleMtzSamples
-      : peaksMtzSamples;
-    const fallbackMtzVals = allSampleMtzSamples.length >= allPeaksMtzSamples.length && allSampleMtzSamples.length > 0
-      ? allSampleMtzSamples
-      : allPeaksMtzSamples;
-    const mtzVals = visMtzVals.length > 0 ? visMtzVals : fallbackMtzVals;
-    const pickPool = (sampVis, pkVis, sampAll, pkAll) => {{
-      const vis = sampVis.length >= pkVis.length && sampVis.length > 0 ? sampVis : pkVis;
-      if (vis.length > 0) return vis;
-      return sampAll.length >= pkAll.length && sampAll.length > 0 ? sampAll : pkAll;
-    }};
-    const fobsVals = pickPool(sampleFobsSamples, peaksFobsSamples, allSampleFobsSamples, allPeaksFobsSamples);
-    const mtzFcalcVals = pickPool(sampleMtzFcalcSamples, peaksMtzFcalcSamples, allSampleMtzFcalcSamples, allPeaksMtzFcalcSamples);
-    const ipredVals = pickPool(sampleIpredSamples, peaksIpredSamples, allSampleIpredSamples, allPeaksIpredSamples);
-    const isigiBounds = computeQuantileScaleBounds(isigiVals, -3.0, 3.0, 20.0);
-    const rawFobsBounds = computeQuantileScaleBounds(fobsVals, 0.0, 1.0, 8.0);
-    const rawMtzFcalcBounds = computeQuantileScaleBounds(mtzFcalcVals, 0.0, 1.0, 8.0);
-    const rawIpredBounds = computeQuantileScaleBounds(ipredVals, 0.0, 3.0, 20.0);
-    // Lock paired colorscales onto identical bounds whenever both sides exist so
-    // toggling |F_obs|² <-> |F_calc|² and I/σ <-> I_pred/σ compares 1-to-1!
+
+    const isigiPick = pickTracker(trIsigi, true);
+    const mtzPick = pickTracker(trMtz, false);
+    const fobsPick = pickTracker(trFobs, false);
+    const mtzFcalcPick = pickTracker(trMtzFcalc, false);
+    const mtzDeltaPick = pickTracker(trMtzDelta, false);
+    const ipredPick = pickTracker(trIpred, false);
+
+    const isSignedMtz = Boolean(
+      (DATA && DATA.mtz_is_signed_i) ||
+      (Number.isFinite(mtzFcalcPick.min) && mtzFcalcPick.min < -1e-6)
+    );
+    const isigiBounds = computeQuantileScaleBounds(isigiPick.vals, -3.0, 3.0, 20.0, {{
+      fullRange, exactMin: isigiPick.min, exactMax: isigiPick.max,
+    }});
+    const rawFobsBounds = computeQuantileScaleBounds(fobsPick.vals, 0.0, 1.0, 8.0, {{
+      fullRange, exactMin: fobsPick.min, exactMax: fobsPick.max,
+    }});
+    const rawMtzFcalcBounds = computeQuantileScaleBounds(
+      mtzFcalcPick.vals,
+      isSignedMtz ? -4.0 : 0.0,
+      isSignedMtz ? 0.0 : 1.0,
+      isSignedMtz ? 4.0 : 8.0,
+      {{
+        fullRange,
+        zeroCentered: isSignedMtz,
+        exactMin: mtzFcalcPick.min,
+        exactMax: mtzFcalcPick.max,
+      }}
+    );
+    const mtzDeltaIBounds = computeQuantileScaleBounds(mtzDeltaPick.vals, -1.0, 0.0, 1.0, {{
+      fullRange,
+      zeroCentered: true,
+      exactMin: mtzDeltaPick.min,
+      exactMax: mtzDeltaPick.max,
+    }});
+    const rawIpredBounds = computeQuantileScaleBounds(ipredPick.vals, 0.0, 3.0, 20.0, {{
+      fullRange, exactMin: ipredPick.min, exactMax: ipredPick.max,
+    }});
+    // Lock paired colorscales onto identical bounds ONLY for non-negative |F_calc|² vs |F_obs|²
     const fobsBounds = rawFobsBounds;
-    const mtzFcalcBounds = (hasFobs && fobsVals.length > 0) ? rawFobsBounds : rawMtzFcalcBounds;
-    const ipredIsigiBounds = (hasIsigi && isigiVals.length > 0) ? isigiBounds : rawIpredBounds;
-    const mtzIsigiBounds = computeQuantileScaleBounds(mtzVals, -3.0, 3.0, 20.0);
+    const mtzFcalcBounds = (!isSignedMtz && hasFobs && fobsPick.vals.length > 0)
+      ? rawFobsBounds
+      : rawMtzFcalcBounds;
+    const ipredIsigiBounds = (!isSignedMtz && hasIsigi && isigiPick.vals.length > 0)
+      ? isigiBounds
+      : rawIpredBounds;
+    const mtzIsigiBounds = computeQuantileScaleBounds(mtzPick.vals, -3.0, 3.0, 20.0, {{
+      fullRange, exactMin: mtzPick.min, exactMax: mtzPick.max,
+    }});
     _peakDataAvailabilitySig = sig;
     _peakDataAvailability = {{
       _p0: p0,
@@ -18288,6 +18634,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       hasFobsSq: hasFobs,
       hasMtzIsigi: hasMtz,
       hasMtzFcalcSq: hasMtzFcalc,
+      hasMtzDeltaI: hasMtzDelta,
+      isSignedMtz,
       hasIpredIsigi: hasIpredIsigiFlag,
       hasResiduals: hasRes,
       hasScales: hasScl,
@@ -18310,6 +18658,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       mtzIsigiMax: mtzIsigiBounds.max,
       mtzIsigiBounds,
       mtzFcalcBounds,
+      mtzDeltaIBounds,
       ipredIsigiBounds,
       resMin,
       resMax,
@@ -18348,6 +18697,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const av = getPeakDataAvailability();
       if (state.wulffColorMode === "fobs") b = av.fobsBounds;
       else if (state.wulffColorMode === "mtz_fcalc") b = av.mtzFcalcBounds;
+      else if (state.wulffColorMode === "mtz_delta_i") b = av.mtzDeltaIBounds;
       else if (state.wulffColorMode === "ipred_isigi") b = av.ipredIsigiBounds;
       else b = av.isigiBounds;
     }}
@@ -18358,7 +18708,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const q25 = Number.isFinite(b && b.q25) ? Math.max(lo, Math.min(mid, b.q25)) : 0.5 * (lo + mid);
     const q75 = Number.isFinite(b && b.q75) ? Math.max(mid, Math.min(hi, b.q75)) : 0.5 * (mid + hi);
     const c = getColorCrossover();
-    const knobGamma = (-Math.log(DEFAULT_COLOR_CROSSOVER)) / Math.max(0.05, -Math.log(c));
+    const knobGamma = (-Math.log(DEFAULT_COLOR_CROSSOVER)) / Math.max(0.01, -Math.log(c));
     const clamped = Math.max(lo, Math.min(hi, isigiVal));
     const effAlpha = Math.max(0.0, Math.min(1.0, alpha));
     let r, g, bl;
@@ -18430,11 +18780,16 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     return getPeakDataAvailability().hasMtzFcalcSq;
   }}
 
+  function hasMtzDeltaI() {{
+    return getPeakDataAvailability().hasMtzDeltaI;
+  }}
+
   function hasIpredIsigi() {{
     return getPeakDataAvailability().hasIpredIsigi;
   }}
 
   function preferredFallbackColorMode() {{
+    if (hasMtzDeltaI() && DATA && DATA.mtz_is_signed_i) return "mtz_delta_i";
     if (hasIpredIsigi()) return "ipred_isigi";
     if (hasMtzFcalcSq()) return "mtz_fcalc";
     if (hasFobsSq()) return "fobs";
@@ -18503,6 +18858,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     if (mode === "mtz_fcalc") {{
       return isigiToColor(peakMtzFcalcSq(p), alpha, avail.mtzFcalcBounds);
     }}
+    if (mode === "mtz_delta_i") {{
+      return isigiToColor(peakMtzDeltaI(p), alpha, avail.mtzDeltaIBounds);
+    }}
     if (mode === "ipred_isigi") {{
       return isigiToColor(peakIpredIsigi(p), alpha, avail.ipredIsigiBounds);
     }}
@@ -18528,15 +18886,20 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     let label = "";
     let tooltip = "";
     const fmtCompactMetric = (v) => {{
-      const clean = Math.abs(v) < 0.05 ? 0.0 : v;
+      const absRaw = Math.abs(v);
+      const clean = absRaw < 1e-4 ? 0.0 : v;
       const absV = Math.abs(clean);
+      if (absV === 0.0) return "0.0";
       if (absV >= 1000) return `${{(clean / 1000).toFixed(1)}}k`;
       if (absV >= 100) return clean.toFixed(0);
+      if (absV < 0.2) return clean.toFixed(2);
       return clean.toFixed(1);
     }};
+    const rangeTag = state.colorFullRange ? "full 0%–100% range" : "quantile-normalized range (P1.5–98.5)";
+    const resRangeTag = state.colorFullRange ? "full 0%–100% range" : "outlier-robust range (P1.5–98.5)";
     const isQuantMode = typeof isQuantileSnrColorMode === "function"
       ? isQuantileSnrColorMode(mode)
-      : (mode === "isigi" || mode === "fobs" || mode === "mtz_fcalc" || mode === "ipred_isigi");
+      : (mode === "isigi" || mode === "fobs" || mode === "mtz_fcalc" || mode === "mtz_delta_i" || mode === "ipred_isigi");
     if (isQuantMode) {{
       const bulkFrac = 0.28;
       let b = null;
@@ -18544,6 +18907,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         b = avail.fobsBounds || {{ min: 0.0, q25: 0.5, median: 1.0, q75: 2.5, max: 8.0 }};
       }} else if (mode === "mtz_fcalc") {{
         b = avail.mtzFcalcBounds || {{ min: 0.0, q25: 0.5, median: 1.0, q75: 2.5, max: 8.0 }};
+      }} else if (mode === "mtz_delta_i") {{
+        b = avail.mtzDeltaIBounds || {{ min: -1.0, q25: -0.25, median: 0.0, q75: 0.25, max: 1.0 }};
       }} else if (mode === "ipred_isigi") {{
         b = avail.ipredIsigiBounds || {{ min: 0.0, q25: 1.0, median: 3.0, q75: 7.0, max: 20.0 }};
       }} else {{
@@ -18579,10 +18944,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const prefix = mode === "fobs"
         ? "|F_obs|²"
         : (mode === "mtz_fcalc"
-          ? "|F_calc|²"
-          : (mode === "ipred_isigi" ? "I_pred/σ (Σ·|F_calc|²/σ_obs)" : "I/σ"));
+          ? (avail.isSignedMtz ? "I_calc (signed)" : "|F_calc|²")
+          : (mode === "mtz_delta_i"
+            ? "ΔI (F−F₀)"
+            : (mode === "ipred_isigi" ? "I_pred/σ (Σ·|F_calc|²/σ_obs)" : "I/σ")));
       label = `${{fmtCompactMetric(lo)}} · ${{fmtCompactMetric(mid)}} · ${{fmtCompactMetric(hi)}}`;
-      tooltip = `${{prefix}} quantile-normalized range [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at median ${{fmtCompactMetric(mid)}} (bulk IQR [${{fmtCompactMetric(q25)}}, ${{fmtCompactMetric(q75)}}])`;
+      tooltip = `${{prefix}} ${{rangeTag}} [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at ${{fmtCompactMetric(mid)}} (bulk IQR [${{fmtCompactMetric(q25)}}, ${{fmtCompactMetric(q75)}}])`;
     }} else if (mode === "residual") {{
       const lo = Number.isFinite(avail.resMin) ? avail.resMin : -3.0;
       const hi = Number.isFinite(avail.resMax) ? avail.resMax : 3.0;
@@ -18596,7 +18963,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         stops.push(`${{residualToColor(res, 1.0, avail)}} ${{(u * 100).toFixed(1)}}%`);
       }}
       label = `${{fmtCompactMetric(lo)}} · ${{fmtCompactMetric(mid)}} · ${{fmtCompactMetric(hi)}}`;
-      tooltip = `ΔI/σ outlier-robust range [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at median ${{fmtCompactMetric(mid)}}σ`;
+      tooltip = `ΔI/σ ${{resRangeTag}} [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at median ${{fmtCompactMetric(mid)}}σ`;
     }} else if (mode === "scale") {{
       for (let k = 0; k <= N; k++) {{
         const u = k / N;
@@ -18647,7 +19014,17 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const lbl = typeof document !== "undefined" && document ? document.getElementById("lbl-color-emphasis") : null;
     if (lbl) {{
       lbl.textContent = spec.label;
-      lbl.title = spec.tooltip || "";
+      lbl.title = spec.tooltip ? `${{spec.tooltip}} — click to toggle P1.5–98.5 vs 0%–100% range` : "";
+    }}
+    const btnRange = typeof document !== "undefined" && document ? document.getElementById("btn-colorscale-fullrange") : null;
+    if (btnRange) {{
+      const isQuantOrRes = (typeof isQuantileSnrColorMode === "function" && isQuantileSnrColorMode(activeMode)) || activeMode === "residual";
+      btnRange.style.display = isQuantOrRes ? "inline-block" : "none";
+      btnRange.textContent = state.colorFullRange ? "0–100%" : "P1.5–98.5";
+      btnRange.classList.toggle("active-btn", Boolean(state.colorFullRange));
+      btnRange.title = state.colorFullRange
+        ? "Showing full 0%–100% min/max range (no outlier clipping) — click to switch to robust P1.5–98.5 (±5σ)"
+        : "Showing robust P1.5–98.5 (±5σ outlier-clipped) range — click to expand to full 0%–100% min/max extrema";
     }}
     if (typeof renderLambdaSnrCarpets === "function") {{
       renderLambdaSnrCarpets();
@@ -18666,6 +19043,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const hasIsigi = hasIntegratedIsigi();
     const hasFobs = typeof hasFobsSq === "function" ? hasFobsSq() : false;
     const hasMtzFcalc = typeof hasMtzFcalcSq === "function" ? hasMtzFcalcSq() : false;
+    const hasMtzDelta = typeof hasMtzDeltaI === "function" ? hasMtzDeltaI() : false;
     const hasIpred = typeof hasIpredIsigi === "function" ? hasIpredIsigi() : false;
     const hasRes = hasCarelessResiduals();
     const hasScl = hasCarelessScales();
@@ -18673,6 +19051,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       (state.wulffColorMode === "isigi" && !hasIsigi) ||
       (state.wulffColorMode === "fobs" && !hasFobs) ||
       (state.wulffColorMode === "mtz_fcalc" && !hasMtzFcalc) ||
+      (state.wulffColorMode === "mtz_delta_i" && !hasMtzDelta) ||
       (state.wulffColorMode === "ipred_isigi" && !hasIpred) ||
       (state.wulffColorMode === "residual" && !hasRes) ||
       (state.wulffColorMode === "scale" && !hasScl)
@@ -18717,6 +19096,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const mtzFullName = (typeof hasExternalMtzOverlay === "function" && hasExternalMtzOverlay())
       ? String(DATA.mtz_overlay_name || "")
       : "";
+    const refMtzFullName = String((DATA && DATA.ref_mtz_overlay_name) || "");
+    const isSignedMtz = Boolean(DATA && DATA.mtz_is_signed_i);
     [selColor, selSpotColor].forEach(sel => {{
       if (!sel) return;
       Array.from(sel.options).forEach(opt => {{
@@ -18731,11 +19112,20 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           opt.style.color = hasFobs ? "" : "#64748b";
         }} else if (opt.value === "mtz_fcalc") {{
           opt.disabled = !hasMtzFcalc;
-          opt.textContent = "Color: |F_calc|²";
+          opt.textContent = isSignedMtz ? "Color: I_calc (±)" : "Color: |F_calc|²";
           opt.title = mtzFullName
-            ? `Globally scaled |F_calc|² from ${{mtzFullName}} (same scale as |F_obs|²)`
-            : "Globally scaled |F_calc|² from .mtz (same scale as |F_obs|²)";
+            ? (isSignedMtz
+              ? `Zero-centered signed intensity I_calc from ${{mtzFullName}}`
+              : `Globally scaled |F_calc|² from ${{mtzFullName}} (same scale as |F_obs|²)`)
+            : "Globally scaled |F_calc|² / I_calc from .mtz";
           opt.style.color = hasMtzFcalc ? "" : "#64748b";
+        }} else if (opt.value === "mtz_delta_i") {{
+          opt.disabled = !hasMtzDelta;
+          opt.textContent = "Color: ΔI (F−F₀)";
+          opt.title = (mtzFullName && refMtzFullName)
+            ? `Shared-scale intensity difference I(${{mtzFullName}}) − I(${{refMtzFullName}}) centered at 0`
+            : "Intensity difference ΔI = I(F) − I(F₀) between primary .mtz and Ref F₀ .mtz (load Ref F₀ in 3D/Wulff bar)";
+          opt.style.color = hasMtzDelta ? "" : "#64748b";
         }} else if (opt.value === "ipred_isigi") {{
           opt.disabled = !hasIpred;
           opt.textContent = "Color: I_pred/σ";
@@ -18752,7 +19142,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         }}
       }});
       sel.value = state.wulffColorMode || "wavelength";
-      if (mtzFullName && (state.wulffColorMode === "mtz_fcalc" || state.wulffColorMode === "ipred_isigi")) {{
+      if (mtzFullName && state.wulffColorMode === "mtz_delta_i" && refMtzFullName) {{
+        sel.title = `Spot Color: ΔI (${{mtzFullName}} − ${{refMtzFullName}})`;
+      }} else if (mtzFullName && (state.wulffColorMode === "mtz_fcalc" || state.wulffColorMode === "ipred_isigi")) {{
         sel.title = `Spot Color (${{mtzFullName}})`;
       }}
     }});
@@ -19109,9 +19501,21 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }}
     let mtzStr = "";
     const fcalcSqVal = peakMtzFcalcSq(p);
+    const deltaIVal = peakMtzDeltaI(p);
+    const rawDeltaIVal = peakMtzRawDeltaI(p);
     const ipredSnrVal = peakIpredIsigi(p);
     if (Number.isFinite(fcalcSqVal) && hasExternalMtzOverlay()) {{
-      mtzStr = ` • |F_calc|²=<strong style="color:#a3e635;">${{fcalcSqVal.toFixed(2)}}</strong>`;
+      const fcLbl = (DATA && DATA.mtz_is_signed_i) ? "I_calc" : "|F_calc|²";
+      const fcSign = (DATA && DATA.mtz_is_signed_i && fcalcSqVal >= 0) ? "+" : "";
+      mtzStr = ` • ${{fcLbl}}=<strong style="color:#a3e635;">${{fcSign}}${{fcalcSqVal.toFixed(2)}}</strong>`;
+      if (Number.isFinite(deltaIVal)) {{
+        const dCol = deltaIVal >= 0 ? "#fb7185" : "#38bdf8";
+        const dSign = deltaIVal >= 0 ? "+" : "";
+        const rawNote = Number.isFinite(rawDeltaIVal) && Math.abs(rawDeltaIVal) >= 100
+          ? ` (raw ${{rawDeltaIVal >= 0 ? "+" : ""}}${{rawDeltaIVal.toExponential(2)}})`
+          : "";
+        mtzStr += ` • ΔI(F−F₀)=<strong style="color:${{dCol}};">${{dSign}}${{deltaIVal.toFixed(3)}}${{rawNote}}</strong>`;
+      }}
       if (Number.isFinite(ipredSnrVal)) {{
         mtzStr += ` • I_pred/σ=<strong style="color:#fbbf24;">${{ipredSnrVal.toFixed(1)}}</strong>`;
       }}
@@ -20209,6 +20613,33 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.selectedPeakId = null;
       state.selectedPeakObj = null;
       state.activeOrbitId = null;
+    }} else if (state.selectedPeakObj) {{
+      const prevSel = state.selectedPeakObj;
+      const selHkl = Array.isArray(prevSel.hkl) ? prevSel.hkl : null;
+      let rebound = null;
+      const findMatchingPeak = (arr) => {{
+        if (!Array.isArray(arr) || !selHkl) return null;
+        for (let i = 0; i < arr.length; i++) {{
+          const cand = arr[i];
+          if (!cand || !Array.isArray(cand.hkl)) continue;
+          if (
+            cand.hkl[0] === selHkl[0] &&
+            cand.hkl[1] === selHkl[1] &&
+            cand.hkl[2] === selHkl[2] &&
+            (cand.run_index || 0) === (prevSel.run_index || 0) &&
+            (cand.bank === undefined || prevSel.bank === undefined || cand.bank === prevSel.bank)
+          ) {{
+            return cand;
+          }}
+        }}
+        return null;
+      }};
+      rebound = findMatchingPeak(PEAKS) || findMatchingPeak(SAMPLE_PEAKS);
+      if (rebound) {{
+        state.selectedPeakObj = rebound;
+        state.selectedPeakId = rebound.id;
+        state.activeOrbitId = rebound.asu_orbit_id || state.activeOrbitId || null;
+      }}
     }}
     const fallbackMode = () => (typeof preferredFallbackColorMode === "function"
       ? preferredFallbackColorMode()
@@ -20218,6 +20649,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }} else if (state.wulffColorMode === "fobs" && (typeof hasFobsSq !== "function" || !hasFobsSq())) {{
       state.wulffColorMode = fallbackMode();
     }} else if (state.wulffColorMode === "mtz_fcalc" && (typeof hasMtzFcalcSq !== "function" || !hasMtzFcalcSq())) {{
+      state.wulffColorMode = fallbackMode();
+    }} else if (state.wulffColorMode === "mtz_delta_i" && (typeof hasMtzDeltaI !== "function" || !hasMtzDeltaI())) {{
       state.wulffColorMode = fallbackMode();
     }} else if (state.wulffColorMode === "ipred_isigi" && (typeof hasIpredIsigi !== "function" || !hasIpredIsigi())) {{
       state.wulffColorMode = fallbackMode();
@@ -22265,7 +22698,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.peakSource,
       state.wulffScope,
       state.wulffColorMode,
+      state.colorFullRange ? 1 : 0,
       getColorCrossover().toFixed(3),
+      DATA.mtz_overlay_name || "",
+      DATA.ref_mtz_overlay_name || "",
       state.dMin,
       state.lamMin,
       state.lamMax,
@@ -23606,13 +24042,48 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         getWulffPeakColor: (p) => peakStrokeColor(p, 0.92),
         isSameReflection,
         setStatusLine,
-        onUpdated: (nd) => {{
+        getMtzOverlaySig: () => `${{DATA.mtz_overlay_name || ""}}|${{DATA.ref_mtz_overlay_name || ""}}|${{DATA.mtz_overlay_matched || 0}}|${{DATA.mtz_is_signed_i ? 1 : 0}}`,
+        onUpdated: (nd, doc) => {{
           DATA.nodal_data = nd || null;
-          DATA.ref_mtz_overlay_name = (nd && nd.ref_name) ? nd.ref_name : null;
+          const prevRefName = DATA.ref_mtz_overlay_name || null;
+          if (doc && doc.ref_mtz_overlay_name !== undefined) {{
+            DATA.ref_mtz_overlay_name = doc.ref_mtz_overlay_name || null;
+          }} else {{
+            DATA.ref_mtz_overlay_name = (nd && nd.ref_name) ? nd.ref_name : null;
+          }}
+          if (doc && doc.ref_mtz_i_asu_lookup !== undefined) {{
+            DATA.ref_mtz_i_asu_lookup = doc.ref_mtz_i_asu_lookup || null;
+            _baselineMeasCache.refMtzIAsuLookup = DATA.ref_mtz_i_asu_lookup;
+          }} else if (!DATA.ref_mtz_overlay_name) {{
+            DATA.ref_mtz_i_asu_lookup = null;
+            _baselineMeasCache.refMtzIAsuLookup = null;
+          }}
+          if (doc && doc.ref_mtz_i_exact_lookup !== undefined) {{
+            DATA.ref_mtz_i_exact_lookup = doc.ref_mtz_i_exact_lookup || null;
+            _baselineMeasCache.refMtzIExactLookup = DATA.ref_mtz_i_exact_lookup;
+          }} else if (!DATA.ref_mtz_overlay_name) {{
+            DATA.ref_mtz_i_exact_lookup = null;
+            _baselineMeasCache.refMtzIExactLookup = null;
+          }}
           if (nd && nd.heterodyne_mode) {{
             state.heterodyneMode = String(nd.heterodyne_mode);
           }}
+          _peakDataAvailabilitySig = "";
+          // When Ref F₀ is freshly loaded on an intensity-only or signed .mtz, auto-activate ΔI (F−F₀)
+          if (
+            DATA.ref_mtz_overlay_name &&
+            DATA.ref_mtz_overlay_name !== prevRefName &&
+            (!nd || !nd.has_phases || DATA.mtz_is_signed_i) &&
+            hasMtzDeltaI()
+          ) {{
+            state.wulffColorMode = "mtz_delta_i";
+          }}
           syncNodalUI();
+          syncWulffUI();
+          if (state.selectedPeakObj) {{
+            updatePeakInspector(state.selectedPeakObj);
+          }}
+          _lastDetRenderSig = "";
           _lastWulffRenderSig = "";
           renderStereoInset(true);
           renderDetector();
@@ -23676,7 +24147,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       (DATA && DATA.mtz_has_phases) ||
       (nd && nd.has_phases)
     );
-    bar.classList.toggle("hidden", !(hasPhasedMtz || is3D));
+    const hasAnyExtMtz = Boolean(
+      hasPhasedMtz ||
+      (typeof hasExternalMtzOverlay === "function" && hasExternalMtzOverlay()) ||
+      (DATA && DATA.mtz_overlay_name)
+    );
+    bar.classList.toggle("hidden", !(hasAnyExtMtz || is3D));
 
     const btnRe = document.getElementById("btn-nodal-re");
     const btnIm = document.getElementById("btn-nodal-im");
@@ -23716,27 +24192,29 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const refName = (nd && nd.ref_name) || (DATA && DATA.ref_mtz_overlay_name) || "";
     const hasRef = Boolean(!_refMtzLoadingState.active && ((nd && nd.ref_has_phases) || refName));
     if (btnRef) {{
-      btnRef.disabled = !hasPhasedMtz || _refMtzLoadingState.active;
+      btnRef.disabled = !hasAnyExtMtz || _refMtzLoadingState.active;
       if (_refMtzLoadingState.active) {{
         const loadNm = _refMtzLoadingState.name || "Ref F₀";
         btnRef.textContent = `F₀: ${{loadNm}}…`;
         btnRef.classList.remove("nodal-ref-active");
         btnRef.classList.add("nodal-ref-loading");
-        btnRef.title = `Loading heterodyne Reference F₀: ${{loadNm}}`;
+        btnRef.title = `Loading Reference F₀: ${{loadNm}}`;
       }} else {{
         btnRef.textContent = hasRef ? `F₀: ${{refName || "Loaded"}}` : "Ref F₀";
         btnRef.classList.remove("nodal-ref-loading");
         btnRef.classList.toggle("nodal-ref-active", hasRef);
         btnRef.title = hasRef
-          ? `Heterodyne Reference F₀ (${{refName}}) — click to replace`
-          : "Load heterodyne reference F₀ .mtz (with phase, e.g. heavy-atom / reference structure factor) for interference nodal surfaces & vortices";
+          ? `Reference F₀ (${{refName}}) — enables ΔI (F−F₀) contrast${{hasPhasedMtz ? " & heterodyne nodal surfaces" : ""}} (click to replace)`
+          : (hasPhasedMtz
+            ? "Load reference F₀ .mtz for ΔI (F−F₀) intensity contrast and heterodyne nodal surfaces / vortices"
+            : "Load reference F₀ .mtz to color reflections by shared-scale intensity difference ΔI (F − F₀)");
       }}
     }}
     if (btnClearRef) {{
       btnClearRef.classList.toggle("hidden", !hasRef);
     }}
     if (selHet) {{
-      selHet.classList.toggle("hidden", !hasRef);
+      selHet.classList.toggle("hidden", !(hasRef && hasPhasedMtz));
       const wantHet = state.heterodyneMode || (nd && nd.heterodyne_mode) || "delta";
       selHet.value = wantHet;
     }}
@@ -23797,7 +24275,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       hasNodalCtrl ? nodalCtrl.getDataSeq() : 0,
       state.wulffScope,
       state.wulffColorMode,
+      state.colorFullRange ? 1 : 0,
       getColorCrossover().toFixed(3),
+      DATA.mtz_overlay_name || "",
+      DATA.ref_mtz_overlay_name || "",
       state.showWulffFriedel ? 1 : 0,
       state.showNodalPoints ? 1 : 0,
       wulffHolzKey,
@@ -24802,18 +25283,48 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     document.getElementById("lbl-det-alpha").textContent = Math.round(state.detAlpha * 100) + "%";
   }});
 
+  function toggleColorFullRange() {{
+    state.colorFullRange = !state.colorFullRange;
+    _peakDataAvailabilitySig = "";
+    _lastDetRenderSig = "";
+    _lastWulffRenderSig = "";
+    updateColorscaleSliderGradient();
+    renderDetector();
+    renderStereoInset(true);
+  }}
+
+  const btnColorFullRange = document.getElementById("btn-colorscale-fullrange");
+  if (btnColorFullRange) {{
+    btnColorFullRange.addEventListener("click", (ev) => {{
+      ev.stopPropagation();
+      toggleColorFullRange();
+    }});
+  }}
+  const lblColorEmphasisEl = document.getElementById("lbl-color-emphasis");
+  if (lblColorEmphasisEl) {{
+    lblColorEmphasisEl.addEventListener("click", () => {{
+      const activeMode = state.wulffColorMode || "wavelength";
+      const isQuantOrRes = (typeof isQuantileSnrColorMode === "function" && isQuantileSnrColorMode(activeMode)) || activeMode === "residual";
+      if (isQuantOrRes) toggleColorFullRange();
+    }});
+  }}
+
   if (slColorEmphasis) {{
     slColorEmphasis.addEventListener("input", () => {{
       if (slColorEmphasis.disabled) return;
       const v = parseFloat(slColorEmphasis.value);
-      state.colorCrossover = Number.isFinite(v) ? Math.max(0.05, Math.min(0.95, v)) : DEFAULT_COLOR_CROSSOVER;
+      state.colorCrossover = Number.isFinite(v) ? Math.max(0.01, Math.min(0.99, v)) : DEFAULT_COLOR_CROSSOVER;
       updateColorscaleSliderGradient();
+      renderDetector();
+      renderStereoInset(true);
     }});
     slColorEmphasis.addEventListener("dblclick", () => {{
       if (slColorEmphasis.disabled) return;
       slColorEmphasis.value = DEFAULT_COLOR_CROSSOVER.toFixed(2);
       state.colorCrossover = DEFAULT_COLOR_CROSSOVER;
       updateColorscaleSliderGradient();
+      renderDetector();
+      renderStereoInset(true);
     }});
     updateColorscaleSliderGradient();
   }}
@@ -25531,6 +26042,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.wulffColorMode = preferredFallbackColorMode();
     }} else if (nextMode === "mtz_fcalc" && !hasMtzFcalcSq()) {{
       state.wulffColorMode = preferredFallbackColorMode();
+    }} else if (nextMode === "mtz_delta_i" && !hasMtzDeltaI()) {{
+      state.wulffColorMode = preferredFallbackColorMode();
     }} else if (nextMode === "ipred_isigi" && !hasIpredIsigi()) {{
       state.wulffColorMode = preferredFallbackColorMode();
     }} else if (nextMode === "isigi" && !hasIntegratedIsigi()) {{
@@ -25541,6 +26054,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     syncWulffUI();
     updateHUD();
     renderDetector();
+    renderStereoInset(true);
   }}
 
   const selWulffColor = document.getElementById("sel-wulff-color");
@@ -26241,6 +26755,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     DATA.mtz_exact_lookup = newPayload.mtz_exact_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_exact_lookup : null);
     DATA.mtz_f_asu_lookup = newPayload.mtz_f_asu_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_f_asu_lookup : null);
     DATA.mtz_f_exact_lookup = newPayload.mtz_f_exact_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_f_exact_lookup : null);
+    DATA.ref_mtz_i_asu_lookup = newPayload.ref_mtz_i_asu_lookup !== undefined
+      ? (newPayload.ref_mtz_i_asu_lookup || null)
+      : (isFrameSwitch && DATA.ref_mtz_overlay_name ? DATA.ref_mtz_i_asu_lookup : null);
+    DATA.ref_mtz_i_exact_lookup = newPayload.ref_mtz_i_exact_lookup !== undefined
+      ? (newPayload.ref_mtz_i_exact_lookup || null)
+      : (isFrameSwitch && DATA.ref_mtz_overlay_name ? DATA.ref_mtz_i_exact_lookup : null);
     DATA.careless_i_asu_lookup = newPayload.careless_i_asu_lookup !== undefined
       ? (newPayload.careless_i_asu_lookup || null)
       : (isFrameSwitch ? DATA.careless_i_asu_lookup : null);
@@ -26260,6 +26780,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     else if (!isFrameSwitch) DATA.mtz_has_sigf_column = true;
     if (newPayload.mtz_has_i_column !== undefined) DATA.mtz_has_i_column = Boolean(newPayload.mtz_has_i_column);
     else if (!isFrameSwitch) DATA.mtz_has_i_column = false;
+    if (newPayload.mtz_is_signed_i !== undefined) DATA.mtz_is_signed_i = Boolean(newPayload.mtz_is_signed_i);
+    else if (!isFrameSwitch) DATA.mtz_is_signed_i = false;
     if (newPayload.mtz_global_f_scale !== undefined) DATA.mtz_global_f_scale = newPayload.mtz_global_f_scale;
     if (newPayload.mtz_global_i_scale !== undefined) DATA.mtz_global_i_scale = newPayload.mtz_global_i_scale;
     if (newPayload.mtz_scale_basis !== undefined) DATA.mtz_scale_basis = newPayload.mtz_scale_basis;
@@ -26346,8 +26868,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       : (newPayload.default_peak_source || state.peakSource);
     applyPeakSource(preferredSrc, false);
     if (!isFrameSwitch && (newPayload.mtz_fresh_overlay || isMtzColorMode(state.wulffColorMode) || isMtzColorMode(newPayload.default_color_mode))) {{
-      if (state.wulffColorMode === "ipred_isigi" && hasIpredIsigi()) {{
+      if (state.wulffColorMode === "mtz_delta_i" && hasMtzDeltaI()) {{
+        state.wulffColorMode = "mtz_delta_i";
+      }} else if (state.wulffColorMode === "ipred_isigi" && hasIpredIsigi()) {{
         state.wulffColorMode = "ipred_isigi";
+      }} else if (hasMtzDeltaI() && DATA.mtz_is_signed_i) {{
+        state.wulffColorMode = "mtz_delta_i";
       }} else if (hasMtzFcalcSq()) {{
         state.wulffColorMode = "mtz_fcalc";
       }}
@@ -26545,6 +27071,14 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     if (LADDER.length > 0) selectLadderRung(state.currentRungIdx, false);
     else {{ renderZoneList(); updateHUD(); }}
     renderFilesDrawer();
+    _peakDataAvailabilitySig = "";
+    _lastDetRenderSig = "";
+    _lastWulffRenderSig = "";
+    renderDetector();
+    renderStereoInset(true);
+    if (state.selectedPeakObj && isFrameSwitch) {{
+      updatePeakInspector(state.selectedPeakObj);
+    }}
     if (newPayload.hydration_job && newPayload.hydration_job.job_id) {{
       startHydrationJobPoll(newPayload.hydration_job);
     }} else {{
@@ -26565,10 +27099,16 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const warnHtml = newPayload.mtz_overlay_warning
         ? ` • <span style="color:var(--accent-gold);">⚠ ${{escTxt(newPayload.mtz_overlay_warning)}}</span>`
         : "";
+      const refHintHtml = DATA.ref_mtz_overlay_name
+        ? ` • Ref F₀: <strong>${{escTxt(DATA.ref_mtz_overlay_name)}}</strong> (<code>ΔI (F−F₀)</code> ready)`
+        : (DATA.mtz_is_signed_i ? ` • Tip: load second spin-contrast file via <strong>Ref F₀</strong> for <code>ΔI (F−F₀)</code>` : "");
       setStatusLine(
         `[MTZ REFERENCE SPOTS]`,
-        `Overlaid <strong>${{Number(newPayload.mtz_overlay_reflections || 0).toLocaleString()}}</strong> ASU reflections from <strong>${{escTxt(newPayload.mtz_overlay_name)}}</strong> (<strong>${{Number(newPayload.mtz_overlay_matched || 0).toLocaleString()}}</strong> spots matched on active detector geometry)${{warnHtml}}.`
+        `Overlaid <strong>${{Number(newPayload.mtz_overlay_reflections || 0).toLocaleString()}}</strong> ASU reflections from <strong>${{escTxt(newPayload.mtz_overlay_name)}}</strong> (<strong>${{Number(newPayload.mtz_overlay_matched || 0).toLocaleString()}}</strong> spots matched on active detector geometry)${{refHintHtml}}${{warnHtml}}.`
       );
+      if (state.selectedPeakObj) {{
+        updatePeakInspector(state.selectedPeakObj);
+      }}
       return;
     }}
     if (artKind === "merged_careless" && hasActualMerge && DATA.merge_metrics) {{

@@ -875,3 +875,168 @@ def test_off_origin_roi_vortices_rendered_and_multirun_sample_peaks_preserved(
     )
     runs_present = {int(p["run_index"]) for p in updated_pl["sample_peaks"]}
     assert runs_present == {0, 3}
+
+
+def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Path):
+    """Signed DNP intensity .mtz files support Ref F0 ΔI(F−F0) contrast, decouple from Careless |F_obs|^2, and trigger 3D redraws."""
+    import gemmi
+
+    dnp_a = tmp_path / "dnp_delta.mtz"
+    dnp_b = tmp_path / "dnp_epsilon.mtz"
+
+    hkls = np.array(
+        [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0], [1, 0, 1], [0, 1, 1]],
+        dtype=np.int32,
+    )
+    # Signed spin-contrast intensities: huge shared background + localized difference on (1, 1, 0)
+    i_a = np.array([450.0, -520.0, 180.0, 960.0, -880.0, 60.0], dtype=np.float32)
+    i_b = np.array([450.0, -520.0, 180.0, 810.0, -880.0, 60.0], dtype=np.float32)
+    sig_i = np.full_like(i_a, 10.0)
+
+    for path, ivals in ((dnp_a, i_a), (dnp_b, i_b)):
+        mtz = gemmi.Mtz(with_base=True)
+        mtz.spacegroup = gemmi.find_spacegroup_by_name("P 1")
+        mtz.set_cell_for_all(gemmi.UnitCell(10.0, 10.0, 10.0, 90.0, 90.0, 90.0))
+        mtz.add_column("I", "J")
+        mtz.add_column("SIGI", "Q")
+        data = np.column_stack([hkls.astype(np.float32), ivals, sig_i])
+        mtz.set_data(data)
+        mtz.write_to_file(str(path))
+
+    ub = np.diag([0.1, 0.1, 0.1])
+    base_payload = build_rainbow_zone_payload()
+    base_payload["ub_matrix"] = ub.tolist()
+    base_payload["u_matrix"] = np.eye(3).tolist()
+    base_payload["b_matrix"] = ub.tolist()
+    base_payload["cell"] = [10.0, 10.0, 10.0, 90.0, 90.0, 90.0]
+    base_payload["space_group"] = "P 1"
+    base_payload["d_min"] = 2.0
+    # Inject positive Careless merged_i to ensure signed DNP .mtz does NOT lock to positive |F_obs|^2
+    for pk in base_payload.get("predicted_peaks", [])[:6]:
+        pk["merged_i"] = 12.5
+
+    enriched = apply_mtz_to_payload(base_payload, str(dnp_a), {"name": "dnp_delta.mtz"})
+    assert enriched["mtz_has_phases"] is False
+    assert enriched["mtz_is_signed_i"] is True
+    assert enriched["mtz_scale_basis"] == "unit_wilson_rms"
+
+    # Load dnp_epsilon.mtz as Ref F0 on intensity-only primary MTZ via API
+    res_doc, status, next_ref, next_het = process_nodal_surfaces_api_request(
+        {"ref_mtz_path": str(dnp_b)},
+        mtz_path=str(dnp_a),
+        ref_mtz_path=None,
+        heterodyne_mode="delta",
+        payload=enriched,
+    )
+    assert status == 200 and res_doc["ok"] is True
+    assert res_doc["nodal_data"] is None or res_doc["nodal_data"]["has_phases"] is False
+    assert res_doc["ref_mtz_overlay_name"] == "dnp_epsilon.mtz"
+    ref_lu = res_doc["ref_mtz_i_asu_lookup"]
+    f_lu = enriched["mtz_f_asu_lookup"]
+    s_i = float(enriched["mtz_global_i_scale"])
+    # Unchanged background reflection (1,0,0) cancels identically; responsive (1,1,0) preserves exact ΔI/S
+    assert abs(f_lu["1,0,0"][3] - ref_lu["1,0,0"][1]) == 0.0
+    assert np.isclose(
+        f_lu["1,1,0"][3] - ref_lu["1,1,0"][1], (960.0 - 810.0) / s_i, atol=2e-4
+    )
+
+    # Frame-only roundtrip preserves signed flag & Ref F0 lookup
+    slim = build_frame_only_response(enriched)
+    assert "ref_mtz_i_asu_lookup" not in slim
+    merged = merge_frame_only_payload(enriched, slim)
+    assert merged["mtz_is_signed_i"] is True
+    assert merged["ref_mtz_i_asu_lookup"] == ref_lu
+
+    # Clear Ref F0 cleanly on intensity-only MTZ
+    res_clr, status_clr, clr_ref, _ = process_nodal_surfaces_api_request(
+        {"clear_ref_mtz": True},
+        mtz_path=str(dnp_a),
+        ref_mtz_path=next_ref,
+        heterodyne_mode=next_het,
+        payload=enriched,
+    )
+    assert status_clr == 200 and res_clr["ok"] is True and clr_ref is None
+    assert enriched["ref_mtz_i_asu_lookup"] is None
+
+    html = render_rainbow_html(enriched)
+    assert '<option value="mtz_delta_i">Color: ΔI (F−F₀)</option>' in html
+    assert 'id="btn-colorscale-fullrange"' in html
+
+    if shutil.which("node") is None:
+        return
+
+    from subhkl.viz.nodal_surfaces import get_nodal_surfaces_js
+
+    js_driver = f"""
+    {get_nodal_surfaces_js()}
+    let fillCalls = 0;
+    const mockCtx = {{
+      setTransform() {{}}, clearRect() {{}}, save() {{}}, restore() {{}},
+      beginPath() {{}}, closePath() {{}}, moveTo() {{}}, lineTo() {{}}, arc() {{}},
+      fillRect() {{}}, strokeRect() {{}}, roundRect() {{}}, clip() {{}}, setLineDash() {{}},
+      fillText() {{}}, drawImage() {{}},
+      measureText: (txt) => ({{ width: String(txt).length * 6 }}),
+      stroke() {{}},
+      fill() {{ fillCalls++; }},
+      createRadialGradient() {{ return {{ addColorStop() {{}} }}; }},
+    }};
+    const mockCanvas = {{
+      width: 320, height: 320,
+      getBoundingClientRect: () => ({{ width: 320, height: 320 }}),
+      getContext: () => mockCtx,
+    }};
+    let overlaySig = "dnp_delta.mtz||6|1";
+    const state = {{
+      showStereo: true, stereoViewMode: "recip3d",
+      wulffYawDeg: 0, wulffPitchDeg: 0, wulffZoom: 1.0, wulffExpanded: false,
+      wulffScope: "all_runs", wulffColorMode: "mtz_fcalc", colorFullRange: false,
+      showWulffFriedel: true, showNodalPoints: false, showZoneArcs: false,
+      showNodalSurfacesRe: false, showNodalSurfacesIm: false, showPhaseVortices: false,
+      dMin: 2.0, lamMin: 0.8, lamMax: 8.0, activeZones: new Set(),
+    }};
+    const ctrl = createNodalSurfacesController({{
+      initialNodalData: null,
+      state,
+      mat3Mul: (A, B) => A,
+      mat3Inv: () => [[10,0,0],[0,10,0],[0,0,10]],
+      mat3Vec: (M, v) => [M[0][0]*v[0], M[1][1]*v[1], M[2][2]*v[2]],
+      getActiveGoniometerR: () => [[1,0,0],[0,1,0],[0,0,1]],
+      getActiveUbMatrix: () => [[0.1,0,0],[0,0.1,0],[0,0,0.1]],
+      getActiveIncidentBeam: () => [0, 0, 1],
+      getActiveSampleOffsetLab: () => [0, 0, 0],
+      buildFullFaceDetectorRaycastPanels: () => [],
+      projectRayToDetectorWithGap: () => ({{ onPanel: false }}),
+      isSphericalDetectorView: () => false,
+      detToScreen: () => [0, 0],
+      projectToWulff: () => [0, 0, 1, 1, 1],
+      getColorCrossover: () => 0.38,
+      getMtzOverlaySig: () => overlaySig,
+      getActiveZoneObjects: () => [],
+      getWulffVisiblePool: () => ({{ visiblePeaks: [{{ id: 1, hkl: [1, 1, 0], d_spacing: 7.0 }}] }}),
+      getWulffPeakColor: () => "#ff5500",
+      isSameReflection: (a, b) => a === b,
+      setStatusLine: () => {{}},
+      onUpdated: () => {{}},
+    }});
+    ctrl.render3DReciprocalView(mockCanvas, false);
+    const f1 = fillCalls;
+    ctrl.render3DReciprocalView(mockCanvas, false);
+    const fCached = fillCalls;
+    overlaySig = "dnp_epsilon.mtz||6|1";
+    ctrl.render3DReciprocalView(mockCanvas, false);
+    const fAfterMtzSwap = fillCalls;
+    state.colorFullRange = true;
+    ctrl.render3DReciprocalView(mockCanvas, false);
+    const fAfterFullRange = fillCalls;
+    console.log(JSON.stringify({{ f1, fCached, fAfterMtzSwap, fAfterFullRange }}));
+    """
+    js_file = tmp_path / "run_dnp_refresh.js"
+    js_file.write_text(js_driver, encoding="utf-8")
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=True
+    )
+    res = json.loads(proc.stdout.strip())
+    assert res["f1"] > 0
+    assert res["fCached"] == res["f1"]
+    assert res["fAfterMtzSwap"] > res["fCached"]
+    assert res["fAfterFullRange"] > res["fAfterMtzSwap"]
