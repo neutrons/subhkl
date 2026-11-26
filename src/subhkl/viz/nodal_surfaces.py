@@ -1607,6 +1607,32 @@ def get_nodal_surfaces_js() -> str:
       return { nSegs, pos0, pos1, side, indices };
     }
 
+    function getActiveVortexList(nd) {
+      if (!nd) return [];
+      const roiV = Array.isArray(nd.roi_vortices) ? nd.roi_vortices : null;
+      const globV = Array.isArray(nd.vortices) ? nd.vortices : null;
+      if (!roiV) return globV || [];
+      if (!globV || roiV === globV) return roiV;
+      const br = nd.brick;
+      const ch = br && Array.isArray(br.center_hkl) ? br.center_hkl : [0, 0, 0];
+      const offOrigin = Math.hypot(Number(ch[0]) || 0, Number(ch[1]) || 0, Number(ch[2]) || 0) > 1e-4;
+      if (!offOrigin) return roiV.length >= globV.length ? roiV : globV;
+      // Off-origin brick: `roi_vortices` covers the active peak/pan brick while `vortices` covers the origin shell.
+      // Merge `roi_vortices` with any origin-shell polylines outside the brick so live ROI clipping works everywhere.
+      const bCg = br && Array.isArray(br.center_g) ? br.center_g : null;
+      const bR2 = br && Number(br.radius_g) > 0 ? Math.pow(Number(br.radius_g) * 0.96, 2) : -1.0;
+      if (!bCg || bR2 <= 0) return roiV.length ? roiV : globV;
+      const merged = roiV.slice();
+      for (let i = 0; i < globV.length; i++) {
+        const pts = globV[i] && globV[i].pts_g;
+        if (!Array.isArray(pts) || pts.length < 2) continue;
+        const mid = pts[pts.length >> 1];
+        const dx = mid[0] - bCg[0], dy = mid[1] - bCg[1], dz = mid[2] - bCg[2];
+        if (dx * dx + dy * dy + dz * dz > bR2) merged.push(globV[i]);
+      }
+      return merged;
+    }
+
     function ensureDecodedMeshes() {
       if (!nodalData || !nodalData.has_phases) {
         decodedMeshes = { re: null, im: null, vortex: null };
@@ -1615,13 +1641,14 @@ def get_nodal_surfaces_js() -> str:
       }
       const reM = nodalData.re_surface || {};
       const imM = nodalData.im_surface || {};
-      const vList = nodalData.vortices || nodalData.roi_vortices || [];
+      const vList = getActiveVortexList(nodalData);
       const sig = [
         makeBrickKey(nodalData),
         reM.n_tris || 0,
         (reM.verts_b64 || "").slice(0, 24),
         imM.n_tris || 0,
         (imM.verts_b64 || "").slice(0, 24),
+        (nodalData.roi_vortices || []).length,
         vList.length,
       ].join("|");
       if (sig === decodedCacheSig) return decodedMeshes;
@@ -1826,7 +1853,8 @@ def get_nodal_surfaces_js() -> str:
           "  vec3 halo = vec3(0.027, 0.035, 0.075);",
           "  float t = smoothstep(0.48, 0.72, ae);",
           "  vec3 rgb = mix(core, halo, t);",
-          "  float alpha = 1.0 - smoothstep(0.84, 0.98, ae);",
+          "  float depthCue = clamp(1.28 - 0.20 * vEyeDist, 0.48, 1.0);",
+          "  float alpha = (1.0 - smoothstep(0.84, 0.98, ae)) * depthCue;",
           "  gl_FragColor = vec4(rgb, alpha);",
           "}",
         ].join("\n");
@@ -2055,9 +2083,11 @@ def get_nodal_surfaces_js() -> str:
           glCtx.disableVertexAttribArray(glProg.aNorm);
         }
 
-        // Depth-buffered 3D 1D phase-vortex ribbons sharing the surface depth buffer!
+        // Clear surface depth buffer so translucent Re=0 / Im=0 sheets never occlude 1D vortices inside the ROI,
+        // while keeping depth testing enabled among the 3D vortex filaments themselves!
         if (hasVor && glVortexProg && glBufs.vortex) {
           glCtx.depthMask(true);
+          glCtx.clear(glCtx.DEPTH_BUFFER_BIT);
           glCtx.disable(glCtx.CULL_FACE);
           glCtx.useProgram(glVortexProg.prog);
           glCtx.uniformMatrix3fv(glVortexProg.uRot, false, rotColMajor);
@@ -2067,7 +2097,7 @@ def get_nodal_surfaces_js() -> str:
           glCtx.uniform1f(glVortexProg.uAspectY, aspectY);
           glCtx.uniform1f(glVortexProg.uCamDist, 2.8);
           glCtx.uniform2f(glVortexProg.uViewportPx, tw, th);
-          glCtx.uniform1f(glVortexProg.uHalfWidthPx, (isExp ? 2.5 : 1.95) * dpr);
+          glCtx.uniform1f(glVortexProg.uHalfWidthPx, (isExp ? 3.1 : 2.45) * dpr);
           glCtx.uniform3f(glVortexProg.uClipCenter, liveRoi.centerG[0], liveRoi.centerG[1], liveRoi.centerG[2]);
           glCtx.uniform1f(glVortexProg.uClipRadius, liveRoi.radiusG);
           glCtx.uniform1f(glVortexProg.uSlabActive, liveRoi.slabActive ? 1.0 : 0.0);
@@ -2128,8 +2158,9 @@ def get_nodal_surfaces_js() -> str:
       }
       if (hasRe) collectSoftwareTris(decodedMeshes.re, [16, 205, 238]);
       if (hasIm) collectSoftwareTris(decodedMeshes.im, [246, 78, 125]);
+      const vorItems = [];
       if (hasVor) {
-        const vList = nodalData.vortices || nodalData.roi_vortices || [];
+        const vList = getActiveVortexList(nodalData);
         for (let vi = 0; vi < vList.length; vi++) {
           const pts = vList[vi] && vList[vi].pts_g;
           if (!Array.isArray(pts) || pts.length < 2) continue;
@@ -2139,41 +2170,42 @@ def get_nodal_surfaces_js() -> str:
             if (!pointInsideLiveRoi(mid, liveRoi)) continue;
             const p0 = projectPoint3D(a, Rtot, center, invScale, cx, cy, Rpx, zoom);
             const p1 = projectPoint3D(b, Rtot, center, invScale, cx, cy, Rpx, zoom);
-            items.push({ kind: "seg", z: 0.5 * (p0[2] + p1[2]) + 0.005, p0, p1 });
+            vorItems.push({ kind: "seg", z: 0.5 * (p0[2] + p1[2]), p0, p1 });
           }
         }
       }
       items.sort((a, b) => a.z - b.z);
+      vorItems.sort((a, b) => a.z - b.z);
       ctx.save();
       ctx.lineCap = "round";
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
-        if (it.kind === "tri") {
-          ctx.beginPath();
-          ctx.moveTo(it.p0[0], it.p0[1]);
-          ctx.lineTo(it.p1[0], it.p1[1]);
-          ctx.lineTo(it.p2[0], it.p2[1]);
-          ctx.closePath();
-          ctx.fillStyle = it.fill;
-          ctx.fill();
-        } else {
-          ctx.beginPath();
-          ctx.moveTo(it.p0[0], it.p0[1]);
-          ctx.lineTo(it.p1[0], it.p1[1]);
-          ctx.strokeStyle = "rgba(7, 9, 19, 0.88)";
-          ctx.lineWidth = isExp ? 4.2 : 3.2;
-          ctx.stroke();
-          ctx.strokeStyle = "#fde047";
-          ctx.lineWidth = isExp ? 2.2 : 1.6;
-          ctx.stroke();
-        }
+        ctx.beginPath();
+        ctx.moveTo(it.p0[0], it.p0[1]);
+        ctx.lineTo(it.p1[0], it.p1[1]);
+        ctx.lineTo(it.p2[0], it.p2[1]);
+        ctx.closePath();
+        ctx.fillStyle = it.fill;
+        ctx.fill();
+      }
+      for (let i = 0; i < vorItems.length; i++) {
+        const it = vorItems[i];
+        ctx.beginPath();
+        ctx.moveTo(it.p0[0], it.p0[1]);
+        ctx.lineTo(it.p1[0], it.p1[1]);
+        ctx.strokeStyle = "rgba(7, 9, 19, 0.88)";
+        ctx.lineWidth = isExp ? 4.4 : 3.4;
+        ctx.stroke();
+        ctx.strokeStyle = "#fde047";
+        ctx.lineWidth = isExp ? 2.4 : 1.8;
+        ctx.stroke();
       }
       ctx.restore();
     }
 
     function countLiveVortices(liveRoi) {
       if (!nodalData || !nodalData.has_phases) return 0;
-      const vList = nodalData.vortices || nodalData.roi_vortices || [];
+      const vList = getActiveVortexList(nodalData);
       let n = 0;
       for (let vi = 0; vi < vList.length; vi++) {
         const pts = vList[vi] && vList[vi].pts_g;
@@ -2596,7 +2628,7 @@ def get_nodal_surfaces_js() -> str:
     function renderWulffVortices(ctx, cx, cy, R, isExp) {
       const st = deps.state;
       if (!nodalData || !nodalData.has_phases || !st.showPhaseVortices) return;
-      const vList = nodalData.vortices || nodalData.roi_vortices || [];
+      const vList = getActiveVortexList(nodalData);
       if (!Array.isArray(vList) || vList.length === 0) return;
 
       const liveRoi = resolveLiveRoi();
@@ -2668,7 +2700,7 @@ def get_nodal_surfaces_js() -> str:
     function renderDetectorVortices(ctx, w, h) {
       const st = deps.state;
       if (!nodalData || !nodalData.has_phases || !st.showPhaseVortices) return;
-      const vList = nodalData.vortices || nodalData.roi_vortices || [];
+      const vList = getActiveVortexList(nodalData);
       if (!Array.isArray(vList) || vList.length === 0) return;
 
       const liveRoi = resolveLiveRoi();

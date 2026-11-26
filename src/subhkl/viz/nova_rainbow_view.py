@@ -10435,6 +10435,8 @@ class RainbowZonesViewModel:
             )
         else:
             self.payload = build_rainbow_zone_payload(**kwargs)
+        if prev_payload is not None:
+            self.payload = merge_frame_only_payload(prev_payload, self.payload)
         if (
             self.mtz_overlay_path
             and os.path.isfile(self.mtz_overlay_path)
@@ -10454,9 +10456,8 @@ class RainbowZonesViewModel:
                     ref_mtz_path=self.ref_mtz_overlay_path,
                     heterodyne_mode=self.heterodyne_mode,
                     compute_nodal=bool(include_all),
+                    update_sample_peaks=bool(include_all),
                 )
-        if prev_payload is not None:
-            self.payload = merge_frame_only_payload(prev_payload, self.payload)
         return self.payload
 
     def to_html(self, mode: str | None = None) -> str:

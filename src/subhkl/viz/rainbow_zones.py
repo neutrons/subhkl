@@ -2012,6 +2012,7 @@ def apply_mtz_to_payload(
     ref_mtz_path: str | os.PathLike | None = None,
     heterodyne_mode: str = "delta",
     compute_nodal: bool = True,
+    update_sample_peaks: bool = True,
 ) -> dict[str, Any]:
     """Attach external MTZ structure-factor/intensity columns onto active UB reflection peaks without modifying B or U."""
     import gemmi
@@ -2786,7 +2787,8 @@ def apply_mtz_to_payload(
         frames_meta = out.get("frames") or []
         r_per_run_raw = out.get("goniometer_R_per_run") or {}
         if (
-            detectors_all
+            update_sample_peaks
+            and detectors_all
             and active_panel_banks
             and len(frames_meta) > 1
             and isinstance(r_per_run_raw, dict)
@@ -2904,7 +2906,15 @@ def apply_mtz_to_payload(
                     sig_all_m = sig_all_m[prio_m]
                     run_all_m = run_all_m[prio_m]
                     _, u_first = np.unique(hkl_all_m, axis=0, return_index=True)
-                    u_keep = np.sort(u_first)[:8000]
+                    if len(u_first) > 24000:
+                        qn_u = np.linalg.norm(
+                            hkl_all_m[u_first].astype(float) @ UB_curr.T, axis=1
+                        )
+                        u_keep = np.sort(
+                            u_first[np.argsort(qn_u, kind="mergesort")[:24000]]
+                        )
+                    else:
+                        u_keep = np.sort(u_first)
                     extra_samp = _serialize_sample_peaks(
                         {
                             "peaks_xyz": pts_all_m[u_keep],
@@ -2934,7 +2944,7 @@ def apply_mtz_to_payload(
                     out["predicted_sample_peaks"] = (
                         list(out.get("predicted_sample_peaks") or []) + extra_samp
                     )
-        elif not out.get("predicted_sample_peaks"):
+        elif update_sample_peaks and not out.get("predicted_sample_peaks"):
             out["predicted_sample_peaks"] = list(out.get("predicted_peaks") or [])
 
     # Annotate predicted & integrated peak sets with normalized MTZ |F̃_calc|² and I_pred/σ columns
@@ -2981,12 +2991,17 @@ def apply_mtz_to_payload(
                         break
     asu_lookup_cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
     matched_counts: dict[str, int] = {}
-    for list_key in (
-        "predicted_peaks",
-        "predicted_sample_peaks",
-        "integrated_peaks",
-        "integrated_sample_peaks",
-    ):
+    annot_keys = (
+        (
+            "predicted_peaks",
+            "predicted_sample_peaks",
+            "integrated_peaks",
+            "integrated_sample_peaks",
+        )
+        if update_sample_peaks
+        else ("predicted_peaks", "integrated_peaks")
+    )
+    for list_key in annot_keys:
         pk_list = out.get(list_key)
         if not isinstance(pk_list, list):
             continue
@@ -19105,8 +19120,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const detYVal = typeof p.det_y === "number" ? p.det_y : 0.0;
     const errDeg = typeof p.angular_error_deg === "number" ? p.angular_error_deg : 0.0;
     const harmMult = p.harmonic_multiplicity || 1;
+    const rIdx = Number(p.run_index) || 0;
+    const rMeta = (DATA.frames || [])[rIdx];
+    const runTag = rMeta && rMeta.label ? `${{rMeta.label}} (#${{rIdx + 1}})` : `RUN #${{rIdx + 1}}`;
     setStatusLine(
-      `[BANK #${{p.bank || 1}} • RUN #${{(p.run_index || 0) + 1}}]`,
+      `[BANK #${{p.bank || 1}} • ${{runTag}}]`,
       `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}}${{bijBadgeStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong>${{intenStr}}${{mtzStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
     );
   }}

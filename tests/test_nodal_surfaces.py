@@ -692,3 +692,186 @@ def test_single_proton_his31_delta_auto_mode_and_pure_diff_mode(tmp_path: Path):
     assert '<option value="diff">ΔF = F−F₀</option>' in html
     assert "const chosenMode = selHetMode.value ||" in html
     assert "nodalCtrl.applyCachedHeterodyneMode(chosenMode)" in html
+
+
+def test_off_origin_roi_vortices_rendered_and_multirun_sample_peaks_preserved(
+    tmp_path: Path,
+):
+    """Off-origin pan/peak bricks must render roi_vortices (not drop them for origin vortices), and frame-only switches must keep all runs in sample_peaks."""
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+
+    f_a = tmp_path / "no_delta.mtz"
+    f_b = tmp_path / "no_eps.mtz"
+    # Three-site difference so ΔF = F_a - F_b produces genuine 1D phase vortices off-origin around hkl=(3,0,-2)
+    base_atoms = [((0.10, 0.20, 0.30), 25.0)]
+    ub, _ = _write_synthetic_phased_mtz(
+        f_a,
+        spacegroup_name="P 1",
+        cell_params=(14.0, 14.0, 18.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=[
+            *base_atoms,
+            ((0.21, 0.14, 0.08), -3.74),
+            ((0.44, 0.33, 0.19), 2.1),
+        ],
+        d_min=2.0,
+    )
+    _write_synthetic_phased_mtz(
+        f_b,
+        spacegroup_name="P 1",
+        cell_params=(14.0, 14.0, 18.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=[
+            *base_atoms,
+            ((0.37, 0.51, 0.27), -3.74),
+        ],
+        d_min=2.0,
+    )
+
+    nd_pan = compute_nodal_surfaces_payload(
+        mtz_path=str(f_a),
+        ub_matrix=ub,
+        d_min=2.0,
+        ref_mtz_path=str(f_b),
+        heterodyne_mode="diff",
+        roi_mode="pan",
+        roi_center_hkl=[3.0, 0.0, -2.0],
+        roi_radius_mult=3.0,
+        roi_grid_size=32,
+        vortex_grid_size=28,
+    )
+    assert len(nd_pan["roi_vortices"]) > 0
+
+    from subhkl.viz.nodal_surfaces import get_nodal_surfaces_js
+
+    nd_json = json.dumps(nd_pan)
+    ub_json = json.dumps(ub.tolist())
+    pan_center_g = (ub @ np.array([3.0, 0.0, -2.0])).tolist()
+    js_driver = f"""
+    {get_nodal_surfaces_js()}
+    global.atob = (b64) => Buffer.from(b64, "base64").toString("binary");
+    let strokeCalls = 0;
+    const mockCtx = {{
+      setTransform() {{}}, clearRect() {{}}, save() {{}}, restore() {{}},
+      beginPath() {{}}, closePath() {{}}, moveTo() {{}}, lineTo() {{}}, arc() {{}},
+      fillRect() {{}}, strokeRect() {{}}, roundRect() {{}}, clip() {{}}, setLineDash() {{}},
+      fillText() {{}}, drawImage() {{}},
+      measureText: (txt) => ({{ width: String(txt).length * 6 }}),
+      stroke() {{ strokeCalls++; }},
+      fill() {{}},
+      createRadialGradient() {{ return {{ addColorStop() {{}} }}; }},
+    }};
+    const mockCanvas = {{
+      width: 400, height: 400,
+      getBoundingClientRect: () => ({{ width: 400, height: 400 }}),
+      getContext: () => mockCtx,
+    }};
+    const state = {{
+      showStereo: true, stereoViewMode: "recip3d",
+      wulffYawDeg: 10, wulffPitchDeg: -10, wulffZoom: 1.0, wulffExpanded: true,
+      wulffScope: "all_runs", wulffColorMode: "mtz_fcalc",
+      showWulffFriedel: true, showNodalPoints: false, showZoneArcs: false,
+      showNodalSurfacesRe: false, showNodalSurfacesIm: false, showPhaseVortices: true,
+      nodalSurfaceAlpha: 0.5, nodalRoiMode: "pan", nodalRoiRadiusMult: 3.0,
+      nodalPanCenterG: {json.dumps(pan_center_g)},
+      dMin: 2.0, lamMin: 0.8, lamMax: 8.0, activeZones: new Set(),
+    }};
+    const ctrl = createNodalSurfacesController({{
+      initialNodalData: {nd_json},
+      state,
+      mat3Mul: (A, B) => A.map((r, i) => [0,1,2].map(j => r[0]*B[0][j] + r[1]*B[1][j] + r[2]*B[2][j])),
+      mat3Inv: () => [[14,0,0],[0,14,0],[0,0,18]],
+      mat3Vec: (M, v) => [M[0][0]*v[0]+M[0][1]*v[1]+M[0][2]*v[2], M[1][0]*v[0]+M[1][1]*v[1]+M[1][2]*v[2], M[2][0]*v[0]+M[2][1]*v[1]+M[2][2]*v[2]],
+      getActiveGoniometerR: () => [[1,0,0],[0,1,0],[0,0,1]],
+      getActiveUbMatrix: () => {ub_json},
+      getActiveIncidentBeam: () => [0, 0, 1],
+      getActiveSampleOffsetLab: () => [0, 0, 0],
+      buildFullFaceDetectorRaycastPanels: () => [{{ bank: 1 }}],
+      projectRayToDetectorWithGap: (kf) => ({{ onPanel: true, det_x: kf[0]*40, det_y: kf[1], det_el: kf[1]*40, bank: 1 }}),
+      isSphericalDetectorView: () => false,
+      detToScreen: (az, y) => [200 + az, 200 - y * 100],
+      projectToWulff: (g, cx, cy, R) => {{
+        const n = Math.hypot(g[0], g[1], g[2]) || 1;
+        return [cx + R * (g[0]/n), cy - R * (g[1]/n), g[2] >= 0 ? 1 : -1, g[2]/n, 1.0];
+      }},
+      getColorCrossover: () => 0.5,
+      getActiveZoneObjects: () => [],
+      getWulffVisiblePool: () => ({{ visiblePeaks: [] }}),
+      getWulffPeakColor: () => "#22d3ee",
+      isSameReflection: (a, b) => a === b,
+      setStatusLine: () => {{}},
+      onUpdated: () => {{}},
+    }});
+    strokeCalls = 0;
+    ctrl.renderWulffVortices(mockCtx, 200, 200, 160, true);
+    const wulffVortexStrokes = strokeCalls;
+    strokeCalls = 0;
+    ctrl.render3DReciprocalView(mockCanvas, true);
+    const recip3DVortexStrokes = strokeCalls;
+    console.log(JSON.stringify({{ wulffVortexStrokes, recip3DVortexStrokes }}));
+    """
+    js_file = tmp_path / "run_off_origin_vor.js"
+    js_file.write_text(js_driver, encoding="utf-8")
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=True
+    )
+    out_counts = json.loads(proc.stdout.strip())
+    assert out_counts["wulffVortexStrokes"] > 0
+    assert out_counts["recip3DVortexStrokes"] > 0
+
+    # Verify merge_frame_only_payload -> apply_mtz_to_payload(..., update_sample_peaks=False) preserves multi-run sample_peaks
+    pk_r0 = {
+        "id": 1,
+        "hkl": [2, 0, 2],
+        "run_index": 0,
+        "bank": 94,
+        "wavelength": 3.5,
+        "d_spacing": 3.1,
+    }
+    pk_r3 = {
+        "id": 2,
+        "hkl": [2, 0, -2],
+        "run_index": 3,
+        "bank": 87,
+        "wavelength": 3.6,
+        "d_spacing": 3.1,
+    }
+    prev_pl = build_rainbow_zone_payload()
+    prev_pl.update(
+        {
+            "ub_matrix": ub.tolist(),
+            "u_matrix": np.eye(3).tolist(),
+            "b_matrix": ub.tolist(),
+            "cell": [14.0, 14.0, 18.0, 90.0, 90.0, 90.0],
+            "space_group": "P 1",
+            "d_min": 2.0,
+            "predicted_peaks": [pk_r0],
+            "predicted_sample_peaks": [pk_r0, pk_r3],
+            "sample_peaks": [pk_r0, pk_r3],
+        }
+    )
+    prev_pl = apply_mtz_to_payload(prev_pl, str(f_a), compute_nodal=False)
+    frame3_pl = build_rainbow_zone_payload()
+    frame3_pl.update(
+        {
+            "ub_matrix": ub.tolist(),
+            "u_matrix": np.eye(3).tolist(),
+            "b_matrix": ub.tolist(),
+            "cell": [14.0, 14.0, 18.0, 90.0, 90.0, 90.0],
+            "space_group": "P 1",
+            "d_min": 2.0,
+            "frame_index": 3,
+            "predicted_peaks": [pk_r3],
+            "predicted_sample_peaks": [],
+            "sample_peaks": [],
+        }
+    )
+    merged_pl = merge_frame_only_payload(prev_pl, frame3_pl)
+    updated_pl = apply_mtz_to_payload(
+        merged_pl,
+        str(f_a),
+        select_mtz_color=False,
+        compute_nodal=False,
+        update_sample_peaks=False,
+    )
+    runs_present = {int(p["run_index"]) for p in updated_pl["sample_peaks"]}
+    assert runs_present == {0, 3}

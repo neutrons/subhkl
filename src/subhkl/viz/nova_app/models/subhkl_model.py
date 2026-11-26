@@ -316,6 +316,8 @@ class SubhklGalaxyModel:
                 self.data.d_min = round(0.5 * float(wl_range[0]), 2)
             elif self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
                 self.data.d_min = round(float(self.payload["d_min"]), 2)
+        if prev_payload is not None:
+            self.payload = merge_frame_only_payload(prev_payload, self.payload)
         if (
             self.mtz_overlay_path
             and os.path.isfile(self.mtz_overlay_path)
@@ -334,9 +336,8 @@ class SubhklGalaxyModel:
                 ref_mtz_path=self.ref_mtz_overlay_path,
                 heterodyne_mode=self.heterodyne_mode,
                 compute_nodal=bool(include_all_runs_peaks),
+                update_sample_peaks=bool(include_all_runs_peaks),
             )
-        if prev_payload is not None:
-            self.payload = merge_frame_only_payload(prev_payload, self.payload)
         return self.payload
 
     def render_html(self) -> str:
