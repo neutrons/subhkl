@@ -960,14 +960,62 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
 
     html = render_rainbow_html(enriched)
     assert '<option value="mtz_delta_i">Color: ΔI (F−F₀)</option>' in html
-    assert 'id="btn-colorscale-fullrange"' in html
+    assert 'id="btn-colorscale-fullrange"' not in html
+    assert (
+        'id="slider-color-emphasis" class="has-out-wings" min="-0.20" max="1.20"'
+        in html
+    )
+    assert "repeating-linear-gradient(-45deg" in html
 
     if shutil.which("node") is None:
         return
 
+    import re
+
     from subhkl.viz.nodal_surfaces import get_nodal_surfaces_js
 
+    inline_js = re.findall(r"<script>([\s\S]*?)</script>", html)[-1]
+    fn_names = [
+        "getColorCrossover",
+        "applyCrossoverCurve",
+        "isQuantileSnrColorMode",
+        "isOutlierRangeColorMode",
+        "applyColorSliderPosition",
+        "computeQuantileScaleBounds",
+        "isigiToColor",
+    ]
+    extracted_fns = []
+    for fn_name in fn_names:
+        m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+        assert m is not None, f"Missing JS function {fn_name}"
+        start = m.start()
+        depth = 0
+        in_str = None
+        esc = False
+        idx = m.end() - 1
+        while idx < len(inline_js):
+            ch = inline_js[idx]
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif in_str:
+                if ch == in_str:
+                    in_str = None
+            elif ch in ("'", '"', "`"):
+                in_str = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    extracted_fns.append(inline_js[start : idx + 1])
+                    break
+            idx += 1
+
     js_driver = f"""
+    const DEFAULT_COLOR_CROSSOVER = 0.38;
+    const COLORSCALE_OUT_WING = 0.20;
     {get_nodal_surfaces_js()}
     let fillCalls = 0;
     const mockCtx = {{
@@ -989,11 +1037,13 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
     const state = {{
       showStereo: true, stereoViewMode: "recip3d",
       wulffYawDeg: 0, wulffPitchDeg: 0, wulffZoom: 1.0, wulffExpanded: false,
-      wulffScope: "all_runs", wulffColorMode: "mtz_fcalc", colorFullRange: false,
+      wulffScope: "all_runs", wulffColorMode: "mtz_delta_i",
+      colorSliderPos: 0.38, colorCrossover: 0.38, colorOutLeft: 0.0, colorOutRight: 0.0,
       showWulffFriedel: true, showNodalPoints: false, showZoneArcs: false,
       showNodalSurfacesRe: false, showNodalSurfacesIm: false, showPhaseVortices: false,
       dMin: 2.0, lamMin: 0.8, lamMax: 8.0, activeZones: new Set(),
     }};
+    {"\n".join(extracted_fns)}
     const ctrl = createNodalSurfacesController({{
       initialNodalData: null,
       state,
@@ -1009,7 +1059,7 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
       isSphericalDetectorView: () => false,
       detToScreen: () => [0, 0],
       projectToWulff: () => [0, 0, 1, 1, 1],
-      getColorCrossover: () => 0.38,
+      getColorCrossover,
       getMtzOverlaySig: () => overlaySig,
       getActiveZoneObjects: () => [],
       getWulffVisiblePool: () => ({{ visiblePeaks: [{{ id: 1, hkl: [1, 1, 0], d_spacing: 7.0 }}] }}),
@@ -1025,10 +1075,46 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
     overlaySig = "dnp_epsilon.mtz||6|1";
     ctrl.render3DReciprocalView(mockCanvas, false);
     const fAfterMtzSwap = fillCalls;
-    state.colorFullRange = true;
+
+    // Synthetic signed DNP distribution with outliers beyond P1.5..P98.5:
+    // bulk in [-0.24, +0.24], responsive positive peaks +0.85 and +1.18, negative peaks -0.92 and -1.45
+    const dist = [];
+    for (let k = 0; k < 200; k++) dist.push(((k % 25) - 12) * 0.02);
+    dist.push(0.85, 1.18, -0.92, -1.45);
+
+    applyColorSliderPosition(0.38, "mtz_delta_i");
+    const bInRange = computeQuantileScaleBounds(dist, -1, 0, 1, {{
+      zeroCentered: true, outLeft: state.colorOutLeft, outRight: state.colorOutRight,
+    }});
+    // In calibrated P1.5-98.5 range, both +0.85 and +1.18 clamp to the same upper pole (and -0.92, -1.45 to lower pole)
+    const colPosAIn = isigiToColor(0.85, 1.0, bInRange);
+    const colPosBIn = isigiToColor(1.18, 1.0, bInRange);
+
+    // Drag slider into RIGHT hatched wing to 100% (pos = 1.20)
+    applyColorSliderPosition(1.20, "mtz_delta_i");
     ctrl.render3DReciprocalView(mockCanvas, false);
-    const fAfterFullRange = fillCalls;
-    console.log(JSON.stringify({{ f1, fCached, fAfterMtzSwap, fAfterFullRange }}));
+    const fAfterRightWing = fillCalls;
+    const bRight100 = computeQuantileScaleBounds(dist, -1, 0, 1, {{
+      zeroCentered: true, outLeft: state.colorOutLeft, outRight: state.colorOutRight,
+    }});
+    const colPosA100 = isigiToColor(0.85, 1.0, bRight100);
+    const colPosB100 = isigiToColor(1.18, 1.0, bRight100);
+
+    // Drag slider into LEFT hatched wing to 0% (pos = -0.20)
+    applyColorSliderPosition(-0.20, "mtz_delta_i");
+    ctrl.render3DReciprocalView(mockCanvas, false);
+    const fAfterLeftWing = fillCalls;
+    const bLeft0 = computeQuantileScaleBounds(dist, -1, 0, 1, {{
+      zeroCentered: true, outLeft: state.colorOutLeft, outRight: state.colorOutRight,
+    }});
+    const colNegA0 = isigiToColor(-0.92, 1.0, bLeft0);
+    const colNegB0 = isigiToColor(-1.45, 1.0, bLeft0);
+
+    console.log(JSON.stringify({{
+      f1, fCached, fAfterMtzSwap, fAfterRightWing, fAfterLeftWing,
+      bInRange, bRight100, bLeft0,
+      colPosAIn, colPosBIn, colPosA100, colPosB100, colNegA0, colNegB0,
+    }}));
     """
     js_file = tmp_path / "run_dnp_refresh.js"
     js_file.write_text(js_driver, encoding="utf-8")
@@ -1039,4 +1125,13 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
     assert res["f1"] > 0
     assert res["fCached"] == res["f1"]
     assert res["fAfterMtzSwap"] > res["fCached"]
-    assert res["fAfterFullRange"] > res["fAfterMtzSwap"]
+    assert res["fAfterRightWing"] > res["fAfterMtzSwap"]
+    assert res["fAfterLeftWing"] > res["fAfterRightWing"]
+    # Clamped in normal range, cleanly separated when dragged into 100% / 0% hatched wings
+    assert res["colPosAIn"] == res["colPosBIn"]
+    assert np.isclose(res["bRight100"]["max"], 1.18, atol=1e-4)
+    assert np.isclose(res["bRight100"]["min"], res["bInRange"]["min"], atol=1e-4)
+    assert res["colPosA100"] != res["colPosB100"]
+    assert np.isclose(res["bLeft0"]["min"], -1.45, atol=1e-4)
+    assert np.isclose(res["bLeft0"]["max"], res["bInRange"]["max"], atol=1e-4)
+    assert res["colNegA0"] != res["colNegB0"]
