@@ -1146,3 +1146,203 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
     assert res["colBulkPos50"] != res["colBulkPos99"]
     assert len({res["colPosA99"], res["colPosB99"], res["colPosMax99"]}) == 3
     assert res["colNegA01"] != res["colNegB01"]
+
+
+def test_antinodal_im0_manifold_and_3d_morse_capsules(tmp_path: Path):
+    """Antinodal regions on Im(W)=0 carry Re(W) scalars, 3D Morse maxima reject saddles & orient capsules along softest curvature, and slider filters live."""
+    from subhkl.viz.nodal_surfaces import extract_morse_maxima_3d, get_nodal_surfaces_js
+
+    # 1. Exact synthetic 3D test: anisotropic positive maximum + isotropic negative minimum + saddle point (must be rejected!)
+    ub_id = np.diag([0.1, 0.1, 0.1])
+    grid = np.linspace(-3.0, 3.0, 41)
+    hh, kk, ll = np.meshgrid(grid, grid, grid, indexing="ij")
+    # Positive elongated ridge maximum at hkl = (1.18, -0.72, 0.44), soft along h-axis (curvature 1.0 vs 6.0 transverse)
+    pos_peak = 120.0 * np.exp(
+        -(0.5 * (hh - 1.18) ** 2 + 3.0 * (kk + 0.72) ** 2 + 3.0 * (ll - 0.44) ** 2)
+    )
+    # Negative isotropic antinode (maximum of -Re W) at hkl = (-1.35, 0.88, -0.55)
+    neg_peak = -95.0 * np.exp(
+        -2.5 * ((hh + 1.35) ** 2 + (kk - 0.88) ** 2 + (ll + 0.55) ** 2)
+    )
+    # Pure index-2 saddle bump around (0.0, 1.8, 0.0): concave in h,k but convex in l -> NOT a Morse maximum!
+    saddle_env = np.exp(-1.5 * (hh**2 + (kk - 1.8) ** 2 + ll**2))
+    saddle_term = (
+        55.0 * (1.0 - 2.0 * hh**2 - 2.0 * (kk - 1.8) ** 2 + 3.5 * ll**2) * saddle_env
+    )
+    Z_syn = (pos_peak + neg_peak + saddle_term) + 1j * (0.4 * hh)
+
+    extrema = extract_morse_maxima_3d(
+        Z_syn,
+        grid,
+        grid,
+        grid,
+        ub_id,
+        mean_g_star=0.1,
+        g_max=0.6,
+    )
+    pos_ext = [e for e in extrema if e["sign"] > 0 and e["abs_val"] > 80.0]
+    neg_ext = [e for e in extrema if e["sign"] < 0 and e["abs_val"] > 70.0]
+    assert len(pos_ext) == 1
+    assert len(neg_ext) == 1
+    # Sub-voxel refinement recovers true critical coordinates accurately
+    assert np.allclose(pos_ext[0]["hkl_cont"], [1.18, -0.72, 0.44], atol=0.05)
+    assert np.allclose(neg_ext[0]["hkl_cont"], [-1.35, 0.88, -0.55], atol=0.05)
+    # Anisotropic positive ridge aligns capsule axis with +h (softest curvature) and has half_len_g > 0
+    assert abs(pos_ext[0]["axis_g"][0]) > 0.96
+    assert pos_ext[0]["aspect"] > 1.8
+    assert pos_ext[0]["half_len_g"] > 0.0
+    # Isotropic negative antinode has aspect ~ 1.0 -> compact spherical capsule (half_len_g ~ 0)
+    assert neg_ext[0]["aspect"] < 1.08
+    assert neg_ext[0]["half_len_g"] < 1e-3
+    # Saddle around (0, 1.8, 0) must be rejected by strict Hessian definiteness
+    for e in extrema:
+        assert (
+            np.linalg.norm(np.array(e["hkl_cont"]) - np.array([0.0, 1.8, 0.0])) > 0.45
+        )
+
+    # 2. End-to-end heterodyne tautomer payload + UI + NodeJS live percentile slider & capsule hit-testing
+    f_delta = tmp_path / "his_delta.mtz"
+    f_ref = tmp_path / "his_deprot.mtz"
+    heavy = [((0.12, 0.24, 0.31), 22.0), ((0.43, 0.11, 0.62), 16.0)]
+    ub, _ = _write_synthetic_phased_mtz(
+        f_delta,
+        spacegroup_name="P 1",
+        cell_params=(12.0, 12.0, 15.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=[*heavy, ((0.28, 0.51, 0.19), -3.74)],
+        d_min=2.0,
+    )
+    _write_synthetic_phased_mtz(
+        f_ref,
+        spacegroup_name="P 1",
+        cell_params=(12.0, 12.0, 15.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=heavy,
+        d_min=2.0,
+    )
+    nd = compute_nodal_surfaces_payload(
+        mtz_path=str(f_delta),
+        ub_matrix=ub,
+        d_min=2.0,
+        ref_mtz_path=str(f_ref),
+        heterodyne_mode="delta",
+        roi_radius_mult=3.0,
+        roi_grid_size=36,
+        vortex_grid_size=30,
+    )
+    assert nd["im_surface"]["n_tris"] > 20
+    assert len(nd["im_surface"]["re_vals_b64"]) > 0
+    assert len(nd["antinode_quantiles"]) == 101
+    assert len(nd["morse_maxima"]) >= 2
+
+    pl = build_rainbow_zone_payload()
+    pl["nodal_data"] = nd
+    html = render_rainbow_html(pl)
+    assert 'id="btn-nodal-antinodes"' in html
+    assert 'id="btn-nodal-morse"' in html
+    assert 'id="slider-antinode-pct"' in html
+
+    if shutil.which("node") is None:
+        return
+
+    js_driver = f"""
+    {get_nodal_surfaces_js()}
+    global.atob = (b64) => Buffer.from(b64, "base64").toString("binary");
+    let strokeCalls = 0;
+    let fillCalls = 0;
+    const textsDrawn = [];
+    const mockCtx = {{
+      setTransform() {{}}, clearRect() {{}}, save() {{}}, restore() {{}},
+      beginPath() {{}}, closePath() {{}}, moveTo() {{}}, lineTo() {{}}, arc() {{}},
+      fillRect() {{}}, strokeRect() {{}}, roundRect() {{}}, clip() {{}}, setLineDash() {{}},
+      fillText(txt) {{ textsDrawn.push(String(txt)); }},
+      drawImage() {{}},
+      measureText: (txt) => ({{ width: String(txt).length * 6 }}),
+      stroke() {{ strokeCalls++; }},
+      fill() {{ fillCalls++; }},
+      createRadialGradient() {{ return {{ addColorStop() {{}} }}; }},
+    }};
+    const mockCanvas = {{
+      width: 420, height: 420,
+      getBoundingClientRect: () => ({{ width: 420, height: 420 }}),
+      getContext: () => mockCtx,
+    }};
+    const state = {{
+      showStereo: true, stereoViewMode: "recip3d",
+      wulffYawDeg: 15, wulffPitchDeg: -18, wulffZoom: 1.0, recip3dZoom: 1.0, wulffExpanded: true,
+      wulffScope: "all_runs", wulffColorMode: "mtz_fcalc",
+      colorPercentile: 0.50, colorCrossover: 0.38,
+      showWulffFriedel: false, showNodalPoints: false, showZoneArcs: false,
+      showNodalSurfacesRe: false, showNodalSurfacesIm: true, showPhaseVortices: false,
+      showAntinodes: true, showMorseCapsules: true, antinodePercentile: 0.0,
+      nodalSurfaceAlpha: 0.56, nodalRoiMode: "origin", nodalRoiRadiusMult: 3.0,
+      dMin: 2.0, lamMin: 0.8, lamMax: 8.0, activeZones: new Set(),
+    }};
+    const ctrl = createNodalSurfacesController({{
+      initialNodalData: {json.dumps(nd)},
+      state,
+      mat3Mul: (A, B) => A.map((r) => [0,1,2].map(j => r[0]*B[0][j] + r[1]*B[1][j] + r[2]*B[2][j])),
+      mat3Inv: () => [[12,0,0],[0,12,0],[0,0,15]],
+      mat3Vec: (M, v) => [M[0][0]*v[0]+M[0][1]*v[1]+M[0][2]*v[2], M[1][0]*v[0]+M[1][1]*v[1]+M[1][2]*v[2], M[2][0]*v[0]+M[2][1]*v[1]+M[2][2]*v[2]],
+      getActiveGoniometerR: () => [[1,0,0],[0,1,0],[0,0,1]],
+      getActiveUbMatrix: () => {json.dumps(ub.tolist())},
+      getActiveIncidentBeam: () => [0, 0, 1],
+      getActiveSampleOffsetLab: () => [0, 0, 0],
+      buildFullFaceDetectorRaycastPanels: () => [],
+      projectRayToDetectorWithGap: () => ({{ onPanel: false }}),
+      isSphericalDetectorView: () => false,
+      detToScreen: () => [0, 0],
+      projectToWulff: () => [0, 0, 1, 1, 1],
+      getColorCrossover: () => 0.38,
+      getActiveZoneObjects: () => [],
+      getWulffVisiblePool: () => ({{ visiblePeaks: [] }}),
+      getWulffPeakColor: () => "#22d3ee",
+      isSameReflection: (a, b) => a === b,
+      setStatusLine: () => {{}},
+      onUpdated: () => {{}},
+    }});
+    const roi = ctrl.resolveLiveRoi();
+    state.antinodePercentile = 0.0;
+    const st0 = ctrl.resolveAntinodeThreshold(roi);
+    ctrl.render3DReciprocalView(mockCanvas, true);
+    const fills0 = fillCalls;
+
+    fillCalls = 0; strokeCalls = 0; textsDrawn.length = 0;
+    state.antinodePercentile = 0.80;
+    const st80 = ctrl.resolveAntinodeThreshold(roi);
+    ctrl.render3DReciprocalView(mockCanvas, true);
+    const fills80 = fillCalls;
+
+    state.antinodePercentile = 1.00;
+    const st100 = ctrl.resolveAntinodeThreshold(roi);
+    ctrl.render3DReciprocalView(mockCanvas, true);
+
+    // Verify Morse capsule hover callout renders cleanly
+    const topM = {json.dumps(nd["morse_maxima"][0])};
+    ctrl.setHoveredMorse(topM);
+    textsDrawn.length = 0;
+    ctrl.render3DReciprocalView(mockCanvas, true);
+
+    console.log(JSON.stringify({{
+      st0, st80, st100,
+      fills0, fills80,
+      strokesAt80: strokeCalls,
+      textsAfterHover: textsDrawn,
+    }}));
+    """
+    js_file = tmp_path / "run_antinode_morse.js"
+    js_file.write_text(js_driver, encoding="utf-8")
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip())
+    assert out["st0"]["tau"] == 0.0
+    assert out["st80"]["tau"] > 0.0
+    assert out["st100"]["tau"] >= out["st80"]["tau"]
+    assert (
+        out["st0"]["activeMorseCount"]
+        >= out["st80"]["activeMorseCount"]
+        >= out["st100"]["activeMorseCount"]
+        >= 1
+    )
+    assert out["fills0"] > out["fills80"] > 0
+    assert out["strokesAt80"] > 0
+    assert any("∇Re=0" in t for t in out["textsAfterHover"])

@@ -11702,6 +11702,38 @@ def render_rainbow_html(
     background: rgba(253, 224, 71, 0.14);
   }}
 
+  .stereo-nodal-bar button.nodal-antinode-pill.active-btn {{
+    border-color: #f59e0b;
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.18);
+  }}
+
+  .stereo-nodal-bar button.nodal-morse-pill.active-btn {{
+    border-color: #e879f9;
+    color: #f0abfc;
+    background: rgba(232, 121, 249, 0.18);
+  }}
+
+  #slider-antinode-pct {{
+    width: 46px;
+    height: 10px;
+    accent-color: #f59e0b;
+    cursor: pointer;
+  }}
+
+  .nodal-pct-readout {{
+    font-size: 0.53rem;
+    color: var(--text-dim);
+    min-width: 24px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }}
+
+  .nodal-pct-readout.active-pct {{
+    color: #fbbf24;
+    font-weight: 700;
+  }}
+
   .stereo-nodal-bar button.nodal-ref-active {{
     border-color: #c084fc;
     color: #e9d5ff;
@@ -13016,6 +13048,10 @@ def render_rainbow_html(
             <button id="btn-nodal-re" type="button" class="active-btn nodal-re-pill" title="Toggle simulated Re=0 nodal surface in 3D Reciprocal Space">Re=0</button>
             <button id="btn-nodal-im" type="button" class="active-btn nodal-im-pill" title="Toggle simulated Im=0 nodal surface in 3D Reciprocal Space">Im=0</button>
             <button id="btn-nodal-vortices" type="button" class="active-btn nodal-vortex-pill" title="Toggle 1D phase vortices (Re=0 ∩ Im=0) across 3D Reciprocal Space, Wulff Net, and Detector Panels">Vortices</button>
+            <button id="btn-nodal-antinodes" type="button" class="nodal-antinode-pill" title="Highlight antinodal regions |Re(W)| ≥ τ on the Im=0 manifold">Antinodes</button>
+            <button id="btn-nodal-morse" type="button" class="nodal-morse-pill" title="Toggle 3D capsules at Morse maxima (∇Re W = 0) within |Re(W)| ≥ τ">Morse</button>
+            <input type="range" id="slider-antinode-pct" min="0" max="100" step="1" value="75" title="Antinode |Re(W)| ≥ τ percentile threshold (75th percentile)" />
+            <span id="lbl-antinode-pct" class="nodal-pct-readout" title="Active |Re(W)| ≥ τ percentile cutoff">75%</span>
             <select id="sel-nodal-roi" title="3D Nodal Surface Region of Interest (Origin sphere, Selected Bragg Peak sphere, Active Laue Zone disk, or Shift+Drag / Right+Drag 3D Pan)">
               <option value="origin">ROI: Origin</option>
               <option value="peak">ROI: Peak</option>
@@ -15760,6 +15796,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     showNodalSurfacesRe: true,     // Cyan Re(Z)=0 nodal surface in 3D Reciprocal Space
     showNodalSurfacesIm: true,     // Coral-Rose Im(Z)=0 nodal surface in 3D Reciprocal Space
     showPhaseVortices: true,       // 1D phase vortices (Re=0 ∩ Im=0) on 3D, Wulff & Detector
+    showAntinodes: false,          // Highlight |Re(W)| >= τ(p) antinodal regions on the Im=0 manifold
+    showMorseCapsules: false,      // 3D capsules at Morse maxima (∇Re W = 0) within |Re(W)| >= τ(p)
+    antinodePercentile: 0.75,      // 0.00 .. 1.00 empirical percentile cutoff τ(p) for |Re(W)|
+    _morseToggledManually: false,
     nodalSurfaceAlpha: 0.56,
     nodalRoiMode: "origin",        // "origin" | "peak" | "zone"
     nodalRoiRadiusMult: 2.5,
@@ -24155,6 +24195,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const btnRe = document.getElementById("btn-nodal-re");
     const btnIm = document.getElementById("btn-nodal-im");
     const btnVor = document.getElementById("btn-nodal-vortices");
+    const btnAnti = document.getElementById("btn-nodal-antinodes");
+    const btnMorse = document.getElementById("btn-nodal-morse");
+    const slAntiPct = document.getElementById("slider-antinode-pct");
+    const lblAntiPct = document.getElementById("lbl-antinode-pct");
     const selRoi = document.getElementById("sel-nodal-roi");
     const slRoi = document.getElementById("slider-nodal-roi");
     const btnRef = document.getElementById("btn-load-ref-mtz");
@@ -24176,6 +24220,29 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     if (btnVor) {{
       btnVor.disabled = !hasPhasedMtz;
       btnVor.classList.toggle("active-btn", hasPhasedMtz && Boolean(state.showPhaseVortices));
+    }}
+    if (btnAnti) {{
+      const isCentricZero = Boolean(nd && nd.is_real_only);
+      btnAnti.disabled = !hasPhasedMtz;
+      btnAnti.classList.toggle("active-btn", hasPhasedMtz && Boolean(state.showAntinodes));
+      btnAnti.title = isCentricZero
+        ? "Centric field (Im ≡ 0 everywhere): filters 3D Morse maxima by |Re(W)| ≥ τ"
+        : "Highlight antinodal regions |Re(W)| ≥ τ on the Im(W)=0 manifold (+Re amber, −Re violet)";
+    }}
+    if (btnMorse) {{
+      btnMorse.disabled = !hasPhasedMtz;
+      btnMorse.classList.toggle("active-btn", hasPhasedMtz && Boolean(state.showMorseCapsules));
+    }}
+    const pctInt = Math.round(Math.max(0.0, Math.min(1.0, Number(state.antinodePercentile ?? 0.75))) * 100);
+    const anyAntiActive = hasPhasedMtz && Boolean(state.showAntinodes || state.showMorseCapsules);
+    if (slAntiPct) {{
+      slAntiPct.disabled = !hasPhasedMtz;
+      slAntiPct.value = String(pctInt);
+      slAntiPct.title = `Antinode |Re(W)| ≥ τ percentile threshold (${{pctInt}}th percentile)`;
+    }}
+    if (lblAntiPct) {{
+      lblAntiPct.textContent = `${{pctInt}}%`;
+      lblAntiPct.classList.toggle("active-pct", anyAntiActive);
     }}
     if (selRoi) {{
       selRoi.disabled = !hasPhasedMtz;
@@ -25196,6 +25263,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const hit = (state.stereoViewMode === "recip3d" && nodalCtrl)
         ? nodalCtrl.findNearestPeak3D(mx, my)
         : findNearestPeakWulff(mx, my);
+      if (state.stereoViewMode === "recip3d" && nodalCtrl && typeof nodalCtrl.findNearestMorse3D === "function") {{
+        const morseHit = (!hit && state.showMorseCapsules) ? nodalCtrl.findNearestMorse3D(mx, my) : null;
+        if (nodalCtrl.setHoveredMorse(morseHit)) {{
+          renderStereoInset(true);
+        }}
+      }}
       const hoverChanged = hit !== state.hoveredPeakObj;
       state.hoveredPeakId = hit ? hit.id : null;
       state.hoveredPeakObj = hit || null;
@@ -25212,6 +25285,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.targetParallaxY = 0.0;
       state.hoveredPeakId = null;
       state.hoveredPeakObj = null;
+      if (nodalCtrl && typeof nodalCtrl.setHoveredMorse === "function" && nodalCtrl.setHoveredMorse(null)) {{
+        renderStereoInset(true);
+      }}
       if (state.selectedPeakId === null) state.activeOrbitId = null;
     }});
     stereoCanvas.addEventListener("wheel", (ev) => {{
@@ -25262,6 +25338,31 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         state.activeOrbitId = hit.asu_orbit_id || null;
         updatePeakInspector(hit);
         maybeRefreshNodalRoiOnSelection("peak");
+      }} else if (
+        state.stereoViewMode === "recip3d" &&
+        state.showMorseCapsules &&
+        nodalCtrl &&
+        typeof nodalCtrl.findNearestMorse3D === "function"
+      ) {{
+        const mHit = nodalCtrl.findNearestMorse3D(mx, my);
+        if (mHit) {{
+          const nh = mHit.nearest_hkl || [0, 0, 0];
+          const pool = (state.wulffScope === "all_runs" && SAMPLE_PEAKS.length > 0) ? SAMPLE_PEAKS : PEAKS;
+          const nearPeak = pool.find(p => Array.isArray(p.hkl) && p.hkl[0] === nh[0] && p.hkl[1] === nh[1] && p.hkl[2] === nh[2]);
+          const reV = Number(mHit.re_val) || 0.0;
+          const imV = Number(mHit.im_val) || 0.0;
+          if (nearPeak) {{
+            state.selectedPeakId = nearPeak.id;
+            state.selectedPeakObj = nearPeak;
+            state.activeOrbitId = nearPeak.asu_orbit_id || null;
+            updatePeakInspector(nearPeak);
+            maybeRefreshNodalRoiOnSelection("peak");
+          }}
+          setStatusLine(
+            "[MORSE ∇Re=0]",
+            `<strong>Re(W) = ${{reV >= 0 ? "+" : ""}}${{reV.toPrecision(4)}}</strong> (Im=${{imV.toPrecision(3)}}) at hkl≈(${{(mHit.hkl_cont || nh).join(", ")}}) • Nearest Bragg: <strong>(${{nh.join(", ")}})</strong>${{nearPeak ? " [selected]" : ""}}`
+          );
+        }}
       }}
     }});
     stereoCanvas.addEventListener("dblclick", () => {{
@@ -26120,6 +26221,59 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       _lastWulffRenderSig = "";
       renderStereoInset(true);
       renderDetector();
+    }});
+  }}
+  const btnNodalAntinodes = document.getElementById("btn-nodal-antinodes");
+  if (btnNodalAntinodes) {{
+    btnNodalAntinodes.addEventListener("click", () => {{
+      state.showAntinodes = !state.showAntinodes;
+      if (state.showAntinodes) {{
+        state.showNodalSurfacesIm = true;
+        if (!state._morseToggledManually) {{
+          state.showMorseCapsules = true;
+        }}
+        if (state.stereoViewMode !== "recip3d") {{
+          state.stereoViewMode = "recip3d";
+        }}
+      }} else if (!state._morseToggledManually) {{
+        state.showMorseCapsules = false;
+      }}
+      syncNodalUI();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+    }});
+  }}
+  const btnNodalMorse = document.getElementById("btn-nodal-morse");
+  if (btnNodalMorse) {{
+    btnNodalMorse.addEventListener("click", () => {{
+      state._morseToggledManually = true;
+      state.showMorseCapsules = !state.showMorseCapsules;
+      if (state.showMorseCapsules && state.stereoViewMode !== "recip3d") {{
+        state.stereoViewMode = "recip3d";
+      }}
+      syncNodalUI();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+    }});
+  }}
+  const slAntinodePct = document.getElementById("slider-antinode-pct");
+  if (slAntinodePct) {{
+    slAntinodePct.addEventListener("input", () => {{
+      const v = parseFloat(slAntinodePct.value);
+      if (Number.isFinite(v)) {{
+        state.antinodePercentile = Math.max(0.0, Math.min(1.0, v / 100.0));
+      }}
+      if (!state.showAntinodes && !state.showMorseCapsules) {{
+        state.showAntinodes = true;
+        state.showMorseCapsules = true;
+        state.showNodalSurfacesIm = true;
+        if (state.stereoViewMode !== "recip3d") {{
+          state.stereoViewMode = "recip3d";
+        }}
+      }}
+      syncNodalUI();
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
     }});
   }}
   const selNodalRoi = document.getElementById("sel-nodal-roi");

@@ -779,6 +779,255 @@ def _pack_u32_b64(arr: np.ndarray) -> str:
     ).decode("ascii")
 
 
+def _trilinear_sample_volume(vol: np.ndarray, pts_idx: np.ndarray) -> np.ndarray:
+    """Vectorized trilinear interpolation of 3D array `vol` at fractional index coordinates `(N, 3)`."""
+    if len(pts_idx) == 0:
+        return np.zeros(0, dtype=np.float64)
+    g0, g1, g2 = vol.shape
+    fx = np.clip(pts_idx[:, 0], 0.0, max(0.0, g0 - 1.000001))
+    fy = np.clip(pts_idx[:, 1], 0.0, max(0.0, g1 - 1.000001))
+    fz = np.clip(pts_idx[:, 2], 0.0, max(0.0, g2 - 1.000001))
+    i0 = np.floor(fx).astype(np.intp)
+    j0 = np.floor(fy).astype(np.intp)
+    k0 = np.floor(fz).astype(np.intp)
+    i1 = np.minimum(i0 + 1, g0 - 1)
+    j1 = np.minimum(j0 + 1, g1 - 1)
+    k1 = np.minimum(k0 + 1, g2 - 1)
+    tx = fx - i0
+    ty = fy - j0
+    tz = fz - k0
+    c000 = vol[i0, j0, k0]
+    c100 = vol[i1, j0, k0]
+    c010 = vol[i0, j1, k0]
+    c110 = vol[i1, j1, k0]
+    c001 = vol[i0, j0, k1]
+    c101 = vol[i1, j0, k1]
+    c011 = vol[i0, j1, k1]
+    c111 = vol[i1, j1, k1]
+    c00 = c000 * (1.0 - tx) + c100 * tx
+    c10 = c010 * (1.0 - tx) + c110 * tx
+    c01 = c001 * (1.0 - tx) + c101 * tx
+    c11 = c011 * (1.0 - tx) + c111 * tx
+    c0 = c00 * (1.0 - ty) + c10 * ty
+    c1 = c01 * (1.0 - ty) + c11 * ty
+    return np.asarray(c0 * (1.0 - tz) + c1 * tz, dtype=np.float64)
+
+
+def extract_morse_maxima_3d(
+    Z: np.ndarray,
+    h0: np.ndarray,
+    h1: np.ndarray,
+    h2: np.ndarray,
+    ub_matrix: np.ndarray,
+    *,
+    mean_g_star: float = 0.05,
+    g_max: float | None = None,
+    roi_center_g: np.ndarray | None = None,
+    roi_radius_g: float | None = None,
+    max_extrema: int = 240,
+) -> list[dict[str, Any]]:
+    """Extract sub-voxel 3D Morse maxima of `|Re(W)|` (`∇Re W = 0` with definite Hessian) and 3D capsule geometry.
+
+    Positive antinodal maxima (`Re W > 0`) require a strictly negative-definite 3x3 Hessian (Morse index 3),
+    while negative antinodal extrema (`Re W < 0`, local maxima of `-Re W`) require a strictly positive-definite
+    Hessian (Morse index 0 of `Re W`), rejecting all saddle points. Principal curvatures of the reciprocal-space
+    Hessian `H_G = UB^{-T} H_h UB^{-1}` orient each 3D capsule along the softest-decay ridge eigenvector.
+    """
+    u = np.asarray(Z.real, dtype=np.float64)
+    v_im = np.asarray(Z.imag, dtype=np.float64)
+    if u.ndim != 3 or min(u.shape) < 3:
+        return []
+    g0, g1, g2 = u.shape
+    u_abs_max = float(np.max(np.abs(u)))
+    if not np.isfinite(u_abs_max) or u_abs_max <= 1e-12:
+        return []
+
+    u_c = u[1:-1, 1:-1, 1:-1]
+    max_nb = np.full_like(u_c, -np.inf)
+    min_nb = np.full_like(u_c, np.inf)
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            for dk in (-1, 0, 1):
+                if di == 0 and dj == 0 and dk == 0:
+                    continue
+                nb = u[
+                    1 + di : g0 - 1 + di,
+                    1 + dj : g1 - 1 + dj,
+                    1 + dk : g2 - 1 + dk,
+                ]
+                np.maximum(max_nb, nb, out=max_nb)
+                np.minimum(min_nb, nb, out=min_nb)
+
+    floor_val = 1e-5 * u_abs_max
+    cand_mask = ((u_c > floor_val) & (u_c >= max_nb)) | (
+        (u_c < -floor_val) & (u_c <= min_nb)
+    )
+    cand_ijk = np.argwhere(cand_mask) + 1
+    if len(cand_ijk) == 0:
+        return []
+
+    dh0 = float(h0[1] - h0[0]) if len(h0) > 1 else 1.0
+    dh1 = float(h1[1] - h1[0]) if len(h1) > 1 else 1.0
+    dh2 = float(h2[1] - h2[0]) if len(h2) > 1 else 1.0
+    inv_dh = np.array(
+        [
+            1.0 / max(abs(dh0), 1e-12),
+            1.0 / max(abs(dh1), 1e-12),
+            1.0 / max(abs(dh2), 1e-12),
+        ]
+    )
+
+    ub = np.asarray(ub_matrix, dtype=np.float64)
+    ub_inv = np.linalg.inv(ub)
+    ub_inv_t = ub_inv.T
+    g_scale = max(float(mean_g_star), 1e-5)
+
+    raw_extrema: list[tuple[float, np.ndarray, dict[str, Any]]] = []
+    eig_tol = 1e-8 * u_abs_max
+
+    for idx_row in cand_ijk:
+        i, j, k = int(idx_row[0]), int(idx_row[1]), int(idx_row[2])
+        u0 = float(u[i, j, k])
+        sgn = 1.0 if u0 > 0.0 else -1.0
+
+        g_xi = np.array(
+            [
+                0.5 * (u[i + 1, j, k] - u[i - 1, j, k]),
+                0.5 * (u[i, j + 1, k] - u[i, j - 1, k]),
+                0.5 * (u[i, j, k + 1] - u[i, j, k - 1]),
+            ],
+            dtype=np.float64,
+        )
+        hxx = u[i + 1, j, k] - 2.0 * u0 + u[i - 1, j, k]
+        hyy = u[i, j + 1, k] - 2.0 * u0 + u[i, j - 1, k]
+        hzz = u[i, j, k + 1] - 2.0 * u0 + u[i, j, k - 1]
+        hxy = 0.25 * (
+            u[i + 1, j + 1, k]
+            - u[i + 1, j - 1, k]
+            - u[i - 1, j + 1, k]
+            + u[i - 1, j - 1, k]
+        )
+        hxz = 0.25 * (
+            u[i + 1, j, k + 1]
+            - u[i + 1, j, k - 1]
+            - u[i - 1, j, k + 1]
+            + u[i - 1, j, k - 1]
+        )
+        hyz = 0.25 * (
+            u[i, j + 1, k + 1]
+            - u[i, j + 1, k - 1]
+            - u[i, j - 1, k + 1]
+            + u[i, j - 1, k - 1]
+        )
+        h_xi = np.array(
+            [[hxx, hxy, hxz], [hxy, hyy, hyz], [hxz, hyz, hzz]], dtype=np.float64
+        )
+        m_xi = -sgn * h_xi
+        evals_xi = np.linalg.eigvalsh(m_xi)
+        if float(evals_xi[0]) <= eig_tol:
+            continue
+
+        try:
+            d_xi = -np.linalg.solve(h_xi, g_xi)
+        except np.linalg.LinAlgError:
+            continue
+        if float(np.max(np.abs(d_xi))) > 0.85:
+            continue
+
+        u_star = float(u0 + 0.5 * np.dot(g_xi, d_xi))
+        if sgn * u_star <= floor_val:
+            continue
+
+        im_grad = np.array(
+            [
+                0.5 * (v_im[i + 1, j, k] - v_im[i - 1, j, k]),
+                0.5 * (v_im[i, j + 1, k] - v_im[i, j - 1, k]),
+                0.5 * (v_im[i, j, k + 1] - v_im[i, j, k - 1]),
+            ],
+            dtype=np.float64,
+        )
+        im_star = float(v_im[i, j, k] + np.dot(im_grad, d_xi))
+
+        vox_pos = np.array([i + d_xi[0], j + d_xi[1], k + d_xi[2]], dtype=np.float64)
+        h_star = np.array(
+            [h0[i] + d_xi[0] * dh0, h1[j] + d_xi[1] * dh1, h2[k] + d_xi[2] * dh2],
+            dtype=np.float64,
+        )
+        g_star = ub @ h_star
+        g_norm = float(np.linalg.norm(g_star))
+        if g_norm <= 1e-6:
+            continue
+        if g_max is not None and g_max > 0.0 and g_norm > float(g_max) * 1.02:
+            continue
+        if (
+            roi_center_g is not None
+            and roi_radius_g is not None
+            and roi_radius_g > 0.0
+            and float(np.linalg.norm(g_star - roi_center_g))
+            > float(roi_radius_g) * 1.02
+        ):
+            continue
+
+        # Transform positive-definite curvature tensor -sgn * H into reciprocal Cartesian G-space
+        m_h = m_xi * np.outer(inv_dh, inv_dh)
+        m_g = ub_inv_t @ m_h @ ub_inv
+        m_g = 0.5 * (m_g + m_g.T)
+        kap, vecs = np.linalg.eigh(m_g)
+        axis_g = np.asarray(vecs[:, 0], dtype=np.float64)
+        ax_n = float(np.linalg.norm(axis_g))
+        axis_g = axis_g / ax_n if ax_n > 1e-12 else np.array([0.0, 0.0, 1.0])
+        for comp in axis_g:
+            if abs(float(comp)) > 1e-6:
+                if comp < 0.0:
+                    axis_g = -axis_g
+                break
+
+        abs_u = abs(u_star)
+        kap_soft = max(float(kap[0]), 1e-12)
+        kap_perp = math.sqrt(max(float(kap[1]), 1e-12) * max(float(kap[2]), 1e-12))
+        r_raw = math.sqrt(2.0 * 0.12 * abs_u / kap_perp)
+        a_raw = math.sqrt(2.0 * 0.12 * abs_u / kap_soft)
+        aspect = float(np.clip(a_raw / max(r_raw, 1e-9), 1.0, 3.2))
+        r_cap = float(np.clip(r_raw, 0.046 * g_scale, 0.112 * g_scale))
+        half_len = float(np.clip(r_cap * (aspect - 1.0), 0.0, 0.21 * g_scale))
+
+        n_hkl = [round(float(x)) for x in h_star]
+        dhkl = float(np.linalg.norm(h_star - np.asarray(n_hkl, dtype=np.float64)))
+
+        raw_extrema.append(
+            (
+                abs_u,
+                vox_pos,
+                {
+                    "pos_g": [round(float(x), 5) for x in g_star],
+                    "hkl_cont": [round(float(x), 3) for x in h_star],
+                    "nearest_hkl": n_hkl,
+                    "dhkl": round(dhkl, 3),
+                    "re_val": round(u_star, 5),
+                    "im_val": round(im_star, 5),
+                    "abs_val": round(abs_u, 5),
+                    "sign": 1 if sgn > 0 else -1,
+                    "axis_g": [round(float(x), 5) for x in axis_g],
+                    "radius_g": round(r_cap, 5),
+                    "half_len_g": round(half_len, 5),
+                    "aspect": round(aspect, 3),
+                },
+            )
+        )
+
+    raw_extrema.sort(key=lambda item: item[0], reverse=True)
+    kept: list[dict[str, Any]] = []
+    kept_vox: list[np.ndarray] = []
+    for _, vpos, rec in raw_extrema:
+        if any(float(np.linalg.norm(vpos - prev)) < 0.48 for prev in kept_vox):
+            continue
+        kept_vox.append(vpos)
+        kept.append(rec)
+        if len(kept) >= max_extrema:
+            break
+    return kept
+
+
 def _extract_single_isosurface_mesh(
     scalar_vol: np.ndarray,
     amp_ref: float,
@@ -788,6 +1037,7 @@ def _extract_single_isosurface_mesh(
     ub_matrix: np.ndarray,
     ub_inv_t: np.ndarray,
     *,
+    aux_scalar_vol: np.ndarray | None = None,
     g_max: float | None = None,
     roi_center_g: np.ndarray | None = None,
     roi_radius_g: float | None = None,
@@ -798,17 +1048,21 @@ def _extract_single_isosurface_mesh(
     """Run Marching Cubes at level=0 and transform vertices/normals into sample reciprocal space G (A^-1)."""
     from skimage.measure import marching_cubes
 
+    empty_res: dict[str, Any] = {
+        "n_verts": 0,
+        "n_tris": 0,
+        "verts_b64": "",
+        "norms_b64": "",
+        "faces_b64": "",
+    }
+    if aux_scalar_vol is not None:
+        empty_res["re_vals_b64"] = ""
+
     vmin = float(np.min(scalar_vol))
     vmax = float(np.max(scalar_vol))
     tol = 1e-4 * max(amp_ref, 1e-12)
     if not (vmin < -tol and vmax > tol):
-        return {
-            "n_verts": 0,
-            "n_tris": 0,
-            "verts_b64": "",
-            "norms_b64": "",
-            "faces_b64": "",
-        }
+        return empty_res
 
     dh0 = float(h0[1] - h0[0]) if len(h0) > 1 else 1.0
     dh1 = float(h1[1] - h1[0]) if len(h1) > 1 else 1.0
@@ -821,13 +1075,7 @@ def _extract_single_isosurface_mesh(
         allow_degenerate=False,
     )
     if len(faces) == 0 or len(verts_idx) == 0:
-        return {
-            "n_verts": 0,
-            "n_tris": 0,
-            "verts_b64": "",
-            "norms_b64": "",
-            "faces_b64": "",
-        }
+        return empty_res
 
     origin_h = np.array([h0[0], h1[0], h2[0]], dtype=np.float64)
     verts_hkl = verts_idx + origin_h[None, :]
@@ -854,13 +1102,7 @@ def _extract_single_isosurface_mesh(
 
     faces_kept = faces[keep_tri]
     if len(faces_kept) == 0:
-        return {
-            "n_verts": 0,
-            "n_tris": 0,
-            "verts_b64": "",
-            "norms_b64": "",
-            "faces_b64": "",
-        }
+        return empty_res
 
     # Compact vertex array to referenced vertices only
     used_v, remap = np.unique(faces_kept.ravel(), return_inverse=True)
@@ -868,13 +1110,28 @@ def _extract_single_isosurface_mesh(
     norms_compact = norms_g[used_v]
     faces_compact = remap.reshape((-1, 3))
 
-    return {
+    res: dict[str, Any] = {
         "n_verts": len(verts_compact),
         "n_tris": len(faces_compact),
         "verts_b64": _pack_f32_b64(verts_compact),
         "norms_b64": _pack_f32_b64(norms_compact),
         "faces_b64": _pack_u32_b64(faces_compact),
     }
+    if aux_scalar_vol is not None:
+        pts_grid_idx = np.column_stack(
+            [
+                verts_idx[used_v, 0] / max(abs(dh0), 1e-12),
+                verts_idx[used_v, 1] / max(abs(dh1), 1e-12),
+                verts_idx[used_v, 2] / max(abs(dh2), 1e-12),
+            ]
+        )
+        re_vals_compact = _trilinear_sample_volume(aux_scalar_vol, pts_grid_idx)
+        res["re_vals_b64"] = _pack_f32_b64(re_vals_compact)
+        res["abs_re_quantiles"] = [
+            round(float(x), 5)
+            for x in np.quantile(np.abs(re_vals_compact), np.linspace(0.0, 1.0, 101))
+        ]
+    return res
 
 
 def compute_nodal_surfaces_payload(
@@ -1069,6 +1326,8 @@ def compute_nodal_surfaces_payload(
         re_mesh = cached_brick["re_surface"]
         im_mesh = cached_brick["im_surface"]
         brick_vortices = cached_brick["brick_vortices"]
+        morse_maxima = cached_brick["morse_maxima"]
+        antinode_quantiles = cached_brick["antinode_quantiles"]
     else:
         h0_b = np.linspace(
             brick_center_hkl[0] - half_span_hkl[0],
@@ -1123,6 +1382,7 @@ def compute_nodal_surfaces_payload(
             h2_b,
             ub,
             ub_inv_t,
+            aux_scalar_vol=Z_brick.real,
             g_max=g_max,
             roi_center_g=brick_center_g,
             roi_radius_g=brick_radius_g,
@@ -1138,11 +1398,42 @@ def compute_nodal_surfaces_payload(
             roi_radius_g=brick_radius_g,
             max_polylines=320,
         )
+        morse_maxima = extract_morse_maxima_3d(
+            Z_brick,
+            h0_b,
+            h1_b,
+            h2_b,
+            ub,
+            mean_g_star=mean_g_star,
+            g_max=g_max,
+            roi_center_g=brick_center_g,
+            roi_radius_g=brick_radius_g,
+            max_extrema=240,
+        )
+        if im_mesh.get("abs_re_quantiles"):
+            antinode_quantiles = list(im_mesh["abs_re_quantiles"])
+        else:
+            hh0, hh1, hh2 = np.meshgrid(h0_b, h1_b, h2_b, indexing="ij")
+            pts_g_all = np.column_stack([hh0.ravel(), hh1.ravel(), hh2.ravel()]) @ ub.T
+            gn_all = np.linalg.norm(pts_g_all, axis=1)
+            dc_all = np.linalg.norm(pts_g_all - brick_center_g[None, :], axis=1)
+            vmask = (gn_all > 1e-5) & (gn_all <= g_max) & (dc_all <= brick_radius_g)
+            abs_re_valid = np.abs(Z_brick.real.ravel()[vmask])
+            if abs_re_valid.size > 0:
+                antinode_quantiles = [
+                    round(float(x), 5)
+                    for x in np.quantile(abs_re_valid, np.linspace(0.0, 1.0, 101))
+                ]
+            else:
+                antinode_quantiles = [0.0] * 101
+
         _BRICK_PAYLOAD_CACHE[brick_cache_key] = {
             "is_real_only": is_real_only,
             "re_surface": re_mesh,
             "im_surface": im_mesh,
             "brick_vortices": brick_vortices,
+            "morse_maxima": morse_maxima,
+            "antinode_quantiles": antinode_quantiles,
         }
         while len(_BRICK_PAYLOAD_CACHE) > _MAX_BRICK_CACHE_ENTRIES:
             _BRICK_PAYLOAD_CACHE.popitem(last=False)
@@ -1265,6 +1556,8 @@ def compute_nodal_surfaces_payload(
         "roi_vortices": brick_vortices,
         "vortices": global_vortices,
         "vortex_shell_radius_g": round(float(shell_radius_g), 5),
+        "morse_maxima": morse_maxima,
+        "antinode_quantiles": antinode_quantiles,
     }
 
 
@@ -1449,15 +1742,20 @@ def get_nodal_surfaces_js() -> str:
     let nodalData = deps.initialNodalData || null;
     let dataSeq = nodalData ? 1 : 0;
     let decodedCacheSig = "";
-    let decodedMeshes = { re: null, im: null, vortex: null };
+    let decodedMeshes = { re: null, im: null, vortex: null, morsePos: null, morseNeg: null, morseList: [] };
     let glCanvas = null;
     let gl = null;
     let glProg = null;
     let glVortexProg = null;
-    let glBufs = { re: null, im: null, vortex: null };
+    let glBufs = { re: null, im: null, vortex: null, morsePos: null, morseNeg: null };
     let glUnavailable = false;
     let last3DRenderSig = "";
     let screenPeakHits3D = [];
+    let screenMorseHits3D = [];
+    let hoveredMorseObj = null;
+    let roiQuantileCacheSig = "";
+    let roiSortedAbsRe = new Float32Array(0);
+    let roiMaxAbsRe = 0.0;
     let fetchInFlight = 0;
     let roiDebounceTimer = null;
     let brickFetchInProgress = false;
@@ -1608,18 +1906,118 @@ def get_nodal_surfaces_js() -> str:
 
     function decodeSingleMesh(m) {
       if (!m || !m.n_tris || !m.verts_b64 || !m.faces_b64) {
-        return { nVerts: 0, nTris: 0, verts: new Float32Array(0), norms: new Float32Array(0), faces: new Uint32Array(0) };
+        return { nVerts: 0, nTris: 0, verts: new Float32Array(0), norms: new Float32Array(0), scalars: null, faces: new Uint32Array(0) };
       }
       const verts = decodeBase64Float32(m.verts_b64);
       const norms = m.norms_b64 ? decodeBase64Float32(m.norms_b64) : new Float32Array(verts.length);
+      const scalars = m.re_vals_b64 ? decodeBase64Float32(m.re_vals_b64) : null;
       const faces = decodeBase64Uint32(m.faces_b64);
       return {
         nVerts: Number(m.n_verts) || (verts.length / 3),
         nTris: Number(m.n_tris) || (faces.length / 3),
         verts,
         norms,
+        scalars: (scalars && scalars.length >= (verts.length / 3)) ? scalars : null,
         faces,
       };
+    }
+
+    function buildMorseCapsuleMesh(caps) {
+      if (!Array.isArray(caps) || caps.length === 0) {
+        return { nVerts: 0, nTris: 0, verts: new Float32Array(0), norms: new Float32Array(0), scalars: new Float32Array(0), faces: new Uint32Array(0) };
+      }
+      const nAz = 14;
+      const capSteps = 4;
+      let totalVerts = 0;
+      let totalTris = 0;
+      for (let ci = 0; ci < caps.length; ci++) {
+        const L = Math.max(0.0, Number(caps[ci].half_len_g) || 0.0);
+        const nRings = (capSteps + 1) + (L > 1e-7 ? (capSteps + 1) : capSteps);
+        totalVerts += nRings * nAz;
+        totalTris += (nRings - 1) * nAz * 2;
+      }
+      const verts = new Float32Array(totalVerts * 3);
+      const norms = new Float32Array(totalVerts * 3);
+      const scalars = new Float32Array(totalVerts);
+      const faces = new Uint32Array(totalTris * 3);
+      const cosPhi = new Float32Array(nAz);
+      const sinPhi = new Float32Array(nAz);
+      for (let a = 0; a < nAz; a++) {
+        const phi = (2.0 * Math.PI * a) / nAz;
+        cosPhi[a] = Math.cos(phi);
+        sinPhi[a] = Math.sin(phi);
+      }
+
+      let vCursor = 0;
+      let fCursor = 0;
+      for (let ci = 0; ci < caps.length; ci++) {
+        const c = caps[ci];
+        const pos = c.pos_g || [0, 0, 0];
+        const rawAx = c.axis_g || [0, 0, 1];
+        const axNorm = Math.hypot(rawAx[0], rawAx[1], rawAx[2]) || 1.0;
+        const ax = rawAx[0] / axNorm, ay = rawAx[1] / axNorm, az = rawAx[2] / axNorm;
+        const refX = Math.abs(ax) < 0.85 ? 1.0 : 0.0;
+        const refY = Math.abs(ax) < 0.85 ? 0.0 : 1.0;
+        let ux = ay * 0.0 - az * refY;
+        let uy = az * refX - ax * 0.0;
+        let uz = ax * refY - ay * refX;
+        const un = Math.hypot(ux, uy, uz) || 1.0;
+        ux /= un; uy /= un; uz /= un;
+        const vx = ay * uz - az * uy;
+        const vy = az * ux - ax * uz;
+        const vz = ax * uy - ay * ux;
+
+        const r = Math.max(1e-5, Number(c.radius_g) || 0.003);
+        const L = Math.max(0.0, Number(c.half_len_g) || 0.0);
+        const reVal = Number(c.re_val) || 0.0;
+        const rings = [];
+        for (let s = 0; s <= capSteps; s++) {
+          const th = -0.5 * Math.PI + (0.5 * Math.PI * s) / capSteps;
+          rings.push([Math.sin(th), Math.cos(th), -L]);
+        }
+        for (let s = (L > 1e-7 ? 0 : 1); s <= capSteps; s++) {
+          const th = (0.5 * Math.PI * s) / capSteps;
+          rings.push([Math.sin(th), Math.cos(th), L]);
+        }
+
+        const baseV = vCursor;
+        const nRings = rings.length;
+        for (let ri = 0; ri < nRings; ri++) {
+          const sinTh = rings[ri][0], cosTh = rings[ri][1], zOff = rings[ri][2];
+          const cxR = pos[0] + zOff * ax;
+          const cyR = pos[1] + zOff * ay;
+          const czR = pos[2] + zOff * az;
+          for (let a = 0; a < nAz; a++) {
+            const cp = cosPhi[a], sp = sinPhi[a];
+            const radX = cp * ux + sp * vx;
+            const radY = cp * uy + sp * vy;
+            const radZ = cp * uz + sp * vz;
+            const nx = cosTh * radX + sinTh * ax;
+            const ny = cosTh * radY + sinTh * ay;
+            const nz = cosTh * radZ + sinTh * az;
+            const o3 = vCursor * 3;
+            norms[o3] = nx;
+            norms[o3 + 1] = ny;
+            norms[o3 + 2] = nz;
+            verts[o3] = cxR + r * nx;
+            verts[o3 + 1] = cyR + r * ny;
+            verts[o3 + 2] = czR + r * nz;
+            scalars[vCursor] = reVal;
+            vCursor++;
+          }
+        }
+        for (let ri = 0; ri < nRings - 1; ri++) {
+          const r0 = baseV + ri * nAz;
+          const r1 = baseV + (ri + 1) * nAz;
+          for (let a = 0; a < nAz; a++) {
+            const aNext = (a + 1) % nAz;
+            const v00 = r0 + a, v10 = r0 + aNext, v11 = r1 + aNext, v01 = r1 + a;
+            faces[fCursor++] = v00; faces[fCursor++] = v10; faces[fCursor++] = v11;
+            faces[fCursor++] = v00; faces[fCursor++] = v11; faces[fCursor++] = v01;
+          }
+        }
+      }
+      return { nVerts: totalVerts, nTris: totalTris, verts, norms, scalars, faces };
     }
 
     function decodeVortexRibbonGeometry(vList) {
@@ -1695,32 +2093,126 @@ def get_nodal_surfaces_js() -> str:
 
     function ensureDecodedMeshes() {
       if (!nodalData || !nodalData.has_phases) {
-        decodedMeshes = { re: null, im: null, vortex: null };
+        decodedMeshes = { re: null, im: null, vortex: null, morsePos: null, morseNeg: null, morseList: [] };
         decodedCacheSig = "";
+        roiQuantileCacheSig = "";
+        roiSortedAbsRe = new Float32Array(0);
+        roiMaxAbsRe = 0.0;
         return decodedMeshes;
       }
       const reM = nodalData.re_surface || {};
       const imM = nodalData.im_surface || {};
       const vList = getActiveVortexList(nodalData);
+      const mList = Array.isArray(nodalData.morse_maxima) ? nodalData.morse_maxima : [];
       const sig = [
         makeBrickKey(nodalData),
         reM.n_tris || 0,
         (reM.verts_b64 || "").slice(0, 24),
         imM.n_tris || 0,
         (imM.verts_b64 || "").slice(0, 24),
+        (imM.re_vals_b64 || "").slice(0, 24),
         (nodalData.roi_vortices || []).length,
         vList.length,
+        mList.length,
       ].join("|");
       if (sig === decodedCacheSig) return decodedMeshes;
       decodedCacheSig = sig;
+      roiQuantileCacheSig = "";
+      const posCaps = [];
+      const negCaps = [];
+      for (let i = 0; i < mList.length; i++) {
+        if ((Number(mList[i].re_val) || 0.0) >= 0.0) posCaps.push(mList[i]);
+        else negCaps.push(mList[i]);
+      }
       decodedMeshes = {
         re: decodeSingleMesh(reM),
         im: decodeSingleMesh(imM),
         vortex: decodeVortexRibbonGeometry(vList),
+        morsePos: buildMorseCapsuleMesh(posCaps),
+        morseNeg: buildMorseCapsuleMesh(negCaps),
+        morseList: mList,
       };
       uploadGlMeshes();
       last3DRenderSig = "";
       return decodedMeshes;
+    }
+
+    function resolveAntinodeThreshold(liveRoi) {
+      ensureDecodedMeshes();
+      const rawPct = Number(deps.state && deps.state.antinodePercentile);
+      const pct = Math.max(0.0, Math.min(1.0, Number.isFinite(rawPct) ? rawPct : 0.75));
+      if (!nodalData || !nodalData.has_phases) {
+        return { pct, tau: 0.0, maxAbs: 1.0, activeMorseCount: 0 };
+      }
+      const roiKey = [
+        decodedCacheSig,
+        liveRoi.mode,
+        liveRoi.centerG[0].toFixed(4),
+        liveRoi.centerG[1].toFixed(4),
+        liveRoi.centerG[2].toFixed(4),
+        liveRoi.radiusG.toFixed(4),
+        liveRoi.slabActive ? `${liveRoi.slabNormal.map(x => x.toFixed(3)).join(",")}:${liveRoi.slabHalfThick.toFixed(4)}` : "0",
+      ].join("|");
+      if (roiKey !== roiQuantileCacheSig) {
+        roiQuantileCacheSig = roiKey;
+        const imMesh = decodedMeshes.im;
+        const vals = [];
+        let maxV = 0.0;
+        if (imMesh && imMesh.scalars && imMesh.nVerts > 0) {
+          const v = imMesh.verts;
+          const sc = imMesh.scalars;
+          const stride = Math.max(1, Math.floor(imMesh.nVerts / 8000));
+          for (let i = 0; i < imMesh.nVerts; i += stride) {
+            const o3 = i * 3;
+            if (pointInsideLiveRoi([v[o3], v[o3 + 1], v[o3 + 2]], liveRoi)) {
+              const av = Math.abs(sc[i]);
+              vals.push(av);
+              if (av > maxV) maxV = av;
+            }
+          }
+        }
+        const mList = decodedMeshes.morseList || [];
+        for (let i = 0; i < mList.length; i++) {
+          const mp = mList[i].pos_g;
+          if (mp && pointInsideLiveRoi(mp, liveRoi)) {
+            const av = Math.abs(Number(mList[i].re_val) || 0.0);
+            if (av > maxV) maxV = av;
+            if (!imMesh || !imMesh.scalars || imMesh.nVerts === 0) vals.push(av);
+          }
+        }
+        if (vals.length === 0 && Array.isArray(nodalData.antinode_quantiles) && nodalData.antinode_quantiles.length > 0) {
+          for (let i = 0; i < nodalData.antinode_quantiles.length; i++) {
+            const av = Math.max(0.0, Number(nodalData.antinode_quantiles[i]) || 0.0);
+            vals.push(av);
+            if (av > maxV) maxV = av;
+          }
+        }
+        vals.sort((a, b) => a - b);
+        roiSortedAbsRe = new Float32Array(vals);
+        roiMaxAbsRe = Math.max(maxV, 1e-6);
+      }
+
+      let tau = 0.0;
+      if (pct > 0.0 && roiSortedAbsRe.length > 0) {
+        const effP = Math.min(0.9995, pct);
+        const fIdx = effP * (roiSortedAbsRe.length - 1);
+        const i0 = Math.floor(fIdx);
+        const i1 = Math.min(roiSortedAbsRe.length - 1, i0 + 1);
+        const frac = fIdx - i0;
+        tau = roiSortedAbsRe[i0] * (1.0 - frac) + roiSortedAbsRe[i1] * frac;
+        if (pct >= 0.999) {
+          tau = Math.min(tau, roiSortedAbsRe[roiSortedAbsRe.length - 1] * 0.9995);
+        }
+      }
+
+      let activeMorseCount = 0;
+      const mList = decodedMeshes.morseList || [];
+      for (let i = 0; i < mList.length; i++) {
+        const mp = mList[i].pos_g;
+        if (!mp || !pointInsideLiveRoi(mp, liveRoi)) continue;
+        if (Math.abs(Number(mList[i].re_val) || 0.0) >= tau) activeMorseCount++;
+      }
+      return { pct, tau, maxAbs: roiMaxAbsRe, activeMorseCount };
     }
 
     function initWebGLOverlay() {
@@ -1766,6 +2258,7 @@ def get_nodal_surfaces_js() -> str:
         const vsSrc = [
           "attribute vec3 aPos;",
           "attribute vec3 aNorm;",
+          "attribute float aScalar;",
           "uniform mat3 uRot;",
           "uniform vec3 uCenter;",
           "uniform float uInvScale;",
@@ -1775,6 +2268,7 @@ def get_nodal_surfaces_js() -> str:
           "varying vec3 vNorm;",
           "varying vec3 vSamplePos;",
           "varying float vEyeDist;",
+          "varying float vScalar;",
           "void main() {",
           "  vec3 p = uRot * ((aPos - uCenter) * uInvScale);",
           "  vec3 n = normalize(uRot * aNorm);",
@@ -1788,6 +2282,7 @@ def get_nodal_surfaces_js() -> str:
           "  vNorm = n;",
           "  vSamplePos = aPos;",
           "  vEyeDist = eyeDist;",
+          "  vScalar = aScalar;",
           "  gl_Position = vec4(clipX, clipY, clipZ, 1.0);",
           "}",
         ].join("\n");
@@ -1801,9 +2296,13 @@ def get_nodal_surfaces_js() -> str:
           "uniform vec3 uSlabNormal;",
           "uniform float uSlabOffset;",
           "uniform float uSlabHalfThick;",
+          "uniform float uAntinodeMode;",
+          "uniform float uAntinodeTau;",
+          "uniform float uAntinodeMax;",
           "varying vec3 vNorm;",
           "varying vec3 vSamplePos;",
           "varying float vEyeDist;",
+          "varying float vScalar;",
           "void main() {",
           "  if (vEyeDist < 0.28) discard;",
           "  vec3 dRoi = vSamplePos - uClipCenter;",
@@ -1811,6 +2310,8 @@ def get_nodal_surfaces_js() -> str:
           "  if (uSlabActive > 0.5) {",
           "    if (abs(dot(vSamplePos, uSlabNormal) - uSlabOffset) > uSlabHalfThick) discard;",
           "  }",
+          "  float absS = abs(vScalar);",
+          "  if (uAntinodeMode > 0.5 && absS < uAntinodeTau) discard;",
           "  vec3 N = normalize(vNorm);",
           "  if (!gl_FrontFacing) N = -N;",
           "  vec3 L1 = normalize(vec3(-0.38, 0.52, 0.76));",
@@ -1818,10 +2319,26 @@ def get_nodal_surfaces_js() -> str:
           "  float diff = 0.34 + 0.50 * max(dot(N, L1), 0.0) + 0.20 * max(dot(N, L2), 0.0);",
           "  vec3 V = vec3(0.0, 0.0, 1.0);",
           "  vec3 H = normalize(L1 + V);",
-          "  float spec = 0.22 * pow(max(dot(N, H), 0.0), 22.0);",
-          "  float rim = 0.16 * pow(1.0 - abs(dot(N, V)), 2.0);",
-          "  vec3 rgb = clamp(uColor.rgb * diff + vec3(spec + rim * 0.5), 0.0, 1.0);",
-          "  gl_FragColor = vec4(rgb, uColor.a);",
+          "  vec3 baseCol = uColor.rgb;",
+          "  float outAlpha = uColor.a;",
+          "  float specGain = 0.22;",
+          "  float rimBoost = 0.0;",
+          "  if (uAntinodeMode > 0.5 && uAntinodeMode < 1.5) {",
+          "    float crest = clamp((absS - uAntinodeTau) / max(1e-6, uAntinodeMax - uAntinodeTau), 0.0, 1.0);",
+          "    vec3 posCol = mix(vec3(0.98, 0.62, 0.11), vec3(1.00, 0.88, 0.42), crest * 0.65);",
+          "    vec3 negCol = mix(vec3(0.76, 0.34, 0.98), vec3(0.92, 0.68, 1.00), crest * 0.65);",
+          "    baseCol = vScalar >= 0.0 ? posCol : negCol;",
+          "    rimBoost = 0.34 * (1.0 - smoothstep(0.0, 0.06, crest));",
+          "    outAlpha = clamp(uColor.a * (1.12 + 0.22 * crest), 0.18, 0.94);",
+          "    specGain = 0.30;",
+          "  } else if (uAntinodeMode > 1.5) {",
+          "    specGain = 0.46;",
+          "    rimBoost = 0.10;",
+          "  }",
+          "  float spec = specGain * pow(max(dot(N, H), 0.0), 26.0);",
+          "  float rim = 0.16 * pow(1.0 - abs(dot(N, V)), 2.0) + rimBoost;",
+          "  vec3 rgb = clamp(baseCol * diff + vec3(spec + rim * 0.65), 0.0, 1.0);",
+          "  gl_FragColor = vec4(rgb, outAlpha);",
           "}",
         ].join("\n");
 
@@ -1835,6 +2352,7 @@ def get_nodal_surfaces_js() -> str:
           prog,
           aPos: gl.getAttribLocation(prog, "aPos"),
           aNorm: gl.getAttribLocation(prog, "aNorm"),
+          aScalar: gl.getAttribLocation(prog, "aScalar"),
           uRot: gl.getUniformLocation(prog, "uRot"),
           uCenter: gl.getUniformLocation(prog, "uCenter"),
           uInvScale: gl.getUniformLocation(prog, "uInvScale"),
@@ -1848,6 +2366,9 @@ def get_nodal_surfaces_js() -> str:
           uSlabNormal: gl.getUniformLocation(prog, "uSlabNormal"),
           uSlabOffset: gl.getUniformLocation(prog, "uSlabOffset"),
           uSlabHalfThick: gl.getUniformLocation(prog, "uSlabHalfThick"),
+          uAntinodeMode: gl.getUniformLocation(prog, "uAntinodeMode"),
+          uAntinodeTau: gl.getUniformLocation(prog, "uAntinodeTau"),
+          uAntinodeMax: gl.getUniformLocation(prog, "uAntinodeMax"),
         };
 
         const vsVortexSrc = [
@@ -1960,10 +2481,16 @@ def get_nodal_surfaces_js() -> str:
       const nbo = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, nbo);
       gl.bufferData(gl.ARRAY_BUFFER, m.norms, gl.STATIC_DRAW);
+      let sbo = null;
+      if (m.scalars && m.scalars.length >= m.nVerts) {
+        sbo = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, sbo);
+        gl.bufferData(gl.ARRAY_BUFFER, m.scalars, gl.STATIC_DRAW);
+      }
       const ibo = gl.createBuffer();
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
       gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.faces, gl.STATIC_DRAW);
-      return { vbo, nbo, ibo, count: m.faces.length, indexType: gl.UNSIGNED_INT };
+      return { vbo, nbo, sbo, ibo, count: m.faces.length, indexType: gl.UNSIGNED_INT };
     }
 
     function uploadGlVortexRibbon(vr) {
@@ -1987,6 +2514,7 @@ def get_nodal_surfaces_js() -> str:
       if (!gl || !b) return;
       if (b.vbo) gl.deleteBuffer(b.vbo);
       if (b.nbo) gl.deleteBuffer(b.nbo);
+      if (b.sbo) gl.deleteBuffer(b.sbo);
       if (b.b0) gl.deleteBuffer(b.b0);
       if (b.b1) gl.deleteBuffer(b.b1);
       if (b.bSide) gl.deleteBuffer(b.bSide);
@@ -1998,9 +2526,13 @@ def get_nodal_surfaces_js() -> str:
       disposeGlMesh(glBufs.re);
       disposeGlMesh(glBufs.im);
       disposeGlMesh(glBufs.vortex);
+      disposeGlMesh(glBufs.morsePos);
+      disposeGlMesh(glBufs.morseNeg);
       glBufs.re = decodedMeshes.re ? uploadGlSingleMesh(decodedMeshes.re) : null;
       glBufs.im = decodedMeshes.im ? uploadGlSingleMesh(decodedMeshes.im) : null;
       glBufs.vortex = decodedMeshes.vortex ? uploadGlVortexRibbon(decodedMeshes.vortex) : null;
+      glBufs.morsePos = decodedMeshes.morsePos ? uploadGlSingleMesh(decodedMeshes.morsePos) : null;
+      glBufs.morseNeg = decodedMeshes.morseNeg ? uploadGlSingleMesh(decodedMeshes.morseNeg) : null;
     }
 
     // Camera matrix matching projectToWulff right-handed SO(3) lab camera coupled with R_gonio
@@ -2060,18 +2592,27 @@ def get_nodal_surfaces_js() -> str:
       return [sx, sy, pz, (D - 0.2) / dist, vis];
     }
 
-    function renderSurfacesAndVortices3D(ctx, w, h, dpr, Rtot, center, invScale, Rpx, zoom, liveRoi, isExp) {
+    function renderSurfacesAndVortices3D(ctx, w, h, dpr, Rtot, center, invScale, Rpx, zoom, liveRoi, isExp, antinodeStats) {
       const st = deps.state;
       if (!nodalData || !nodalData.has_phases) return;
       ensureDecodedMeshes();
+      const antinodeOn = Boolean(st.showAntinodes);
+      const morseOn = Boolean(st.showMorseCapsules);
       const hasRe = st.showNodalSurfacesRe && decodedMeshes.re && decodedMeshes.re.nTris > 0;
-      const hasIm = st.showNodalSurfacesIm && decodedMeshes.im && decodedMeshes.im.nTris > 0;
+      const hasIm = (st.showNodalSurfacesIm || antinodeOn) && decodedMeshes.im && decodedMeshes.im.nTris > 0;
       const hasVor = st.showPhaseVortices && decodedMeshes.vortex && decodedMeshes.vortex.nSegs > 0;
-      if (!hasRe && !hasIm && !hasVor) return;
+      const hasMorse = morseOn && (
+        (decodedMeshes.morsePos && decodedMeshes.morsePos.nTris > 0) ||
+        (decodedMeshes.morseNeg && decodedMeshes.morseNeg.nTris > 0)
+      );
+      if (!hasRe && !hasIm && !hasVor && !hasMorse) return;
 
+      const aStats = antinodeStats || resolveAntinodeThreshold(liveRoi);
+      const tau = aStats.tau;
+      const maxAbs = aStats.maxAbs;
       const surfAlpha = Math.max(0.12, Math.min(0.92, Number(st.nodalSurfaceAlpha) || 0.56));
       const glCtx = initWebGLOverlay();
-      if (glCtx && glProg && (glBufs.re || glBufs.im || glBufs.vortex)) {
+      if (glCtx && glProg && (glBufs.re || glBufs.im || glBufs.vortex || glBufs.morsePos || glBufs.morseNeg)) {
         const tw = Math.max(1, Math.round(w * dpr));
         const th = Math.max(1, Math.round(h * dpr));
         if (glCanvas.width !== tw || glCanvas.height !== th) {
@@ -2098,7 +2639,7 @@ def get_nodal_surfaces_js() -> str:
         const aspectX = scalePx / (0.5 * w);
         const aspectY = scalePx / (0.5 * h);
 
-        if ((hasRe && glBufs.re) || (hasIm && glBufs.im)) {
+        function bindProgCommonUniforms() {
           glCtx.useProgram(glProg.prog);
           glCtx.uniformMatrix3fv(glProg.uRot, false, rotColMajor);
           glCtx.uniform3f(glProg.uCenter, center[0], center[1], center[2]);
@@ -2112,42 +2653,65 @@ def get_nodal_surfaces_js() -> str:
           glCtx.uniform3f(glProg.uSlabNormal, liveRoi.slabNormal[0], liveRoi.slabNormal[1], liveRoi.slabNormal[2]);
           glCtx.uniform1f(glProg.uSlabOffset, liveRoi.slabOffset);
           glCtx.uniform1f(glProg.uSlabHalfThick, liveRoi.slabHalfThick);
-
-          function drawPass(buf, rgba, cullFaceMode, depthMask) {
-            if (!buf) return;
-            glCtx.depthMask(depthMask);
-            if (cullFaceMode) {
-              glCtx.enable(glCtx.CULL_FACE);
-              glCtx.cullFace(cullFaceMode);
-            } else {
-              glCtx.disable(glCtx.CULL_FACE);
-            }
-            glCtx.uniform4f(glProg.uColor, rgba[0], rgba[1], rgba[2], rgba[3]);
-            glCtx.bindBuffer(glCtx.ARRAY_BUFFER, buf.vbo);
-            glCtx.enableVertexAttribArray(glProg.aPos);
-            glCtx.vertexAttribPointer(glProg.aPos, 3, glCtx.FLOAT, false, 0, 0);
-            glCtx.bindBuffer(glCtx.ARRAY_BUFFER, buf.nbo);
-            glCtx.enableVertexAttribArray(glProg.aNorm);
-            glCtx.vertexAttribPointer(glProg.aNorm, 3, glCtx.FLOAT, false, 0, 0);
-            glCtx.bindBuffer(glCtx.ELEMENT_ARRAY_BUFFER, buf.ibo);
-            glCtx.drawElements(glCtx.TRIANGLES, buf.count, buf.indexType, 0);
-          }
-
-          const colRe = [0.06, 0.78, 0.92, surfAlpha];
-          const colIm = [0.96, 0.30, 0.48, surfAlpha];
-          if (hasRe && glBufs.re) drawPass(glBufs.re, [colRe[0], colRe[1], colRe[2], surfAlpha * 0.78], glCtx.FRONT, true);
-          if (hasIm && glBufs.im) drawPass(glBufs.im, [colIm[0], colIm[1], colIm[2], surfAlpha * 0.78], glCtx.FRONT, true);
-          if (hasRe && glBufs.re) drawPass(glBufs.re, colRe, glCtx.BACK, false);
-          if (hasIm && glBufs.im) drawPass(glBufs.im, colIm, glCtx.BACK, false);
-          glCtx.disableVertexAttribArray(glProg.aPos);
-          glCtx.disableVertexAttribArray(glProg.aNorm);
+          glCtx.uniform1f(glProg.uAntinodeTau, tau);
+          glCtx.uniform1f(glProg.uAntinodeMax, maxAbs);
         }
 
-        // Clear surface depth buffer so translucent Re=0 / Im=0 sheets never occlude 1D vortices inside the ROI,
-        // while keeping depth testing enabled among the 3D vortex filaments themselves!
-        if (hasVor && glVortexProg && glBufs.vortex) {
+        function drawPass(buf, rgba, cullFaceMode, depthMask, antinodeMode) {
+          if (!buf) return;
+          glCtx.depthMask(depthMask);
+          if (cullFaceMode) {
+            glCtx.enable(glCtx.CULL_FACE);
+            glCtx.cullFace(cullFaceMode);
+          } else {
+            glCtx.disable(glCtx.CULL_FACE);
+          }
+          glCtx.uniform1f(glProg.uAntinodeMode, antinodeMode || 0.0);
+          glCtx.uniform4f(glProg.uColor, rgba[0], rgba[1], rgba[2], rgba[3]);
+          glCtx.bindBuffer(glCtx.ARRAY_BUFFER, buf.vbo);
+          glCtx.enableVertexAttribArray(glProg.aPos);
+          glCtx.vertexAttribPointer(glProg.aPos, 3, glCtx.FLOAT, false, 0, 0);
+          glCtx.bindBuffer(glCtx.ARRAY_BUFFER, buf.nbo);
+          glCtx.enableVertexAttribArray(glProg.aNorm);
+          glCtx.vertexAttribPointer(glProg.aNorm, 3, glCtx.FLOAT, false, 0, 0);
+          if (glProg.aScalar >= 0) {
+            if (buf.sbo) {
+              glCtx.bindBuffer(glCtx.ARRAY_BUFFER, buf.sbo);
+              glCtx.enableVertexAttribArray(glProg.aScalar);
+              glCtx.vertexAttribPointer(glProg.aScalar, 1, glCtx.FLOAT, false, 0, 0);
+            } else {
+              glCtx.disableVertexAttribArray(glProg.aScalar);
+              glCtx.vertexAttrib1f(glProg.aScalar, 0.0);
+            }
+          }
+          glCtx.bindBuffer(glCtx.ELEMENT_ARRAY_BUFFER, buf.ibo);
+          glCtx.drawElements(glCtx.TRIANGLES, buf.count, buf.indexType, 0);
+        }
+
+        if ((hasRe && glBufs.re) || (hasIm && glBufs.im)) {
+          bindProgCommonUniforms();
+          const colRe = [0.06, 0.78, 0.92, surfAlpha];
+          const colIm = [0.96, 0.30, 0.48, surfAlpha];
+          const imMode = (antinodeOn && glBufs.im && glBufs.im.sbo) ? 1.0 : 0.0;
+          if (hasRe && glBufs.re) drawPass(glBufs.re, [colRe[0], colRe[1], colRe[2], surfAlpha * 0.78], glCtx.FRONT, true, 0.0);
+          if (hasIm && glBufs.im) drawPass(glBufs.im, [colIm[0], colIm[1], colIm[2], surfAlpha * 0.78], glCtx.FRONT, true, imMode);
+          if (hasRe && glBufs.re) drawPass(glBufs.re, colRe, glCtx.BACK, false, 0.0);
+          if (hasIm && glBufs.im) drawPass(glBufs.im, colIm, glCtx.BACK, false, imMode);
+          glCtx.disableVertexAttribArray(glProg.aPos);
+          glCtx.disableVertexAttribArray(glProg.aNorm);
+          if (glProg.aScalar >= 0) glCtx.disableVertexAttribArray(glProg.aScalar);
+        }
+
+        // Clear surface depth buffer so translucent Re=0 / Im=0 sheets never occlude 1D vortices or 3D Morse capsules,
+        // while keeping hardware depth testing active between vortex filaments and 3D Morse capsules!
+        const needForegroundClear = (hasVor && glVortexProg && glBufs.vortex) || (hasMorse && (glBufs.morsePos || glBufs.morseNeg));
+        if (needForegroundClear) {
           glCtx.depthMask(true);
           glCtx.clear(glCtx.DEPTH_BUFFER_BIT);
+        }
+
+        if (hasVor && glVortexProg && glBufs.vortex) {
+          glCtx.depthMask(true);
           glCtx.disable(glCtx.CULL_FACE);
           glCtx.useProgram(glVortexProg.prog);
           glCtx.uniformMatrix3fv(glVortexProg.uRot, false, rotColMajor);
@@ -2182,6 +2746,15 @@ def get_nodal_surfaces_js() -> str:
           glCtx.disableVertexAttribArray(glVortexProg.aSide);
         }
 
+        if (hasMorse && (glBufs.morsePos || glBufs.morseNeg)) {
+          bindProgCommonUniforms();
+          if (glBufs.morsePos) drawPass(glBufs.morsePos, [1.00, 0.76, 0.16, 0.95], glCtx.BACK, true, 2.0);
+          if (glBufs.morseNeg) drawPass(glBufs.morseNeg, [0.85, 0.42, 1.00, 0.95], glCtx.BACK, true, 2.0);
+          glCtx.disableVertexAttribArray(glProg.aPos);
+          glCtx.disableVertexAttribArray(glProg.aNorm);
+          if (glProg.aScalar >= 0) glCtx.disableVertexAttribArray(glProg.aScalar);
+        }
+
         glCtx.depthMask(true);
         glCtx.disable(glCtx.CULL_FACE);
         ctx.save();
@@ -2193,12 +2766,21 @@ def get_nodal_surfaces_js() -> str:
       // Software Canvas2D depth-sorted fallback (used in headless / non-WebGL environments)
       const items = [];
       const cx = w * 0.5, cy = h * 0.5;
-      function collectSoftwareTris(mesh, baseRgb) {
+      function collectSoftwareTris(mesh, baseRgb, useAntinodeFilter) {
         if (!mesh || !mesh.nTris) return;
         const stride = Math.max(1, Math.ceil(mesh.nTris / 3500));
-        const v = mesh.verts, n = mesh.norms, f = mesh.faces;
+        const v = mesh.verts, n = mesh.norms, f = mesh.faces, sc = mesh.scalars;
         for (let t = 0; t < mesh.nTris; t += stride) {
-          const i0 = f[3 * t] * 3, i1 = f[3 * t + 1] * 3, i2 = f[3 * t + 2] * 3;
+          const v0 = f[3 * t], v1 = f[3 * t + 1], v2 = f[3 * t + 2];
+          let rgb = baseRgb;
+          let triAlpha = surfAlpha;
+          if (useAntinodeFilter && sc) {
+            const sMid = (sc[v0] + sc[v1] + sc[v2]) / 3.0;
+            if (Math.abs(sMid) < tau) continue;
+            rgb = sMid >= 0.0 ? [251, 174, 36] : [198, 98, 252];
+            triAlpha = Math.min(0.92, surfAlpha * 1.18);
+          }
+          const i0 = v0 * 3, i1 = v1 * 3, i2 = v2 * 3;
           const mPt = [(v[i0] + v[i1] + v[i2]) / 3.0, (v[i0 + 1] + v[i1 + 1] + v[i2 + 1]) / 3.0, (v[i0 + 2] + v[i1 + 2] + v[i2 + 2]) / 3.0];
           if (!pointInsideLiveRoi(mPt, liveRoi)) continue;
           const p0 = projectPoint3D([v[i0], v[i0 + 1], v[i0 + 2]], Rtot, center, invScale, cx, cy, Rpx, zoom);
@@ -2212,13 +2794,13 @@ def get_nodal_surfaces_js() -> str:
             kind: "tri",
             z: (p0[2] + p1[2] + p2[2]) / 3.0,
             p0, p1, p2,
-            fill: `rgba(${Math.round(baseRgb[0] * shade)},${Math.round(baseRgb[1] * shade)},${Math.round(baseRgb[2] * shade)},${surfAlpha.toFixed(2)})`,
+            fill: `rgba(${Math.round(rgb[0] * shade)},${Math.round(rgb[1] * shade)},${Math.round(rgb[2] * shade)},${triAlpha.toFixed(2)})`,
           });
         }
       }
-      if (hasRe) collectSoftwareTris(decodedMeshes.re, [16, 205, 238]);
-      if (hasIm) collectSoftwareTris(decodedMeshes.im, [246, 78, 125]);
-      const vorItems = [];
+      if (hasRe) collectSoftwareTris(decodedMeshes.re, [16, 205, 238], false);
+      if (hasIm) collectSoftwareTris(decodedMeshes.im, [246, 78, 125], antinodeOn);
+      const fgItems = [];
       if (hasVor) {
         const vList = getActiveVortexList(nodalData);
         for (let vi = 0; vi < vList.length; vi++) {
@@ -2230,12 +2812,31 @@ def get_nodal_surfaces_js() -> str:
             if (!pointInsideLiveRoi(mid, liveRoi)) continue;
             const p0 = projectPoint3D(a, Rtot, center, invScale, cx, cy, Rpx, zoom);
             const p1 = projectPoint3D(b, Rtot, center, invScale, cx, cy, Rpx, zoom);
-            vorItems.push({ kind: "seg", z: 0.5 * (p0[2] + p1[2]), p0, p1 });
+            fgItems.push({ kind: "seg", z: 0.5 * (p0[2] + p1[2]), p0, p1 });
           }
         }
       }
+      if (hasMorse) {
+        const mList = decodedMeshes.morseList || [];
+        for (let mi = 0; mi < mList.length; mi++) {
+          const mc = mList[mi];
+          const reVal = Number(mc.re_val) || 0.0;
+          if (Math.abs(reVal) < tau) continue;
+          const pos = mc.pos_g;
+          if (!pos || !pointInsideLiveRoi(pos, liveRoi)) continue;
+          const ax = mc.axis_g || [0, 0, 1];
+          const L = Math.max(0.0, Number(mc.half_len_g) || 0.0);
+          const rG = Math.max(1e-5, Number(mc.radius_g) || 0.003);
+          const pA = projectPoint3D([pos[0] - L * ax[0], pos[1] - L * ax[1], pos[2] - L * ax[2]], Rtot, center, invScale, cx, cy, Rpx, zoom);
+          const pB = projectPoint3D([pos[0] + L * ax[0], pos[1] + L * ax[1], pos[2] + L * ax[2]], Rtot, center, invScale, cx, cy, Rpx, zoom);
+          const pM = projectPoint3D(pos, Rtot, center, invScale, cx, cy, Rpx, zoom);
+          if (!pM[4]) continue;
+          const rPx = Math.max(3.2, Math.min(22.0, rG * invScale * Rpx * zoom * pM[3]));
+          fgItems.push({ kind: "capsule", z: pM[2], pA, pB, rPx, isPos: reVal >= 0.0 });
+        }
+      }
       items.sort((a, b) => a.z - b.z);
-      vorItems.sort((a, b) => a.z - b.z);
+      fgItems.sort((a, b) => a.z - b.z);
       ctx.save();
       ctx.lineCap = "round";
       for (let i = 0; i < items.length; i++) {
@@ -2248,17 +2849,32 @@ def get_nodal_surfaces_js() -> str:
         ctx.fillStyle = it.fill;
         ctx.fill();
       }
-      for (let i = 0; i < vorItems.length; i++) {
-        const it = vorItems[i];
-        ctx.beginPath();
-        ctx.moveTo(it.p0[0], it.p0[1]);
-        ctx.lineTo(it.p1[0], it.p1[1]);
-        ctx.strokeStyle = "rgba(7, 9, 19, 0.88)";
-        ctx.lineWidth = isExp ? 4.4 : 3.4;
-        ctx.stroke();
-        ctx.strokeStyle = "#fde047";
-        ctx.lineWidth = isExp ? 2.4 : 1.8;
-        ctx.stroke();
+      for (let i = 0; i < fgItems.length; i++) {
+        const it = fgItems[i];
+        if (it.kind === "seg") {
+          ctx.beginPath();
+          ctx.moveTo(it.p0[0], it.p0[1]);
+          ctx.lineTo(it.p1[0], it.p1[1]);
+          ctx.strokeStyle = "rgba(7, 9, 19, 0.88)";
+          ctx.lineWidth = isExp ? 4.4 : 3.4;
+          ctx.stroke();
+          ctx.strokeStyle = "#fde047";
+          ctx.lineWidth = isExp ? 2.4 : 1.8;
+          ctx.stroke();
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(it.pA[0], it.pA[1]);
+          ctx.lineTo(it.pB[0] + (Math.hypot(it.pB[0] - it.pA[0], it.pB[1] - it.pA[1]) < 0.2 ? 0.01 : 0.0), it.pB[1]);
+          ctx.strokeStyle = "rgba(7, 9, 19, 0.90)";
+          ctx.lineWidth = 2.0 * it.rPx + 2.2;
+          ctx.stroke();
+          ctx.strokeStyle = it.isPos ? "#f59e0b" : "#c084fc";
+          ctx.lineWidth = 2.0 * it.rPx;
+          ctx.stroke();
+          ctx.strokeStyle = it.isPos ? "#fef08a" : "#f5d0fe";
+          ctx.lineWidth = Math.max(1.4, 0.72 * it.rPx);
+          ctx.stroke();
+        }
       }
       ctx.restore();
     }
@@ -2319,6 +2935,9 @@ def get_nodal_surfaces_js() -> str:
       const selRef = st.selectedPeakObj ? `${st.selectedPeakObj.id}:${(st.selectedPeakObj.hkl || []).join(",")}` : String(st.selectedPeakId);
       const zonesKey = st.showZoneArcs ? `${st.selectedZoneId || ""}:${Array.from(st.activeZones || []).join(",")}` : "off";
       const mtzOverlaySig = typeof deps.getMtzOverlaySig === "function" ? deps.getMtzOverlaySig() : "";
+      const hovMorseKey = hoveredMorseObj && Array.isArray(hoveredMorseObj.pos_g)
+        ? hoveredMorseObj.pos_g.join(",")
+        : "";
       const sig = [
         targetW, targetH,
         (st.wulffYawDeg || 0).toFixed(3),
@@ -2334,6 +2953,10 @@ def get_nodal_surfaces_js() -> str:
         st.showNodalSurfacesRe ? 1 : 0,
         st.showNodalSurfacesIm ? 1 : 0,
         st.showPhaseVortices ? 1 : 0,
+        st.showAntinodes ? 1 : 0,
+        st.showMorseCapsules ? 1 : 0,
+        Number(st.antinodePercentile ?? 0.75).toFixed(3),
+        hovMorseKey,
         (st.nodalSurfaceAlpha || 0.56).toFixed(2),
         liveRoi.mode,
         liveRoi.radiusG.toFixed(5),
@@ -2537,8 +3160,29 @@ def get_nodal_surfaces_js() -> str:
         }
       }
 
-      // 3. Depth-buffered Two-color 2D Nodal Surfaces (Re=0 Cyan & Im=0 Coral-Rose) + 1D Phase Vortices
-      renderSurfacesAndVortices3D(ctx, w, h, dpr, Rtot, center, invScale, Rpx, zoom, liveRoi, isExp);
+      // 3. Depth-buffered Two-color 2D Nodal Surfaces (Re=0 Cyan & Im=0 Coral / Antinodes) + 1D Vortices + 3D Morse Capsules
+      const antinodeStats = (nodalData && nodalData.has_phases)
+        ? resolveAntinodeThreshold(liveRoi)
+        : { pct: 0.75, tau: 0.0, maxAbs: 1.0, activeMorseCount: 0 };
+      renderSurfacesAndVortices3D(ctx, w, h, dpr, Rtot, center, invScale, Rpx, zoom, liveRoi, isExp, antinodeStats);
+
+      // Record screen-space 3D Morse capsule hit targets & draw hover callout when active
+      screenMorseHits3D = [];
+      if (nodalData && nodalData.has_phases && st.showMorseCapsules && decodedMeshes.morseList) {
+        const mList = decodedMeshes.morseList;
+        for (let mi = 0; mi < mList.length; mi++) {
+          const mc = mList[mi];
+          if (Math.abs(Number(mc.re_val) || 0.0) < antinodeStats.tau) continue;
+          const pos = mc.pos_g;
+          if (!pos || !pointInsideLiveRoi(pos, liveRoi)) continue;
+          const prM = projectPoint3D(pos, Rtot, center, invScale, cx, cy, Rpx, zoom);
+          if (!prM[4]) continue;
+          const rG = Math.max(1e-5, Number(mc.radius_g) || 0.003);
+          const rPx = Math.max(8.5, Math.min(24.0, rG * invScale * Rpx * zoom * prM[3] + 5.0));
+          screenMorseHits3D.push({ morse: mc, x: prM[0], y: prM[1], r: rPx, z: prM[2] });
+        }
+        screenMorseHits3D.sort((a, b) => a.z - b.z);
+      }
 
       // 4. Reciprocal lattice basis axes {a*, b*, c*} through origin
       if (ub) {
@@ -2638,16 +3282,61 @@ def get_nodal_surfaces_js() -> str:
           : `${liveRoi.mult.toFixed(1)}×a⋆`;
         const zoomTag = Math.abs(zoom - 1.0) > 0.03 ? ` • ${zoom.toFixed(2)}×` : "";
         if (st.showNodalSurfacesRe) pills.push({ txt: `Re[${fLbl}]=0 • ${roiTag}${zoomTag}`, col: "#22d3ee" });
-        if (st.showNodalSurfacesIm) {
+        if (st.showAntinodes) {
+          const pctTxt = Math.round(antinodeStats.pct * 100);
+          pills.push({
+            txt: nodalData.is_real_only
+              ? `Antinodes |Re[${fLbl}]|≥P${pctTxt} (centric)`
+              : `Im[${fLbl}]=0 Antinodes |Re|≥P${pctTxt}`,
+            col: "#f59e0b",
+          });
+        } else if (st.showNodalSurfacesIm) {
           pills.push({
             txt: nodalData.is_real_only ? `Im[${fLbl}]≡0 (centric)` : `Im[${fLbl}]=0`,
             col: "#fb7185",
           });
         }
         if (st.showPhaseVortices) pills.push({ txt: `1D Vortices (${nVor} in ROI)`, col: "#fde047" });
+        if (st.showMorseCapsules) {
+          pills.push({
+            txt: `Morse ∇Re=0 (${antinodeStats.activeMorseCount} capsules)`,
+            col: "#e879f9",
+          });
+        }
         if (brickFetchInProgress) pills.push({ txt: "Streaming 3D brick…", col: "#94a3b8" });
       } else {
         pills.push({ txt: "3D Reciprocal Lattice (load phased .mtz for Re/Im surfaces & vortices)", col: "#94a3b8" });
+      }
+
+      if (hoveredMorseObj && st.showMorseCapsules && Array.isArray(hoveredMorseObj.pos_g)) {
+        const prH = projectPoint3D(hoveredMorseObj.pos_g, Rtot, center, invScale, cx, cy, Rpx, zoom);
+        if (prH[4]) {
+          const reV = Number(hoveredMorseObj.re_val) || 0.0;
+          const nh = hoveredMorseObj.nearest_hkl || [0, 0, 0];
+          const sgnStr = reV >= 0 ? "+" : "";
+          const callout = `∇Re=0 (${sgnStr}${reV.toPrecision(3)}) • near (${nh.join(",")})`;
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(prH[0], prH[1], isExp ? 9.5 : 7.5, 0, Math.PI * 2);
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 1.8;
+          ctx.stroke();
+          ctx.font = isExp ? "bold 10px monospace" : "bold 8.5px monospace";
+          const cw = ctx.measureText(callout).width + 10;
+          const lx = Math.min(w - cw - 6, Math.max(6, prH[0] + 10));
+          const ly = Math.max(18, prH[1] - 8);
+          ctx.fillStyle = "rgba(7, 9, 19, 0.90)";
+          ctx.strokeStyle = reV >= 0 ? "#f59e0b" : "#c084fc";
+          ctx.lineWidth = 1.1;
+          ctx.beginPath();
+          if (typeof ctx.roundRect === "function") ctx.roundRect(lx, ly - 11, cw, 15, 3);
+          else ctx.rect(lx, ly - 11, cw, 15);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = reV >= 0 ? "#fde68a" : "#f5d0fe";
+          ctx.fillText(callout, lx + 5, ly);
+          ctx.restore();
+        }
       }
       let py = 8;
       const bh = isExp ? 16 : 13.5;
@@ -2685,6 +3374,30 @@ def get_nodal_surfaces_js() -> str:
         }
       }
       return best;
+    }
+
+    function findNearestMorse3D(mx, my) {
+      let best = null;
+      let bestScore = 16.0;
+      for (let i = screenMorseHits3D.length - 1; i >= 0; i--) {
+        const h = screenMorseHits3D[i];
+        const d = Math.hypot(mx - h.x, my - h.y);
+        if (d <= h.r && d < bestScore) {
+          bestScore = d;
+          best = h.morse;
+        }
+      }
+      return best;
+    }
+
+    function setHoveredMorse(mObj) {
+      const next = mObj || null;
+      if (hoveredMorseObj !== next) {
+        hoveredMorseObj = next;
+        last3DRenderSig = "";
+        return true;
+      }
+      return false;
     }
 
     // Project 1D phase vortices onto the Convex 3D Wulff Sphere (radial unit-vector projection G / |G|),
@@ -3188,6 +3901,10 @@ def get_nodal_surfaces_js() -> str:
       clearRefMtz,
       render3DReciprocalView,
       findNearestPeak3D,
+      findNearestMorse3D,
+      setHoveredMorse,
+      getHoveredMorse: () => hoveredMorseObj,
+      resolveAntinodeThreshold,
       renderWulffVortices,
       renderDetectorVortices,
       requestNodalUpdate,
