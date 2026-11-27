@@ -961,11 +961,13 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
     html = render_rainbow_html(enriched)
     assert '<option value="mtz_delta_i">Color: ΔI (F−F₀)</option>' in html
     assert 'id="btn-colorscale-fullrange"' not in html
+    assert "has-out-wings" not in html
+    assert "badge-colorscale-oor" not in html
+    assert "repeating-linear-gradient(-45deg" not in html
     assert (
-        'id="slider-color-emphasis" class="has-out-wings" min="-0.20" max="1.20"'
+        'id="slider-color-emphasis" min="0.00" max="1.00" step="0.01" value="0.50"'
         in html
     )
-    assert "repeating-linear-gradient(-45deg" in html
 
     if shutil.which("node") is None:
         return
@@ -979,10 +981,9 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
         "getColorCrossover",
         "applyCrossoverCurve",
         "isQuantileSnrColorMode",
-        "isOutlierRangeColorMode",
-        "applyColorSliderPosition",
         "computeQuantileScaleBounds",
         "isigiToColor",
+        "buildColorscaleGradientSpec",
     ]
     extracted_fns = []
     for fn_name in fn_names:
@@ -1015,7 +1016,8 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
 
     js_driver = f"""
     const DEFAULT_COLOR_CROSSOVER = 0.38;
-    const COLORSCALE_OUT_WING = 0.20;
+    const DEFAULT_COLOR_PERCENTILE = 0.50;
+    const ORBIT_PALETTE = ["#ff38b4", "#00e5ff"];
     {get_nodal_surfaces_js()}
     let fillCalls = 0;
     const mockCtx = {{
@@ -1038,12 +1040,27 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
       showStereo: true, stereoViewMode: "recip3d",
       wulffYawDeg: 0, wulffPitchDeg: 0, wulffZoom: 1.0, wulffExpanded: false,
       wulffScope: "all_runs", wulffColorMode: "mtz_delta_i",
-      colorSliderPos: 0.38, colorCrossover: 0.38, colorOutLeft: 0.0, colorOutRight: 0.0,
+      colorPercentile: 0.50, colorCrossover: 0.38,
       showWulffFriedel: true, showNodalPoints: false, showZoneArcs: false,
       showNodalSurfacesRe: false, showNodalSurfacesIm: false, showPhaseVortices: false,
       dMin: 2.0, lamMin: 0.8, lamMax: 8.0, activeZones: new Set(),
     }};
+    // Synthetic signed DNP distribution: 201 distinct bulk reflections in [-0.24, +0.24],
+    // high-percentile responsive peaks +0.85, +1.18, extreme +746000.0, and negative -0.92, -1.45
+    const dist = [];
+    for (let k = 0; k <= 200; k++) dist.push((k - 100) * 0.0024);
+    dist.push(0.85, 1.18, 746000.0, -0.92, -1.45);
+    let b = null;
+    function getPeakDataAvailability() {{
+      return {{ isSignedMtz: true, mtzDeltaIBounds: b }};
+    }}
+    function residualToColor() {{ return "rgba(0,0,0,1)"; }}
+    function scaleToColor() {{ return "rgba(0,0,0,1)"; }}
+    function hexToRgba() {{ return "rgba(0,0,0,1)"; }}
+    function wavelengthToColor() {{ return "rgba(0,0,0,1)"; }}
     {"\n".join(extracted_fns)}
+    b = computeQuantileScaleBounds(dist, -1, 0, 1);
+
     const ctrl = createNodalSurfacesController({{
       initialNodalData: null,
       state,
@@ -1076,44 +1093,37 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
     ctrl.render3DReciprocalView(mockCanvas, false);
     const fAfterMtzSwap = fillCalls;
 
-    // Synthetic signed DNP distribution with outliers beyond P1.5..P98.5:
-    // bulk in [-0.24, +0.24], responsive positive peaks +0.85 and +1.18, negative peaks -0.92 and -1.45
-    const dist = [];
-    for (let k = 0; k < 200; k++) dist.push(((k % 25) - 12) * 0.02);
-    dist.push(0.85, 1.18, -0.92, -1.45);
+    // At 50th percentile (0.50), median maps to Champagne-Gold and +746000 outlier does not crush bulk
+    state.colorPercentile = 0.50;
+    const spec50 = buildColorscaleGradientSpec("mtz_delta_i", 0.50);
+    const colBulkPos50 = isigiToColor(0.18, 1.0, b);
+    const colMed50 = isigiToColor(b.median, 1.0, b);
 
-    applyColorSliderPosition(0.38, "mtz_delta_i");
-    const bInRange = computeQuantileScaleBounds(dist, -1, 0, 1, {{
-      zeroCentered: true, outLeft: state.colorOutLeft, outRight: state.colorOutRight,
-    }});
-    // In calibrated P1.5-98.5 range, both +0.85 and +1.18 clamp to the same upper pole (and -0.92, -1.45 to lower pole)
-    const colPosAIn = isigiToColor(0.85, 1.0, bInRange);
-    const colPosBIn = isigiToColor(1.18, 1.0, bInRange);
-
-    // Drag slider into RIGHT hatched wing to 100% (pos = 1.20)
-    applyColorSliderPosition(1.20, "mtz_delta_i");
+    // Drag slider to 99th percentile (0.99): bulk cools down while top 1% (+0.85, +1.18, +746000) separate cleanly
+    state.colorPercentile = 0.99;
     ctrl.render3DReciprocalView(mockCanvas, false);
-    const fAfterRightWing = fillCalls;
-    const bRight100 = computeQuantileScaleBounds(dist, -1, 0, 1, {{
-      zeroCentered: true, outLeft: state.colorOutLeft, outRight: state.colorOutRight,
-    }});
-    const colPosA100 = isigiToColor(0.85, 1.0, bRight100);
-    const colPosB100 = isigiToColor(1.18, 1.0, bRight100);
+    const fAfterPct99 = fillCalls;
+    const spec99 = buildColorscaleGradientSpec("mtz_delta_i", 0.99);
+    const colBulkPos99 = isigiToColor(0.18, 1.0, b);
+    const colPosA99 = isigiToColor(0.85, 1.0, b);
+    const colPosB99 = isigiToColor(1.18, 1.0, b);
+    const colPosMax99 = isigiToColor(746000.0, 1.0, b);
 
-    // Drag slider into LEFT hatched wing to 0% (pos = -0.20)
-    applyColorSliderPosition(-0.20, "mtz_delta_i");
+    // Drag slider to 1st percentile (0.01): negative tail (-0.92, -1.45) separates cleanly
+    state.colorPercentile = 0.01;
     ctrl.render3DReciprocalView(mockCanvas, false);
-    const fAfterLeftWing = fillCalls;
-    const bLeft0 = computeQuantileScaleBounds(dist, -1, 0, 1, {{
-      zeroCentered: true, outLeft: state.colorOutLeft, outRight: state.colorOutRight,
-    }});
-    const colNegA0 = isigiToColor(-0.92, 1.0, bLeft0);
-    const colNegB0 = isigiToColor(-1.45, 1.0, bLeft0);
+    const fAfterPct01 = fillCalls;
+    const spec01 = buildColorscaleGradientSpec("mtz_delta_i", 0.01);
+    const colNegA01 = isigiToColor(-0.92, 1.0, b);
+    const colNegB01 = isigiToColor(-1.45, 1.0, b);
 
     console.log(JSON.stringify({{
-      f1, fCached, fAfterMtzSwap, fAfterRightWing, fAfterLeftWing,
-      bInRange, bRight100, bLeft0,
-      colPosAIn, colPosBIn, colPosA100, colPosB100, colNegA0, colNegB0,
+      f1, fCached, fAfterMtzSwap, fAfterPct99, fAfterPct01,
+      min: b.min, max: b.max,
+      spec50Label: spec50.label, spec99Label: spec99.label, spec01Label: spec01.label,
+      colBulkPos50, colBulkPos99, colMed50,
+      colPosA99, colPosB99, colPosMax99,
+      colNegA01, colNegB01,
     }}));
     """
     js_file = tmp_path / "run_dnp_refresh.js"
@@ -1125,13 +1135,14 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
     assert res["f1"] > 0
     assert res["fCached"] == res["f1"]
     assert res["fAfterMtzSwap"] > res["fCached"]
-    assert res["fAfterRightWing"] > res["fAfterMtzSwap"]
-    assert res["fAfterLeftWing"] > res["fAfterRightWing"]
-    # Clamped in normal range, cleanly separated when dragged into 100% / 0% hatched wings
-    assert res["colPosAIn"] == res["colPosBIn"]
-    assert np.isclose(res["bRight100"]["max"], 1.18, atol=1e-4)
-    assert np.isclose(res["bRight100"]["min"], res["bInRange"]["min"], atol=1e-4)
-    assert res["colPosA100"] != res["colPosB100"]
-    assert np.isclose(res["bLeft0"]["min"], -1.45, atol=1e-4)
-    assert np.isclose(res["bLeft0"]["max"], res["bInRange"]["max"], atol=1e-4)
-    assert res["colNegA0"] != res["colNegB0"]
+    assert res["fAfterPct99"] > res["fAfterMtzSwap"]
+    assert res["fAfterPct01"] > res["fAfterPct99"]
+    assert np.isclose(res["min"], -1.45, atol=1e-6)
+    assert np.isclose(res["max"], 746000.0, atol=1e-6)
+    assert "(P50%)" in res["spec50Label"]
+    assert "(P99%)" in res["spec99Label"]
+    assert "(P1%)" in res["spec01Label"]
+    assert res["colMed50"] == "rgba(254, 232, 170, 1.000)"
+    assert res["colBulkPos50"] != res["colBulkPos99"]
+    assert len({res["colPosA99"], res["colPosB99"], res["colPosMax99"]}) == 3
+    assert res["colNegA01"] != res["colNegB01"]

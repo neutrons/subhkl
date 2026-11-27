@@ -12581,37 +12581,7 @@ def render_rainbow_html(
     box-shadow: 0 0 6px rgba(0, 229, 255, 0.32);
   }}
 
-  .cs-oor-badge {{
-    display: inline-block;
-    font-family: var(--font-mono, monospace);
-    font-size: 0.55rem;
-    font-weight: 700;
-    line-height: 1.1;
-    padding: 1px 5px;
-    border-radius: 3px;
-    border: 1px solid rgba(56, 189, 248, 0.65);
-    color: #f8fafc;
-    background-color: rgba(15, 23, 42, 0.88);
-    background-image: repeating-linear-gradient(
-      -45deg,
-      rgba(56, 189, 248, 0.28) 0px 2.5px,
-      rgba(15, 23, 42, 0.15) 2.5px 5px
-    );
-    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
-    pointer-events: none;
-  }}
-
-  .cs-oor-badge.oor-right {{
-    border-color: rgba(251, 146, 60, 0.78);
-    background-image: repeating-linear-gradient(
-      -45deg,
-      rgba(249, 115, 22, 0.34) 0px 2.5px,
-      rgba(15, 23, 42, 0.15) 2.5px 5px
-    );
-  }}
-
-  /* Photoshop-checkerboard + live active-colorscale gradient slider with crossover knob
-     and hatched out-of-range wings ([0%, 14.286%] = 0%..P1.5, [85.714%, 100%] = P98.5..100%) */
+  /* Photoshop-checkerboard + live active-colorscale gradient slider (0–100th percentile / inverse CDF) */
   #slider-color-emphasis {{
     -webkit-appearance: none;
     appearance: none;
@@ -12621,7 +12591,7 @@ def render_rainbow_html(
     border: 1px solid rgba(148, 163, 184, 0.48);
     background-color: #cbd5e1;
     background-image:
-      var(--cs-gradient, linear-gradient(90deg, rgba(20, 184, 166, 0.90) 0%, rgba(162, 220, 178, 0.85) 36%, rgba(254, 232, 170, 0.90) 50%, rgba(251, 140, 36, 0.98) 78%, rgba(232, 56, 24, 1) 100%)),
+      var(--cs-gradient, linear-gradient(90deg, rgba(20, 184, 166, 0.90) 0%, rgba(162, 220, 178, 0.85) 25%, rgba(254, 232, 170, 0.90) 50%, rgba(251, 140, 36, 0.98) 78%, rgba(232, 56, 24, 1) 100%)),
       repeating-conic-gradient(#64748b 0% 25%, #cbd5e1 0% 50%);
     background-size: 100% 100%, 8px 8px;
     background-position: 0 0, 0 0;
@@ -12630,29 +12600,6 @@ def render_rainbow_html(
     cursor: ew-resize;
     outline: none;
     margin: 2px 0 4px 0;
-  }}
-
-  #slider-color-emphasis.has-out-wings {{
-    background-image:
-      linear-gradient(90deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.92)),
-      linear-gradient(90deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.92)),
-      repeating-linear-gradient(-45deg, rgba(15, 23, 42, 0.56) 0px 2.5px, rgba(248, 250, 252, 0.24) 2.5px 5px),
-      repeating-linear-gradient(-45deg, rgba(15, 23, 42, 0.56) 0px 2.5px, rgba(248, 250, 252, 0.24) 2.5px 5px),
-      var(--cs-gradient, linear-gradient(90deg, rgba(20, 184, 166, 0.90) 0%, rgba(254, 232, 170, 0.90) 50%, rgba(232, 56, 24, 1) 100%)),
-      repeating-conic-gradient(#64748b 0% 25%, #cbd5e1 0% 50%);
-    background-size: 1.5px 100%, 1.5px 100%, 14.286% 100%, 14.286% 100%, 100% 100%, 8px 8px;
-    background-position: 14.286% 0, 85.714% 0, 0 0, 100% 0, 0 0, 0 0;
-    background-repeat: no-repeat, no-repeat, no-repeat, no-repeat, no-repeat, repeat;
-  }}
-
-  #slider-color-emphasis.is-out-left {{
-    border-color: rgba(45, 212, 191, 0.85);
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.38), 0 0 6px rgba(20, 184, 166, 0.35);
-  }}
-
-  #slider-color-emphasis.is-out-right {{
-    border-color: rgba(251, 146, 60, 0.88);
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.38), 0 0 6px rgba(249, 115, 22, 0.38);
   }}
 
   #slider-color-emphasis::-webkit-slider-thumb {{
@@ -12667,16 +12614,6 @@ def render_rainbow_html(
     cursor: ew-resize;
   }}
 
-  #slider-color-emphasis.is-out-left::-webkit-slider-thumb {{
-    border-color: #5eead4;
-    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.9), 0 0 6px rgba(45, 212, 191, 0.75);
-  }}
-
-  #slider-color-emphasis.is-out-right::-webkit-slider-thumb {{
-    border-color: #fdba74;
-    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.9), 0 0 6px rgba(251, 146, 60, 0.8);
-  }}
-
   #slider-color-emphasis::-moz-range-thumb {{
     width: 8px;
     height: 16px;
@@ -12685,16 +12622,6 @@ def render_rainbow_html(
     border: 2px solid #f8fafc;
     box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.85), 0 1px 4px rgba(0, 0, 0, 0.65);
     cursor: ew-resize;
-  }}
-
-  #slider-color-emphasis.is-out-left::-moz-range-thumb {{
-    border-color: #5eead4;
-    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.9), 0 0 6px rgba(45, 212, 191, 0.75);
-  }}
-
-  #slider-color-emphasis.is-out-right::-moz-range-thumb {{
-    border-color: #fdba74;
-    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.9), 0 0 6px rgba(251, 146, 60, 0.8);
   }}
 
   .controls-section-divider {{
@@ -13142,13 +13069,10 @@ def render_rainbow_html(
           </div>
 
           <div class="slider-row" id="colorscale-slider-row">
-            <span style="display:inline-flex;align-items:center;gap:4px;">
-              <span id="lbl-colorscale-title">Colorscale</span>
-              <span id="badge-colorscale-oor" class="cs-oor-badge" style="display:none;"></span>
-            </span>
+            <span id="lbl-colorscale-title">Colorscale</span>
             <span id="lbl-color-emphasis" style="white-space:nowrap;">-3.0 · 3.0 · 20.0</span>
           </div>
-          <input type="range" id="slider-color-emphasis" class="has-out-wings" min="-0.20" max="1.20" step="0.01" value="0.38" title="Drag inside solid bar to tune P1.5–98.5 contrast; drag further left/right into hatched wings to extend threshold to 0%/100% extrema (double-click to reset)" />
+          <input type="range" id="slider-color-emphasis" min="0.00" max="1.00" step="0.01" value="0.50" title="Drag across 0–100th percentile to map linear color values onto percentiles / inverse CDF (double-click to reset)" />
 
           <div class="controls-section-divider" role="separator" aria-hidden="true"></div>
 
@@ -15826,10 +15750,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     wulffFrame: "sample",         // always project in Sample frame (coupled via goniometer R)
     wulffCoupled: true,           // 360° periodic detector pan <-> Wulff yaw always coupled
     wulffColorMode: initColorMode, // "wavelength" | "orbit" | "isigi" | "fobs" | "mtz_fcalc" | "mtz_delta_i" | "ipred_isigi" | "residual" | "scale"
-    colorSliderPos: 0.38,         // raw slider pos: [-0.20, 0.0) hatched 0%..P1.5 | [0.0, 1.0] solid P1.5..P98.5 | (1.0, 1.20] hatched P98.5..100%
-    colorCrossover: 0.38,         // 0.06 (boost weak/small diffs) .. 0.38 (default) .. 0.94 (extreme tail)
-    colorOutLeft: 0.0,            // 0..1 continuous excursion into left hatched wing (P1.5 -> 0% min)
-    colorOutRight: 0.0,           // 0..1 continuous excursion into right hatched wing (P98.5 -> 100% max)
+    colorPercentile: 0.50,        // 0.00 (0th percentile) .. 0.50 (50th percentile / median) .. 1.00 (100th percentile)
+    colorCrossover: 0.38,         // 0.06 .. 0.38 (default) .. 0.94 for non-percentile modes (wavelength / scale / orbit)
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
@@ -15884,7 +15806,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   }};
 
   const DEFAULT_COLOR_CROSSOVER = 0.38;
-  const COLORSCALE_OUT_WING = 0.20;
+  const DEFAULT_COLOR_PERCENTILE = 0.50;
   const ORBIT_PALETTE = [
     "#ff38b4", "#00e5ff", "#fbbf24", "#10b981", "#a855f7", "#f97316",
     "#38bdf8", "#84cc16", "#f43f5e", "#14b8a6", "#eab308", "#6366f1"
@@ -17926,39 +17848,76 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   }}
 
   // Diverging Blue–White–Red colormap for Careless standardized residual (I_obs - I_pred)/sigma,
-  // spanning outlier-robust [resMin, resMax] (or hatched out-of-range 0%/100% wings) with neutral White at resMedian.
+  // mapping empirical 0–100th percentile (CDF) onto linear color values with slider midpoint at state.colorPercentile.
   function residualToColor(resVal, alpha = 1.0, bounds = null) {{
     if (typeof resVal !== "number" || !Number.isFinite(resVal)) return `rgba(148, 163, 184, 0.000)`;
     const b = bounds || getPeakDataAvailability();
-    const lo = Number.isFinite(b && b.resMin) ? b.resMin : -3.0;
-    const hi = Number.isFinite(b && b.resMax) ? b.resMax : 3.0;
-    const rawMid = Number.isFinite(b && b.resMedian) ? b.resMedian : (b && b.resMean);
-    const mid = Number.isFinite(rawMid) ? Math.max(lo, Math.min(hi, rawMid)) : 0.5 * (lo + hi);
-    const uLeft = Math.max(0.0, Math.min(1.0, Number(state.colorOutLeft || 0.0)));
-    const uRight = Math.max(0.0, Math.min(1.0, Number(state.colorOutRight || 0.0)));
-    const clamped = Math.max(lo, Math.min(hi, resVal));
-    if (clamped < mid) {{
-      const negSpan = mid - lo;
-      const frac = negSpan > 1e-6 ? Math.min(1.0, (mid - clamped) / negSpan) : 0.0;
-      const baseU = applyCrossoverCurve(frac);
-      const u = uLeft > 0.0
-        ? (baseU * (1.0 - uLeft) + Math.pow(frac, 1.8) * uLeft)
-        : (uRight > 0.0 ? (baseU * (1.0 - uRight) + Math.pow(frac, 1.2) * uRight) : baseU);
-      const r = Math.round(248 * (1 - u) + 30 * u);
-      const g = Math.round(250 * (1 - u) + 170 * u);
-      const bl = Math.round(252 * (1 - u) + 255 * u);
-      return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{alpha.toFixed(3)}})`;
+    const rb = b && b.resBounds ? b.resBounds : null;
+    const sorted = rb && Array.isArray(rb.sorted) && rb.sorted.length >= 2 ? rb.sorted : null;
+    let p = 0.5;
+    if (sorted) {{
+      const n = sorted.length;
+      if (sorted[0] === sorted[n - 1]) {{
+        p = 0.5;
+      }} else if (resVal <= sorted[0]) {{
+        p = 0.0;
+      }} else if (resVal >= sorted[n - 1]) {{
+        p = 1.0;
+      }} else {{
+        let lo = 0, hi = n;
+        while (lo < hi) {{
+          const m = (lo + hi) >> 1;
+          if (sorted[m] < resVal) lo = m + 1;
+          else hi = m;
+        }}
+        const lb = lo;
+        if (lb < n && sorted[lb] === resVal) {{
+          let lo2 = lb, hi2 = n;
+          while (lo2 < hi2) {{
+            const m = (lo2 + hi2) >> 1;
+            if (sorted[m] <= resVal) lo2 = m + 1;
+            else hi2 = m;
+          }}
+          p = (0.5 * (lb + lo2 - 1)) / (n - 1);
+        }} else {{
+          const v0 = sorted[lb - 1];
+          const v1 = sorted[lb];
+          const span = v1 - v0;
+          p = ((lb - 1) + (span > 0 ? (resVal - v0) / span : 0.5)) / (n - 1);
+        }}
+      }}
     }} else {{
-      const posSpan = hi - mid;
-      const frac = posSpan > 1e-6 ? Math.min(1.0, (clamped - mid) / posSpan) : 0.0;
-      const baseU = applyCrossoverCurve(frac);
-      const u = uRight > 0.0
-        ? (baseU * (1.0 - uRight) + Math.pow(frac, 1.8) * uRight)
-        : (uLeft > 0.0 ? (baseU * (1.0 - uLeft) + Math.pow(frac, 1.2) * uLeft) : baseU);
-      const r = Math.round(248 * (1 - u) + 244 * u);
-      const g = Math.round(250 * (1 - u) + 63 * u);
-      const bl = Math.round(252 * (1 - u) + 94 * u);
-      return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{alpha.toFixed(3)}})`;
+      const lo = Number.isFinite(b && b.resMin) ? b.resMin : -3.0;
+      const hi = Number.isFinite(b && b.resMax) ? b.resMax : 3.0;
+      const rawMid = Number.isFinite(b && b.resMedian) ? b.resMedian : (b && b.resMean);
+      const mid = Number.isFinite(rawMid) ? Math.max(lo, Math.min(hi, rawMid)) : 0.5 * (lo + hi);
+      const clamped = Math.max(lo, Math.min(hi, resVal));
+      if (clamped < mid) {{
+        const negSpan = mid - lo;
+        p = negSpan > 1e-6 ? 0.5 * ((clamped - lo) / negSpan) : 0.5;
+      }} else {{
+        const posSpan = hi - mid;
+        p = posSpan > 1e-6 ? 0.5 + 0.5 * ((clamped - mid) / posSpan) : 0.5;
+      }}
+    }}
+    p = Math.max(0.0, Math.min(1.0, p));
+    const rawPct = Number.isFinite(state.colorPercentile) ? state.colorPercentile : 0.50;
+    const s = Math.max(0.001, Math.min(0.999, rawPct));
+    const denom = (1.0 - s) * p + s * (1.0 - p);
+    const u = denom > 0 ? ((1.0 - s) * p) / denom : 0.5;
+    const effAlpha = Math.max(0.0, Math.min(1.0, alpha));
+    if (u < 0.5) {{
+      const w = (0.5 - u) / 0.5;
+      const r = Math.round(248 * (1 - w) + 30 * w);
+      const g = Math.round(250 * (1 - w) + 170 * w);
+      const bl = Math.round(252 * (1 - w) + 255 * w);
+      return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{effAlpha.toFixed(3)}})`;
+    }} else {{
+      const w = (u - 0.5) / 0.5;
+      const r = Math.round(248 * (1 - w) + 244 * w);
+      const g = Math.round(250 * (1 - w) + 63 * w);
+      const bl = Math.round(252 * (1 - w) + 94 * w);
+      return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{effAlpha.toFixed(3)}})`;
     }}
   }}
 
@@ -18339,22 +18298,25 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   }}
 
   function computeQuantileScaleBounds(rawVals, defLo = -3.0, defMid = 3.0, defHi = 20.0, opts = null) {{
-    const fullRange = Boolean(opts && opts.fullRange);
-    const uLeft = fullRange ? 1.0 : Math.max(0.0, Math.min(1.0, Number((opts && opts.outLeft) || 0.0)));
-    const uRight = fullRange ? 1.0 : Math.max(0.0, Math.min(1.0, Number((opts && opts.outRight) || 0.0)));
-    const zeroCentered = Boolean(opts && opts.zeroCentered);
     if (!Array.isArray(rawVals) || rawVals.length === 0) {{
+      const q25Def = 0.5 * (defLo + defMid);
+      const q75Def = 0.5 * (defMid + defHi);
       return {{
         min: defLo,
-        q25: 0.5 * (defLo + defMid),
+        q25: q25Def,
         median: defMid,
-        q75: 0.5 * (defMid + defHi),
+        q75: q75Def,
         max: defHi,
-        outLeft: uLeft,
-        outRight: uRight,
+        sorted: [defLo, q25Def, defMid, q75Def, defHi],
       }};
     }}
     const sorted = rawVals.slice().sort((a, b) => a - b);
+    if (opts && typeof opts.exactMin === "number" && Number.isFinite(opts.exactMin) && opts.exactMin < sorted[0]) {{
+      sorted.unshift(opts.exactMin);
+    }}
+    if (opts && typeof opts.exactMax === "number" && Number.isFinite(opts.exactMax) && opts.exactMax > sorted[sorted.length - 1]) {{
+      sorted.push(opts.exactMax);
+    }}
     const qAt = (q) => {{
       if (sorted.length === 1) return sorted[0];
       const pos = Math.max(0.0, Math.min(1.0, q)) * (sorted.length - 1);
@@ -18363,112 +18325,27 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       const next = sorted[Math.min(sorted.length - 1, base + 1)];
       return sorted[base] + rest * (next - sorted[base]);
     }};
-    const trueMin = (opts && typeof opts.exactMin === "number" && Number.isFinite(opts.exactMin))
-      ? Math.min(opts.exactMin, sorted[0])
-      : sorted[0];
-    const trueMax = (opts && typeof opts.exactMax === "number" && Number.isFinite(opts.exactMax))
-      ? Math.max(opts.exactMax, sorted[sorted.length - 1])
-      : sorted[sorted.length - 1];
-
-    if (zeroCentered) {{
-      const absSorted = sorted.map((v) => Math.abs(v)).sort((a, b) => a - b);
-      const qAbsAt = (q) => {{
-        if (absSorted.length === 1) return absSorted[0];
-        const pos = Math.max(0.0, Math.min(1.0, q)) * (absSorted.length - 1);
-        const base = Math.floor(pos);
-        const rest = pos - base;
-        const next = absSorted[Math.min(absSorted.length - 1, base + 1)];
-        return absSorted[base] + rest * (next - absSorted[base]);
-      }};
-      const absMed = qAbsAt(0.5);
-      let robMaxAbs = absSorted.length >= 20 ? qAbsAt(0.985) : absSorted[absSorted.length - 1];
-      if (absSorted.length >= 4) {{
-        const sigmaAbs = 1.4826 * absMed;
-        const q75Abs = qAbsAt(0.75);
-        const spreadAbs = Math.max(sigmaAbs, q75Abs / 1.15);
-        if (spreadAbs > 1e-6) {{
-          robMaxAbs = Math.min(robMaxAbs, 5.5 * spreadAbs);
-        }}
+    const maxKnots = 2049;
+    let cdfKnots;
+    if (sorted.length === 1) {{
+      cdfKnots = [sorted[0], sorted[0]];
+    }} else if (sorted.length <= maxKnots) {{
+      cdfKnots = sorted;
+    }} else {{
+      cdfKnots = new Array(maxKnots);
+      for (let k = 0; k < maxKnots; k++) {{
+        cdfKnots[k] = qAt(k / (maxKnots - 1));
       }}
-      if (!(robMaxAbs > 1e-6)) robMaxAbs = 1.0;
-      const fullNegAbs = Math.max(robMaxAbs, Math.abs(Math.min(0.0, trueMin)));
-      const fullPosAbs = Math.max(robMaxAbs, Math.max(0.0, trueMax));
-      const negMax = uLeft > 0.0
-        ? (robMaxAbs * Math.pow(fullNegAbs / Math.max(1e-6, robMaxAbs), uLeft))
-        : robMaxAbs;
-      const posMax = uRight > 0.0
-        ? (robMaxAbs * Math.pow(fullPosAbs / Math.max(1e-6, robMaxAbs), uRight))
-        : robMaxAbs;
-      const qBulkBase = Math.max(0.05 * robMaxAbs, Math.min(0.95 * robMaxAbs, absMed > 1e-9 ? absMed : 0.25 * robMaxAbs));
-      const q25Neg = -(qBulkBase * (1.0 - 0.65 * uLeft) + robMaxAbs * 0.65 * uLeft);
-      const q75Pos = (qBulkBase * (1.0 - 0.65 * uRight) + robMaxAbs * 0.65 * uRight);
-      return {{
-        min: -negMax,
-        q25: Math.max(-0.95 * negMax, Math.min(-0.02 * negMax, q25Neg)),
-        median: 0.0,
-        q75: Math.max(0.02 * posMax, Math.min(0.95 * posMax, q75Pos)),
-        max: posMax,
-        outLeft: uLeft,
-        outRight: uRight,
-      }};
+      cdfKnots[0] = sorted[0];
+      cdfKnots[maxKnots - 1] = sorted[sorted.length - 1];
     }}
-
-    const med = qAt(0.5);
-    const q25Raw = qAt(0.25);
-    const q75Raw = qAt(0.75);
-    let loRob = sorted.length >= 20 ? qAt(0.015) : sorted[0];
-    let hiRob = sorted.length >= 20 ? qAt(0.985) : sorted[sorted.length - 1];
-    if (sorted.length >= 4) {{
-      const iqr = Math.max(0.0, q75Raw - q25Raw);
-      const absDevs = sorted.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
-      const mPos = 0.5 * (absDevs.length - 1);
-      const mBase = Math.floor(mPos);
-      const mad = absDevs[mBase] + (mPos - mBase) * (absDevs[Math.min(absDevs.length - 1, mBase + 1)] - absDevs[mBase]);
-      const sigmaMad = 1.4826 * mad;
-      const spread = Math.max(sigmaMad, iqr / 1.349);
-      if (spread > 1e-6) {{
-        loRob = Math.max(loRob, med - 5.0 * spread);
-        hiRob = Math.min(hiRob, med + 5.0 * spread);
-      }}
-    }}
-    let minRob = Math.min(loRob, med);
-    let maxRob = Math.max(hiRob, med);
-    if (maxRob - minRob < 1e-6) {{
-      minRob = med - 1.0;
-      maxRob = med + 1.0;
-    }} else if (med - minRob < 1e-6 && trueMin >= med - 1e-6) {{
-      minRob = med - Math.max(1.0, 0.25 * (maxRob - med));
-    }} else if (maxRob - med < 1e-6 && trueMax <= med + 1e-6) {{
-      maxRob = med + Math.max(1.0, 0.25 * (med - minRob));
-    }}
-    const negSpanRob = Math.max(1e-6, med - minRob);
-    const posSpanRob = Math.max(1e-6, maxRob - med);
-    const loTarget = trueMin < minRob ? trueMin : (uLeft >= 0.999 && trueMin <= med ? trueMin : minRob);
-    const hiTarget = Math.max(maxRob, trueMax);
-    const negSpanFull = Math.max(1e-6, med - loTarget);
-    const posSpanFull = Math.max(posSpanRob, hiTarget - med);
-    const minV = uLeft > 0.0
-      ? (med - negSpanRob * Math.pow(negSpanFull / negSpanRob, uLeft))
-      : minRob;
-    const maxV = uRight > 0.0
-      ? (med + posSpanRob * Math.pow(posSpanFull / posSpanRob, uRight))
-      : maxRob;
-    const negSpan = Math.max(1e-6, med - minV);
-    const posSpan = Math.max(1e-6, maxV - med);
-    const q25Base = Math.max(minRob + 0.05 * negSpanRob, Math.min(med - 0.05 * negSpanRob, q25Raw));
-    const q75Base = Math.max(med + 0.05 * posSpanRob, Math.min(maxRob - 0.05 * posSpanRob, q75Raw));
-    const q25Shift = trueMin < minRob ? (q25Base * (1.0 - 0.55 * uLeft) + minRob * 0.55 * uLeft) : q25Base;
-    const q75Shift = trueMax > maxRob ? (q75Base * (1.0 - 0.55 * uRight) + maxRob * 0.55 * uRight) : q75Base;
-    const q25 = Math.max(minV + 0.03 * negSpan, Math.min(med - 0.03 * negSpan, q25Shift));
-    const q75 = Math.max(med + 0.03 * posSpan, Math.min(maxV - 0.03 * posSpan, q75Shift));
     return {{
-      min: minV,
-      q25,
-      median: med,
-      q75,
-      max: maxV,
-      outLeft: uLeft,
-      outRight: uRight,
+      min: cdfKnots[0],
+      q25: qAt(0.25),
+      median: qAt(0.50),
+      q75: qAt(0.75),
+      max: cdfKnots[cdfKnots.length - 1],
+      sorted: cdfKnots,
     }};
   }}
 
@@ -18494,14 +18371,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const dSig = `${{Number(state.dMin || 0).toFixed(3)}},${{Number(state.lamMin || 0).toFixed(3)}},${{Number(state.lamMax || 0).toFixed(3)}}`;
     const mergedFlag = evalCarelessMerged() ? "1" : "0";
     const extMtzFlag = evalExternalMtz() ? "1" : "0";
-    const outLeftVal = Math.max(0.0, Math.min(1.0, Number(state.colorOutLeft || 0.0)));
-    const outRightVal = Math.max(0.0, Math.min(1.0, Number(state.colorOutRight || 0.0)));
-    const outWingSig = `${{outLeftVal.toFixed(3)}},${{outRightVal.toFixed(3)}}`;
     const signedMtzFlag = DATA && DATA.mtz_is_signed_i ? "1" : "0";
     const bmCache = typeof _baselineMeasCache !== "undefined" ? _baselineMeasCache : null;
     const refLuObj = (bmCache && bmCache.refMtzIAsuLookup) || (DATA && DATA.ref_mtz_i_asu_lookup) || null;
     const hasRefLuFlag = refLuObj ? "1" : "0";
-    const sig = `${{dynEp}}|${{dSig}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{DATA.ref_mtz_overlay_name || ""}}|${{hasRefLuFlag}}|${{signedMtzFlag}}|${{outWingSig}}|${{mergedFlag}}|${{extMtzFlag}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}|${{i0}}|${{m0}}|${{mf0}}|${{md0}}|${{fo0}}`;
+    const sig = `${{dynEp}}|${{dSig}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{DATA.ref_mtz_overlay_name || ""}}|${{hasRefLuFlag}}|${{signedMtzFlag}}|${{mergedFlag}}|${{extMtzFlag}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}|${{i0}}|${{m0}}|${{mf0}}|${{md0}}|${{fo0}}`;
     if (
       _peakDataAvailabilitySig === sig &&
       _peakDataAvailability._p0 === p0 &&
@@ -18629,43 +18503,17 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       return {{ vals: tr.allPeaks, min: tr.allPeaksMin, max: tr.allPeaksMax }};
     }};
 
-    let resMin = -3.0, resMax = 3.0, resMedian = 0.0;
     const resPick = pickTracker(trRes, false);
-    const resVals = resPick.vals.slice();
-    if (hasRes && resVals.length > 0) {{
-      resVals.sort((a, b) => a - b);
-      resMedian = quantileSorted(resVals, 0.5);
-      const resTrueMin = Number.isFinite(resPick.min) ? Math.min(resPick.min, resVals[0]) : resVals[0];
-      const resTrueMax = Number.isFinite(resPick.max) ? Math.max(resPick.max, resVals[resVals.length - 1]) : resVals[resVals.length - 1];
-      let loRob = resVals.length >= 20 ? quantileSorted(resVals, 0.015) : resVals[0];
-      let hiRob = resVals.length >= 20 ? quantileSorted(resVals, 0.985) : resVals[resVals.length - 1];
-      if (resVals.length >= 4) {{
-        const iqr = Math.max(0.0, quantileSorted(resVals, 0.75) - quantileSorted(resVals, 0.25));
-        const absDevs = resVals.map((v) => Math.abs(v - resMedian)).sort((a, b) => a - b);
-        const sigmaMad = 1.4826 * quantileSorted(absDevs, 0.5);
-        const spread = Math.max(sigmaMad, iqr / 1.349);
-        if (spread > 1e-6) {{
-          loRob = Math.max(loRob, resMedian - 5.0 * spread);
-          hiRob = Math.min(hiRob, resMedian + 5.0 * spread);
-        }}
-      }}
-      let minRob = Math.min(loRob, resMedian);
-      let maxRob = Math.max(hiRob, resMedian);
-      if (maxRob - minRob < 1e-6) {{
-        minRob = resMedian - 1.0;
-        maxRob = resMedian + 1.0;
-      }}
-      const negSpanRob = Math.max(1e-6, resMedian - minRob);
-      const posSpanRob = Math.max(1e-6, maxRob - resMedian);
-      const negSpanFull = Math.max(negSpanRob, resMedian - Math.min(minRob, resTrueMin));
-      const posSpanFull = Math.max(posSpanRob, Math.max(maxRob, resTrueMax) - resMedian);
-      resMin = outLeftVal > 0.0
-        ? (resMedian - negSpanRob * Math.pow(negSpanFull / negSpanRob, outLeftVal))
-        : minRob;
-      resMax = outRightVal > 0.0
-        ? (resMedian + posSpanRob * Math.pow(posSpanFull / posSpanRob, outRightVal))
-        : maxRob;
-    }}
+    const resBounds = computeQuantileScaleBounds(
+      hasRes ? resPick.vals : [],
+      -3.0,
+      0.0,
+      3.0,
+      {{ exactMin: resPick.min, exactMax: resPick.max }}
+    );
+    const resMin = resBounds.min;
+    const resMax = resBounds.max;
+    const resMedian = resBounds.median;
 
     const isigiPick = pickTracker(trIsigi, true);
     const mtzPick = pickTracker(trMtz, false);
@@ -18679,10 +18527,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       (Number.isFinite(mtzFcalcPick.min) && mtzFcalcPick.min < -1e-6)
     );
     const isigiBounds = computeQuantileScaleBounds(isigiPick.vals, -3.0, 3.0, 20.0, {{
-      outLeft: outLeftVal, outRight: outRightVal, exactMin: isigiPick.min, exactMax: isigiPick.max,
+      exactMin: isigiPick.min, exactMax: isigiPick.max,
     }});
     const rawFobsBounds = computeQuantileScaleBounds(fobsPick.vals, 0.0, 1.0, 8.0, {{
-      outLeft: outLeftVal, outRight: outRightVal, exactMin: fobsPick.min, exactMax: fobsPick.max,
+      exactMin: fobsPick.min, exactMax: fobsPick.max,
     }});
     const rawMtzFcalcBounds = computeQuantileScaleBounds(
       mtzFcalcPick.vals,
@@ -18690,24 +18538,18 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       isSignedMtz ? 0.0 : 1.0,
       isSignedMtz ? 4.0 : 8.0,
       {{
-        outLeft: outLeftVal,
-        outRight: outRightVal,
-        zeroCentered: isSignedMtz,
         exactMin: mtzFcalcPick.min,
         exactMax: mtzFcalcPick.max,
       }}
     );
     const mtzDeltaIBounds = computeQuantileScaleBounds(mtzDeltaPick.vals, -1.0, 0.0, 1.0, {{
-      outLeft: outLeftVal,
-      outRight: outRightVal,
-      zeroCentered: true,
       exactMin: mtzDeltaPick.min,
       exactMax: mtzDeltaPick.max,
     }});
     const rawIpredBounds = computeQuantileScaleBounds(ipredPick.vals, 0.0, 3.0, 20.0, {{
-      outLeft: outLeftVal, outRight: outRightVal, exactMin: ipredPick.min, exactMax: ipredPick.max,
+      exactMin: ipredPick.min, exactMax: ipredPick.max,
     }});
-    // Lock paired colorscales onto identical bounds ONLY for non-negative |F_calc|² vs |F_obs|²
+    // Lock paired colorscales onto identical empirical CDF bounds ONLY for non-negative |F_calc|² vs |F_obs|²
     const fobsBounds = rawFobsBounds;
     const mtzFcalcBounds = (!isSignedMtz && hasFobs && fobsPick.vals.length > 0)
       ? rawFobsBounds
@@ -18716,7 +18558,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       ? isigiBounds
       : rawIpredBounds;
     const mtzIsigiBounds = computeQuantileScaleBounds(mtzPick.vals, -3.0, 3.0, 20.0, {{
-      outLeft: outLeftVal, outRight: outRightVal, exactMin: mtzPick.min, exactMax: mtzPick.max,
+      exactMin: mtzPick.min, exactMax: mtzPick.max,
     }});
     _peakDataAvailabilitySig = sig;
     _peakDataAvailability = {{
@@ -18731,11 +18573,11 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       hasIpredIsigi: hasIpredIsigiFlag,
       hasResiduals: hasRes,
       hasScales: hasScl,
-      isigiTop: Math.max(12.0, isigiBounds.max),
-      fobsTop: Math.max(4.0, fobsBounds.max),
-      mtzIsigiTop: Math.max(12.0, mtzIsigiBounds.max),
-      mtzFcalcTop: Math.max(4.0, mtzFcalcBounds.max),
-      ipredIsigiTop: Math.max(12.0, ipredIsigiBounds.max),
+      isigiTop: Math.max(12.0, isigiBounds.q75 * 2.5),
+      fobsTop: Math.max(4.0, fobsBounds.q75 * 2.5),
+      mtzIsigiTop: Math.max(12.0, mtzIsigiBounds.q75 * 2.5),
+      mtzFcalcTop: Math.max(4.0, mtzFcalcBounds.q75 * 2.5),
+      ipredIsigiTop: Math.max(12.0, ipredIsigiBounds.q75 * 2.5),
       isigiMin: isigiBounds.min,
       isigiQ25: isigiBounds.q25,
       isigiMedian: isigiBounds.median,
@@ -18752,6 +18594,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       mtzFcalcBounds,
       mtzDeltaIBounds,
       ipredIsigiBounds,
+      resBounds,
       resMin,
       resMax,
       resMedian,
@@ -18760,17 +18603,13 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     return _peakDataAvailability;
   }}
 
-  // Warm Geyser-inspired diverging I/σ colormap, piecewise quantile-normalized over
-  // [lo (Q1.5), Q25, median (Q50), Q75, hi (Q98.5)] so [Q25, Q75] always sits inside the
-  // central warm band (distinct from Blue–White–Red ΔI/σ):
-  //   lo (weak/negative tail): Sea-Teal (20, 184, 166) -> Warm Sage-Cream (162, 220, 178) ->
-  //   median (bulk of peaks): Warm Sunlit Champagne-Gold (254, 232, 170) ->
-  //   hi (strong Bragg peaks): Vivid Solar Tangerine (251, 140, 36) -> Fiery Flame-Vermilion (232, 56, 24).
+  // Warm Geyser-inspired diverging colormap mapped over the 0–100th percentile empirical CDF
+  // (Sea-Teal -> Warm Sage-Cream -> Champagne-Gold -> Golden-Apricot -> Solar Tangerine -> Flame-Vermilion),
+  // with state.colorPercentile in [0, 1] selecting the percentile mapped to the linear color midpoint.
   function isigiToColor(isigiVal, alpha = 1.0, bounds = null) {{
     if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal)) {{
       return "rgba(148, 163, 184, 0.000)";
     }}
-    const bulkFrac = 0.28;
     let b = null;
     if (bounds && typeof bounds === "object") {{
       b = Number.isFinite(bounds.median)
@@ -18793,72 +18632,95 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       else if (state.wulffColorMode === "ipred_isigi") b = av.ipredIsigiBounds;
       else b = av.isigiBounds;
     }}
-    const lo = Number.isFinite(b && b.min) ? b.min : -3.0;
-    const hi = Number.isFinite(b && b.max) ? b.max : 20.0;
-    const rawMid = Number.isFinite(b && b.median) ? b.median : 0.5 * (lo + hi);
-    const mid = Math.max(lo, Math.min(hi, rawMid));
-    const q25 = Number.isFinite(b && b.q25) ? Math.max(lo, Math.min(mid, b.q25)) : 0.5 * (lo + mid);
-    const q75 = Number.isFinite(b && b.q75) ? Math.max(mid, Math.min(hi, b.q75)) : 0.5 * (mid + hi);
-    const c = getColorCrossover();
-    const knobGamma = (-Math.log(DEFAULT_COLOR_CROSSOVER)) / Math.max(0.01, -Math.log(c));
-    const uLeft = Math.max(0.0, Math.min(1.0, Number((b && b.outLeft) ?? state.colorOutLeft ?? 0.0)));
-    const uRight = Math.max(0.0, Math.min(1.0, Number((b && b.outRight) ?? state.colorOutRight ?? 0.0)));
-    const gammaNeg = uLeft > 0.0
-      ? (knobGamma * (1.0 - uLeft) + 2.2 * uLeft)
-      : (uRight > 0.0 ? (knobGamma * (1.0 - uRight) + 1.4 * uRight) : knobGamma);
-    const gammaPos = uRight > 0.0
-      ? (knobGamma * (1.0 - uRight) + 2.2 * uRight)
-      : (uLeft > 0.0 ? (knobGamma * (1.0 - uLeft) + 1.4 * uLeft) : knobGamma);
-    const clamped = Math.max(lo, Math.min(hi, isigiVal));
-    const effAlpha = Math.max(0.0, Math.min(1.0, alpha));
-    let r, g, bl;
-    if (clamped < mid) {{
-      let qFrac = 0.0;
-      if (clamped >= q25 && mid - q25 > 1e-6) {{
-        qFrac = bulkFrac * ((mid - clamped) / (mid - q25));
-      }} else if (q25 - lo > 1e-6) {{
-        qFrac = bulkFrac + (1.0 - bulkFrac) * ((q25 - clamped) / (q25 - lo));
-      }} else if (mid - lo > 1e-6) {{
-        qFrac = (mid - clamped) / (mid - lo);
-      }}
-      qFrac = Math.max(0.0, Math.min(1.0, qFrac));
-      const u = qFrac <= 0.0 ? 0.0 : (qFrac >= 1.0 ? 1.0 : Math.pow(qFrac, gammaNeg));
-      if (u <= 0.5) {{
-        // Warm Sunlit Champagne-Gold (254, 232, 170) -> Warm Sage-Cream (162, 220, 178)
-        const s = u / 0.5;
-        r = Math.round(254 + (162 - 254) * s);
-        g = Math.round(232 + (220 - 232) * s);
-        bl = Math.round(170 + (178 - 170) * s);
+    const sorted = b && Array.isArray(b.sorted) && b.sorted.length >= 2 ? b.sorted : null;
+    let p = 0.5;
+    if (sorted) {{
+      const n = sorted.length;
+      if (sorted[0] === sorted[n - 1]) {{
+        p = 0.5;
+      }} else if (isigiVal <= sorted[0]) {{
+        p = 0.0;
+      }} else if (isigiVal >= sorted[n - 1]) {{
+        p = 1.0;
       }} else {{
-        // Warm Sage-Cream (162, 220, 178) -> Luminous Sea-Teal (20, 184, 166)
-        const s = (u - 0.5) / 0.5;
-        r = Math.round(162 + (20 - 162) * s);
-        g = Math.round(220 + (184 - 220) * s);
-        bl = Math.round(178 + (166 - 178) * s);
+        let lo = 0, hi = n;
+        while (lo < hi) {{
+          const m = (lo + hi) >> 1;
+          if (sorted[m] < isigiVal) lo = m + 1;
+          else hi = m;
+        }}
+        const lb = lo;
+        if (lb < n && sorted[lb] === isigiVal) {{
+          let lo2 = lb, hi2 = n;
+          while (lo2 < hi2) {{
+            const m = (lo2 + hi2) >> 1;
+            if (sorted[m] <= isigiVal) lo2 = m + 1;
+            else hi2 = m;
+          }}
+          p = (0.5 * (lb + lo2 - 1)) / (n - 1);
+        }} else {{
+          const v0 = sorted[lb - 1];
+          const v1 = sorted[lb];
+          const span = v1 - v0;
+          p = ((lb - 1) + (span > 0 ? (isigiVal - v0) / span : 0.5)) / (n - 1);
+        }}
       }}
     }} else {{
-      let qFrac = 0.0;
-      if (clamped <= q75 && q75 - mid > 1e-6) {{
-        qFrac = bulkFrac * ((clamped - mid) / (q75 - mid));
-      }} else if (hi - q75 > 1e-6) {{
-        qFrac = bulkFrac + (1.0 - bulkFrac) * ((clamped - q75) / (hi - q75));
-      }} else if (hi - mid > 1e-6) {{
-        qFrac = (clamped - mid) / (hi - mid);
+      const lo = Number.isFinite(b && b.min) ? b.min : -3.0;
+      const hi = Number.isFinite(b && b.max) ? b.max : 20.0;
+      const mid = Math.max(lo, Math.min(hi, Number.isFinite(b && b.median) ? b.median : 0.5 * (lo + hi)));
+      const q25 = Number.isFinite(b && b.q25) ? Math.max(lo, Math.min(mid, b.q25)) : 0.5 * (lo + mid);
+      const q75 = Number.isFinite(b && b.q75) ? Math.max(mid, Math.min(hi, b.q75)) : 0.5 * (mid + hi);
+      const clamped = Math.max(lo, Math.min(hi, isigiVal));
+      if (clamped <= lo) p = 0.0;
+      else if (clamped >= hi) p = 1.0;
+      else if (clamped < q25) p = q25 - lo > 1e-6 ? 0.25 * ((clamped - lo) / (q25 - lo)) : 0.25;
+      else if (clamped < mid) p = mid - q25 > 1e-6 ? 0.25 + 0.25 * ((clamped - q25) / (mid - q25)) : 0.50;
+      else if (clamped <= q75) p = q75 - mid > 1e-6 ? 0.50 + 0.25 * ((clamped - mid) / (q75 - mid)) : 0.50;
+      else p = hi - q75 > 1e-6 ? 0.75 + 0.25 * ((clamped - q75) / (hi - q75)) : 1.00;
+    }}
+    p = Math.max(0.0, Math.min(1.0, p));
+    const rawPct = Number.isFinite(state.colorPercentile) ? state.colorPercentile : 0.50;
+    const s = Math.max(0.001, Math.min(0.999, rawPct));
+    const denom = (1.0 - s) * p + s * (1.0 - p);
+    const u = denom > 0 ? ((1.0 - s) * p) / denom : 0.5;
+    const effAlpha = Math.max(0.0, Math.min(1.0, alpha));
+    let r, g, bl;
+    if (u < 0.5) {{
+      const w = (0.5 - u) / 0.5;
+      if (w <= 0.5) {{
+        // Warm Sunlit Champagne-Gold (254, 232, 170) -> Warm Sage-Cream (162, 220, 178)
+        const t = w / 0.5;
+        r = Math.round(254 + (162 - 254) * t);
+        g = Math.round(232 + (220 - 232) * t);
+        bl = Math.round(170 + (178 - 170) * t);
+      }} else {{
+        // Warm Sage-Cream (162, 220, 178) -> Luminous Sea-Teal (20, 184, 166)
+        const t = (w - 0.5) / 0.5;
+        r = Math.round(162 + (20 - 162) * t);
+        g = Math.round(220 + (184 - 220) * t);
+        bl = Math.round(178 + (166 - 178) * t);
       }}
-      qFrac = Math.max(0.0, Math.min(1.0, qFrac));
-      const u = qFrac <= 0.0 ? 0.0 : (qFrac >= 1.0 ? 1.0 : Math.pow(qFrac, gammaPos));
-      if (u <= 0.5) {{
-        // Warm Sunlit Champagne-Gold (254, 232, 170) -> Vivid Solar Tangerine (251, 140, 36)
-        const s = u / 0.5;
-        r = Math.round(254 + (251 - 254) * s);
-        g = Math.round(232 + (140 - 232) * s);
-        bl = Math.round(170 + (36 - 170) * s);
+    }} else {{
+      const w = (u - 0.5) / 0.5;
+      if (w <= 0.5) {{
+        // Warm Sunlit Champagne-Gold (254, 232, 170) -> Warm Golden-Apricot (252, 176, 92)
+        const t = w / 0.5;
+        r = Math.round(254 + (252 - 254) * t);
+        g = Math.round(232 + (176 - 232) * t);
+        bl = Math.round(170 + (92 - 170) * t);
+      }} else if (w <= 0.78) {{
+        // Warm Golden-Apricot (252, 176, 92) -> Vivid Solar Tangerine (251, 140, 36)
+        const t = (w - 0.5) / 0.28;
+        r = Math.round(252 + (251 - 252) * t);
+        g = Math.round(176 + (140 - 176) * t);
+        bl = Math.round(92 + (36 - 92) * t);
       }} else {{
         // Vivid Solar Tangerine (251, 140, 36) -> Fiery Flame-Vermilion (232, 56, 24)
-        const s = (u - 0.5) / 0.5;
-        r = Math.round(251 + (232 - 251) * s);
-        g = Math.round(140 + (56 - 140) * s);
-        bl = Math.round(36 + (24 - 36) * s);
+        const t = (w - 0.78) / 0.22;
+        r = Math.round(251 + (232 - 251) * t);
+        g = Math.round(140 + (56 - 140) * t);
+        bl = Math.round(36 + (24 - 36) * t);
       }}
     }}
     return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{effAlpha.toFixed(3)}})`;
@@ -18978,64 +18840,67 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
 
   function buildColorscaleGradientSpec(mode, crossoverVal) {{
     const prevC = state.colorCrossover;
-    const prevOutL = state.colorOutLeft;
-    const prevOutR = state.colorOutRight;
-    const wing = typeof COLORSCALE_OUT_WING === "number" ? COLORSCALE_OUT_WING : 0.20;
+    const prevP = state.colorPercentile;
     const isQuantMode = typeof isQuantileSnrColorMode === "function"
       ? isQuantileSnrColorMode(mode)
       : (mode === "isigi" || mode === "fobs" || mode === "mtz_fcalc" || mode === "mtz_delta_i" || mode === "ipred_isigi");
-    const hasOutWings = isQuantMode || mode === "residual";
-    const rawPos = Number.isFinite(crossoverVal) ? crossoverVal : DEFAULT_COLOR_CROSSOVER;
-    if (hasOutWings) {{
-      if (rawPos < 0.0) {{
-        state.colorOutLeft = Math.max(0.0, Math.min(1.0, -rawPos / wing));
-        state.colorOutRight = 0.0;
-        state.colorCrossover = 0.06;
-      }} else if (rawPos > 1.0) {{
-        state.colorOutLeft = 0.0;
-        state.colorOutRight = Math.max(0.0, Math.min(1.0, (rawPos - 1.0) / wing));
-        state.colorCrossover = 0.94;
-      }} else {{
-        state.colorOutLeft = 0.0;
-        state.colorOutRight = 0.0;
-        state.colorCrossover = Math.max(0.06, Math.min(0.94, rawPos));
-      }}
+    const isPercentileMode = isQuantMode || mode === "residual";
+    if (isPercentileMode) {{
+      const rawPct = Number.isFinite(crossoverVal)
+        ? Math.max(0.0, Math.min(1.0, crossoverVal))
+        : (Number.isFinite(state.colorPercentile) ? Math.max(0.0, Math.min(1.0, state.colorPercentile)) : 0.50);
+      state.colorPercentile = rawPct;
     }} else {{
-      state.colorOutLeft = 0.0;
-      state.colorOutRight = 0.0;
-      state.colorCrossover = Math.max(0.06, Math.min(0.94, rawPos));
+      const rawC = Number.isFinite(crossoverVal) ? crossoverVal : DEFAULT_COLOR_CROSSOVER;
+      state.colorCrossover = Math.max(0.06, Math.min(0.94, rawC));
     }}
     const c = getColorCrossover();
-    const uOutL = Math.max(0.0, Math.min(1.0, Number(state.colorOutLeft || 0.0)));
-    const uOutR = Math.max(0.0, Math.min(1.0, Number(state.colorOutRight || 0.0)));
+    const selPct = Math.max(0.0, Math.min(1.0, Number.isFinite(state.colorPercentile) ? state.colorPercentile : 0.50));
+    const s = Math.max(0.001, Math.min(0.999, selPct));
     const avail = getPeakDataAvailability();
     const stops = [];
     const N = 16;
     let label = "";
     let tooltip = "";
     const fmtCompactMetric = (v) => {{
+      if (!Number.isFinite(v)) return "0.0";
       const absRaw = Math.abs(v);
       const clean = absRaw < 1e-4 ? 0.0 : v;
       const absV = Math.abs(clean);
       if (absV === 0.0) return "0.0";
+      if (absV >= 1e9) return `${{(clean / 1e9).toFixed(1)}}B`;
+      if (absV >= 1e6) return `${{(clean / 1e6).toFixed(1)}}M`;
       if (absV >= 1000) return `${{(clean / 1000).toFixed(1)}}k`;
       if (absV >= 100) return clean.toFixed(0);
       if (absV < 0.2) return clean.toFixed(2);
       return clean.toFixed(1);
     }};
-    const loPct = (1.5 * (1.0 - uOutL)).toFixed(uOutL >= 0.99 ? 0 : 1);
-    const hiPct = (98.5 + 1.5 * uOutR).toFixed(uOutR >= 0.99 ? 0 : 1);
-    const isOutAny = uOutL > 1e-4 || uOutR > 1e-4;
-    const rangeTag = isOutAny
-      ? `extended out-of-range (P${{loPct}}–${{hiPct}}%)`
-      : "quantile-normalized range (P1.5–98.5)";
-    const resRangeTag = isOutAny
-      ? `extended out-of-range (P${{loPct}}–${{hiPct}}%)`
-      : "outlier-robust range (P1.5–98.5)";
-    const wingPct = (wing / (1.0 + 2.0 * wing)) * 100.0;
-    const spanPct = 100.0 - 2.0 * wingPct;
+    const invCdfOf = (b, q) => {{
+      const qc = Math.max(0.0, Math.min(1.0, q));
+      if (b && Array.isArray(b.sorted) && b.sorted.length >= 2) {{
+        const arr = b.sorted;
+        const pos = qc * (arr.length - 1);
+        const i = Math.floor(pos);
+        const rest = pos - i;
+        return arr[i] + rest * (arr[Math.min(arr.length - 1, i + 1)] - arr[i]);
+      }}
+      const lo = Number.isFinite(b && b.min) ? b.min : -3.0;
+      const hi = Number.isFinite(b && b.max) ? b.max : 20.0;
+      const mid = Math.max(lo, Math.min(hi, Number.isFinite(b && b.median) ? b.median : 0.5 * (lo + hi)));
+      const q25 = Number.isFinite(b && b.q25) ? Math.max(lo, Math.min(mid, b.q25)) : 0.5 * (lo + mid);
+      const q75 = Number.isFinite(b && b.q75) ? Math.max(mid, Math.min(hi, b.q75)) : 0.5 * (mid + hi);
+      if (qc <= 0.25) return lo + (qc / 0.25) * (q25 - lo);
+      if (qc <= 0.50) return q25 + ((qc - 0.25) / 0.25) * (mid - q25);
+      if (qc <= 0.75) return mid + ((qc - 0.50) / 0.25) * (q75 - mid);
+      return q75 + ((qc - 0.75) / 0.25) * (hi - q75);
+    }};
+    const linearToPct = (u) => {{
+      const uc = Math.max(0.0, Math.min(1.0, u));
+      const den = s * uc + (1.0 - s) * (1.0 - uc);
+      return den > 0 ? (s * uc) / den : uc;
+    }};
+    const pctRound = Math.round(selPct * 100);
     if (isQuantMode) {{
-      const bulkFrac = 0.28;
       let b = null;
       if (mode === "fobs") {{
         b = avail.fobsBounds || {{ min: 0.0, q25: 0.5, median: 1.0, q75: 2.5, max: 8.0 }};
@@ -19054,30 +18919,16 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           max: Number.isFinite(avail.isigiMax) ? avail.isigiMax : 20.0,
         }};
       }}
-      const lo = Number.isFinite(b.min) ? b.min : -3.0;
-      const hi = Number.isFinite(b.max) ? b.max : 20.0;
-      const mid = Math.max(lo, Math.min(hi, Number.isFinite(b.median) ? b.median : 0.5 * (lo + hi)));
-      const q25 = Number.isFinite(b.q25) ? Math.max(lo, Math.min(mid, b.q25)) : 0.5 * (lo + mid);
-      const q75 = Number.isFinite(b.q75) ? Math.max(mid, Math.min(hi, b.q75)) : 0.5 * (mid + hi);
-      stops.push(`${{isigiToColor(lo, 1.0, b)}} 0.0%`);
+      // Map uniform linear color levels u_k in [0, 1] onto percentiles p(u_k; s) in [0%, 100%] / inverse CDF Q(p)
       for (let k = 0; k <= N; k++) {{
         const u = k / N;
-        let snr;
-        if (u <= 0.5) {{
-          const qFrac = (0.5 - u) / 0.5;
-          snr = qFrac <= bulkFrac
-            ? (mid - (mid - q25) * (qFrac / Math.max(1e-6, bulkFrac)))
-            : (q25 - (q25 - lo) * ((qFrac - bulkFrac) / Math.max(1e-6, 1.0 - bulkFrac)));
-        }} else {{
-          const qFrac = (u - 0.5) / 0.5;
-          snr = qFrac <= bulkFrac
-            ? (mid + (q75 - mid) * (qFrac / Math.max(1e-6, bulkFrac)))
-            : (q75 + (hi - q75) * ((qFrac - bulkFrac) / Math.max(1e-6, 1.0 - bulkFrac)));
-        }}
-        const pct = wingPct + u * spanPct;
-        stops.push(`${{isigiToColor(snr, 1.0, b)}} ${{pct.toFixed(1)}}%`);
+        const pStop = linearToPct(u);
+        const valStop = invCdfOf(b, pStop);
+        stops.push(`${{isigiToColor(valStop, 1.0, b)}} ${{(pStop * 100.0).toFixed(1)}}%`);
       }}
-      stops.push(`${{isigiToColor(hi, 1.0, b)}} 100.0%`);
+      const vLo = selPct <= 0.01 ? invCdfOf(b, 0.0) : invCdfOf(b, linearToPct(0.05));
+      const vMid = invCdfOf(b, selPct);
+      const vHi = selPct >= 0.99 ? invCdfOf(b, 1.0) : invCdfOf(b, linearToPct(0.95));
       const prefix = mode === "fobs"
         ? "|F_obs|²"
         : (mode === "mtz_fcalc"
@@ -19085,25 +18936,27 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           : (mode === "mtz_delta_i"
             ? "ΔI (F−F₀)"
             : (mode === "ipred_isigi" ? "I_pred/σ (Σ·|F_calc|²/σ_obs)" : "I/σ")));
-      label = `${{fmtCompactMetric(lo)}} · ${{fmtCompactMetric(mid)}} · ${{fmtCompactMetric(hi)}}`;
-      tooltip = `${{prefix}} ${{rangeTag}} [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at ${{fmtCompactMetric(mid)}} (bulk IQR [${{fmtCompactMetric(q25)}}, ${{fmtCompactMetric(q75)}}]) — drag into hatched ends for 0%/100% extrema`;
+      label = `${{fmtCompactMetric(vLo)}} · ${{fmtCompactMetric(vMid)}} (P${{pctRound}}%) · ${{fmtCompactMetric(vHi)}}`;
+      tooltip = `${{prefix}} quantile-normalized range (0–100th percentile inverse CDF): P0%=${{fmtCompactMetric(invCdfOf(b, 0.0))}}, P${{pctRound}}%=${{fmtCompactMetric(vMid)}}, P100%=${{fmtCompactMetric(invCdfOf(b, 1.0))}} (bulk IQR [${{fmtCompactMetric(invCdfOf(b, 0.25))}}, ${{fmtCompactMetric(invCdfOf(b, 0.75))}}])`;
     }} else if (mode === "residual") {{
-      const lo = Number.isFinite(avail.resMin) ? avail.resMin : -3.0;
-      const hi = Number.isFinite(avail.resMax) ? avail.resMax : 3.0;
-      const rawMid = Number.isFinite(avail.resMedian) ? avail.resMedian : avail.resMean;
-      const mid = Number.isFinite(rawMid) ? Math.max(lo, Math.min(hi, rawMid)) : 0.5 * (lo + hi);
-      stops.push(`${{residualToColor(lo, 1.0, avail)}} 0.0%`);
+      const rb = avail.resBounds || {{
+        min: Number.isFinite(avail.resMin) ? avail.resMin : -3.0,
+        q25: -1.0,
+        median: Number.isFinite(avail.resMedian) ? avail.resMedian : 0.0,
+        q75: 1.0,
+        max: Number.isFinite(avail.resMax) ? avail.resMax : 3.0,
+      }};
       for (let k = 0; k <= N; k++) {{
         const u = k / N;
-        const res = u <= 0.5
-          ? (lo + (u / 0.5) * (mid - lo))
-          : (mid + ((u - 0.5) / 0.5) * (hi - mid));
-        const pct = wingPct + u * spanPct;
-        stops.push(`${{residualToColor(res, 1.0, avail)}} ${{pct.toFixed(1)}}%`);
+        const pStop = linearToPct(u);
+        const valStop = invCdfOf(rb, pStop);
+        stops.push(`${{residualToColor(valStop, 1.0, avail)}} ${{(pStop * 100.0).toFixed(1)}}%`);
       }}
-      stops.push(`${{residualToColor(hi, 1.0, avail)}} 100.0%`);
-      label = `${{fmtCompactMetric(lo)}} · ${{fmtCompactMetric(mid)}} · ${{fmtCompactMetric(hi)}}`;
-      tooltip = `ΔI/σ ${{resRangeTag}} [${{fmtCompactMetric(lo)}}, ${{fmtCompactMetric(hi)}}] centered at median ${{fmtCompactMetric(mid)}}σ — drag into hatched ends for 0%/100% extrema`;
+      const vLo = selPct <= 0.01 ? invCdfOf(rb, 0.0) : invCdfOf(rb, linearToPct(0.05));
+      const vMid = invCdfOf(rb, selPct);
+      const vHi = selPct >= 0.99 ? invCdfOf(rb, 1.0) : invCdfOf(rb, linearToPct(0.95));
+      label = `${{fmtCompactMetric(vLo)}} · ${{fmtCompactMetric(vMid)}} (P${{pctRound}}%) · ${{fmtCompactMetric(vHi)}}`;
+      tooltip = `ΔI/σ 0–100th percentile inverse-CDF scale: P0%=${{fmtCompactMetric(invCdfOf(rb, 0.0))}}, P${{pctRound}}%=${{fmtCompactMetric(vMid)}}σ, P100%=${{fmtCompactMetric(invCdfOf(rb, 1.0))}}`;
     }} else if (mode === "scale") {{
       for (let k = 0; k <= N; k++) {{
         const u = k / N;
@@ -19134,112 +18987,42 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       tooltip = `Spectral hue midpoint λ ~ ${{crossLam.toFixed(2)}} Å across [${{lMin.toFixed(2)}}, ${{lMax.toFixed(2)}}] Å (limits set by Wavelength λ [Å] slider)`;
     }}
     state.colorCrossover = prevC;
-    state.colorOutLeft = prevOutL;
-    state.colorOutRight = prevOutR;
+    state.colorPercentile = prevP;
     return {{
       gradient: `linear-gradient(90deg, ${{stops.join(", ")}})`,
       label,
       tooltip,
-      hasOutWings,
     }};
-  }}
-
-  function isOutlierRangeColorMode(mode) {{
-    const m = mode || state.wulffColorMode || "wavelength";
-    return (typeof isQuantileSnrColorMode === "function" ? isQuantileSnrColorMode(m) : false) || m === "residual";
-  }}
-
-  function applyColorSliderPosition(rawPos, mode) {{
-    const activeMode = mode || state.wulffColorMode || "wavelength";
-    const hasWings = isOutlierRangeColorMode(activeMode);
-    const v = Number.isFinite(rawPos) ? rawPos : DEFAULT_COLOR_CROSSOVER;
-    if (!hasWings) {{
-      const clamped = Math.max(0.06, Math.min(0.94, v));
-      state.colorSliderPos = clamped;
-      state.colorCrossover = clamped;
-      state.colorOutLeft = 0.0;
-      state.colorOutRight = 0.0;
-      return;
-    }}
-    const wing = COLORSCALE_OUT_WING;
-    const s = Math.max(-wing, Math.min(1.0 + wing, v));
-    state.colorSliderPos = s;
-    if (s < 0.0) {{
-      state.colorOutLeft = Math.max(0.0, Math.min(1.0, -s / wing));
-      state.colorOutRight = 0.0;
-      state.colorCrossover = 0.06;
-    }} else if (s > 1.0) {{
-      state.colorOutLeft = 0.0;
-      state.colorOutRight = Math.max(0.0, Math.min(1.0, (s - 1.0) / wing));
-      state.colorCrossover = 0.94;
-    }} else {{
-      state.colorOutLeft = 0.0;
-      state.colorOutRight = 0.0;
-      state.colorCrossover = Math.max(0.06, Math.min(0.94, s));
-    }}
   }}
 
   function updateColorscaleSliderGradient() {{
     const activeMode = state.wulffColorMode || "wavelength";
-    const wing = typeof COLORSCALE_OUT_WING === "number" ? COLORSCALE_OUT_WING : 0.20;
-    const hasWings = typeof isOutlierRangeColorMode === "function"
-      ? isOutlierRangeColorMode(activeMode)
+    const isPctMode = (typeof isQuantileSnrColorMode === "function"
+      ? isQuantileSnrColorMode(activeMode)
       : (
           activeMode === "isigi" ||
           activeMode === "fobs" ||
           activeMode === "mtz_fcalc" ||
           activeMode === "mtz_delta_i" ||
-          activeMode === "ipred_isigi" ||
-          activeMode === "residual"
-        );
-    if (!hasWings && (state.colorOutLeft > 0 || state.colorOutRight > 0 || state.colorSliderPos < 0.06 || state.colorSliderPos > 0.94)) {{
-      if (typeof applyColorSliderPosition === "function") {{
-        applyColorSliderPosition(state.colorCrossover, activeMode);
-      }} else {{
-        state.colorOutLeft = 0.0;
-        state.colorOutRight = 0.0;
-        state.colorSliderPos = getColorCrossover();
-      }}
-    }}
-    const curSliderPos = hasWings
-      ? (Number.isFinite(state.colorSliderPos) ? state.colorSliderPos : getColorCrossover())
+          activeMode === "ipred_isigi"
+        )) || activeMode === "residual";
+    const curVal = isPctMode
+      ? Math.max(0.0, Math.min(1.0, Number.isFinite(state.colorPercentile) ? state.colorPercentile : 0.50))
       : getColorCrossover();
-    const spec = buildColorscaleGradientSpec(activeMode, curSliderPos);
+    const spec = buildColorscaleGradientSpec(activeMode, curVal);
     if (slColorEmphasis) {{
       slColorEmphasis.disabled = false;
       slColorEmphasis.setAttribute("aria-disabled", "false");
-      slColorEmphasis.min = hasWings ? (-wing).toFixed(2) : "0.06";
-      slColorEmphasis.max = hasWings ? (1.0 + wing).toFixed(2) : "0.94";
-      slColorEmphasis.value = curSliderPos.toFixed(2);
-      if (slColorEmphasis.classList && typeof slColorEmphasis.classList.toggle === "function") {{
-        slColorEmphasis.classList.toggle("has-out-wings", hasWings);
-        slColorEmphasis.classList.toggle("is-out-left", Boolean(hasWings && state.colorOutLeft > 1e-4));
-        slColorEmphasis.classList.toggle("is-out-right", Boolean(hasWings && state.colorOutRight > 1e-4));
-      }}
+      slColorEmphasis.min = isPctMode ? "0.00" : "0.06";
+      slColorEmphasis.max = isPctMode ? "1.00" : "0.94";
+      slColorEmphasis.value = curVal.toFixed(2);
       slColorEmphasis.style.setProperty("--cs-gradient", spec.gradient);
-      slColorEmphasis.title = spec.tooltip || "Drag knob to tune colorscale contrast / midpoint crossover (double-click to reset)";
+      slColorEmphasis.title = spec.tooltip || "Drag across 0–100th percentile to map linear color values onto percentiles / inverse CDF (double-click to reset)";
     }}
     const lbl = typeof document !== "undefined" && document ? document.getElementById("lbl-color-emphasis") : null;
     if (lbl) {{
       lbl.textContent = spec.label;
       lbl.title = spec.tooltip || "";
-    }}
-    const badgeOor = typeof document !== "undefined" && document ? document.getElementById("badge-colorscale-oor") : null;
-    if (badgeOor) {{
-      if (hasWings && state.colorOutLeft > 1e-4) {{
-        const pLo = Math.max(0.0, 1.5 * (1.0 - state.colorOutLeft));
-        badgeOor.style.display = "inline-block";
-        badgeOor.classList.remove("oor-right");
-        badgeOor.textContent = pLo <= 0.02 ? "◀ 0%" : `◀ P${{pLo.toFixed(1)}}%`;
-      }} else if (hasWings && state.colorOutRight > 1e-4) {{
-        const pHi = Math.min(100.0, 98.5 + 1.5 * state.colorOutRight);
-        badgeOor.style.display = "inline-block";
-        badgeOor.classList.add("oor-right");
-        badgeOor.textContent = pHi >= 99.98 ? "100% ▶" : `P${{pHi.toFixed(1)}}% ▶`;
-      }} else {{
-        badgeOor.style.display = "none";
-        badgeOor.classList.remove("oor-right");
-      }}
     }}
     if (typeof renderLambdaSnrCarpets === "function") {{
       renderLambdaSnrCarpets();
@@ -22913,9 +22696,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.peakSource,
       state.wulffScope,
       state.wulffColorMode,
-      Number(state.colorSliderPos ?? 0.38).toFixed(3),
-      Number(state.colorOutLeft || 0).toFixed(3),
-      Number(state.colorOutRight || 0).toFixed(3),
+      Number(state.colorPercentile ?? 0.50).toFixed(3),
       getColorCrossover().toFixed(3),
       DATA.mtz_overlay_name || "",
       DATA.ref_mtz_overlay_name || "",
@@ -24492,9 +24273,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       hasNodalCtrl ? nodalCtrl.getDataSeq() : 0,
       state.wulffScope,
       state.wulffColorMode,
-      Number(state.colorSliderPos ?? 0.38).toFixed(3),
-      Number(state.colorOutLeft || 0).toFixed(3),
-      Number(state.colorOutRight || 0).toFixed(3),
+      Number(state.colorPercentile ?? 0.50).toFixed(3),
       getColorCrossover().toFixed(3),
       DATA.mtz_overlay_name || "",
       DATA.ref_mtz_overlay_name || "",
@@ -25506,8 +25285,13 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     slColorEmphasis.addEventListener("input", () => {{
       if (slColorEmphasis.disabled) return;
       const v = parseFloat(slColorEmphasis.value);
-      applyColorSliderPosition(Number.isFinite(v) ? v : DEFAULT_COLOR_CROSSOVER);
-      _peakDataAvailabilitySig = "";
+      const activeMode = state.wulffColorMode || "wavelength";
+      const isPctMode = isQuantileSnrColorMode(activeMode) || activeMode === "residual";
+      if (isPctMode) {{
+        state.colorPercentile = Number.isFinite(v) ? Math.max(0.0, Math.min(1.0, v)) : DEFAULT_COLOR_PERCENTILE;
+      }} else {{
+        state.colorCrossover = Number.isFinite(v) ? Math.max(0.06, Math.min(0.94, v)) : DEFAULT_COLOR_CROSSOVER;
+      }}
       _lastDetRenderSig = "";
       _lastWulffRenderSig = "";
       updateColorscaleSliderGradient();
@@ -25516,8 +25300,13 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }});
     slColorEmphasis.addEventListener("dblclick", () => {{
       if (slColorEmphasis.disabled) return;
-      applyColorSliderPosition(DEFAULT_COLOR_CROSSOVER);
-      _peakDataAvailabilitySig = "";
+      const activeMode = state.wulffColorMode || "wavelength";
+      const isPctMode = isQuantileSnrColorMode(activeMode) || activeMode === "residual";
+      if (isPctMode) {{
+        state.colorPercentile = DEFAULT_COLOR_PERCENTILE;
+      }} else {{
+        state.colorCrossover = DEFAULT_COLOR_CROSSOVER;
+      }}
       _lastDetRenderSig = "";
       _lastWulffRenderSig = "";
       updateColorscaleSliderGradient();
