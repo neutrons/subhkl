@@ -2115,7 +2115,9 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert 'id="slider-wl-max"' in html_doc
     assert 'id="wl-knob-min"' in html_doc and ">[</button>" in html_doc
     assert 'id="wl-knob-max"' in html_doc and ">]</button>" in html_doc
-    assert "Unit cell / Params" in html_doc
+    assert "Unit Cell..." in html_doc
+    assert 'id="mtz-status-badge"' in html_doc
+    assert "updateMtzStatusBadge" in html_doc
     assert 'id="inp-lmin"' not in html_doc
     assert 'id="inp-lmax"' not in html_doc
     assert 'id="inp-dmin"' not in html_doc
@@ -3403,10 +3405,11 @@ syncWulffYawFromDetector();
 const gNeg10 = gForChiElDeg(-10.0, 0.0);
 const friedelNeg10AtPos10 = projectToWulff([-gNeg10[0], -gNeg10[1], -gNeg10[2]], 100, 100, 80);
 
-// Warm Geyser-inspired quantile-normalized divergent I/σ scale:
+// Warm Geyser-inspired 0–100th percentile (empirical CDF / inverse CDF) divergent I/σ scale:
 // Sea-Teal (-3.0) -> Champagne-Gold median (+3.0) -> Solar Tangerine -> Flame-Vermilion (+40.0)
+state.colorPercentile = 0.50;
 state.colorCrossover = 0.38;
-const testBounds = {{ min: -3.0, q25: 0.5, median: 3.0, q75: 9.0, max: 40.0, pNeg: 1.0, pPos: 0.72 }};
+const testBounds = {{ min: -3.0, q25: 0.5, median: 3.0, q75: 9.0, max: 40.0 }};
 const colMissing = isigiToColor(NaN, 1.0, testBounds);
 const colLowPole = isigiToColor(-3.0, 1.0, testBounds);
 const colBelowMed = isigiToColor(0.0, 1.0, testBounds);
@@ -3414,15 +3417,15 @@ const colMedGold = isigiToColor(3.0, 1.0, testBounds);
 const colWarmMid = isigiToColor(14.0, 1.0, testBounds);
 const colFlameHi = isigiToColor(150.0, 1.0, testBounds);
 
-// Crossover knob: dragging right (0.84) widens the warm center band so moderate +8σ stays closer to Champagne-Gold;
-// dragging left (0.12) sharpens contrast around median so +8σ shifts strongly toward Tangerine/Flame-Vermilion
-state.colorCrossover = 0.84;
+// Percentile slider knob: dragging right (0.84 = P84%) moves midpoint up so moderate +8σ stays closer to Champagne-Gold;
+// dragging left (0.12 = P12%) moves midpoint down so +8σ shifts strongly toward Tangerine/Flame-Vermilion
+state.colorPercentile = 0.84;
 const colMidRightKnob = isigiToColor(8.0, 1.0, testBounds);
-state.colorCrossover = 0.12;
+state.colorPercentile = 0.12;
 const colMidLeftKnob = isigiToColor(8.0, 1.0, testBounds);
-state.colorCrossover = 0.38;
+state.colorPercentile = 0.50;
 
-const gradIsigi = buildColorscaleGradientSpec("isigi", 0.38);
+const gradIsigi = buildColorscaleGradientSpec("isigi", 0.50);
 const gradWl = buildColorscaleGradientSpec("wavelength", 0.50);
 
 // Parallax trigger gating: off on plain hover AND off on mouse-button pan/drag;
@@ -7767,7 +7770,7 @@ def test_wilson_prior_default_mean_calibrated_residual_colorbar_and_single_table
         js_harness = f"""
 const DEFAULT_COLOR_CROSSOVER = 0.38;
 const ORBIT_PALETTE = ["#ff38b4", "#00e5ff"];
-const state = {{ colorCrossover: 0.38, peakSource: "integrated", lamMin: 1.0, lamMax: 3.0 }};
+const state = {{ colorPercentile: 0.50, colorCrossover: 0.38, peakSource: "integrated", lamMin: 1.0, lamMax: 3.0 }};
 const DATA = {{ mtz_overlay_name: "" }};
 let _dynPredEpoch = 0;
 let _peakDataAvailabilitySig = "";
@@ -7775,7 +7778,7 @@ let _peakDataAvailability = {{
   hasIsigi: false, hasMtzIsigi: false, hasResiduals: false, hasScales: false,
   isigiTop: 40.0, mtzIsigiTop: 40.0, resMin: -3.0, resMax: 3.0, resMedian: 0.0, resMean: 0.0,
 }};
-// Include a massive positive outlier (+590000.0) that previously blew up mean (μ=98341.0) and resMax!
+// Include a massive positive outlier (+590000.0) that previously blew up mean (μ=98341.0) and crushed moderate residuals!
 const SAMPLE_PEAKS = [
   {{ id: 1, careless_residual: -2.0 }},
   {{ id: 2, careless_residual: 4.0 }},
@@ -7783,7 +7786,7 @@ const SAMPLE_PEAKS = [
   {{ id: 4, careless_residual: 12.0 }},
   {{ id: 5, careless_residual: 16.0 }},
   {{ id: 6, careless_residual: 590000.0 }},
-]; // sorted: [-2, 4, 8, 12, 16, 590000] -> median = 10.0, outlier fenced far below 590000
+]; // sorted: [-2, 4, 8, 12, 16, 590000] -> median = 10.0, empirical CDF keeps 16.0 at P80% unaffected by +590000!
 const PEAKS = [SAMPLE_PEAKS[0], SAMPLE_PEAKS[2]];
 function isigiToColor() {{ return "rgba(0,0,0,1)"; }}
 function scaleToColor() {{ return "rgba(0,0,0,1)"; }}
@@ -7791,7 +7794,7 @@ function hexToRgba() {{ return "rgba(0,0,0,1)"; }}
 function wavelengthToColor() {{ return "rgba(0,0,0,1)"; }}
 {"\n".join(extracted)}
 const avail = getPeakDataAvailability();
-const spec = buildColorscaleGradientSpec("residual", 0.38);
+const spec = buildColorscaleGradientSpec("residual", 0.50);
 console.log(JSON.stringify({{
   avail: {{ resMin: avail.resMin, resMax: avail.resMax, resMedian: avail.resMedian, resMean: avail.resMean }},
   colMin: residualToColor(avail.resMin, 1.0),
@@ -7809,20 +7812,20 @@ console.log(JSON.stringify({{
         assert out["avail"]["resMedian"] == 10.0
         assert out["avail"]["resMean"] == 10.0
         assert out["avail"]["resMin"] == -2.0
-        # Extreme +590000 outlier is fenced instead of stretching colorbar to 590000
-        assert 16.0 <= out["avail"]["resMax"] < 100.0
+        assert out["avail"]["resMax"] == 590000.0
         assert out["colMin"] == "rgba(30, 170, 255, 1.000)"
         assert out["colMed"] == "rgba(248, 250, 252, 1.000)"
         assert out["colOutlier"] == "rgba(244, 63, 94, 1.000)"
+        assert out["colAboveMed"] != out["colOutlier"]
         # Positive residual +4.0 is below dataset median (+10.0), so it tints toward blue (b > r)
         r_lo, _, b_lo = [int(x) for x in re.findall(r"\d+", out["colBelowMed"])[:3]]
         assert b_lo > r_lo
-        # Residual +16.0 is above dataset median (+10.0), so it tints toward red (r > b)
+        # Residual +16.0 is above dataset median (+10.0) at P80%, so it tints strongly toward red despite +590000 outlier!
         r_hi, _, b_hi = [int(x) for x in re.findall(r"\d+", out["colAboveMed"])[:3]]
-        assert r_hi > b_hi
+        assert r_hi > b_hi + 40
         assert "μ=" not in out["spec"]["label"]
-        assert " · 10.0 · " in out["spec"]["label"]
-        assert "median 10.0σ" in out["spec"]["tooltip"]
+        assert " · 10.0 (P50%) · " in out["spec"]["label"]
+        assert "P50%=10.0σ" in out["spec"]["tooltip"]
         assert "rgba(248, 250, 252, 1.000) 50.0%" in out["spec"]["gradient"]
 
 
@@ -10360,6 +10363,7 @@ def test_divergent_quantile_isigi_colorscale_and_signed_mtz(tmp_path) -> None:
 const DEFAULT_COLOR_CROSSOVER = 0.38;
 const ORBIT_PALETTE = ["#ff38b4", "#00e5ff"];
 const state = {{
+  colorPercentile: 0.50,
   colorCrossover: 0.38,
   peakSource: "integrated",
   wulffColorMode: "isigi",
@@ -10389,7 +10393,7 @@ const colExtremeNeg = isigiToColor(-999.0, 1.0, b);
 const resLo = residualToColor(avail.resMin, 1.0, avail);
 const resMed = residualToColor(avail.resMedian, 1.0, avail);
 const resHi = residualToColor(avail.resMax, 1.0, avail);
-const specIsigi = buildColorscaleGradientSpec("isigi", 0.38);
+const specIsigi = buildColorscaleGradientSpec("isigi", 0.50);
 
 // Also check truncated positive-only frame I/σ >= 2.5 (e.g. single-frame peak finder threshold)
 const truncBounds = computeQuantileScaleBounds(
@@ -10426,10 +10430,11 @@ console.log(JSON.stringify({{
     assert abs(out["signedNegMtz"] - (-3.0)) < 1e-6
 
     b = out["bounds"]
-    # Unbiased PEAKS median (~0.8..2.0) used instead of top-k SAMPLE_PEAKS (>600), and [-999, +76M] outliers fenced!
-    assert -15.0 < b["min"] < 0.0
+    # Unbiased PEAKS median (~0.8..2.0) & IQR used instead of top-k SAMPLE_PEAKS (>600), spanning full 0-100th percentile
+    assert b["min"] == -999.0
     assert 0.0 < b["median"] < 4.0
-    assert 6.0 < b["max"] < 30.0
+    assert 1.5 < b["q75"] < 10.0
+    assert b["max"] == 76_682_336.0
     assert out["colExtremePos"] == out["colHi"] == "rgba(232, 56, 24, 1.000)"
     assert out["colExtremeNeg"] == out["colLo"] == "rgba(20, 184, 166, 1.000)"
     assert out["colMed"] == "rgba(254, 232, 170, 1.000)"
