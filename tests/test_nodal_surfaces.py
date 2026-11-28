@@ -1230,8 +1230,15 @@ def test_antinodal_im0_manifold_and_3d_morse_capsules(tmp_path: Path):
     )
     assert nd["im_surface"]["n_tris"] > 20
     assert len(nd["im_surface"]["re_vals_b64"]) > 0
+    assert "re_brick" in nd and len(nd["re_brick"]["dims"]) == 3
+    assert nd["re_brick"]["scale"] > 0.0
+    assert len(nd["re_brick"]["vals_i16_b64"]) > 0
     assert len(nd["antinode_quantiles"]) == 101
-    assert len(nd["morse_maxima"]) >= 2
+    assert len(nd["antinode_tail_quantiles"]) == 101
+    assert len(nd["detector_antinode_tail_quantiles"]) == 101
+    assert len(nd["morse_maxima"]) >= 4
+    max_morse_brick = max(abs(float(m["re_val"])) for m in nd["morse_maxima"])
+    assert nd["antinode_quantiles"][-1] >= max_morse_brick - 1e-5
 
     pl = build_rainbow_zone_payload()
     pl["nodal_data"] = nd
@@ -1314,16 +1321,41 @@ def test_antinodal_im0_manifold_and_3d_morse_capsules(tmp_path: Path):
     state.antinodePercentile = 1.00;
     const st100 = ctrl.resolveAntinodeThreshold(roi);
     ctrl.render3DReciprocalView(mockCanvas, true);
+    const detTh100 = ctrl.resolveDetectorMorseThreshold();
+
+    // Verify 3D antinode pockets render independently when Im=0 & Morse capsules are OFF
+    state.showNodalSurfacesIm = false;
+    state.showMorseCapsules = false;
+    state.showAntinodes = true;
+
+    fillCalls = 0; textsDrawn.length = 0;
+    state.antinodePercentile = 0.0;
+    ctrl.render3DReciprocalView(mockCanvas, true);
+    const fillsImOff0 = fillCalls;
+
+    fillCalls = 0; textsDrawn.length = 0;
+    state.antinodePercentile = 0.80;
+    ctrl.render3DReciprocalView(mockCanvas, true);
+    const fillsImOff80 = fillCalls;
+    const textsImOff80 = textsDrawn.slice();
+
+    fillCalls = 0;
+    state.antinodePercentile = 1.00;
+    ctrl.render3DReciprocalView(mockCanvas, true);
+    const fillsImOff100 = fillCalls;
 
     // Verify Morse capsule hover callout renders cleanly
+    state.showMorseCapsules = true;
     const topM = {json.dumps(nd["morse_maxima"][0])};
     ctrl.setHoveredMorse(topM);
     textsDrawn.length = 0;
     ctrl.render3DReciprocalView(mockCanvas, true);
 
     console.log(JSON.stringify({{
-      st0, st80, st100,
+      st0, st80, st100, detTh100,
       fills0, fills80,
+      fillsImOff0, fillsImOff80, fillsImOff100,
+      textsImOff80,
       strokesAt80: strokeCalls,
       textsAfterHover: textsDrawn,
     }}));
@@ -1336,14 +1368,21 @@ def test_antinodal_im0_manifold_and_3d_morse_capsules(tmp_path: Path):
     out = json.loads(proc.stdout.strip())
     assert out["st0"]["tau"] == 0.0
     assert out["st80"]["tau"] > 0.0
-    assert out["st100"]["tau"] >= out["st80"]["tau"]
+    assert out["st100"]["tau"] > out["st80"]["tau"]
     assert (
         out["st0"]["activeMorseCount"]
-        >= out["st80"]["activeMorseCount"]
+        > out["st80"]["activeMorseCount"]
         >= out["st100"]["activeMorseCount"]
         >= 1
     )
+    # At 100%, only the global/ROI top Morse extremum (and any exact Friedel mate) survives
+    assert out["st100"]["activeMorseCount"] <= 2
+    assert out["detTh100"]["tau"] > 0.0
     assert out["fills0"] > out["fills80"] > 0
+    # 3D antinode pockets render independently of Im=0 and shrink monotonically 0% -> 80% -> 100%
+    assert out["fillsImOff0"] > out["fillsImOff80"] > out["fillsImOff100"] > 0
+    assert any("3D Antinodes" in t for t in out["textsImOff80"])
+    assert not any("Im[" in t for t in out["textsImOff80"])
     assert out["strokesAt80"] > 0
     assert any("∇Re=0" in t for t in out["textsAfterHover"])
 

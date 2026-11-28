@@ -13068,9 +13068,9 @@ def render_rainbow_html(
             <button id="btn-nodal-re" type="button" class="active-btn nodal-re-pill" title="Toggle simulated Re=0 nodal surface in 3D Reciprocal Space">Re=0</button>
             <button id="btn-nodal-im" type="button" class="active-btn nodal-im-pill" title="Toggle simulated Im=0 nodal surface in 3D Reciprocal Space">Im=0</button>
             <button id="btn-nodal-vortices" type="button" class="active-btn nodal-vortex-pill" title="Toggle 1D phase vortices (Re=0 ∩ Im=0) across 3D Reciprocal Space, Wulff Net, and Detector Panels">Vortices</button>
-            <button id="btn-nodal-antinodes" type="button" class="nodal-antinode-pill" title="Highlight antinodal regions |Re(W)| ≥ τ on the Im=0 manifold">Antinodes</button>
+            <button id="btn-nodal-antinodes" type="button" class="nodal-antinode-pill" title="Highlight 3D antinodal pockets |Re(W)| ≥ τ_3D in reciprocal space (+Re gold, −Re purple)">Antinodes</button>
             <button id="btn-nodal-morse" type="button" class="nodal-morse-pill" title="Toggle 3D Morse capsules (∇Re W = 0) and map Mahalanobis-proximal Morse extrema onto the 2D Detector">Morse</button>
-            <input type="range" id="slider-antinode-pct" min="0" max="100" step="1" value="75" title="Antinode |Re(W)| ≥ τ percentile threshold (75th percentile)" />
+            <input type="range" id="slider-antinode-pct" min="0" max="100" step="0.5" value="75" title="3D Antinode |Re(W)| ≥ τ_3D percentile threshold (75%)" />
             <span id="lbl-antinode-pct" class="nodal-pct-readout" title="Active |Re(W)| ≥ τ percentile cutoff">75%</span>
             <input type="range" id="slider-morse-mahal" min="0.20" max="2.50" step="0.05" value="1.00" title="Mahalanobis distance threshold d_M ≤ σ from Morse extremum for 2D Detector mapping (1.00σ)" />
             <span id="lbl-morse-mahal" class="nodal-mahal-readout" title="Active Mahalanobis distance cutoff d_M for detector Morse mapping">1.0σ</span>
@@ -24430,26 +24430,24 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       btnVor.classList.toggle("active-btn", hasPhasedMtz && Boolean(state.showPhaseVortices));
     }}
     if (btnAnti) {{
-      const isCentricZero = Boolean(nd && nd.is_real_only);
       btnAnti.disabled = !hasPhasedMtz;
       btnAnti.classList.toggle("active-btn", hasPhasedMtz && Boolean(state.showAntinodes));
-      btnAnti.title = isCentricZero
-        ? "Centric field (Im ≡ 0 everywhere): filters 3D Morse maxima by |Re(W)| ≥ τ"
-        : "Highlight antinodal regions |Re(W)| ≥ τ on the Im(W)=0 manifold (+Re amber, −Re violet)";
+      btnAnti.title = "Highlight 3D antinodal pockets |Re(W)| ≥ τ_3D in reciprocal space (+Re gold, −Re purple)";
     }}
     if (btnMorse) {{
       btnMorse.disabled = !hasPhasedMtz;
       btnMorse.classList.toggle("active-btn", hasPhasedMtz && Boolean(state.showMorseCapsules));
     }}
-    const pctInt = Math.round(Math.max(0.0, Math.min(1.0, Number(state.antinodePercentile ?? 0.75))) * 100);
+    const pctVal = Math.round(Math.max(0.0, Math.min(1.0, Number(state.antinodePercentile ?? 0.75))) * 200) / 2;
+    const pctStr = Number.isInteger(pctVal) ? String(pctVal) : pctVal.toFixed(1);
     const anyAntiActive = hasPhasedMtz && Boolean(state.showAntinodes || state.showMorseCapsules);
     if (slAntiPct) {{
       slAntiPct.disabled = !hasPhasedMtz;
-      slAntiPct.value = String(pctInt);
-      slAntiPct.title = `Antinode |Re(W)| ≥ τ percentile threshold (${{pctInt}}th percentile)`;
+      slAntiPct.value = String(pctVal);
+      slAntiPct.title = `3D Antinode |Re(W)| ≥ τ_3D percentile threshold (${{pctStr}}%)`;
     }}
     if (lblAntiPct) {{
-      lblAntiPct.textContent = `${{pctInt}}%`;
+      lblAntiPct.textContent = `${{pctStr}}%`;
       lblAntiPct.classList.toggle("active-pct", anyAntiActive);
     }}
     const mahalSigma = Math.max(0.20, Math.min(2.50, Number(state.morseMahalSigma ?? 1.0)));
@@ -26472,7 +26470,6 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     btnNodalAntinodes.addEventListener("click", () => {{
       state.showAntinodes = !state.showAntinodes;
       if (state.showAntinodes) {{
-        state.showNodalSurfacesIm = true;
         if (!state._morseToggledManually) {{
           state.showMorseCapsules = true;
         }}
@@ -26541,7 +26538,6 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       if (!state.showAntinodes && !state.showMorseCapsules) {{
         state.showAntinodes = true;
         state.showMorseCapsules = true;
-        state.showNodalSurfacesIm = true;
         if (state.stereoViewMode !== "recip3d") {{
           state.stereoViewMode = "recip3d";
         }}
