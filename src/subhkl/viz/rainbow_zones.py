@@ -14780,7 +14780,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   // Steps directly in lab reciprocal space (RUB = R_run * U * B) with exact unit-vector Householder rays
   // kf_hat = ki_hat + lam * g_lab and a 32x32x2 hemisphere directional panel LUT, scanning 10M+ Ewald-shell
   // lattice points in ~100 ms without materializing 40M+ full-sphere lattice points.
-  function raycastRunDirectEwaldShell(ub, sgHelper, Rrun, sLab, panelsGeom, wlMin, wlMax, dMinEff, runIdx, isActiveFrame, maxOutPeaks, frustumFilter = null) {{
+  function raycastRunDirectEwaldShell(ub, sgHelper, Rrun, sLab, panelsGeom, wlMin, wlMax, dMinEff, runIdx, isActiveFrame, maxOutPeaks, frustumFilter = null, explicitHkls = null) {{
     if (!ub || !sgHelper || panelsGeom.length === 0) return [];
     let usePanels = panelsGeom;
     if (frustumFilter && Array.isArray(PANELS) && PANELS.length > 0) {{
@@ -14947,218 +14947,234 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const dMinCut = Math.max(0.15, dMinEff) - 1e-5;
     const qCut2 = Math.min(qMax2 * 1.000002, 1.0 / (dMinCut * dMinCut));
 
-    rodScan:
-    for (let hi = 0; hi < hOrder.length; hi++) {{
-      const h = hOrder[hi];
-      const hbx = h * b1x, hby = h * b1y, hbz = h * b1z;
-      for (let k = kMin; k <= kMax; k++) {{
-        const px = hbx + k * b2x;
-        const py = hby + k * b2y;
-        const pz = hbz + k * b2z;
+    function evalSingleLabHkl(h, k, l, glx, gly, glz, gDotKi) {{
+      if (gDotKi >= -1e-6) return;
+      const g2 = glx * glx + gly * gly + glz * glz;
+      if (g2 <= 1e-12 || g2 > qCut2) return;
+      if (gDotKi * gDotKi <= 1e-10 * g2) return;
+      const lam = (-2.0 * gDotKi) / g2;
+      if (lam < wlMin || lam > wlMax) return;
 
-        const pDotB3 = px * b3x + py * b3y + pz * b3z;
-        const p2 = px * px + py * py + pz * pz;
-        const discRes = pDotB3 * pDotB3 - cStar2 * (p2 - qMax2);
-        if (discRes < 0.0) continue;
+      const kfy = kiy + lam * gly;
+      if (kfy < globalMinKfy || kfy > globalMaxKfy) return;
+      const kfx = kix + lam * glx;
+      const kfz = kiz + lam * glz;
 
-        const pox = px - cOutX, poy = py - cOutY, poz = pz - cOutZ;
-        const poDotB3 = pox * b3x + poy * b3y + poz * b3z;
-        const po2 = pox * pox + poy * poy + poz * poz;
-        const discOut = poDotB3 * poDotB3 - cStar2 * (po2 - rOut2);
-        if (discOut < 0.0) continue;
+      if (flatBucketStart !== null) {{
+        const bx = Math.max(0, Math.min(31, ((kfx + 1.0) * 16.0) | 0));
+        const by = Math.max(0, Math.min(31, ((kfy + 1.0) * 16.0) | 0));
+        const cell = (kfz < 0.0 ? 1024 : 0) | (by << 5) | bx;
+        const bStart = flatBucketStart[cell];
+        const bEnd = flatBucketEnd[cell];
+        if (bStart === bEnd) return;
+        if (sgHelper.isAbsent(h, k, l)) return;
+        for (let bi = bStart; bi < bEnd; bi++) {{
+          const pIdx = flatBucketPanels[bi];
+          const det = panelsGeom[pIdx];
+          const cDot = kfx * det.midRay[0] + kfy * det.midRay[1] + kfz * det.midRay[2];
+          if (cDot < det.cosCone) continue;
+          const denom = kfx * det.norm[0] + kfy * det.norm[1] + kfz * det.norm[2];
+          if (Math.abs(denom) <= 1e-8) continue;
+          const tRay = det.csDotN / denom;
+          if (tRay <= 0.0) continue;
+          const ptX = sx0 + tRay * kfx;
+          const ptY = sy0 + tRay * kfy;
+          const ptZ = sz0 + tRay * kfz;
+          const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
+          const rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
+          if (rowF < det.minRow || rowF >= det.maxRow) continue;
+          const colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
+          if (colF < det.minCol || colF >= det.maxCol) continue;
+          if (det.validMask !== null && !isDetectorPixelValid(det.validMask, rowF, colF)) continue;
 
-        const sqRes = Math.sqrt(discRes);
-        const sqOut = Math.sqrt(discOut);
-        const lLo = Math.max(
-          -4096,
-          Math.ceil((-pDotB3 - sqRes) / cStar2 - 1e-7),
-          Math.ceil((-poDotB3 - sqOut) / cStar2 - 1e-7)
-        );
-        const lHi = Math.min(
-          4096,
-          Math.floor((-pDotB3 + sqRes) / cStar2 + 1e-7),
-          Math.floor((-poDotB3 + sqOut) / cStar2 + 1e-7)
-        );
-        if (lLo > lHi) continue;
+          if (frustumFilter) {{
+            const [azF, dyF, elF] = labToCyl([ptX, ptY, ptZ]);
+            const pyF = frustumFilter.isSph ? elF : dyF;
+            if (pyF < frustumFilter.dyMin || pyF > frustumFilter.dyMax) break;
+            if (!frustumFilter.fullAzVisible) {{
+              const inAzF = (azF >= frustumFilter.dxMin && azF <= frustumFilter.dxMax) ||
+                            (azF - 360.0 >= frustumFilter.dxMin && azF - 360.0 <= frustumFilter.dxMax) ||
+                            (azF + 360.0 >= frustumFilter.dxMin && azF + 360.0 <= frustumFilter.dxMax);
+              if (!inAzF) break;
+            }}
+          }}
 
-        // Inner Ewald sphere hole (wl > wlMax)
-        const pix = px - cInX, piy = py - cInY, piz = pz - cInZ;
-        const piDotB3 = pix * b3x + piy * b3y + piz * b3z;
-        const pi2 = pix * pix + piy * piy + piz * piz;
-        const discIn = piDotB3 * piDotB3 - cStar2 * (pi2 - rIn2);
-        let segCount = 1;
-        let s0Lo = lLo, s0Hi = lHi, s1Lo = 1, s1Hi = 0;
-        if (discIn > 0.0) {{
-          const sqIn = Math.sqrt(discIn);
-          const exclLo = Math.ceil((-piDotB3 - sqIn) / cStar2 + 1e-5);
-          const exclHi = Math.floor((-piDotB3 + sqIn) / cStar2 - 1e-5);
-          if (exclLo <= exclHi) {{
-            s0Lo = lLo;
-            s0Hi = Math.min(lHi, exclLo - 1);
-            s1Lo = Math.max(lLo, exclHi + 1);
-            s1Hi = lHi;
-            segCount = 2;
+          const qn = Math.sqrt(g2);
+          const dVal = 1.0 / qn;
+          const gx = Rrun[0][0] * glx + Rrun[1][0] * gly + Rrun[2][0] * glz;
+          const gy = Rrun[0][1] * glx + Rrun[1][1] * gly + Rrun[2][1] * glz;
+          const gz = Rrun[0][2] * glx + Rrun[1][2] * gly + Rrun[2][2] * glz;
+          hitH.push(h); hitK.push(k); hitL.push(l); hitPIdx.push(pIdx);
+          hitRow.push(rowF); hitCol.push(colF);
+          hitPtX.push(ptX); hitPtY.push(ptY); hitPtZ.push(ptZ);
+          hitGx.push(gx); hitGy.push(gy); hitGz.push(gz);
+          hitGlx.push(glx); hitGly.push(gly); hitGlz.push(glz);
+          hitQn.push(qn); hitD.push(dVal); hitLam.push(lam);
+          break;
+        }}
+        return;
+      }}
+
+      if (sgHelper.isAbsent(h, k, l)) return;
+      for (let pIdx = 0; pIdx < nPanels; pIdx++) {{
+        const det = panelsGeom[pIdx];
+        let tRay = -1.0, rowF = -1.0, colF = -1.0, ptX = 0.0, ptY = 0.0, ptZ = 0.0;
+        if (!det.isCurved) {{
+          const cDot = kfx * det.midRay[0] + kfy * det.midRay[1] + kfz * det.midRay[2];
+          if (cDot < det.cosCone) continue;
+          const denom = kfx * det.norm[0] + kfy * det.norm[1] + kfz * det.norm[2];
+          if (Math.abs(denom) <= 1e-8) continue;
+          tRay = det.csDotN / denom;
+          if (tRay <= 0.0) continue;
+          ptX = sx0 + tRay * kfx;
+          ptY = sy0 + tRay * kfy;
+          ptZ = sz0 + tRay * kfz;
+          const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
+          rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
+          if (rowF < det.minRow || rowF >= det.maxRow) continue;
+          colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
+          if (colF < det.minCol || colF >= det.maxCol) continue;
+        }} else {{
+          const vx = det.vhat[0], vy = det.vhat[1], vz = det.vhat[2];
+          const dx = kfy * vz - kfz * vy;
+          const dy = kfz * vx - kfx * vz;
+          const dz = kfx * vy - kfy * vx;
+          const qa = dx * dx + dy * dy + dz * dz;
+          if (qa <= 1e-12) continue;
+          const qb = 2.0 * (det.bVec[0] * dx + det.bVec[1] * dy + det.bVec[2] * dz);
+          const delta = qb * qb - 4.0 * qa * det.qc;
+          if (delta < 0.0) continue;
+          const sq = Math.sqrt(delta);
+          const t2 = (-qb - sq) / (2.0 * qa);
+          const t1 = (-qb + sq) / (2.0 * qa);
+          tRay = t2 > 0.0 ? t2 : t1;
+          if (tRay <= 0.0) continue;
+          ptX = sx0 + tRay * kfx;
+          ptY = sy0 + tRay * kfy;
+          ptZ = sz0 + tRay * kfz;
+          const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
+          const dotV = rx * vx + ry * vy + rz * vz;
+          rowF = dotV / det.dh;
+          if (rowF < det.minRow || rowF >= det.maxRow) continue;
+          const dpx = rx - dotV * vx, dpy = ry - dotV * vy, dpz = rz - dotV * vz;
+          const dotR = dpx * det.rhat[0] + dpy * det.rhat[1] + dpz * det.rhat[2];
+          const dotW = dpx * det.what[0] + dpy * det.what[1] + dpz * det.what[2];
+          if (Math.abs(dotW) <= 1e-12) continue;
+          let dt = 2.0 * Math.atan(-dotR / dotW);
+          const twoPi = 2.0 * Math.PI;
+          dt = ((dt % twoPi) + twoPi) % twoPi;
+          colF = dt * (det.radius / det.dw);
+          if (colF < det.minCol || colF >= det.maxCol) continue;
+        }}
+        if (det.validMask !== null && !isDetectorPixelValid(det.validMask, rowF, colF)) continue;
+
+        if (frustumFilter) {{
+          const [azF, dyF, elF] = labToCyl([ptX, ptY, ptZ]);
+          const pyF = frustumFilter.isSph ? elF : dyF;
+          if (pyF < frustumFilter.dyMin || pyF > frustumFilter.dyMax) break;
+          if (!frustumFilter.fullAzVisible) {{
+            const inAzF = (azF >= frustumFilter.dxMin && azF <= frustumFilter.dxMax) ||
+                          (azF - 360.0 >= frustumFilter.dxMin && azF - 360.0 <= frustumFilter.dxMax) ||
+                          (azF + 360.0 >= frustumFilter.dxMin && azF + 360.0 <= frustumFilter.dxMax);
+            if (!inAzF) break;
           }}
         }}
 
-        const pDotKi = px * kix + py * kiy + pz * kiz;
-        for (let seg = 0; seg < segCount; seg++) {{
-          const curLo = seg === 0 ? s0Lo : s1Lo;
-          const curHi = seg === 0 ? s0Hi : s1Hi;
-          if (curLo > curHi) continue;
-          let glx = px + curLo * b3x;
-          let gly = py + curLo * b3y;
-          let glz = pz + curLo * b3z;
-          let gDotKi = pDotKi + curLo * b3DotKi;
-          for (let l = curLo; l <= curHi; l++, glx += b3x, gly += b3y, glz += b3z, gDotKi += b3DotKi) {{
-            if (h === 0 && k === 0 && l === 0) continue;
-            if (++nEvals > MAX_EWALD_SHELL_EVALS) break rodScan;
-            if (gDotKi >= -1e-6) continue;
-            const g2 = glx * glx + gly * gly + glz * glz;
-            if (g2 <= 1e-12 || g2 > qCut2) continue;
-            // qn > 1e-8 && sth = -gDotKi / qn > 1e-5 => gDotKi^2 > 1e-10 * g2
-            if (gDotKi * gDotKi <= 1e-10 * g2) continue;
-            const lam = (-2.0 * gDotKi) / g2;
-            if (lam < wlMin || lam > wlMax) continue;
+        const qn = Math.sqrt(g2);
+        const dVal = 1.0 / qn;
+        const gx = Rrun[0][0] * glx + Rrun[1][0] * gly + Rrun[2][0] * glz;
+        const gy = Rrun[0][1] * glx + Rrun[1][1] * gly + Rrun[2][1] * glz;
+        const gz = Rrun[0][2] * glx + Rrun[1][2] * gly + Rrun[2][2] * glz;
+        hitH.push(h); hitK.push(k); hitL.push(l); hitPIdx.push(pIdx);
+        hitRow.push(rowF); hitCol.push(colF);
+        hitPtX.push(ptX); hitPtY.push(ptY); hitPtZ.push(ptZ);
+        hitGx.push(gx); hitGy.push(gy); hitGz.push(gz);
+        hitGlx.push(glx); hitGly.push(gly); hitGlz.push(glz);
+        hitQn.push(qn); hitD.push(dVal); hitLam.push(lam);
+        break;
+      }}
+    }}
 
-            // Householder reflection of unit ki across g_lab: |kf| === 1 identically!
-            const kfy = kiy + lam * gly;
-            if (kfy < globalMinKfy || kfy > globalMaxKfy) continue;
-            const kfx = kix + lam * glx;
-            const kfz = kiz + lam * glz;
+    if (Array.isArray(explicitHkls)) {{
+      for (let ei = 0; ei < explicitHkls.length; ei++) {{
+        const hkl = explicitHkls[ei];
+        if (!Array.isArray(hkl) || hkl.length !== 3) continue;
+        const h = hkl[0] | 0, k = hkl[1] | 0, l = hkl[2] | 0;
+        if (h === 0 && k === 0 && l === 0) continue;
+        const glx = h * b1x + k * b2x + l * b3x;
+        const gly = h * b1y + k * b2y + l * b3y;
+        const glz = h * b1z + k * b2z + l * b3z;
+        const gDotKi = glx * kix + gly * kiy + glz * kiz;
+        evalSingleLabHkl(h, k, l, glx, gly, glz, gDotKi);
+      }}
+    }} else {{
+      rodScan:
+      for (let hi = 0; hi < hOrder.length; hi++) {{
+        const h = hOrder[hi];
+        const hbx = h * b1x, hby = h * b1y, hbz = h * b1z;
+        for (let k = kMin; k <= kMax; k++) {{
+          const px = hbx + k * b2x;
+          const py = hby + k * b2y;
+          const pz = hbz + k * b2z;
 
-            if (flatBucketStart !== null) {{
-              const bx = Math.max(0, Math.min(31, ((kfx + 1.0) * 16.0) | 0));
-              const by = Math.max(0, Math.min(31, ((kfy + 1.0) * 16.0) | 0));
-              const cell = (kfz < 0.0 ? 1024 : 0) | (by << 5) | bx;
-              const bStart = flatBucketStart[cell];
-              const bEnd = flatBucketEnd[cell];
-              if (bStart === bEnd) continue;
-              if (sgHelper.isAbsent(h, k, l)) continue;
-              for (let bi = bStart; bi < bEnd; bi++) {{
-                const pIdx = flatBucketPanels[bi];
-                const det = panelsGeom[pIdx];
-                const cDot = kfx * det.midRay[0] + kfy * det.midRay[1] + kfz * det.midRay[2];
-                if (cDot < det.cosCone) continue;
-                const denom = kfx * det.norm[0] + kfy * det.norm[1] + kfz * det.norm[2];
-                if (Math.abs(denom) <= 1e-8) continue;
-                const tRay = det.csDotN / denom;
-                if (tRay <= 0.0) continue;
-                const ptX = sx0 + tRay * kfx;
-                const ptY = sy0 + tRay * kfy;
-                const ptZ = sz0 + tRay * kfz;
-                const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
-                const rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
-                if (rowF < det.minRow || rowF >= det.maxRow) continue;
-                const colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
-                if (colF < det.minCol || colF >= det.maxCol) continue;
-                if (det.validMask !== null && !isDetectorPixelValid(det.validMask, rowF, colF)) continue;
+          const pDotB3 = px * b3x + py * b3y + pz * b3z;
+          const p2 = px * px + py * py + pz * pz;
+          const discRes = pDotB3 * pDotB3 - cStar2 * (p2 - qMax2);
+          if (discRes < 0.0) continue;
 
-                if (frustumFilter) {{
-                  const [azF, dyF, elF] = labToCyl([ptX, ptY, ptZ]);
-                  const pyF = frustumFilter.isSph ? elF : dyF;
-                  if (pyF < frustumFilter.dyMin || pyF > frustumFilter.dyMax) break;
-                  if (!frustumFilter.fullAzVisible) {{
-                    const inAzF = (azF >= frustumFilter.dxMin && azF <= frustumFilter.dxMax) ||
-                                  (azF - 360.0 >= frustumFilter.dxMin && azF - 360.0 <= frustumFilter.dxMax) ||
-                                  (azF + 360.0 >= frustumFilter.dxMin && azF + 360.0 <= frustumFilter.dxMax);
-                    if (!inAzF) break;
-                  }}
-                }}
+          const pox = px - cOutX, poy = py - cOutY, poz = pz - cOutZ;
+          const poDotB3 = pox * b3x + poy * b3y + poz * b3z;
+          const po2 = pox * pox + poy * poy + poz * poz;
+          const discOut = poDotB3 * poDotB3 - cStar2 * (po2 - rOut2);
+          if (discOut < 0.0) continue;
 
-                const qn = Math.sqrt(g2);
-                const dVal = 1.0 / qn;
-                const gx = Rrun[0][0] * glx + Rrun[1][0] * gly + Rrun[2][0] * glz;
-                const gy = Rrun[0][1] * glx + Rrun[1][1] * gly + Rrun[2][1] * glz;
-                const gz = Rrun[0][2] * glx + Rrun[1][2] * gly + Rrun[2][2] * glz;
-                hitH.push(h); hitK.push(k); hitL.push(l); hitPIdx.push(pIdx);
-                hitRow.push(rowF); hitCol.push(colF);
-                hitPtX.push(ptX); hitPtY.push(ptY); hitPtZ.push(ptZ);
-                hitGx.push(gx); hitGy.push(gy); hitGz.push(gz);
-                hitGlx.push(glx); hitGly.push(gly); hitGlz.push(glz);
-                hitQn.push(qn); hitD.push(dVal); hitLam.push(lam);
-                break;
-              }}
-              continue;
+          const sqRes = Math.sqrt(discRes);
+          const sqOut = Math.sqrt(discOut);
+          const lLo = Math.max(
+            -4096,
+            Math.ceil((-pDotB3 - sqRes) / cStar2 - 1e-7),
+            Math.ceil((-poDotB3 - sqOut) / cStar2 - 1e-7)
+          );
+          const lHi = Math.min(
+            4096,
+            Math.floor((-pDotB3 + sqRes) / cStar2 + 1e-7),
+            Math.floor((-poDotB3 + sqOut) / cStar2 + 1e-7)
+          );
+          if (lLo > lHi) continue;
+
+          // Inner Ewald sphere hole (wl > wlMax)
+          const pix = px - cInX, piy = py - cInY, piz = pz - cInZ;
+          const piDotB3 = pix * b3x + piy * b3y + piz * b3z;
+          const pi2 = pix * pix + piy * piy + piz * piz;
+          const discIn = piDotB3 * piDotB3 - cStar2 * (pi2 - rIn2);
+          let segCount = 1;
+          let s0Lo = lLo, s0Hi = lHi, s1Lo = 1, s1Hi = 0;
+          if (discIn > 0.0) {{
+            const sqIn = Math.sqrt(discIn);
+            const exclLo = Math.ceil((-piDotB3 - sqIn) / cStar2 + 1e-5);
+            const exclHi = Math.floor((-piDotB3 + sqIn) / cStar2 - 1e-5);
+            if (exclLo <= exclHi) {{
+              s0Lo = lLo;
+              s0Hi = Math.min(lHi, exclLo - 1);
+              s1Lo = Math.max(lLo, exclHi + 1);
+              s1Hi = lHi;
+              segCount = 2;
             }}
+          }}
 
-            if (sgHelper.isAbsent(h, k, l)) continue;
-            for (let pIdx = 0; pIdx < nPanels; pIdx++) {{
-              const det = panelsGeom[pIdx];
-              let tRay = -1.0, rowF = -1.0, colF = -1.0, ptX = 0.0, ptY = 0.0, ptZ = 0.0;
-              if (!det.isCurved) {{
-                const cDot = kfx * det.midRay[0] + kfy * det.midRay[1] + kfz * det.midRay[2];
-                if (cDot < det.cosCone) continue;
-                const denom = kfx * det.norm[0] + kfy * det.norm[1] + kfz * det.norm[2];
-                if (Math.abs(denom) <= 1e-8) continue;
-                tRay = det.csDotN / denom;
-                if (tRay <= 0.0) continue;
-                ptX = sx0 + tRay * kfx;
-                ptY = sy0 + tRay * kfy;
-                ptZ = sz0 + tRay * kfz;
-                const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
-                rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
-                if (rowF < det.minRow || rowF >= det.maxRow) continue;
-                colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
-                if (colF < det.minCol || colF >= det.maxCol) continue;
-              }} else {{
-                const vx = det.vhat[0], vy = det.vhat[1], vz = det.vhat[2];
-                const dx = kfy * vz - kfz * vy;
-                const dy = kfz * vx - kfx * vz;
-                const dz = kfx * vy - kfy * vx;
-                const qa = dx * dx + dy * dy + dz * dz;
-                if (qa <= 1e-12) continue;
-                const qb = 2.0 * (det.bVec[0] * dx + det.bVec[1] * dy + det.bVec[2] * dz);
-                const delta = qb * qb - 4.0 * qa * det.qc;
-                if (delta < 0.0) continue;
-                const sq = Math.sqrt(delta);
-                const t2 = (-qb - sq) / (2.0 * qa);
-                const t1 = (-qb + sq) / (2.0 * qa);
-                tRay = t2 > 0.0 ? t2 : t1;
-                if (tRay <= 0.0) continue;
-                ptX = sx0 + tRay * kfx;
-                ptY = sy0 + tRay * kfy;
-                ptZ = sz0 + tRay * kfz;
-                const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
-                const dotV = rx * vx + ry * vy + rz * vz;
-                rowF = dotV / det.dh;
-                if (rowF < det.minRow || rowF >= det.maxRow) continue;
-                const dpx = rx - dotV * vx, dpy = ry - dotV * vy, dpz = rz - dotV * vz;
-                const dotR = dpx * det.rhat[0] + dpy * det.rhat[1] + dpz * det.rhat[2];
-                const dotW = dpx * det.what[0] + dpy * det.what[1] + dpz * det.what[2];
-                if (Math.abs(dotW) <= 1e-12) continue;
-                let dt = 2.0 * Math.atan(-dotR / dotW);
-                const twoPi = 2.0 * Math.PI;
-                dt = ((dt % twoPi) + twoPi) % twoPi;
-                colF = dt * (det.radius / det.dw);
-                if (colF < det.minCol || colF >= det.maxCol) continue;
-              }}
-              if (det.validMask !== null && !isDetectorPixelValid(det.validMask, rowF, colF)) continue;
-
-              if (frustumFilter) {{
-                const [azF, dyF, elF] = labToCyl([ptX, ptY, ptZ]);
-                const pyF = frustumFilter.isSph ? elF : dyF;
-                if (pyF < frustumFilter.dyMin || pyF > frustumFilter.dyMax) break;
-                if (!frustumFilter.fullAzVisible) {{
-                  const inAzF = (azF >= frustumFilter.dxMin && azF <= frustumFilter.dxMax) ||
-                                (azF - 360.0 >= frustumFilter.dxMin && azF - 360.0 <= frustumFilter.dxMax) ||
-                                (azF + 360.0 >= frustumFilter.dxMin && azF + 360.0 <= frustumFilter.dxMax);
-                  if (!inAzF) break;
-                }}
-              }}
-
-              const qn = Math.sqrt(g2);
-              const dVal = 1.0 / qn;
-              const gx = Rrun[0][0] * glx + Rrun[1][0] * gly + Rrun[2][0] * glz;
-              const gy = Rrun[0][1] * glx + Rrun[1][1] * gly + Rrun[2][1] * glz;
-              const gz = Rrun[0][2] * glx + Rrun[1][2] * gly + Rrun[2][2] * glz;
-              hitH.push(h); hitK.push(k); hitL.push(l); hitPIdx.push(pIdx);
-              hitRow.push(rowF); hitCol.push(colF);
-              hitPtX.push(ptX); hitPtY.push(ptY); hitPtZ.push(ptZ);
-              hitGx.push(gx); hitGy.push(gy); hitGz.push(gz);
-              hitGlx.push(glx); hitGly.push(gly); hitGlz.push(glz);
-              hitQn.push(qn); hitD.push(dVal); hitLam.push(lam);
-              break;
+          const pDotKi = px * kix + py * kiy + pz * kiz;
+          for (let seg = 0; seg < segCount; seg++) {{
+            const curLo = seg === 0 ? s0Lo : s1Lo;
+            const curHi = seg === 0 ? s0Hi : s1Hi;
+            if (curLo > curHi) continue;
+            let glx = px + curLo * b3x;
+            let gly = py + curLo * b3y;
+            let glz = pz + curLo * b3z;
+            let gDotKi = pDotKi + curLo * b3DotKi;
+            for (let l = curLo; l <= curHi; l++, glx += b3x, gly += b3y, glz += b3z, gDotKi += b3DotKi) {{
+              if (h === 0 && k === 0 && l === 0) continue;
+              if (++nEvals > MAX_EWALD_SHELL_EVALS) break rodScan;
+              evalSingleLabHkl(h, k, l, glx, gly, glz, gDotKi);
             }}
           }}
         }}
@@ -22161,6 +22177,110 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     return _detVisiblePeaksCache;
   }}
 
+  let _detMorseCandSig = "";
+  let _detMorseCandFirst = null;
+  let _detMorseCandCache = [];
+
+  // Ensure every Morse-proximal reflection in the full d >= d_min sphere is evaluated across all
+  // detector banks, even when global PEAKS is capped at 12,000 (initial payload) or 36,000 (dynamic).
+  function getDetectorMorseCandidatePeaks() {{
+    const allVisible = getVisibleDetectorPeaks();
+    if (
+      typeof nodalCtrl === "undefined" ||
+      !nodalCtrl ||
+      !nodalCtrl.hasPhases() ||
+      state.peakSource !== "predicted"
+    ) {{
+      return allVisible;
+    }}
+    const firstRef = PEAKS.length > 0 ? PEAKS[0] : null;
+    const dynEp = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
+    const activeRunIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const nodalSeq = typeof nodalCtrl.getDataSeq === "function" ? nodalCtrl.getDataSeq() : 0;
+    const sig = `${{dynEp}}|${{activeRunIdx}}|${{nodalSeq}}|${{allVisible.length}}|${{state.wulffColorMode}}|${{state.dMin}}|${{state.lamMin}}|${{state.lamMax}}|${{DATA.mtz_overlay_name || ""}}`;
+    if (_detMorseCandSig === sig && _detMorseCandFirst === firstRef) {{
+      return _detMorseCandCache;
+    }}
+    _detMorseCandSig = sig;
+    _detMorseCandFirst = firstRef;
+
+    const morseHkls = typeof nodalCtrl.getAllDetectorMorseHkls === "function"
+      ? nodalCtrl.getAllDetectorMorseHkls()
+      : [];
+    if (!Array.isArray(morseHkls) || morseHkls.length === 0) {{
+      _detMorseCandCache = allVisible;
+      return _detMorseCandCache;
+    }}
+
+    const seenHkl = new Set();
+    for (let i = 0; i < allVisible.length; i++) {{
+      const p = allVisible[i];
+      if (p && Array.isArray(p.hkl) && p.hkl.length === 3) {{
+        seenHkl.add(`${{p.hkl[0]}},${{p.hkl[1]}},${{p.hkl[2]}}`);
+      }}
+    }}
+    const missingHkls = [];
+    for (let i = 0; i < morseHkls.length; i++) {{
+      const hk = morseHkls[i];
+      if (Array.isArray(hk) && hk.length === 3 && !seenHkl.has(`${{hk[0]}},${{hk[1]}},${{hk[2]}}`)) {{
+        missingHkls.push(hk);
+      }}
+    }}
+    if (missingHkls.length === 0) {{
+      _detMorseCandCache = allVisible;
+      return _detMorseCandCache;
+    }}
+
+    const ub = getActiveUbMatrix();
+    const Ractive = getActiveGoniometerR();
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : null;
+    const sActive = (sMap && Array.isArray(sMap[String(activeRunIdx)]))
+      ? sMap[String(activeRunIdx)]
+      : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0]);
+    const panelsGeom = buildActiveDetectorRaycastPanels(sActive);
+    if (!ub || panelsGeom.length === 0) {{
+      _detMorseCandCache = allVisible;
+      return _detMorseCandCache;
+    }}
+    const dFloor = getDynamicDminFloor();
+    const dMinEff = Math.max(dFloor, Number(state.dMin) || dFloor);
+    const wlMin = Math.max(0.05, Number(state.lamMin) || 2.0);
+    const wlMax = Math.max(wlMin + 0.05, Number(state.lamMax) || 4.5);
+
+    const extraPeaks = raycastRunDirectEwaldShell(
+      ub,
+      buildClientSpaceGroupHelper(),
+      Ractive,
+      sActive,
+      panelsGeom,
+      wlMin,
+      wlMax,
+      dMinEff,
+      activeRunIdx,
+      true,
+      missingHkls.length + 16,
+      null,
+      missingHkls
+    );
+    if (!Array.isArray(extraPeaks) || extraPeaks.length === 0) {{
+      _detMorseCandCache = allVisible;
+      return _detMorseCandCache;
+    }}
+    const merged = allVisible.slice();
+    for (let i = 0; i < extraPeaks.length; i++) {{
+      const ep = extraPeaks[i];
+      ep.id = 2000000 + i;
+      ep._isMorseSynthesized = true;
+      if (isPeakVisible(ep)) merged.push(ep);
+    }}
+    _detMorseCandCache = merged;
+    return _detMorseCandCache;
+  }}
+
   function _computePeakLodPriority(p, tieIdx, hasActiveZones, useSnr) {{
     let pri = (typeof p.d_spacing === "number" && Number.isFinite(p.d_spacing) && p.d_spacing > 0)
       ? p.d_spacing
@@ -23271,7 +23391,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     // 4a. MORSE EXTREMA DETECTOR LAYER: Uniaxial Gold (+Re W) / Violet (−Re W) stadium capsules mapped onto
     //     all active-bandpass Bragg reflections within Mahalanobis distance d_M <= state.morseMahalSigma
     if (typeof nodalCtrl !== "undefined" && nodalCtrl && state.showMorseCapsules) {{
-      const allDetPeaks = getVisibleDetectorPeaks();
+      const allDetPeaks = getDetectorMorseCandidatePeaks();
       nodalCtrl.renderDetectorMorseExtrema(ctx, w, h, {{
         peaks: allDetPeaks,
         affScaleX,
@@ -23282,6 +23402,16 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         getPeakVert,
         isPeakHighlighted: isPeakHighlightedTarget,
       }});
+      const mSum = typeof nodalCtrl.getLastDetectorMorseSummary === "function"
+        ? nodalCtrl.getLastDetectorMorseSummary()
+        : null;
+      const lblMorseMahal = document.getElementById("lbl-morse-mahal");
+      if (lblMorseMahal && mSum) {{
+        const bestStr = mSum.bestPeak && Array.isArray(mSum.bestPeak.hkl)
+          ? ` • closest (${{mSum.bestPeak.hkl.join(",")}}) d_M=${{mSum.bestMatch.dMahal.toFixed(2)}}σ [Bank ${{mSum.bestPeak.bank}}]`
+          : "";
+        lblMorseMahal.title = `Active Mahalanobis cutoff d_M ≤ ${{mSum.maxMahal.toFixed(2)}}σ: ${{mSum.totalMatched}} detector peak(s) (${{mSum.onScreenMatched}} in view)${{bestStr}}`;
+      }}
       const focusPeak = state.hoveredPeakObj || state.selectedPeakObj;
       if (focusPeak && !queuedTooltipPeakIds.has(focusPeak.id) && nodalCtrl.getPeakMorseMatch(focusPeak.hkl)) {{
         const pyF = getPeakVert(focusPeak);
@@ -26374,6 +26504,33 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       renderDetector();
     }});
   }}
+  function announceDetectorMorseSummary() {{
+    if (typeof nodalCtrl === "undefined" || !nodalCtrl || !state.showMorseCapsules) return;
+    const mSum = typeof nodalCtrl.getLastDetectorMorseSummary === "function"
+      ? nodalCtrl.getLastDetectorMorseSummary()
+      : null;
+    if (!mSum) return;
+    if (mSum.totalMatched === 0) {{
+      setStatusLine(
+        "[MORSE ∇Re=0]",
+        `0 detector peaks within <strong>d_M ≤ ${{mSum.maxMahal.toFixed(2)}}σ</strong> at <strong>${{Math.round(mSum.pct * 100)}}%</strong> antinode cutoff`
+      );
+      return;
+    }}
+    const bp = mSum.bestPeak;
+    const bm = mSum.bestMatch;
+    const bestCol = bm && bm.morse && bm.morse.re_val >= 0 ? "#f59e0b" : "#c084fc";
+    const hklTxt = bp && Array.isArray(bp.hkl) ? `(${{bp.hkl.join(", ")}})` : "";
+    const bankTxt = bp && bp.bank !== undefined ? `Bank ${{bp.bank}}` : "";
+    const viewNote = mSum.onScreenMatched < mSum.totalMatched
+      ? ` <span style="color:var(--text-dim);">(${{mSum.onScreenMatched}} in current viewport)</span>`
+      : "";
+    setStatusLine(
+      "[MORSE ∇Re=0]",
+      `<strong>${{mSum.totalMatched}}</strong> detector peak${{mSum.totalMatched === 1 ? "" : "s"}} ≤ <strong>${{mSum.maxMahal.toFixed(2)}}σ</strong>${{viewNote}} • closest <strong style="color:${{bestCol}};">${{hklTxt}}</strong> d_M=<strong>${{bm.dMahal.toFixed(2)}}σ</strong> [${{bankTxt}}]`
+    );
+  }}
+
   const slAntinodePct = document.getElementById("slider-antinode-pct");
   if (slAntinodePct) {{
     slAntinodePct.addEventListener("input", () => {{
@@ -26394,6 +26551,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       _lastWulffRenderSig = "";
       renderStereoInset(true);
       renderDetector();
+      announceDetectorMorseSummary();
     }});
     slAntinodePct.addEventListener("dblclick", () => {{
       if (slAntinodePct.disabled) return;
@@ -26403,6 +26561,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       _lastWulffRenderSig = "";
       renderStereoInset(true);
       renderDetector();
+      announceDetectorMorseSummary();
     }});
   }}
   const slMorseMahal = document.getElementById("slider-morse-mahal");
@@ -26421,6 +26580,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       _lastWulffRenderSig = "";
       renderStereoInset(true);
       renderDetector();
+      announceDetectorMorseSummary();
     }});
     slMorseMahal.addEventListener("dblclick", () => {{
       if (slMorseMahal.disabled) return;
@@ -26430,6 +26590,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       _lastWulffRenderSig = "";
       renderStereoInset(true);
       renderDetector();
+      announceDetectorMorseSummary();
     }});
   }}
   const selNodalRoi = document.getElementById("sel-nodal-roi");

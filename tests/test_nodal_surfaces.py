@@ -1536,8 +1536,44 @@ def test_detector_morse_mahalanobis_full_sphere_mapping(tmp_path):
     state.antinodePercentile = 0.90;
     const nPct90 = ctrl.renderDetectorMorseExtrema(mockCtx, 800, 500, detOpts);
 
+    // Verify getAllDetectorMorseHkls() and off-screen bank summary (totalMatched vs onScreenMatched)
+    const allHkls = ctrl.getAllDetectorMorseHkls();
+    state.antinodePercentile = 0.0;
+    state.morseMahalSigma = 2.40;
+    const zoomedOffscreenOpts = Object.assign({{}}, detOpts, {{ affOffsetX: 50000.0 }});
+    const nOffscreen = ctrl.renderDetectorMorseExtrema(mockCtx, 800, 500, zoomedOffscreenOpts);
+    const sumOffscreen = ctrl.getLastDetectorMorseSummary();
+
+    // Verify ROI invariance: perturbing local morse_maxima cannot alter canonical detector d_M / re_val
+    const beforeMatch = matchedPeak ? ctrl.getPeakMorseMatch(matchedPeak.hkl) : null;
+    if (matchedPeak) {{
+      const perturbed = Object.assign({{}}, {json.dumps(nd)}, {{
+        morse_maxima: [{{
+          hkl_cont: matchedPeak.hkl.slice(),
+          re_val: 1e-9,
+          im_val: 0.0,
+          prec_h: [999.0, 999.0, 999.0, 0.0, 0.0, 0.0],
+          axis_g: [0.0, 0.0, 1.0],
+          aspect: 1.0,
+        }}],
+      }});
+      ctrl.setNodalData(perturbed);
+    }}
+    const afterMatch = matchedPeak ? ctrl.getPeakMorseMatch(matchedPeak.hkl) : null;
+    const roiInvariant = Boolean(
+      beforeMatch &&
+      afterMatch &&
+      Math.abs(beforeMatch.dMahal - afterMatch.dMahal) < 1e-9 &&
+      Math.abs(beforeMatch.morse.re_val - afterMatch.morse.re_val) < 1e-9
+    );
+
     console.log(JSON.stringify({{
-      n24, n10, n02, nPct90,
+      n24, n10, n02, nPct90, nOffscreen,
+      totalMatchedOffscreen: sumOffscreen ? sumOffscreen.totalMatched : -1,
+      onScreenMatchedOffscreen: sumOffscreen ? sumOffscreen.onScreenMatched : -1,
+      hasBestPeak: Boolean(sumOffscreen && sumOffscreen.bestPeak),
+      allHklsCount: Array.isArray(allHkls) ? allHkls.length : 0,
+      roiInvariant,
       strokeCalls,
       hitMatches: Boolean(matchedPeak && hitPeak && hitPeak.id === matchedPeak.id),
     }}));
@@ -1551,5 +1587,11 @@ def test_detector_morse_mahalanobis_full_sphere_mapping(tmp_path):
     assert out["n24"] >= 1
     assert out["n24"] >= out["n10"] >= out["n02"]
     assert out["n24"] >= out["nPct90"]
+    assert out["nOffscreen"] == 0
+    assert out["totalMatchedOffscreen"] == out["n24"]
+    assert out["onScreenMatchedOffscreen"] == 0
+    assert out["hasBestPeak"] is True
+    assert out["allHklsCount"] > 0
+    assert out["roiInvariant"] is True
     assert out["strokeCalls"] > 0
     assert out["hitMatches"] is True

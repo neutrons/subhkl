@@ -1326,28 +1326,37 @@ def _compute_full_sphere_detector_morse(
     ub = np.asarray(ub_matrix, dtype=np.float64)
     im0_samples: list[np.ndarray] = []
     if not is_centric:
-        im_a = im_v[:-1, :, :]
-        im_b = im_v[1:, :, :]
-        cross = (im_a <= 0.0) != (im_b <= 0.0)
-        cx_i, cx_j, cx_k = np.nonzero(cross)
-        if len(cx_i) > 0:
-            if len(cx_i) > 40000:
-                step_s = max(1, len(cx_i) // 40000)
-                cx_i = cx_i[::step_s]
-                cx_j = cx_j[::step_s]
-                cx_k = cx_k[::step_s]
-            a_val = np.abs(im_v[cx_i, cx_j, cx_k])
-            b_val = np.abs(im_v[cx_i + 1, cx_j, cx_k])
+        hg_axes = (hg0, hg1, hg2)
+        for ax_d in range(3):
+            sl_a = [slice(None), slice(None), slice(None)]
+            sl_b = [slice(None), slice(None), slice(None)]
+            sl_a[ax_d] = slice(None, -1)
+            sl_b[ax_d] = slice(1, None)
+            im_a = im_v[tuple(sl_a)]
+            im_b = im_v[tuple(sl_b)]
+            cross = (im_a <= 0.0) != (im_b <= 0.0)
+            cx_idx = list(np.nonzero(cross))
+            if len(cx_idx[0]) == 0:
+                continue
+            if len(cx_idx[0]) > 25000:
+                step_s = max(1, len(cx_idx[0]) // 25000)
+                cx_idx = [arr[::step_s] for arr in cx_idx]
+            tup_a = (cx_idx[0], cx_idx[1], cx_idx[2])
+            cx_b = list(cx_idx)
+            cx_b[ax_d] = cx_idx[ax_d] + 1
+            tup_b = (cx_b[0], cx_b[1], cx_b[2])
+            a_val = np.abs(im_v[tup_a])
+            b_val = np.abs(im_v[tup_b])
             t_lin = a_val / np.maximum(a_val + b_val, 1e-15)
-            h_cross = np.column_stack(
-                [hg0[cx_i] + t_lin / float(k_up), hg1[cx_j], hg2[cx_k]]
-            )
+            cols = [hg_axes[d][cx_idx[d]].copy() for d in range(3)]
+            cols[ax_d] = cols[ax_d] + t_lin / float(k_up)
+            h_cross = np.column_stack(cols)
             gn_c = np.linalg.norm(h_cross @ ub.T, axis=1)
             in_sph = (gn_c > 1e-5) & (gn_c <= g_max)
             if np.any(in_sph):
-                re_c = (1.0 - t_lin[in_sph]) * re_v[
-                    cx_i[in_sph], cx_j[in_sph], cx_k[in_sph]
-                ] + t_lin[in_sph] * re_v[cx_i[in_sph] + 1, cx_j[in_sph], cx_k[in_sph]]
+                re_c = (1.0 - t_lin[in_sph]) * re_v[tup_a][in_sph] + t_lin[
+                    in_sph
+                ] * re_v[tup_b][in_sph]
                 im0_samples.append(np.abs(re_c))
 
     if im0_samples:
@@ -2126,6 +2135,8 @@ def get_nodal_surfaces_js() -> str:
     let screenMorseHitsDet = [];
     let detectorMorseMap = new Map();
     let detectorMorseRecords = [];
+    let detectorMorseHkls = [];
+    let lastDetectorMorseSummary = null;
     let hoveredMorseObj = null;
     let roiQuantileCacheSig = "";
     let roiSortedAbsRe = new Float32Array(0);
@@ -2467,10 +2478,12 @@ def get_nodal_surfaces_js() -> str:
 
     function buildDetectorMorseIndex(nd, roiMorseList) {
       const hklMap = new Map();
+      const allHkls = [];
       const allRecords = [];
       if (!nd || !nd.has_phases) {
         detectorMorseMap = hklMap;
         detectorMorseRecords = allRecords;
+        detectorMorseHkls = allHkls;
         return;
       }
       const voxBuckets = new Map();
@@ -2505,7 +2518,27 @@ def get_nodal_surfaces_js() -> str:
         allRecords.push(rec);
       }
 
-      if (Array.isArray(roiMorseList)) {
+      // Always prefer canonical full-sphere Whittaker-Shannon FFT records when present so
+      // 2D detector Morse rankings and d_M values are 100% invariant to 3D ROI center/mode.
+      let loadedCanonicalFullSphere = false;
+      if (nd.detector_morse_b64) {
+        const raw = decodeBase64Float32(nd.detector_morse_b64);
+        const nRows = Math.floor(raw.length / 15);
+        if (nRows > 0) loadedCanonicalFullSphere = true;
+        for (let i = 0; i < nRows; i++) {
+          const o = i * 15;
+          addRecordIfUnique({
+            hkl_cont: [raw[o], raw[o + 1], raw[o + 2]],
+            re_val: raw[o + 3],
+            im_val: raw[o + 4],
+            prec_h: [raw[o + 5], raw[o + 6], raw[o + 7], raw[o + 8], raw[o + 9], raw[o + 10]],
+            axis_g: [raw[o + 11], raw[o + 12], raw[o + 13]],
+            aspect: Math.max(1.0, raw[o + 14] || 1.0),
+          });
+        }
+      }
+
+      if (!loadedCanonicalFullSphere && Array.isArray(roiMorseList)) {
         for (let i = 0; i < roiMorseList.length; i++) {
           const m = roiMorseList[i];
           if (!m || !Array.isArray(m.hkl_cont) || m.hkl_cont.length !== 3) continue;
@@ -2519,22 +2552,6 @@ def get_nodal_surfaces_js() -> str:
             prec_h: ph,
             axis_g: Array.isArray(m.axis_g) && m.axis_g.length === 3 ? m.axis_g : [0.0, 0.0, 1.0],
             aspect: Math.max(1.0, Number(m.aspect) || 1.0),
-          });
-        }
-      }
-
-      if (nd.detector_morse_b64) {
-        const raw = decodeBase64Float32(nd.detector_morse_b64);
-        const nRows = Math.floor(raw.length / 15);
-        for (let i = 0; i < nRows; i++) {
-          const o = i * 15;
-          addRecordIfUnique({
-            hkl_cont: [raw[o], raw[o + 1], raw[o + 2]],
-            re_val: raw[o + 3],
-            im_val: raw[o + 4],
-            prec_h: [raw[o + 5], raw[o + 6], raw[o + 7], raw[o + 8], raw[o + 9], raw[o + 10]],
-            axis_g: [raw[o + 11], raw[o + 12], raw[o + 13]],
-            aspect: Math.max(1.0, raw[o + 14] || 1.0),
           });
         }
       }
@@ -2585,6 +2602,7 @@ def get_nodal_surfaces_js() -> str:
                 if (!arr) {
                   arr = [];
                   hklMap.set(hklKey, arr);
+                  allHkls.push([ih, ik, il]);
                 }
                 arr.push({ morse: rec, dMahal });
               }
@@ -2599,6 +2617,7 @@ def get_nodal_surfaces_js() -> str:
       }
       detectorMorseMap = hklMap;
       detectorMorseRecords = allRecords;
+      detectorMorseHkls = allHkls;
     }
 
     function ensureDecodedMeshes() {
@@ -2606,7 +2625,9 @@ def get_nodal_surfaces_js() -> str:
         decodedMeshes = { re: null, im: null, vortex: null, morsePos: null, morseNeg: null, morseList: [] };
         detectorMorseMap = new Map();
         detectorMorseRecords = [];
+        detectorMorseHkls = [];
         screenMorseHitsDet = [];
+        lastDetectorMorseSummary = null;
         decodedCacheSig = "";
         roiQuantileCacheSig = "";
         roiSortedAbsRe = new Float32Array(0);
@@ -4166,7 +4187,7 @@ def get_nodal_surfaces_js() -> str:
       ctx.restore();
     }
 
-    function projectCrystalGToDetector(gVec, Rg, ki, sLab, fullPanels, isSph) {
+    function projectCrystalGToDetector(gVec, Rg, ki, sLab, fullPanels, isSph, allowGap) {
       const gn = Math.hypot(gVec[0], gVec[1], gVec[2]);
       if (!(gn > 1e-7)) return null;
       const gLab = deps.mat3Vec(Rg, gVec);
@@ -4180,28 +4201,43 @@ def get_nodal_surfaces_js() -> str:
       const kf = [kfx / kfn, kfy / kfn, kfz / kfn];
       if (ki[0] * kf[0] + ki[1] * kf[1] + ki[2] * kf[2] > 0.9995) return null;
       const proj = deps.projectRayToDetectorWithGap(kf, sLab, fullPanels);
-      if (!proj || !proj.onPanel) return null;
+      if (!proj) return null;
+      if (!allowGap && !proj.onPanel) return null;
+      if (allowGap && !proj.onPanel && !proj.visible) return null;
       return {
         detX: proj.det_x,
         detV: isSph ? proj.det_el : proj.det_y,
         bank: proj.bank,
+        onPanel: Boolean(proj.onPanel),
       };
     }
 
     // Map full-sphere 3D Morse extrema (∇Re W = 0) onto the 2D Detector whenever a Bragg peak
     // falls within anisotropic Mahalanobis distance d_M(h_hkl, h_*) <= state.morseMahalSigma
-    // and |Re W(h_*)| >= τ(p). Evaluates across ALL active-bandpass detector peaks (immune to zoom LOD).
+    // and |Re W(h_*)| >= τ(p). Pills remain peak-anchored so 2D radial Laue projection never
+    // creates harmonic/co-directional false positives, with a dashed crest-offset vector when zoomed in.
     function renderDetectorMorseExtrema(ctx, w, h, detOpts) {
       screenMorseHitsDet = [];
+      lastDetectorMorseSummary = null;
       const st = deps.state;
       if (!nodalData || !nodalData.has_phases || !st.showMorseCapsules) return 0;
       ensureDecodedMeshes();
       if (detectorMorseMap.size === 0) return 0;
 
       const peaks = (detOpts && Array.isArray(detOpts.peaks)) ? detOpts.peaks : [];
-      if (peaks.length === 0) return 0;
-
       const thresh = resolveDetectorMorseThreshold();
+      if (peaks.length === 0) {
+        lastDetectorMorseSummary = {
+          totalMatched: 0,
+          onScreenMatched: 0,
+          bestPeak: null,
+          bestMatch: null,
+          maxMahal: thresh.maxMahal,
+          pct: thresh.pct,
+        };
+        return 0;
+      }
+
       const ub = deps.getActiveUbMatrix();
       const Rg = deps.getActiveGoniometerR();
       const ki = deps.getActiveIncidentBeam();
@@ -4230,6 +4266,9 @@ def get_nodal_surfaces_js() -> str:
 
       const shiftList = [0.0, -360.0, 360.0];
       let drawnCount = 0;
+      let totalMatched = 0;
+      let bestPeak = null;
+      let bestMatch = null;
 
       ctx.save();
       ctx.lineCap = "round";
@@ -4241,6 +4280,17 @@ def get_nodal_surfaces_js() -> str:
         const match = getPeakMorseMatch(p.hkl, thresh);
         if (!match) continue;
 
+        totalMatched++;
+        if (
+          !bestMatch ||
+          match.dMahal < bestMatch.dMahal - 1e-6 ||
+          (Math.abs(match.dMahal - bestMatch.dMahal) <= 1e-6 &&
+           Math.abs(match.morse.re_val) > Math.abs(bestMatch.morse.re_val))
+        ) {
+          bestMatch = match;
+          bestPeak = p;
+        }
+
         const m = match.morse;
         const isPos = m.re_val >= 0.0;
         const isHov = Boolean(isHoveredFn(p));
@@ -4251,7 +4301,8 @@ def get_nodal_surfaces_js() -> str:
         let dirV = 0.0;
         let hasPanelDir = false;
         let effAspect = 1.0;
-        let starProj = null;
+        let starDetX = null;
+        let starDetV = null;
 
         if (ub && Array.isArray(m.axis_g) && m.axis_g.length === 3) {
           const gx = ub[0][0] * p.hkl[0] + ub[0][1] * p.hkl[1] + ub[0][2] * p.hkl[2];
@@ -4271,16 +4322,21 @@ def get_nodal_surfaces_js() -> str:
               const stepG = 0.06 * gn;
               const prPlus = projectCrystalGToDetector(
                 [gx + stepG * ax0, gy + stepG * ax1, gz + stepG * ax2],
-                Rg, ki, sLab, fullPanels, isSph
+                Rg, ki, sLab, fullPanels, isSph, true
               );
               const prMinus = projectCrystalGToDetector(
                 [gx - stepG * ax0, gy - stepG * ax1, gz - stepG * ax2],
-                Rg, ki, sLab, fullPanels, isSph
+                Rg, ki, sLab, fullPanels, isSph, true
               );
-              if (prPlus && prMinus && prPlus.bank === prMinus.bank && Math.abs(prPlus.detX - prMinus.detX) < 25.0) {
-                dirAz = prPlus.detX - prMinus.detX;
-                dirV = prPlus.detV - prMinus.detV;
-                hasPanelDir = (Math.hypot(dirAz, dirV) > 1e-7);
+              if (prPlus && prMinus) {
+                let dAzDir = prPlus.detX - prMinus.detX;
+                while (dAzDir > 180.0) dAzDir -= 360.0;
+                while (dAzDir < -180.0) dAzDir += 360.0;
+                if (Math.abs(dAzDir) < 25.0) {
+                  dirAz = dAzDir;
+                  dirV = prPlus.detV - prMinus.detV;
+                  hasPanelDir = (Math.hypot(dirAz, dirV) > 1e-7);
+                }
               }
             }
 
@@ -4288,7 +4344,16 @@ def get_nodal_surfaces_js() -> str:
               const gsx = ub[0][0] * m.hkl_cont[0] + ub[0][1] * m.hkl_cont[1] + ub[0][2] * m.hkl_cont[2];
               const gsy = ub[1][0] * m.hkl_cont[0] + ub[1][1] * m.hkl_cont[1] + ub[1][2] * m.hkl_cont[2];
               const gsz = ub[2][0] * m.hkl_cont[0] + ub[2][1] * m.hkl_cont[1] + ub[2][2] * m.hkl_cont[2];
-              starProj = projectCrystalGToDetector([gsx, gsy, gsz], Rg, ki, sLab, fullPanels, isSph);
+              const starProj = projectCrystalGToDetector([gsx, gsy, gsz], Rg, ki, sLab, fullPanels, isSph, true);
+              if (starProj) {
+                let dAzStar = starProj.detX - p.det_x;
+                while (dAzStar > 180.0) dAzStar -= 360.0;
+                while (dAzStar < -180.0) dAzStar += 360.0;
+                if (Math.abs(dAzStar) < 18.0) {
+                  starDetX = p.det_x + dAzStar;
+                  starDetV = starProj.detV;
+                }
+              }
             }
           }
         }
@@ -4324,21 +4389,21 @@ def get_nodal_surfaces_js() -> str:
             }
           }
 
-          // Subtle tether + crest pip when projected continuous extremum G* lands near the reflection on-panel
-          if (starProj && Math.abs(starProj.detX - p.det_x) < 18.0) {
+          // Subtle tether + crest pip when projected continuous extremum G* separates from the peak when zoomed in
+          if (starDetX !== null && starDetV !== null) {
             let xs = 0.0, ys = 0.0;
             if (hasAffine) {
-              xs = affScaleX * (starProj.detX + shiftAz) + affOffsetX;
-              ys = affScaleY * starProj.detV + affOffsetY;
+              xs = affScaleX * (starDetX + shiftAz) + affOffsetX;
+              ys = affScaleY * starDetV + affOffsetY;
             } else {
-              const scS = deps.detToScreen(starProj.detX + shiftAz, starProj.detV, w, h, 0.45);
+              const scS = deps.detToScreen(starDetX + shiftAz, starDetV, w, h, 0.45);
               xs = scS[0];
               ys = scS[1];
             }
             const dsPx = Math.hypot(xs - x, ys - y);
-            if (dsPx >= 2.4 && dsPx <= 32.0) {
+            if (dsPx >= 2.2 && dsPx <= 52.0) {
               ctx.save();
-              ctx.globalAlpha = 0.72 * rimAlpha;
+              ctx.globalAlpha = 0.76 * rimAlpha;
               ctx.setLineDash([2, 2]);
               ctx.beginPath();
               ctx.moveTo(x, y);
@@ -4348,11 +4413,11 @@ def get_nodal_surfaces_js() -> str:
               ctx.stroke();
               ctx.setLineDash([]);
               ctx.beginPath();
-              ctx.arc(xs, ys, 2.3, 0, Math.PI * 2);
+              ctx.arc(xs, ys, 2.5, 0, Math.PI * 2);
               ctx.fillStyle = "rgba(7, 9, 19, 0.92)";
               ctx.fill();
               ctx.beginPath();
-              ctx.arc(xs, ys, 1.5, 0, Math.PI * 2);
+              ctx.arc(xs, ys, 1.6, 0, Math.PI * 2);
               ctx.fillStyle = isPos ? "#fef08a" : "#f5d0fe";
               ctx.fill();
               ctx.restore();
@@ -4410,6 +4475,14 @@ def get_nodal_surfaces_js() -> str:
         if (anyCopyOnScreen) drawnCount++;
       }
 
+      lastDetectorMorseSummary = {
+        totalMatched,
+        onScreenMatched: drawnCount,
+        bestPeak,
+        bestMatch,
+        maxMahal: thresh.maxMahal,
+        pct: thresh.pct,
+      };
       ctx.globalAlpha = 1.0;
       ctx.restore();
       return drawnCount;
@@ -4750,6 +4823,11 @@ def get_nodal_surfaces_js() -> str:
       resolveAntinodeThreshold,
       resolveDetectorMorseThreshold,
       getPeakMorseMatch,
+      getAllDetectorMorseHkls: () => {
+        ensureDecodedMeshes();
+        return detectorMorseHkls;
+      },
+      getLastDetectorMorseSummary: () => lastDetectorMorseSummary,
       renderWulffVortices,
       renderDetectorVortices,
       renderDetectorMorseExtrema,
