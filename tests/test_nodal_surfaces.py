@@ -16,6 +16,8 @@ from subhkl.viz.nodal_surfaces import (
     compute_nodal_surfaces_payload,
     detect_mtz_f_and_phase_columns,
     evaluate_field_on_hkl_grid,
+    extract_morse_maxima_3d,
+    get_nodal_surfaces_js,
     load_phased_structure_factor_field,
     process_nodal_surfaces_api_request,
 )
@@ -1150,8 +1152,6 @@ def test_signed_dnp_intensity_ref_contrast_and_fullrange_3d_refresh(tmp_path: Pa
 
 def test_antinodal_im0_manifold_and_3d_morse_capsules(tmp_path: Path):
     """Antinodal regions on Im(W)=0 carry Re(W) scalars, 3D Morse maxima reject saddles & orient capsules along softest curvature, and slider filters live."""
-    from subhkl.viz.nodal_surfaces import extract_morse_maxima_3d, get_nodal_surfaces_js
-
     # 1. Exact synthetic 3D test: anisotropic positive maximum + isotropic negative minimum + saddle point (must be rejected!)
     ub_id = np.diag([0.1, 0.1, 0.1])
     grid = np.linspace(-3.0, 3.0, 41)
@@ -1346,3 +1346,210 @@ def test_antinodal_im0_manifold_and_3d_morse_capsules(tmp_path: Path):
     assert out["fills0"] > out["fills80"] > 0
     assert out["strokesAt80"] > 0
     assert any("∇Re=0" in t for t in out["textsAfterHover"])
+
+
+def test_detector_morse_mahalanobis_full_sphere_mapping(tmp_path):
+    """Verify anisotropic Mahalanobis precision tensor, full-sphere high-hkl Morse packing, and 2D detector UI."""
+    # 1. Exact anisotropic Mahalanobis distance along soft ridge vs stiff transverse axis
+    n = 41
+    h_ax = np.linspace(-3.0, 3.0, n)
+    H0, H1, H2 = np.meshgrid(h_ax, h_ax, h_ax, indexing="ij")
+    ub_iso = np.diag([0.1, 0.1, 0.1])
+
+    # Uniaxial ridge centered at (0.55, 0.0, 0.0):
+    # u(h) = 100 * exp(-0.5 * [1.0*(h - 0.55)^2 + 12.0*k^2 + 12.0*l^2])
+    # Exact P_h = -∇_h^2 u(h*) / u(h*) = diag(1.0, 12.0, 12.0):
+    #   - Peak (1, 0, 0) has Δh = (0.45, 0, 0) -> d_M = sqrt(1.0 * 0.45^2) = 0.45σ (INSIDE 1.0σ!)
+    #   - Peak (0, 1, 0) has Δh = (-0.55, 1.0, 0) -> d_M = sqrt(0.3025 + 12.0) = 3.51σ (OUTSIDE!)
+    re_ridge = 100.0 * np.exp(
+        -0.5 * (1.0 * (H0 - 0.55) ** 2 + 12.0 * H1**2 + 12.0 * H2**2)
+    )
+    im_ridge = 15.0 * H2
+    ext = extract_morse_maxima_3d(
+        re_ridge + 1j * im_ridge,
+        h_ax,
+        h_ax,
+        h_ax,
+        ub_iso,
+        mean_g_star=0.1,
+        g_max=0.6,
+    )
+    assert len(ext) == 1
+    ph = ext[0]["prec_h"]
+    assert np.isclose(ph[0], 1.0, rtol=0.06)
+    assert np.isclose(ph[1], 12.0, rtol=0.08)
+    assert np.isclose(ph[2], 12.0, rtol=0.08)
+    assert np.isclose(ext[0]["min_mahal"], 0.45, atol=0.04)
+    assert ext[0]["nearest_hkl"] == [1, 0, 0]
+
+    # 2. Full-sphere heterodyne Morse extraction reaches high-index reflections outside Origin 2.0×a* ROI
+    f_delta = tmp_path / "full_sphere_delta.mtz"
+    f_ref = tmp_path / "full_sphere_ref.mtz"
+    heavy = [((0.14, 0.27, 0.33), 24.0), ((0.46, 0.13, 0.61), 18.0)]
+    ub, _ = _write_synthetic_phased_mtz(
+        f_delta,
+        spacegroup_name="P 1",
+        cell_params=(16.0, 16.0, 20.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=[*heavy, ((0.31, 0.52, 0.21), -3.74)],
+        d_min=1.8,
+    )
+    _write_synthetic_phased_mtz(
+        f_ref,
+        spacegroup_name="P 1",
+        cell_params=(16.0, 16.0, 20.0, 90.0, 90.0, 90.0),
+        atoms_frac_and_b=heavy,
+        d_min=1.8,
+    )
+    nd = compute_nodal_surfaces_payload(
+        mtz_path=str(f_delta),
+        ub_matrix=ub,
+        d_min=1.8,
+        ref_mtz_path=str(f_ref),
+        heterodyne_mode="delta",
+        roi_radius_mult=2.0,
+        roi_grid_size=34,
+        vortex_grid_size=28,
+    )
+    assert nd["detector_morse_count"] > len(nd["morse_maxima"])
+    assert len(nd["detector_morse_b64"]) > 0
+    assert len(nd["detector_antinode_quantiles"]) == 101
+
+    raw_f32 = np.frombuffer(
+        base64.b64decode(nd["detector_morse_b64"]), dtype="<f4"
+    ).reshape(-1, 15)
+    assert raw_f32.shape[0] == nd["detector_morse_count"]
+    roi_r = float(nd["roi"]["radius_g"])
+    g_ext = raw_f32[:, 0:3] @ ub.T
+    outside_roi_idx = np.nonzero(np.linalg.norm(g_ext, axis=1) > roi_r * 1.4)[0]
+    assert len(outside_roi_idx) >= 3
+
+    # Build candidate Bragg peak list spanning high-index reflections outside the Origin 3D ROI
+    hi_peaks = []
+    seen_hkl: set[tuple[int, int, int]] = set()
+    for row_i in outside_roi_idx[:40]:
+        hc = raw_f32[row_i, 0:3]
+        hk = (round(float(hc[0])), round(float(hc[1])), round(float(hc[2])))
+        if hk == (0, 0, 0) or hk in seen_hkl:
+            continue
+        seen_hkl.add(hk)
+        hi_peaks.append(
+            {
+                "id": len(hi_peaks) + 1,
+                "hkl": [hk[0], hk[1], hk[2]],
+                "det_x": -120.0 + 11.0 * len(hi_peaks),
+                "det_y": -0.15 + 0.02 * (len(hi_peaks) % 9),
+                "det_el": 8.0,
+                "wavelength": 2.4,
+                "d_spacing": 2.1,
+            }
+        )
+    assert len(hi_peaks) >= 3
+
+    pl = build_rainbow_zone_payload()
+    pl["nodal_data"] = nd
+    html = render_rainbow_html(pl)
+    assert 'id="slider-morse-mahal"' in html
+    assert 'id="lbl-morse-mahal"' in html
+
+    if shutil.which("node") is None:
+        return
+
+    js_driver = f"""
+    {get_nodal_surfaces_js()}
+    global.atob = (b64) => Buffer.from(b64, "base64").toString("binary");
+    let strokeCalls = 0;
+    const mockCtx = {{
+      setTransform() {{}}, clearRect() {{}}, save() {{}}, restore() {{}},
+      beginPath() {{}}, closePath() {{}}, moveTo() {{}}, lineTo() {{}}, arc() {{}},
+      translate() {{}}, rotate() {{}}, setLineDash() {{}},
+      fillRect() {{}}, strokeRect() {{}}, roundRect() {{}}, clip() {{}},
+      fillText() {{}}, drawImage() {{}},
+      measureText: (txt) => ({{ width: String(txt).length * 6 }}),
+      stroke() {{ strokeCalls++; }},
+      fill() {{}},
+      createRadialGradient() {{ return {{ addColorStop() {{}} }}; }},
+    }};
+    const state = {{
+      showStereo: true, stereoViewMode: "recip3d",
+      showAntinodes: true, showMorseCapsules: true,
+      antinodePercentile: 0.0, morseMahalSigma: 2.40,
+      nodalRoiMode: "origin", nodalRoiRadiusMult: 2.0,
+      dMin: 1.8, lamMin: 0.8, lamMax: 8.0, activeZones: new Set(),
+    }};
+    const ctrl = createNodalSurfacesController({{
+      initialNodalData: {json.dumps(nd)},
+      state,
+      mat3Mul: (A, B) => A.map((r) => [0,1,2].map(j => r[0]*B[0][j] + r[1]*B[1][j] + r[2]*B[2][j])),
+      mat3Inv: () => [[16,0,0],[0,16,0],[0,0,20]],
+      mat3Vec: (M, v) => [M[0][0]*v[0]+M[0][1]*v[1]+M[0][2]*v[2], M[1][0]*v[0]+M[1][1]*v[1]+M[1][2]*v[2], M[2][0]*v[0]+M[2][1]*v[1]+M[2][2]*v[2]],
+      getActiveGoniometerR: () => [[1,0,0],[0,1,0],[0,0,1]],
+      getActiveUbMatrix: () => {json.dumps(ub.tolist())},
+      getActiveIncidentBeam: () => [0, 0, 1],
+      getActiveSampleOffsetLab: () => [0, 0, 0],
+      buildFullFaceDetectorRaycastPanels: () => [],
+      projectRayToDetectorWithGap: () => ({{ onPanel: false }}),
+      isSphericalDetectorView: () => false,
+      detToScreen: (az, y) => [400 + az * 2.0, 250 - y * 300.0],
+      projectToWulff: () => [0, 0, 1, 1, 1],
+      getColorCrossover: () => 0.38,
+      getActiveZoneObjects: () => [],
+      getWulffVisiblePool: () => ({{ visiblePeaks: [] }}),
+      getWulffPeakColor: () => "#22d3ee",
+      isSameReflection: (a, b) => a === b,
+      setStatusLine: () => {{}},
+      onUpdated: () => {{}},
+    }});
+
+    const peaks = {json.dumps(hi_peaks)};
+    const detOpts = {{
+      peaks,
+      affScaleX: 2.0,
+      affOffsetX: 400.0,
+      affScaleY: -300.0,
+      affOffsetY: 250.0,
+      baseR: 4.0,
+      getPeakVert: (p) => p.det_y,
+      isPeakHighlighted: () => false,
+    }};
+
+    state.antinodePercentile = 0.0;
+    state.morseMahalSigma = 2.40;
+    const n24 = ctrl.renderDetectorMorseExtrema(mockCtx, 800, 500, detOpts);
+
+    // Verify screen hit-testing resolves one of the matched high-index peaks outside the Origin 3D ROI
+    let matchedPeak = null;
+    for (const p of peaks) {{
+      const m = ctrl.getPeakMorseMatch(p.hkl);
+      if (m) {{ matchedPeak = p; break; }}
+    }}
+    const hitX = matchedPeak ? (2.0 * matchedPeak.det_x + 400.0) : -999;
+    const hitY = matchedPeak ? (-300.0 * matchedPeak.det_y + 250.0) : -999;
+    const hitPeak = ctrl.findNearestDetectorMorsePeak(hitX, hitY);
+
+    state.morseMahalSigma = 1.00;
+    const n10 = ctrl.renderDetectorMorseExtrema(mockCtx, 800, 500, detOpts);
+
+    state.morseMahalSigma = 0.20;
+    const n02 = ctrl.renderDetectorMorseExtrema(mockCtx, 800, 500, detOpts);
+
+    state.morseMahalSigma = 2.40;
+    state.antinodePercentile = 0.90;
+    const nPct90 = ctrl.renderDetectorMorseExtrema(mockCtx, 800, 500, detOpts);
+
+    console.log(JSON.stringify({{
+      n24, n10, n02, nPct90,
+      strokeCalls,
+      hitMatches: Boolean(matchedPeak && hitPeak && hitPeak.id === matchedPeak.id),
+    }}));
+    """
+    js_file = tmp_path / "run_det_morse.js"
+    js_file.write_text(js_driver, encoding="utf-8")
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip())
+    assert out["n24"] >= 1
+    assert out["n24"] >= out["n10"] >= out["n02"]
+    assert out["n24"] >= out["nPct90"]
+    assert out["strokeCalls"] > 0
+    assert out["hitMatches"] is True

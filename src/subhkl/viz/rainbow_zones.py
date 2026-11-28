@@ -11734,6 +11734,26 @@ def render_rainbow_html(
     font-weight: 700;
   }}
 
+  #slider-morse-mahal {{
+    width: 44px;
+    height: 10px;
+    accent-color: #e879f9;
+    cursor: pointer;
+  }}
+
+  .nodal-mahal-readout {{
+    font-size: 0.53rem;
+    color: var(--text-dim);
+    min-width: 26px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }}
+
+  .nodal-mahal-readout.active-mahal {{
+    color: #f0abfc;
+    font-weight: 700;
+  }}
+
   .stereo-nodal-bar button.nodal-ref-active {{
     border-color: #c084fc;
     color: #e9d5ff;
@@ -13049,9 +13069,11 @@ def render_rainbow_html(
             <button id="btn-nodal-im" type="button" class="active-btn nodal-im-pill" title="Toggle simulated Im=0 nodal surface in 3D Reciprocal Space">Im=0</button>
             <button id="btn-nodal-vortices" type="button" class="active-btn nodal-vortex-pill" title="Toggle 1D phase vortices (Re=0 ∩ Im=0) across 3D Reciprocal Space, Wulff Net, and Detector Panels">Vortices</button>
             <button id="btn-nodal-antinodes" type="button" class="nodal-antinode-pill" title="Highlight antinodal regions |Re(W)| ≥ τ on the Im=0 manifold">Antinodes</button>
-            <button id="btn-nodal-morse" type="button" class="nodal-morse-pill" title="Toggle 3D capsules at Morse maxima (∇Re W = 0) within |Re(W)| ≥ τ">Morse</button>
+            <button id="btn-nodal-morse" type="button" class="nodal-morse-pill" title="Toggle 3D Morse capsules (∇Re W = 0) and map Mahalanobis-proximal Morse extrema onto the 2D Detector">Morse</button>
             <input type="range" id="slider-antinode-pct" min="0" max="100" step="1" value="75" title="Antinode |Re(W)| ≥ τ percentile threshold (75th percentile)" />
             <span id="lbl-antinode-pct" class="nodal-pct-readout" title="Active |Re(W)| ≥ τ percentile cutoff">75%</span>
+            <input type="range" id="slider-morse-mahal" min="0.20" max="2.50" step="0.05" value="1.00" title="Mahalanobis distance threshold d_M ≤ σ from Morse extremum for 2D Detector mapping (1.00σ)" />
+            <span id="lbl-morse-mahal" class="nodal-mahal-readout" title="Active Mahalanobis distance cutoff d_M for detector Morse mapping">1.0σ</span>
             <select id="sel-nodal-roi" title="3D Nodal Surface Region of Interest (Origin sphere, Selected Bragg Peak sphere, Active Laue Zone disk, or Shift+Drag / Right+Drag 3D Pan)">
               <option value="origin">ROI: Origin</option>
               <option value="peak">ROI: Peak</option>
@@ -15797,8 +15819,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     showNodalSurfacesIm: true,     // Coral-Rose Im(Z)=0 nodal surface in 3D Reciprocal Space
     showPhaseVortices: true,       // 1D phase vortices (Re=0 ∩ Im=0) on 3D, Wulff & Detector
     showAntinodes: false,          // Highlight |Re(W)| >= τ(p) antinodal regions on the Im=0 manifold
-    showMorseCapsules: false,      // 3D capsules at Morse maxima (∇Re W = 0) within |Re(W)| >= τ(p)
+    showMorseCapsules: false,      // 3D capsules at Morse maxima (∇Re W = 0) & 2D Detector Mahalanobis mapping
     antinodePercentile: 0.75,      // 0.00 .. 1.00 empirical percentile cutoff τ(p) for |Re(W)|
+    morseMahalSigma: 1.0,          // 0.20 .. 2.50σ Mahalanobis distance cutoff d_M for mapping Morse extrema onto Bragg peaks
     _morseToggledManually: false,
     nodalSurfaceAlpha: 0.56,
     nodalRoiMode: "origin",        // "origin" | "peak" | "zone"
@@ -19558,6 +19581,16 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         mtzStr += ` • I_pred/σ=<strong style="color:#fbbf24;">${{ipredSnrVal.toFixed(1)}}</strong>`;
       }}
     }}
+    let morseStr = "";
+    if (typeof nodalCtrl !== "undefined" && nodalCtrl && nodalCtrl.hasPhases() && Array.isArray(p.hkl)) {{
+      const mHit = nodalCtrl.getPeakMorseMatch(p.hkl);
+      if (mHit && mHit.morse) {{
+        const mv = Number(mHit.morse.re_val) || 0.0;
+        const mCol = mv >= 0 ? "#f59e0b" : "#c084fc";
+        const mSgn = mv >= 0 ? "+" : "";
+        morseStr = ` • Morse ∇Re=0: <strong style="color:${{mCol}};">${{mSgn}}${{mv.toPrecision(3)}} (d_M=${{mHit.dMahal.toFixed(2)}}σ)</strong>`;
+      }}
+    }}
     const detXVal = typeof p.det_x === "number" ? p.det_x : 0.0;
     const detYVal = typeof p.det_y === "number" ? p.det_y : 0.0;
     const errDeg = typeof p.angular_error_deg === "number" ? p.angular_error_deg : 0.0;
@@ -19567,7 +19600,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const runTag = rMeta && rMeta.label ? `${{rMeta.label}} (#${{rIdx + 1}})` : `RUN #${{rIdx + 1}}`;
     setStatusLine(
       `[BANK #${{p.bank || 1}} • ${{runTag}}]`,
-      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}}${{bijBadgeStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong>${{intenStr}}${{mtzStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
+      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}}${{bijBadgeStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong>${{intenStr}}${{mtzStr}}${{morseStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
     );
   }}
 
@@ -22729,6 +22762,12 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.hiResTextures ? 1 : 0,
       state.showPixelMask ? 1 : 0,
       state.showNodalPoints ? 1 : 0,
+      state.showPhaseVortices ? 1 : 0,
+      state.showAntinodes ? 1 : 0,
+      state.showMorseCapsules ? 1 : 0,
+      Number(state.antinodePercentile ?? 0.75).toFixed(3),
+      Number(state.morseMahalSigma ?? 1.0).toFixed(3),
+      (typeof nodalCtrl !== "undefined" && nodalCtrl) ? nodalCtrl.getDataSeq() : 0,
       holzKey,
       _panelTexEpoch,
       PANELS.length,
@@ -23229,6 +23268,35 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     }}
     ctx.restore();
 
+    // 4a. MORSE EXTREMA DETECTOR LAYER: Uniaxial Gold (+Re W) / Violet (−Re W) stadium capsules mapped onto
+    //     all active-bandpass Bragg reflections within Mahalanobis distance d_M <= state.morseMahalSigma
+    if (typeof nodalCtrl !== "undefined" && nodalCtrl && state.showMorseCapsules) {{
+      const allDetPeaks = getVisibleDetectorPeaks();
+      nodalCtrl.renderDetectorMorseExtrema(ctx, w, h, {{
+        peaks: allDetPeaks,
+        affScaleX,
+        affOffsetX,
+        affScaleY,
+        affOffsetY,
+        baseR,
+        getPeakVert,
+        isPeakHighlighted: isPeakHighlightedTarget,
+      }});
+      const focusPeak = state.hoveredPeakObj || state.selectedPeakObj;
+      if (focusPeak && !queuedTooltipPeakIds.has(focusPeak.id) && nodalCtrl.getPeakMorseMatch(focusPeak.hkl)) {{
+        const pyF = getPeakVert(focusPeak);
+        for (let sIdx = 0; sIdx < 3; sIdx++) {{
+          const xf = affScaleX * (focusPeak.det_x + shiftList[sIdx]) + affOffsetX;
+          const yf = affScaleY * pyF + affOffsetY;
+          if (xf >= 0 && xf <= w && yf >= 0 && yf <= h) {{
+            queuedTooltipPeakIds.add(focusPeak.id);
+            pendingTooltips.push({{ p: focusPeak, x: xf, y: yf, isHovered: true, isBijvoetMate: false }});
+            break;
+          }}
+        }}
+      }}
+    }}
+
     // 4b. NODAL POINTS LAYER: Big bull's-eye circles (filled with a dot) at Laue zone intersections + {{a*, b*, c*}}
     const pendingNodalTooltips = [];
     if (state.showNodalPoints) {{
@@ -23333,7 +23401,15 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         ? ` ΔI/σ=${{p.careless_residual >= 0 ? "+" : ""}}${{p.careless_residual.toFixed(1)}}σ`
         : "";
       const bijBadge = isBijvoetMate ? " [Bijvoet]" : "";
-      const tag = `(${{p.hkl.join(",")}})${{bijBadge}} λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{resBadge}}`;
+      let morseBadge = "";
+      if (typeof nodalCtrl !== "undefined" && nodalCtrl && state.showMorseCapsules && Array.isArray(p.hkl)) {{
+        const mHit = nodalCtrl.getPeakMorseMatch(p.hkl);
+        if (mHit && mHit.morse) {{
+          const mSign = (Number(mHit.morse.re_val) || 0.0) >= 0.0 ? "+Re" : "−Re";
+          morseBadge = ` [Morse ${{mSign}} ${{mHit.dMahal.toFixed(2)}}σ]`;
+        }}
+      }}
+      const tag = `(${{p.hkl.join(",")}})${{bijBadge}} λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{resBadge}}${{morseBadge}}`;
       ctx.save();
       ctx.font = "bold 11px monospace";
       const tw = ctx.measureText(tag).width + 10;
@@ -24199,6 +24275,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     const btnMorse = document.getElementById("btn-nodal-morse");
     const slAntiPct = document.getElementById("slider-antinode-pct");
     const lblAntiPct = document.getElementById("lbl-antinode-pct");
+    const slMorseMahal = document.getElementById("slider-morse-mahal");
+    const lblMorseMahal = document.getElementById("lbl-morse-mahal");
     const selRoi = document.getElementById("sel-nodal-roi");
     const slRoi = document.getElementById("slider-nodal-roi");
     const btnRef = document.getElementById("btn-load-ref-mtz");
@@ -24243,6 +24321,19 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     if (lblAntiPct) {{
       lblAntiPct.textContent = `${{pctInt}}%`;
       lblAntiPct.classList.toggle("active-pct", anyAntiActive);
+    }}
+    const mahalSigma = Math.max(0.20, Math.min(2.50, Number(state.morseMahalSigma ?? 1.0)));
+    const mahalFmt = Number.isInteger(Math.round(mahalSigma * 10) / 10 * 10) && Math.abs(mahalSigma * 10 - Math.round(mahalSigma * 10)) < 1e-6
+      ? mahalSigma.toFixed(1)
+      : mahalSigma.toFixed(2);
+    if (slMorseMahal) {{
+      slMorseMahal.disabled = !hasPhasedMtz;
+      slMorseMahal.value = mahalSigma.toFixed(2);
+      slMorseMahal.title = `Mahalanobis distance threshold d_M ≤ ${{mahalSigma.toFixed(2)}}σ from Morse extremum for 2D Detector mapping`;
+    }}
+    if (lblMorseMahal) {{
+      lblMorseMahal.textContent = `${{mahalFmt}}σ`;
+      lblMorseMahal.classList.toggle("active-mahal", hasPhasedMtz && Boolean(state.showMorseCapsules));
     }}
     if (selRoi) {{
       selRoi.disabled = !hasPhasedMtz;
@@ -24335,6 +24426,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       state.showNodalSurfacesRe ? 1 : 0,
       state.showNodalSurfacesIm ? 1 : 0,
       state.showPhaseVortices ? 1 : 0,
+      state.showAntinodes ? 1 : 0,
+      state.showMorseCapsules ? 1 : 0,
+      Number(state.antinodePercentile ?? 0.75).toFixed(3),
+      Number(state.morseMahalSigma ?? 1.0).toFixed(3),
       state.nodalRoiMode || "origin",
       (Number(state.nodalRoiRadiusMult) || 2.5).toFixed(2),
       hasNodalCtrl ? nodalCtrl.getDataSeq() : 0,
@@ -24606,6 +24701,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       }}
     }}
     projectedPeaks.sort((a, b) => a.zCam - b.zCam);
+    const wulffMorseThresh = (hasNodalCtrl && state.showMorseCapsules && nodalCtrl.hasPhases())
+      ? nodalCtrl.resolveDetectorMorseThreshold()
+      : null;
 
     ctx.save();
     for (let i = 0; i < projectedPeaks.length; i++) {{
@@ -24659,6 +24757,19 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           // Front hemisphere (closer to viewer): larger filled circle
           ctx.fillStyle = col;
           ctx.fill();
+        }}
+      }}
+
+      if (wulffMorseThresh && Array.isArray(displayHkl) && displayHkl.length === 3) {{
+        const mHitW = nodalCtrl.getPeakMorseMatch(displayHkl, wulffMorseThresh);
+        if (mHitW && mHitW.morse) {{
+          ctx.beginPath();
+          ctx.arc(sx, sy, rDot + (isExp ? 3.2 : 2.5), 0, Math.PI * 2);
+          ctx.strokeStyle = (Number(mHitW.morse.re_val) || 0.0) >= 0.0 ? "#f59e0b" : "#c084fc";
+          ctx.globalAlpha = hemi >= 0 ? 0.94 : 0.42;
+          ctx.lineWidth = isExp ? 1.8 : 1.35;
+          ctx.stroke();
+          ctx.globalAlpha = 1.0;
         }}
       }}
 
@@ -24884,6 +24995,9 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
           best = p;
         }}
       }}
+    }}
+    if (!best && typeof nodalCtrl !== "undefined" && nodalCtrl && state.showMorseCapsules) {{
+      best = nodalCtrl.findNearestDetectorMorsePeak(mx, my);
     }}
     return best;
   }}
@@ -26239,8 +26353,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         state.showMorseCapsules = false;
       }}
       syncNodalUI();
+      _lastDetRenderSig = "";
       _lastWulffRenderSig = "";
       renderStereoInset(true);
+      renderDetector();
     }});
   }}
   const btnNodalMorse = document.getElementById("btn-nodal-morse");
@@ -26252,8 +26368,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         state.stereoViewMode = "recip3d";
       }}
       syncNodalUI();
+      _lastDetRenderSig = "";
       _lastWulffRenderSig = "";
       renderStereoInset(true);
+      renderDetector();
     }});
   }}
   const slAntinodePct = document.getElementById("slider-antinode-pct");
@@ -26272,8 +26390,46 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         }}
       }}
       syncNodalUI();
+      _lastDetRenderSig = "";
       _lastWulffRenderSig = "";
       renderStereoInset(true);
+      renderDetector();
+    }});
+    slAntinodePct.addEventListener("dblclick", () => {{
+      if (slAntinodePct.disabled) return;
+      state.antinodePercentile = 0.75;
+      syncNodalUI();
+      _lastDetRenderSig = "";
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      renderDetector();
+    }});
+  }}
+  const slMorseMahal = document.getElementById("slider-morse-mahal");
+  if (slMorseMahal) {{
+    slMorseMahal.addEventListener("input", () => {{
+      const v = parseFloat(slMorseMahal.value);
+      if (Number.isFinite(v)) {{
+        state.morseMahalSigma = Math.max(0.20, Math.min(2.50, v));
+      }}
+      if (!state.showMorseCapsules) {{
+        state._morseToggledManually = true;
+        state.showMorseCapsules = true;
+      }}
+      syncNodalUI();
+      _lastDetRenderSig = "";
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      renderDetector();
+    }});
+    slMorseMahal.addEventListener("dblclick", () => {{
+      if (slMorseMahal.disabled) return;
+      state.morseMahalSigma = 1.0;
+      syncNodalUI();
+      _lastDetRenderSig = "";
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      renderDetector();
     }});
   }}
   const selNodalRoi = document.getElementById("sel-nodal-roi");

@@ -60,6 +60,7 @@ _PHI_LABEL_PRIORITY: tuple[str, ...] = (
 
 _PHASED_FIELD_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
 _GLOBAL_VORTEX_CACHE: OrderedDict[tuple[Any, ...], list[dict[str, Any]]] = OrderedDict()
+_GLOBAL_MORSE_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
 _BRICK_PAYLOAD_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
 _MAX_FIELD_CACHE_ENTRIES = 10
 _MAX_BRICK_CACHE_ENTRIES = 16
@@ -813,6 +814,17 @@ def _trilinear_sample_volume(vol: np.ndarray, pts_idx: np.ndarray) -> np.ndarray
     return np.asarray(c0 * (1.0 - tz) + c1 * tz, dtype=np.float64)
 
 
+_NEIGHBOR_INT_OFFSETS_5 = np.stack(
+    np.meshgrid(
+        np.arange(-2, 3, dtype=np.float64),
+        np.arange(-2, 3, dtype=np.float64),
+        np.arange(-2, 3, dtype=np.float64),
+        indexing="ij",
+    ),
+    axis=-1,
+).reshape(-1, 3)
+
+
 def extract_morse_maxima_3d(
     Z: np.ndarray,
     h0: np.ndarray,
@@ -825,13 +837,16 @@ def extract_morse_maxima_3d(
     roi_center_g: np.ndarray | None = None,
     roi_radius_g: float | None = None,
     max_extrema: int = 240,
+    bragg_mahal_cap: float | None = None,
 ) -> list[dict[str, Any]]:
     """Extract sub-voxel 3D Morse maxima of `|Re(W)|` (`∇Re W = 0` with definite Hessian) and 3D capsule geometry.
 
     Positive antinodal maxima (`Re W > 0`) require a strictly negative-definite 3x3 Hessian (Morse index 3),
     while negative antinodal extrema (`Re W < 0`, local maxima of `-Re W`) require a strictly positive-definite
     Hessian (Morse index 0 of `Re W`), rejecting all saddle points. Principal curvatures of the reciprocal-space
-    Hessian `H_G = UB^{-T} H_h UB^{-1}` orient each 3D capsule along the softest-decay ridge eigenvector.
+    Hessian `H_G = UB^{-T} H_h UB^{-1}` orient each 3D capsule along the softest-decay ridge eigenvector and
+    yield the exact dimensionless Miller-space Mahalanobis precision tensor `P_h = -∇_h^2 Re(W) / Re(W)`
+    (satisfying `(h - h*)^T P_h (h - h*) == (G - G*)^T Σ_G^{-1} (G - G*)`).
     """
     u = np.asarray(Z.real, dtype=np.float64)
     v_im = np.asarray(Z.imag, dtype=np.float64)
@@ -874,158 +889,482 @@ def extract_morse_maxima_3d(
             1.0 / max(abs(dh0), 1e-12),
             1.0 / max(abs(dh1), 1e-12),
             1.0 / max(abs(dh2), 1e-12),
-        ]
+        ],
+        dtype=np.float64,
     )
 
     ub = np.asarray(ub_matrix, dtype=np.float64)
     ub_inv = np.linalg.inv(ub)
     ub_inv_t = ub_inv.T
     g_scale = max(float(mean_g_star), 1e-5)
+    vox_step_g = float(
+        np.linalg.norm(ub @ np.array([abs(dh0), abs(dh1), abs(dh2)], dtype=np.float64))
+    )
 
-    raw_extrema: list[tuple[float, np.ndarray, dict[str, Any]]] = []
+    ii = cand_ijk[:, 0]
+    jj = cand_ijk[:, 1]
+    kk = cand_ijk[:, 2]
+    h_coarse = np.column_stack([h0[ii], h1[jj], h2[kk]])
+    g_coarse = h_coarse @ ub.T
+    keep_pre = np.ones(len(cand_ijk), dtype=bool)
+    if g_max is not None and g_max > 0.0:
+        keep_pre &= np.linalg.norm(g_coarse, axis=1) <= float(g_max) * 1.03 + vox_step_g
+    if roi_center_g is not None and roi_radius_g is not None and roi_radius_g > 0.0:
+        keep_pre &= (
+            np.linalg.norm(g_coarse - np.asarray(roi_center_g)[None, :], axis=1)
+            <= float(roi_radius_g) * 1.03 + vox_step_g
+        )
+    if not np.any(keep_pre):
+        return []
+    ii = ii[keep_pre]
+    jj = jj[keep_pre]
+    kk = kk[keep_pre]
+
+    u0 = u[ii, jj, kk]
+    sgn = np.where(u0 > 0.0, 1.0, -1.0)
+
+    gx2 = 0.5 * (u[ii + 1, jj, kk] - u[ii - 1, jj, kk])
+    gy2 = 0.5 * (u[ii, jj + 1, kk] - u[ii, jj - 1, kk])
+    gz2 = 0.5 * (u[ii, jj, kk + 1] - u[ii, jj, kk - 1])
+    hxx2 = u[ii + 1, jj, kk] - 2.0 * u0 + u[ii - 1, jj, kk]
+    hyy2 = u[ii, jj + 1, kk] - 2.0 * u0 + u[ii, jj - 1, kk]
+    hzz2 = u[ii, jj, kk + 1] - 2.0 * u0 + u[ii, jj, kk - 1]
+
+    in4_x = (ii >= 2) & (ii <= g0 - 3)
+    in4_y = (jj >= 2) & (jj <= g1 - 3)
+    in4_z = (kk >= 2) & (kk <= g2 - 3)
+    if np.any(in4_x):
+        ix = ii[in4_x]
+        jx = jj[in4_x]
+        kx = kk[in4_x]
+        gx2[in4_x] = (
+            -u[ix + 2, jx, kx]
+            + 8.0 * u[ix + 1, jx, kx]
+            - 8.0 * u[ix - 1, jx, kx]
+            + u[ix - 2, jx, kx]
+        ) / 12.0
+        hxx2[in4_x] = (
+            -u[ix + 2, jx, kx]
+            + 16.0 * u[ix + 1, jx, kx]
+            - 30.0 * u[ix, jx, kx]
+            + 16.0 * u[ix - 1, jx, kx]
+            - u[ix - 2, jx, kx]
+        ) / 12.0
+    if np.any(in4_y):
+        iy = ii[in4_y]
+        jy = jj[in4_y]
+        ky = kk[in4_y]
+        gy2[in4_y] = (
+            -u[iy, jy + 2, ky]
+            + 8.0 * u[iy, jy + 1, ky]
+            - 8.0 * u[iy, jy - 1, ky]
+            + u[iy, jy - 2, ky]
+        ) / 12.0
+        hyy2[in4_y] = (
+            -u[iy, jy + 2, ky]
+            + 16.0 * u[iy, jy + 1, ky]
+            - 30.0 * u[iy, jy, ky]
+            + 16.0 * u[iy, jy - 1, ky]
+            - u[iy, jy - 2, ky]
+        ) / 12.0
+    if np.any(in4_z):
+        iz = ii[in4_z]
+        jz = jj[in4_z]
+        kz = kk[in4_z]
+        gz2[in4_z] = (
+            -u[iz, jz, kz + 2]
+            + 8.0 * u[iz, jz, kz + 1]
+            - 8.0 * u[iz, jz, kz - 1]
+            + u[iz, jz, kz - 2]
+        ) / 12.0
+        hzz2[in4_z] = (
+            -u[iz, jz, kz + 2]
+            + 16.0 * u[iz, jz, kz + 1]
+            - 30.0 * u[iz, jz, kz]
+            + 16.0 * u[iz, jz, kz - 1]
+            - u[iz, jz, kz - 2]
+        ) / 12.0
+
+    hxy = 0.25 * (
+        u[ii + 1, jj + 1, kk]
+        - u[ii + 1, jj - 1, kk]
+        - u[ii - 1, jj + 1, kk]
+        + u[ii - 1, jj - 1, kk]
+    )
+    hxz = 0.25 * (
+        u[ii + 1, jj, kk + 1]
+        - u[ii + 1, jj, kk - 1]
+        - u[ii - 1, jj, kk + 1]
+        + u[ii - 1, jj, kk - 1]
+    )
+    hyz = 0.25 * (
+        u[ii, jj + 1, kk + 1]
+        - u[ii, jj + 1, kk - 1]
+        - u[ii, jj - 1, kk + 1]
+        + u[ii, jj - 1, kk - 1]
+    )
+
+    g_xi = np.column_stack([gx2, gy2, gz2])
+    n_c = len(ii)
+    h_xi = np.empty((n_c, 3, 3), dtype=np.float64)
+    h_xi[:, 0, 0] = hxx2
+    h_xi[:, 1, 1] = hyy2
+    h_xi[:, 2, 2] = hzz2
+    h_xi[:, 0, 1] = h_xi[:, 1, 0] = hxy
+    h_xi[:, 0, 2] = h_xi[:, 2, 0] = hxz
+    h_xi[:, 1, 2] = h_xi[:, 2, 1] = hyz
+
     eig_tol = 1e-8 * u_abs_max
+    m_xi = -sgn[:, None, None] * h_xi
+    evals_xi = np.linalg.eigvalsh(m_xi)
+    def_mask = evals_xi[:, 0] > eig_tol
+    if not np.any(def_mask):
+        return []
 
-    for idx_row in cand_ijk:
-        i, j, k = int(idx_row[0]), int(idx_row[1]), int(idx_row[2])
-        u0 = float(u[i, j, k])
-        sgn = 1.0 if u0 > 0.0 else -1.0
+    ii = ii[def_mask]
+    jj = jj[def_mask]
+    kk = kk[def_mask]
+    u0 = u0[def_mask]
+    sgn = sgn[def_mask]
+    g_xi = g_xi[def_mask]
+    h_xi = h_xi[def_mask]
+    m_xi = m_xi[def_mask]
 
-        g_xi = np.array(
-            [
-                0.5 * (u[i + 1, j, k] - u[i - 1, j, k]),
-                0.5 * (u[i, j + 1, k] - u[i, j - 1, k]),
-                0.5 * (u[i, j, k + 1] - u[i, j, k - 1]),
-            ],
-            dtype=np.float64,
-        )
-        hxx = u[i + 1, j, k] - 2.0 * u0 + u[i - 1, j, k]
-        hyy = u[i, j + 1, k] - 2.0 * u0 + u[i, j - 1, k]
-        hzz = u[i, j, k + 1] - 2.0 * u0 + u[i, j, k - 1]
-        hxy = 0.25 * (
-            u[i + 1, j + 1, k]
-            - u[i + 1, j - 1, k]
-            - u[i - 1, j + 1, k]
-            + u[i - 1, j - 1, k]
-        )
-        hxz = 0.25 * (
-            u[i + 1, j, k + 1]
-            - u[i + 1, j, k - 1]
-            - u[i - 1, j, k + 1]
-            + u[i - 1, j, k - 1]
-        )
-        hyz = 0.25 * (
-            u[i, j + 1, k + 1]
-            - u[i, j + 1, k - 1]
-            - u[i, j - 1, k + 1]
-            + u[i, j - 1, k - 1]
-        )
-        h_xi = np.array(
-            [[hxx, hxy, hxz], [hxy, hyy, hyz], [hxz, hyz, hzz]], dtype=np.float64
-        )
-        m_xi = -sgn * h_xi
-        evals_xi = np.linalg.eigvalsh(m_xi)
-        if float(evals_xi[0]) <= eig_tol:
-            continue
+    d_xi = -np.linalg.solve(h_xi, g_xi[..., None])[..., 0]
+    u_star = u0 + 0.5 * np.sum(g_xi * d_xi, axis=1)
+    step_ok = (np.max(np.abs(d_xi), axis=1) <= 0.85) & (sgn * u_star > floor_val)
+    if not np.any(step_ok):
+        return []
 
-        try:
-            d_xi = -np.linalg.solve(h_xi, g_xi)
-        except np.linalg.LinAlgError:
-            continue
-        if float(np.max(np.abs(d_xi))) > 0.85:
-            continue
+    ii = ii[step_ok]
+    jj = jj[step_ok]
+    kk = kk[step_ok]
+    sgn = sgn[step_ok]
+    d_xi = d_xi[step_ok]
+    u_star = u_star[step_ok]
+    m_xi = m_xi[step_ok]
 
-        u_star = float(u0 + 0.5 * np.dot(g_xi, d_xi))
-        if sgn * u_star <= floor_val:
-            continue
+    vox_pos = np.column_stack([ii + d_xi[:, 0], jj + d_xi[:, 1], kk + d_xi[:, 2]])
+    h_star = np.column_stack(
+        [
+            h0[ii] + d_xi[:, 0] * dh0,
+            h1[jj] + d_xi[:, 1] * dh1,
+            h2[kk] + d_xi[:, 2] * dh2,
+        ]
+    )
+    g_star = h_star @ ub.T
+    g_norm = np.linalg.norm(g_star, axis=1)
 
-        im_grad = np.array(
-            [
-                0.5 * (v_im[i + 1, j, k] - v_im[i - 1, j, k]),
-                0.5 * (v_im[i, j + 1, k] - v_im[i, j - 1, k]),
-                0.5 * (v_im[i, j, k + 1] - v_im[i, j, k - 1]),
-            ],
-            dtype=np.float64,
+    geom_ok = g_norm > 1e-6
+    if g_max is not None and g_max > 0.0:
+        geom_ok &= g_norm <= float(g_max) * 1.02
+    if roi_center_g is not None and roi_radius_g is not None and roi_radius_g > 0.0:
+        geom_ok &= (
+            np.linalg.norm(g_star - np.asarray(roi_center_g)[None, :], axis=1)
+            <= float(roi_radius_g) * 1.02
         )
-        im_star = float(v_im[i, j, k] + np.dot(im_grad, d_xi))
+    if not np.any(geom_ok):
+        return []
 
-        vox_pos = np.array([i + d_xi[0], j + d_xi[1], k + d_xi[2]], dtype=np.float64)
-        h_star = np.array(
-            [h0[i] + d_xi[0] * dh0, h1[j] + d_xi[1] * dh1, h2[k] + d_xi[2] * dh2],
-            dtype=np.float64,
-        )
-        g_star = ub @ h_star
-        g_norm = float(np.linalg.norm(g_star))
-        if g_norm <= 1e-6:
-            continue
-        if g_max is not None and g_max > 0.0 and g_norm > float(g_max) * 1.02:
-            continue
-        if (
-            roi_center_g is not None
-            and roi_radius_g is not None
-            and roi_radius_g > 0.0
-            and float(np.linalg.norm(g_star - roi_center_g))
-            > float(roi_radius_g) * 1.02
-        ):
-            continue
+    ii = ii[geom_ok]
+    jj = jj[geom_ok]
+    kk = kk[geom_ok]
+    sgn = sgn[geom_ok]
+    d_xi = d_xi[geom_ok]
+    u_star = u_star[geom_ok]
+    m_xi = m_xi[geom_ok]
+    vox_pos = vox_pos[geom_ok]
+    h_star = h_star[geom_ok]
+    g_star = g_star[geom_ok]
 
-        # Transform positive-definite curvature tensor -sgn * H into reciprocal Cartesian G-space
-        m_h = m_xi * np.outer(inv_dh, inv_dh)
-        m_g = ub_inv_t @ m_h @ ub_inv
-        m_g = 0.5 * (m_g + m_g.T)
-        kap, vecs = np.linalg.eigh(m_g)
-        axis_g = np.asarray(vecs[:, 0], dtype=np.float64)
-        ax_n = float(np.linalg.norm(axis_g))
-        axis_g = axis_g / ax_n if ax_n > 1e-12 else np.array([0.0, 0.0, 1.0])
-        for comp in axis_g:
+    abs_u = np.abs(u_star)
+    m_h = m_xi * (inv_dh[None, :, None] * inv_dh[None, None, :])
+    m_h = 0.5 * (m_h + np.swapaxes(m_h, -1, -2))
+    prec_h = m_h / np.maximum(abs_u, 1e-12)[:, None, None]
+
+    base_hkl = np.round(h_star)
+    cand_hkl = base_hkl[:, None, :] + _NEIGHBOR_INT_OFFSETS_5[None, :, :]
+    delta_h = cand_hkl - h_star[:, None, :]
+    d2_all = np.einsum("nki,nij,nkj->nk", delta_h, prec_h, delta_h)
+    best_k = np.argmin(d2_all, axis=1)
+    min_d2 = np.maximum(0.0, d2_all[np.arange(len(h_star)), best_k])
+    min_mahal = np.sqrt(min_d2)
+    nearest_hkl_arr = np.round(cand_hkl[np.arange(len(h_star)), best_k]).astype(
+        np.int32
+    )
+
+    if bragg_mahal_cap is not None and bragg_mahal_cap > 0.0:
+        m_ok = min_mahal <= float(bragg_mahal_cap)
+        if not np.any(m_ok):
+            return []
+        ii = ii[m_ok]
+        jj = jj[m_ok]
+        kk = kk[m_ok]
+        sgn = sgn[m_ok]
+        d_xi = d_xi[m_ok]
+        u_star = u_star[m_ok]
+        abs_u = abs_u[m_ok]
+        m_h = m_h[m_ok]
+        prec_h = prec_h[m_ok]
+        vox_pos = vox_pos[m_ok]
+        h_star = h_star[m_ok]
+        g_star = g_star[m_ok]
+        min_mahal = min_mahal[m_ok]
+        nearest_hkl_arr = nearest_hkl_arr[m_ok]
+
+    im_grad = np.column_stack(
+        [
+            0.5 * (v_im[ii + 1, jj, kk] - v_im[ii - 1, jj, kk]),
+            0.5 * (v_im[ii, jj + 1, kk] - v_im[ii, jj - 1, kk]),
+            0.5 * (v_im[ii, jj, kk + 1] - v_im[ii, jj, kk - 1]),
+        ]
+    )
+    im_star = v_im[ii, jj, kk] + np.sum(im_grad * d_xi, axis=1)
+
+    m_g = np.einsum("ai,nij,bj->nab", ub_inv_t, m_h, ub_inv)
+    m_g = 0.5 * (m_g + np.swapaxes(m_g, -1, -2))
+    kap, vecs = np.linalg.eigh(m_g)
+    axis_g_all = vecs[:, :, 0]
+    ax_norms = np.linalg.norm(axis_g_all, axis=1)
+    valid_ax = ax_norms > 1e-12
+    axis_g_all[valid_ax] /= ax_norms[valid_ax, None]
+    axis_g_all[~valid_ax] = np.array([0.0, 0.0, 1.0])
+
+    kap_soft = np.maximum(kap[:, 0], 1e-12)
+    kap_perp = np.sqrt(np.maximum(kap[:, 1], 1e-12) * np.maximum(kap[:, 2], 1e-12))
+    r_raw = np.sqrt(2.0 * 0.12 * abs_u / kap_perp)
+    a_raw = np.sqrt(2.0 * 0.12 * abs_u / kap_soft)
+    aspect_all = np.clip(a_raw / np.maximum(r_raw, 1e-9), 1.0, 3.2)
+    r_cap_all = np.clip(r_raw, 0.046 * g_scale, 0.112 * g_scale)
+    half_len_all = np.clip(r_cap_all * (aspect_all - 1.0), 0.0, 0.21 * g_scale)
+    dhkl_all = np.linalg.norm(
+        h_star - nearest_hkl_arr.astype(np.float64),
+        axis=1,
+    )
+
+    order = np.argsort(-abs_u)
+    kept: list[dict[str, Any]] = []
+    vox_buckets: dict[tuple[int, int, int], list[np.ndarray]] = {}
+    for idx in order:
+        vp = vox_pos[idx]
+        bk = (math.floor(vp[0]), math.floor(vp[1]), math.floor(vp[2]))
+        dup = False
+        for b0 in (bk[0] - 1, bk[0], bk[0] + 1):
+            for b1 in (bk[1] - 1, bk[1], bk[1] + 1):
+                for b2 in (bk[2] - 1, bk[2], bk[2] + 1):
+                    lst = vox_buckets.get((b0, b1, b2))
+                    if lst is not None and any(
+                        float(np.linalg.norm(vp - prev)) < 0.48 for prev in lst
+                    ):
+                        dup = True
+                        break
+                if dup:
+                    break
+            if dup:
+                break
+        if dup:
+            continue
+        vox_buckets.setdefault(bk, []).append(vp)
+
+        ax_v = axis_g_all[idx].copy()
+        for comp in ax_v:
             if abs(float(comp)) > 1e-6:
                 if comp < 0.0:
-                    axis_g = -axis_g
+                    ax_v = -ax_v
                 break
-
-        abs_u = abs(u_star)
-        kap_soft = max(float(kap[0]), 1e-12)
-        kap_perp = math.sqrt(max(float(kap[1]), 1e-12) * max(float(kap[2]), 1e-12))
-        r_raw = math.sqrt(2.0 * 0.12 * abs_u / kap_perp)
-        a_raw = math.sqrt(2.0 * 0.12 * abs_u / kap_soft)
-        aspect = float(np.clip(a_raw / max(r_raw, 1e-9), 1.0, 3.2))
-        r_cap = float(np.clip(r_raw, 0.046 * g_scale, 0.112 * g_scale))
-        half_len = float(np.clip(r_cap * (aspect - 1.0), 0.0, 0.21 * g_scale))
-
-        n_hkl = [round(float(x)) for x in h_star]
-        dhkl = float(np.linalg.norm(h_star - np.asarray(n_hkl, dtype=np.float64)))
-
-        raw_extrema.append(
-            (
-                abs_u,
-                vox_pos,
-                {
-                    "pos_g": [round(float(x), 5) for x in g_star],
-                    "hkl_cont": [round(float(x), 3) for x in h_star],
-                    "nearest_hkl": n_hkl,
-                    "dhkl": round(dhkl, 3),
-                    "re_val": round(u_star, 5),
-                    "im_val": round(im_star, 5),
-                    "abs_val": round(abs_u, 5),
-                    "sign": 1 if sgn > 0 else -1,
-                    "axis_g": [round(float(x), 5) for x in axis_g],
-                    "radius_g": round(r_cap, 5),
-                    "half_len_g": round(half_len, 5),
-                    "aspect": round(aspect, 3),
-                },
-            )
+        ph = prec_h[idx]
+        kept.append(
+            {
+                "pos_g": [round(float(x), 5) for x in g_star[idx]],
+                "hkl_cont": [round(float(x), 4) for x in h_star[idx]],
+                "nearest_hkl": [int(x) for x in nearest_hkl_arr[idx]],
+                "dhkl": round(float(dhkl_all[idx]), 3),
+                "min_mahal": round(float(min_mahal[idx]), 3),
+                "re_val": round(float(u_star[idx]), 5),
+                "im_val": round(float(im_star[idx]), 5),
+                "abs_val": round(float(abs_u[idx]), 5),
+                "sign": 1 if sgn[idx] > 0 else -1,
+                "prec_h": [
+                    float(f"{ph[0, 0]:.6g}"),
+                    float(f"{ph[1, 1]:.6g}"),
+                    float(f"{ph[2, 2]:.6g}"),
+                    float(f"{ph[0, 1]:.6g}"),
+                    float(f"{ph[0, 2]:.6g}"),
+                    float(f"{ph[1, 2]:.6g}"),
+                ],
+                "axis_g": [round(float(x), 5) for x in ax_v],
+                "radius_g": round(float(r_cap_all[idx]), 5),
+                "half_len_g": round(float(half_len_all[idx]), 5),
+                "aspect": round(float(aspect_all[idx]), 3),
+            }
         )
-
-    raw_extrema.sort(key=lambda item: item[0], reverse=True)
-    kept: list[dict[str, Any]] = []
-    kept_vox: list[np.ndarray] = []
-    for _, vpos, rec in raw_extrema:
-        if any(float(np.linalg.norm(vpos - prev)) < 0.48 for prev in kept_vox):
-            continue
-        kept_vox.append(vpos)
-        kept.append(rec)
         if len(kept) >= max_extrema:
             break
     return kept
+
+
+def _upsample_field_zero_padded_fft(
+    field: dict[str, Any],
+    oversample: int,
+) -> tuple[np.ndarray, list[int]]:
+    """Evaluate exact Whittaker-Shannon interpolated F(q / K) across [-hmax, +hmax] via zero-padded 3D FFT."""
+    rho = field["rho"]
+    dims = tuple(int(x) for x in field["dims"])
+    hmax = [int(x) for x in field["hmax"]]
+    k_up = max(2, int(oversample))
+    m_shape = (k_up * dims[0], k_up * dims[1], k_up * dims[2])
+    pad = np.zeros(m_shape, dtype=np.complex128)
+    s0 = np.arange(-hmax[0], dims[0] - hmax[0]) % m_shape[0]
+    s1 = np.arange(-hmax[1], dims[1] - hmax[1]) % m_shape[1]
+    s2 = np.arange(-hmax[2], dims[2] - hmax[2]) % m_shape[2]
+    pad[np.ix_(s0, s1, s2)] = rho
+    f_shifted = np.fft.fftshift(np.fft.ifftn(pad) * float(np.prod(m_shape)))
+    centers = [m_shape[0] // 2, m_shape[1] // 2, m_shape[2] // 2]
+    return f_shifted, centers
+
+
+def _pack_detector_morse_b64(records: list[dict[str, Any]]) -> tuple[int, str]:
+    """Pack Morse extrema into a compact base64 Float32Array (15 floats/row) for fast full-detector matching."""
+    n = len(records)
+    if n == 0:
+        return 0, ""
+    buf = np.empty((n, 15), dtype="<f4")
+    for idx, r in enumerate(records):
+        hc = r["hkl_cont"]
+        ph = r["prec_h"]
+        ax = r["axis_g"]
+        buf[idx, 0] = hc[0]
+        buf[idx, 1] = hc[1]
+        buf[idx, 2] = hc[2]
+        buf[idx, 3] = r["re_val"]
+        buf[idx, 4] = r["im_val"]
+        buf[idx, 5] = ph[0]
+        buf[idx, 6] = ph[1]
+        buf[idx, 7] = ph[2]
+        buf[idx, 8] = ph[3]
+        buf[idx, 9] = ph[4]
+        buf[idx, 10] = ph[5]
+        buf[idx, 11] = ax[0]
+        buf[idx, 12] = ax[1]
+        buf[idx, 13] = ax[2]
+        buf[idx, 14] = r["aspect"]
+    return n, base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def _compute_full_sphere_detector_morse(
+    primary_field: dict[str, Any],
+    ref_field: dict[str, Any] | None,
+    *,
+    heterodyne_mode: str,
+    f_to_f0_scale: float,
+    ub_matrix: np.ndarray,
+    mean_g_star: float,
+    g_max: float,
+) -> dict[str, Any]:
+    """Extract Bragg-proximal 3D Morse extrema and Im=0 |Re W| quantiles across the entire d >= d_min sphere."""
+    max_dim = max(int(x) for x in primary_field["dims"])
+    use_het = (
+        ref_field is not None
+        and bool(ref_field.get("has_phases"))
+        and heterodyne_mode != "single"
+    )
+    if use_het and ref_field is not None:
+        max_dim = max(max_dim, *(int(x) for x in ref_field["dims"]))
+
+    k_up = 4 if max_dim <= 25 else (3 if max_dim <= 47 else 2)
+    f_sub, c_f = _upsample_field_zero_padded_fft(primary_field, k_up)
+    if not use_het or ref_field is None:
+        z_full = f_sub
+        c_z = c_f
+    else:
+        f0_sub, c_0 = _upsample_field_zero_padded_fft(ref_field, k_up)
+        q_lo = [min(c_f[d], c_0[d]) for d in range(3)]
+        q_hi = [
+            min(f_sub.shape[d] - c_f[d], f0_sub.shape[d] - c_0[d]) for d in range(3)
+        ]
+        f_crop = f_sub[
+            c_f[0] - q_lo[0] : c_f[0] + q_hi[0],
+            c_f[1] - q_lo[1] : c_f[1] + q_hi[1],
+            c_f[2] - q_lo[2] : c_f[2] + q_hi[2],
+        ]
+        f0_crop = f0_sub[
+            c_0[0] - q_lo[0] : c_0[0] + q_hi[0],
+            c_0[1] - q_lo[1] : c_0[1] + q_hi[1],
+            c_0[2] - q_lo[2] : c_0[2] + q_hi[2],
+        ]
+        mode = str(heterodyne_mode or "delta").lower()
+        if mode == "product":
+            z_full = np.conj(f0_crop) * f_crop
+        elif mode == "diff":
+            z_full = float(f_to_f0_scale) * f_crop - f0_crop
+        else:
+            z_full = np.conj(f0_crop) * (float(f_to_f0_scale) * f_crop - f0_crop)
+        c_z = q_lo
+
+    hg0 = (np.arange(z_full.shape[0], dtype=np.float64) - float(c_z[0])) / float(k_up)
+    hg1 = (np.arange(z_full.shape[1], dtype=np.float64) - float(c_z[1])) / float(k_up)
+    hg2 = (np.arange(z_full.shape[2], dtype=np.float64) - float(c_z[2])) / float(k_up)
+
+    records = extract_morse_maxima_3d(
+        z_full,
+        hg0,
+        hg1,
+        hg2,
+        ub_matrix,
+        mean_g_star=mean_g_star,
+        g_max=g_max,
+        max_extrema=12000,
+        bragg_mahal_cap=2.75,
+    )
+    n_det, det_b64 = _pack_detector_morse_b64(records)
+
+    re_v = z_full.real
+    im_v = z_full.imag
+    amp_90 = float(np.percentile(np.abs(z_full), 90.0)) if z_full.size > 0 else 0.0
+    is_centric = float(np.max(np.abs(im_v))) <= 1e-4 * max(amp_90, 1e-12)
+
+    ub = np.asarray(ub_matrix, dtype=np.float64)
+    im0_samples: list[np.ndarray] = []
+    if not is_centric:
+        im_a = im_v[:-1, :, :]
+        im_b = im_v[1:, :, :]
+        cross = (im_a <= 0.0) != (im_b <= 0.0)
+        cx_i, cx_j, cx_k = np.nonzero(cross)
+        if len(cx_i) > 0:
+            if len(cx_i) > 40000:
+                step_s = max(1, len(cx_i) // 40000)
+                cx_i = cx_i[::step_s]
+                cx_j = cx_j[::step_s]
+                cx_k = cx_k[::step_s]
+            a_val = np.abs(im_v[cx_i, cx_j, cx_k])
+            b_val = np.abs(im_v[cx_i + 1, cx_j, cx_k])
+            t_lin = a_val / np.maximum(a_val + b_val, 1e-15)
+            h_cross = np.column_stack(
+                [hg0[cx_i] + t_lin / float(k_up), hg1[cx_j], hg2[cx_k]]
+            )
+            gn_c = np.linalg.norm(h_cross @ ub.T, axis=1)
+            in_sph = (gn_c > 1e-5) & (gn_c <= g_max)
+            if np.any(in_sph):
+                re_c = (1.0 - t_lin[in_sph]) * re_v[
+                    cx_i[in_sph], cx_j[in_sph], cx_k[in_sph]
+                ] + t_lin[in_sph] * re_v[cx_i[in_sph] + 1, cx_j[in_sph], cx_k[in_sph]]
+                im0_samples.append(np.abs(re_c))
+
+    if im0_samples:
+        q_pool = np.concatenate(im0_samples)
+    elif records:
+        q_pool = np.array([float(r["abs_val"]) for r in records], dtype=np.float64)
+    else:
+        q_pool = np.zeros(1, dtype=np.float64)
+
+    det_quantiles = [
+        round(float(x), 5) for x in np.quantile(q_pool, np.linspace(0.0, 1.0, 101))
+    ]
+    return {
+        "detector_morse_count": n_det,
+        "detector_morse_b64": det_b64,
+        "detector_antinode_quantiles": det_quantiles,
+    }
 
 
 def _extract_single_isosurface_mesh(
@@ -1495,6 +1834,35 @@ def compute_nodal_surfaces_payload(
             while len(_GLOBAL_VORTEX_CACHE) > _MAX_FIELD_CACHE_ENTRIES:
                 _GLOBAL_VORTEX_CACHE.popitem(last=False)
 
+    # Full-sphere (d >= d_min) Bragg-proximal Morse extrema for 2D detector Mahalanobis mapping
+    m_cache_key = (
+        primary.get("path"),
+        primary.get("q75_f"),
+        ref_field.get("path") if ref_field is not None else None,
+        ref_field.get("q75_f") if ref_field is not None else None,
+        eff_het_mode,
+        round(float(f_to_f0_scale), 8),
+        round(float(g_max), 4),
+        tuple(np.round(ub.ravel(), 5).tolist()),
+    )
+    cached_gm = _GLOBAL_MORSE_CACHE.get(m_cache_key)
+    if cached_gm is not None:
+        _GLOBAL_MORSE_CACHE.move_to_end(m_cache_key)
+        det_morse_info = cached_gm
+    else:
+        det_morse_info = _compute_full_sphere_detector_morse(
+            primary,
+            ref_field,
+            heterodyne_mode=eff_het_mode,
+            f_to_f0_scale=f_to_f0_scale,
+            ub_matrix=ub,
+            mean_g_star=mean_g_star,
+            g_max=g_max,
+        )
+        _GLOBAL_MORSE_CACHE[m_cache_key] = det_morse_info
+        while len(_GLOBAL_MORSE_CACHE) > _MAX_FIELD_CACHE_ENTRIES:
+            _GLOBAL_MORSE_CACHE.popitem(last=False)
+
     if eff_het_mode == "delta":
         formula_label = "F₀*·(F − F₀)"
     elif eff_het_mode == "diff":
@@ -1558,6 +1926,9 @@ def compute_nodal_surfaces_payload(
         "vortex_shell_radius_g": round(float(shell_radius_g), 5),
         "morse_maxima": morse_maxima,
         "antinode_quantiles": antinode_quantiles,
+        "detector_morse_count": det_morse_info["detector_morse_count"],
+        "detector_morse_b64": det_morse_info["detector_morse_b64"],
+        "detector_antinode_quantiles": det_morse_info["detector_antinode_quantiles"],
     }
 
 
@@ -1752,6 +2123,9 @@ def get_nodal_surfaces_js() -> str:
     let last3DRenderSig = "";
     let screenPeakHits3D = [];
     let screenMorseHits3D = [];
+    let screenMorseHitsDet = [];
+    let detectorMorseMap = new Map();
+    let detectorMorseRecords = [];
     let hoveredMorseObj = null;
     let roiQuantileCacheSig = "";
     let roiSortedAbsRe = new Float32Array(0);
@@ -2091,9 +2465,148 @@ def get_nodal_surfaces_js() -> str:
       return merged;
     }
 
+    function buildDetectorMorseIndex(nd, roiMorseList) {
+      const hklMap = new Map();
+      const allRecords = [];
+      if (!nd || !nd.has_phases) {
+        detectorMorseMap = hklMap;
+        detectorMorseRecords = allRecords;
+        return;
+      }
+      const voxBuckets = new Map();
+      function addRecordIfUnique(rec) {
+        const hc = rec.hkl_cont;
+        if (!Array.isArray(hc) || hc.length !== 3) return;
+        const bx = Math.floor(hc[0] * 2.0);
+        const by = Math.floor(hc[1] * 2.0);
+        const bz = Math.floor(hc[2] * 2.0);
+        for (let dx = -1; dx <= 1; dx++) {
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dz = -1; dz <= 1; dz++) {
+              const bucket = voxBuckets.get(`${bx + dx},${by + dy},${bz + dz}`);
+              if (bucket) {
+                for (let k = 0; k < bucket.length; k++) {
+                  const prev = bucket[k].hkl_cont;
+                  if (Math.hypot(hc[0] - prev[0], hc[1] - prev[1], hc[2] - prev[2]) < 0.44) {
+                    return;
+                  }
+                }
+              }
+            }
+          }
+        }
+        const key = `${bx},${by},${bz}`;
+        let lst = voxBuckets.get(key);
+        if (!lst) {
+          lst = [];
+          voxBuckets.set(key, lst);
+        }
+        lst.push(rec);
+        allRecords.push(rec);
+      }
+
+      if (Array.isArray(roiMorseList)) {
+        for (let i = 0; i < roiMorseList.length; i++) {
+          const m = roiMorseList[i];
+          if (!m || !Array.isArray(m.hkl_cont) || m.hkl_cont.length !== 3) continue;
+          const ph = Array.isArray(m.prec_h) && m.prec_h.length === 6
+            ? m.prec_h
+            : [6.0, 6.0, 6.0, 0.0, 0.0, 0.0];
+          addRecordIfUnique({
+            hkl_cont: [Number(m.hkl_cont[0]) || 0, Number(m.hkl_cont[1]) || 0, Number(m.hkl_cont[2]) || 0],
+            re_val: Number(m.re_val) || 0.0,
+            im_val: Number(m.im_val) || 0.0,
+            prec_h: ph,
+            axis_g: Array.isArray(m.axis_g) && m.axis_g.length === 3 ? m.axis_g : [0.0, 0.0, 1.0],
+            aspect: Math.max(1.0, Number(m.aspect) || 1.0),
+          });
+        }
+      }
+
+      if (nd.detector_morse_b64) {
+        const raw = decodeBase64Float32(nd.detector_morse_b64);
+        const nRows = Math.floor(raw.length / 15);
+        for (let i = 0; i < nRows; i++) {
+          const o = i * 15;
+          addRecordIfUnique({
+            hkl_cont: [raw[o], raw[o + 1], raw[o + 2]],
+            re_val: raw[o + 3],
+            im_val: raw[o + 4],
+            prec_h: [raw[o + 5], raw[o + 6], raw[o + 7], raw[o + 8], raw[o + 9], raw[o + 10]],
+            axis_g: [raw[o + 11], raw[o + 12], raw[o + 13]],
+            aspect: Math.max(1.0, raw[o + 14] || 1.0),
+          });
+        }
+      }
+
+      const maxCap = 2.65;
+      const maxCap2 = maxCap * maxCap;
+      for (let idx = 0; idx < allRecords.length; idx++) {
+        const rec = allRecords[idx];
+        const hc0 = rec.hkl_cont[0], hc1 = rec.hkl_cont[1], hc2 = rec.hkl_cont[2];
+        const ph = rec.prec_h;
+        const phh = Number(ph[0]) || 0.0;
+        const pkk = Number(ph[1]) || 0.0;
+        const pll = Number(ph[2]) || 0.0;
+        const phk = Number(ph[3]) || 0.0;
+        const phl = Number(ph[4]) || 0.0;
+        const pkl = Number(ph[5]) || 0.0;
+        if (!(phh > 1e-9 && pkk > 1e-9 && pll > 1e-9)) continue;
+
+        const c00 = pkk * pll - pkl * pkl;
+        const c11 = phh * pll - phl * phl;
+        const c22 = phh * pkk - phk * phk;
+        const det = phh * c00 - phk * (phk * pll - pkl * phl) + phl * (phk * pkl - pkk * phl);
+        let rh = 2, rk = 2, rl = 2;
+        if (det > 1e-12 && c00 > 0.0 && c11 > 0.0 && c22 > 0.0) {
+          rh = Math.max(1, Math.min(4, Math.ceil(maxCap * Math.sqrt(c00 / det))));
+          rk = Math.max(1, Math.min(4, Math.ceil(maxCap * Math.sqrt(c11 / det))));
+          rl = Math.max(1, Math.min(4, Math.ceil(maxCap * Math.sqrt(c22 / det))));
+        }
+        const hRound = Math.round(hc0);
+        const kRound = Math.round(hc1);
+        const lRound = Math.round(hc2);
+        for (let ih = hRound - rh; ih <= hRound + rh; ih++) {
+          const dh = ih - hc0;
+          for (let ik = kRound - rk; ik <= kRound + rk; ik++) {
+            const dk = ik - hc1;
+            for (let il = lRound - rl; il <= lRound + rl; il++) {
+              const dl = il - hc2;
+              const d2 = (
+                phh * dh * dh +
+                pkk * dk * dk +
+                pll * dl * dl +
+                2.0 * (phk * dh * dk + phl * dh * dl + pkl * dk * dl)
+              );
+              if (d2 >= -1e-7 && d2 <= maxCap2) {
+                const dMahal = Math.sqrt(Math.max(0.0, d2));
+                const hklKey = `${ih},${ik},${il}`;
+                let arr = hklMap.get(hklKey);
+                if (!arr) {
+                  arr = [];
+                  hklMap.set(hklKey, arr);
+                }
+                arr.push({ morse: rec, dMahal });
+              }
+            }
+          }
+        }
+      }
+      for (const arr of hklMap.values()) {
+        if (arr.length > 1) {
+          arr.sort((a, b) => (a.dMahal - b.dMahal) || (Math.abs(b.morse.re_val) - Math.abs(a.morse.re_val)));
+        }
+      }
+      detectorMorseMap = hklMap;
+      detectorMorseRecords = allRecords;
+    }
+
     function ensureDecodedMeshes() {
       if (!nodalData || !nodalData.has_phases) {
         decodedMeshes = { re: null, im: null, vortex: null, morsePos: null, morseNeg: null, morseList: [] };
+        detectorMorseMap = new Map();
+        detectorMorseRecords = [];
+        screenMorseHitsDet = [];
         decodedCacheSig = "";
         roiQuantileCacheSig = "";
         roiSortedAbsRe = new Float32Array(0);
@@ -2114,6 +2627,8 @@ def get_nodal_surfaces_js() -> str:
         (nodalData.roi_vortices || []).length,
         vList.length,
         mList.length,
+        nodalData.detector_morse_count || 0,
+        (nodalData.detector_morse_b64 || "").slice(0, 24),
       ].join("|");
       if (sig === decodedCacheSig) return decodedMeshes;
       decodedCacheSig = sig;
@@ -2132,9 +2647,57 @@ def get_nodal_surfaces_js() -> str:
         morseNeg: buildMorseCapsuleMesh(negCaps),
         morseList: mList,
       };
+      buildDetectorMorseIndex(nodalData, mList);
       uploadGlMeshes();
       last3DRenderSig = "";
       return decodedMeshes;
+    }
+
+    function resolveDetectorMorseThreshold() {
+      ensureDecodedMeshes();
+      const rawPct = Number(deps.state && deps.state.antinodePercentile);
+      const pct = Math.max(0.0, Math.min(1.0, Number.isFinite(rawPct) ? rawPct : 0.75));
+      const rawSig = Number(deps.state && deps.state.morseMahalSigma);
+      const maxMahal = Math.max(0.10, Math.min(3.0, Number.isFinite(rawSig) ? rawSig : 1.0));
+      if (!nodalData || !nodalData.has_phases) {
+        return { pct, tau: 0.0, maxMahal };
+      }
+      const qArr = (Array.isArray(nodalData.detector_antinode_quantiles) && nodalData.detector_antinode_quantiles.length > 0)
+        ? nodalData.detector_antinode_quantiles
+        : (Array.isArray(nodalData.antinode_quantiles) ? nodalData.antinode_quantiles : []);
+      let tau = 0.0;
+      if (pct > 0.0 && qArr.length > 0) {
+        const effP = Math.min(0.9995, pct);
+        const fIdx = effP * (qArr.length - 1);
+        const i0 = Math.floor(fIdx);
+        const i1 = Math.min(qArr.length - 1, i0 + 1);
+        const frac = fIdx - i0;
+        const v0 = Math.max(0.0, Number(qArr[i0]) || 0.0);
+        const v1 = Math.max(0.0, Number(qArr[i1]) || 0.0);
+        tau = v0 * (1.0 - frac) + v1 * frac;
+        if (pct >= 0.999) {
+          const topV = Math.max(0.0, Number(qArr[qArr.length - 1]) || 0.0);
+          tau = Math.min(tau, topV * 0.9995);
+        }
+      }
+      return { pct, tau, maxMahal };
+    }
+
+    function getPeakMorseMatch(hkl, preThresh) {
+      if (!nodalData || !nodalData.has_phases || !Array.isArray(hkl) || hkl.length !== 3) {
+        return null;
+      }
+      ensureDecodedMeshes();
+      const arr = detectorMorseMap.get(`${hkl[0]},${hkl[1]},${hkl[2]}`);
+      if (!arr || arr.length === 0) return null;
+      const th = preThresh || resolveDetectorMorseThreshold();
+      for (let i = 0; i < arr.length; i++) {
+        const cand = arr[i];
+        if (cand.dMahal <= th.maxMahal + 1e-7 && Math.abs(cand.morse.re_val) >= th.tau - 1e-7) {
+          return cand;
+        }
+      }
+      return null;
     }
 
     function resolveAntinodeThreshold(liveRoi) {
@@ -2956,6 +3519,7 @@ def get_nodal_surfaces_js() -> str:
         st.showAntinodes ? 1 : 0,
         st.showMorseCapsules ? 1 : 0,
         Number(st.antinodePercentile ?? 0.75).toFixed(3),
+        Number(st.morseMahalSigma ?? 1.0).toFixed(3),
         hovMorseKey,
         (st.nodalSurfaceAlpha || 0.56).toFixed(2),
         liveRoi.mode,
@@ -3237,6 +3801,9 @@ def get_nodal_surfaces_js() -> str:
             }
           }
         }
+        const morseThresh3D = (nodalData && nodalData.has_phases && st.showMorseCapsules)
+          ? resolveDetectorMorseThreshold()
+          : null;
         drawList.sort((a, b) => a.z - b.z);
         ctx.save();
         for (let i = 0; i < drawList.length; i++) {
@@ -3245,6 +3812,15 @@ def get_nodal_surfaces_js() -> str:
           const rBase = (isExp ? 3.5 : 2.7) * Math.max(0.65, Math.min(1.55, it.sc));
           const rad = it.isFocus ? rBase + 2.4 : (it.isFriedel ? rBase * 0.78 : rBase);
           const col = deps.getWulffPeakColor(it.p);
+          const mHit = (!it.isFriedel && morseThresh3D) ? getPeakMorseMatch(it.p.hkl, morseThresh3D) : null;
+          if (mHit) {
+            ctx.beginPath();
+            ctx.arc(it.x, it.y, rad + 2.6, 0, Math.PI * 2);
+            ctx.strokeStyle = mHit.morse.re_val >= 0.0 ? "#f59e0b" : "#c084fc";
+            ctx.globalAlpha = 0.94;
+            ctx.lineWidth = isExp ? 1.8 : 1.4;
+            ctx.stroke();
+          }
           ctx.beginPath();
           ctx.arc(it.x, it.y, rad, 0, Math.PI * 2);
           ctx.fillStyle = col;
@@ -3298,8 +3874,9 @@ def get_nodal_surfaces_js() -> str:
         }
         if (st.showPhaseVortices) pills.push({ txt: `1D Vortices (${nVor} in ROI)`, col: "#fde047" });
         if (st.showMorseCapsules) {
+          const mahalTxt = Number(st.morseMahalSigma ?? 1.0).toFixed(2).replace(/0$/, "");
           pills.push({
-            txt: `Morse ∇Re=0 (${antinodeStats.activeMorseCount} capsules)`,
+            txt: `Morse ∇Re=0 (${antinodeStats.activeMorseCount} capsules • dM≤${mahalTxt}σ)`,
             col: "#e879f9",
           });
         }
@@ -3587,6 +4164,272 @@ def get_nodal_surfaces_js() -> str:
         }
       }
       ctx.restore();
+    }
+
+    function projectCrystalGToDetector(gVec, Rg, ki, sLab, fullPanels, isSph) {
+      const gn = Math.hypot(gVec[0], gVec[1], gVec[2]);
+      if (!(gn > 1e-7)) return null;
+      const gLab = deps.mat3Vec(Rg, gVec);
+      const sinTh = -(ki[0] * gLab[0] + ki[1] * gLab[1] + ki[2] * gLab[2]) / gn;
+      if (!(sinTh > 1e-4 && sinTh < 0.9999)) return null;
+      const invGn = 1.0 / gn;
+      const kfx = ki[0] + 2.0 * sinTh * gLab[0] * invGn;
+      const kfy = ki[1] + 2.0 * sinTh * gLab[1] * invGn;
+      const kfz = ki[2] + 2.0 * sinTh * gLab[2] * invGn;
+      const kfn = Math.hypot(kfx, kfy, kfz) || 1.0;
+      const kf = [kfx / kfn, kfy / kfn, kfz / kfn];
+      if (ki[0] * kf[0] + ki[1] * kf[1] + ki[2] * kf[2] > 0.9995) return null;
+      const proj = deps.projectRayToDetectorWithGap(kf, sLab, fullPanels);
+      if (!proj || !proj.onPanel) return null;
+      return {
+        detX: proj.det_x,
+        detV: isSph ? proj.det_el : proj.det_y,
+        bank: proj.bank,
+      };
+    }
+
+    // Map full-sphere 3D Morse extrema (∇Re W = 0) onto the 2D Detector whenever a Bragg peak
+    // falls within anisotropic Mahalanobis distance d_M(h_hkl, h_*) <= state.morseMahalSigma
+    // and |Re W(h_*)| >= τ(p). Evaluates across ALL active-bandpass detector peaks (immune to zoom LOD).
+    function renderDetectorMorseExtrema(ctx, w, h, detOpts) {
+      screenMorseHitsDet = [];
+      const st = deps.state;
+      if (!nodalData || !nodalData.has_phases || !st.showMorseCapsules) return 0;
+      ensureDecodedMeshes();
+      if (detectorMorseMap.size === 0) return 0;
+
+      const peaks = (detOpts && Array.isArray(detOpts.peaks)) ? detOpts.peaks : [];
+      if (peaks.length === 0) return 0;
+
+      const thresh = resolveDetectorMorseThreshold();
+      const ub = deps.getActiveUbMatrix();
+      const Rg = deps.getActiveGoniometerR();
+      const ki = deps.getActiveIncidentBeam();
+      const sLab = deps.getActiveSampleOffsetLab();
+      const fullPanels = deps.buildFullFaceDetectorRaycastPanels(sLab);
+      const isSph = deps.isSphericalDetectorView();
+
+      const hasAffine = Boolean(
+        detOpts &&
+        Number.isFinite(detOpts.affScaleX) &&
+        Number.isFinite(detOpts.affOffsetX) &&
+        Number.isFinite(detOpts.affScaleY) &&
+        Number.isFinite(detOpts.affOffsetY)
+      );
+      const affScaleX = hasAffine ? detOpts.affScaleX : 1.0;
+      const affOffsetX = hasAffine ? detOpts.affOffsetX : 0.0;
+      const affScaleY = hasAffine ? detOpts.affScaleY : 1.0;
+      const affOffsetY = hasAffine ? detOpts.affOffsetY : 0.0;
+      const baseR = (detOpts && Number.isFinite(detOpts.baseR)) ? detOpts.baseR : 3.2;
+      const getVert = (detOpts && typeof detOpts.getPeakVert === "function")
+        ? detOpts.getPeakVert
+        : ((p) => (isSph ? p.det_el : p.det_y));
+      const isHoveredFn = (detOpts && typeof detOpts.isPeakHighlighted === "function")
+        ? detOpts.isPeakHighlighted
+        : (() => false);
+
+      const shiftList = [0.0, -360.0, 360.0];
+      let drawnCount = 0;
+
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+
+      for (let pIdx = 0; pIdx < peaks.length; pIdx++) {
+        const p = peaks[pIdx];
+        if (!p || !Array.isArray(p.hkl) || p.hkl.length !== 3) continue;
+        const match = getPeakMorseMatch(p.hkl, thresh);
+        if (!match) continue;
+
+        const m = match.morse;
+        const isPos = m.re_val >= 0.0;
+        const isHov = Boolean(isHoveredFn(p));
+        const py = getVert(p);
+
+        // Compute Laue-projected 2D uniaxial ridge direction & foreshortening from 3D axis_g
+        let dirAz = 1.0;
+        let dirV = 0.0;
+        let hasPanelDir = false;
+        let effAspect = 1.0;
+        let starProj = null;
+
+        if (ub && Array.isArray(m.axis_g) && m.axis_g.length === 3) {
+          const gx = ub[0][0] * p.hkl[0] + ub[0][1] * p.hkl[1] + ub[0][2] * p.hkl[2];
+          const gy = ub[1][0] * p.hkl[0] + ub[1][1] * p.hkl[1] + ub[1][2] * p.hkl[2];
+          const gz = ub[2][0] * p.hkl[0] + ub[2][1] * p.hkl[1] + ub[2][2] * p.hkl[2];
+          const gn = Math.hypot(gx, gy, gz);
+          if (gn > 1e-6) {
+            const ax = m.axis_g;
+            const axNorm = Math.hypot(ax[0], ax[1], ax[2]) || 1.0;
+            const ax0 = ax[0] / axNorm, ax1 = ax[1] / axNorm, ax2 = ax[2] / axNorm;
+            const dotRadial = Math.max(-1.0, Math.min(1.0, (ax0 * gx + ax1 * gy + ax2 * gz) / gn));
+            const sinPsi = Math.sqrt(Math.max(0.0, 1.0 - dotRadial * dotRadial));
+            const rawAspect = Math.max(1.0, Math.min(3.2, Number(m.aspect) || 1.0));
+            effAspect = 1.0 + (rawAspect - 1.0) * sinPsi;
+
+            if (effAspect > 1.04 && fullPanels && fullPanels.length > 0) {
+              const stepG = 0.06 * gn;
+              const prPlus = projectCrystalGToDetector(
+                [gx + stepG * ax0, gy + stepG * ax1, gz + stepG * ax2],
+                Rg, ki, sLab, fullPanels, isSph
+              );
+              const prMinus = projectCrystalGToDetector(
+                [gx - stepG * ax0, gy - stepG * ax1, gz - stepG * ax2],
+                Rg, ki, sLab, fullPanels, isSph
+              );
+              if (prPlus && prMinus && prPlus.bank === prMinus.bank && Math.abs(prPlus.detX - prMinus.detX) < 25.0) {
+                dirAz = prPlus.detX - prMinus.detX;
+                dirV = prPlus.detV - prMinus.detV;
+                hasPanelDir = (Math.hypot(dirAz, dirV) > 1e-7);
+              }
+            }
+
+            if (Array.isArray(m.hkl_cont) && m.hkl_cont.length === 3 && fullPanels && fullPanels.length > 0) {
+              const gsx = ub[0][0] * m.hkl_cont[0] + ub[0][1] * m.hkl_cont[1] + ub[0][2] * m.hkl_cont[2];
+              const gsy = ub[1][0] * m.hkl_cont[0] + ub[1][1] * m.hkl_cont[1] + ub[1][2] * m.hkl_cont[2];
+              const gsz = ub[2][0] * m.hkl_cont[0] + ub[2][1] * m.hkl_cont[1] + ub[2][2] * m.hkl_cont[2];
+              starProj = projectCrystalGToDetector([gsx, gsy, gsz], Rg, ki, sLab, fullPanels, isSph);
+            }
+          }
+        }
+
+        const rCap = Math.max(5.5, Math.min(13.5, baseR + (isHov ? 4.8 : 3.6)));
+        const halfL = rCap * Math.min(1.75, Math.max(0.0, effAspect - 1.0));
+        const proxFrac = Math.max(0.0, Math.min(1.0, match.dMahal / Math.max(0.15, thresh.maxMahal)));
+        const rimAlpha = isHov ? 1.0 : (0.96 - 0.24 * proxFrac);
+
+        let anyCopyOnScreen = false;
+        for (let sIdx = 0; sIdx < 3; sIdx++) {
+          const shiftAz = shiftList[sIdx];
+          let x = 0.0, y = 0.0;
+          if (hasAffine) {
+            x = affScaleX * (p.det_x + shiftAz) + affOffsetX;
+            y = affScaleY * py + affOffsetY;
+          } else {
+            const sc = deps.detToScreen(p.det_x + shiftAz, py, w, h, 0.45);
+            x = sc[0];
+            y = sc[1];
+          }
+          if (x < -44 || x > w + 44 || y < -44 || y > h + 44) continue;
+          anyCopyOnScreen = true;
+
+          let ux = 1.0, uy = 0.0;
+          if (hasPanelDir) {
+            const sxDir = hasAffine ? (affScaleX * dirAz) : dirAz;
+            const syDir = hasAffine ? (affScaleY * dirV) : -dirV;
+            const sNorm = Math.hypot(sxDir, syDir);
+            if (sNorm > 1e-7) {
+              ux = sxDir / sNorm;
+              uy = syDir / sNorm;
+            }
+          }
+
+          // Subtle tether + crest pip when projected continuous extremum G* lands near the reflection on-panel
+          if (starProj && Math.abs(starProj.detX - p.det_x) < 18.0) {
+            let xs = 0.0, ys = 0.0;
+            if (hasAffine) {
+              xs = affScaleX * (starProj.detX + shiftAz) + affOffsetX;
+              ys = affScaleY * starProj.detV + affOffsetY;
+            } else {
+              const scS = deps.detToScreen(starProj.detX + shiftAz, starProj.detV, w, h, 0.45);
+              xs = scS[0];
+              ys = scS[1];
+            }
+            const dsPx = Math.hypot(xs - x, ys - y);
+            if (dsPx >= 2.4 && dsPx <= 32.0) {
+              ctx.save();
+              ctx.globalAlpha = 0.72 * rimAlpha;
+              ctx.setLineDash([2, 2]);
+              ctx.beginPath();
+              ctx.moveTo(x, y);
+              ctx.lineTo(xs, ys);
+              ctx.strokeStyle = isPos ? "#fde047" : "#f0abfc";
+              ctx.lineWidth = 1.15;
+              ctx.stroke();
+              ctx.setLineDash([]);
+              ctx.beginPath();
+              ctx.arc(xs, ys, 2.3, 0, Math.PI * 2);
+              ctx.fillStyle = "rgba(7, 9, 19, 0.92)";
+              ctx.fill();
+              ctx.beginPath();
+              ctx.arc(xs, ys, 1.5, 0, Math.PI * 2);
+              ctx.fillStyle = isPos ? "#fef08a" : "#f5d0fe";
+              ctx.fill();
+              ctx.restore();
+            }
+          }
+
+          const epsSeg = halfL < 0.08 ? 0.01 : 0.0;
+          const axA = x - halfL * ux;
+          const ayA = y - halfL * uy;
+          const axB = x + halfL * ux + epsSeg;
+          const ayB = y + halfL * uy;
+
+          // Stadium translucent interior tint
+          ctx.globalAlpha = isHov ? 0.24 : 0.14;
+          ctx.beginPath();
+          ctx.moveTo(axA, ayA);
+          ctx.lineTo(axB, ayB);
+          ctx.strokeStyle = isPos ? "#f59e0b" : "#c084fc";
+          ctx.lineWidth = 2.0 * rCap;
+          ctx.stroke();
+
+          // Crisp uniaxial stadium rim: dark contrast halo + Gold/Violet outer stroke + bright crest highlight
+          const ang = Math.atan2(uy, ux);
+          ctx.save();
+          ctx.translate(x, y);
+          ctx.rotate(ang);
+          ctx.beginPath();
+          ctx.arc(-halfL, 0, rCap, Math.PI * 0.5, Math.PI * 1.5);
+          ctx.arc(halfL, 0, rCap, -Math.PI * 0.5, Math.PI * 0.5);
+          ctx.closePath();
+
+          ctx.globalAlpha = rimAlpha;
+          ctx.strokeStyle = "rgba(7, 9, 19, 0.90)";
+          ctx.lineWidth = isHov ? 4.4 : 3.6;
+          ctx.stroke();
+
+          ctx.strokeStyle = isPos ? "#f59e0b" : "#c084fc";
+          ctx.lineWidth = isHov ? 2.5 : 2.0;
+          ctx.stroke();
+
+          ctx.strokeStyle = isPos ? "#fef08a" : "#f5d0fe";
+          ctx.lineWidth = isHov ? 1.15 : 0.85;
+          ctx.stroke();
+          ctx.restore();
+
+          screenMorseHitsDet.push({
+            peak: p,
+            morse: m,
+            dMahal: match.dMahal,
+            x,
+            y,
+            r: rCap + halfL + 3.5,
+          });
+        }
+        if (anyCopyOnScreen) drawnCount++;
+      }
+
+      ctx.globalAlpha = 1.0;
+      ctx.restore();
+      return drawnCount;
+    }
+
+    function findNearestDetectorMorsePeak(mx, my) {
+      if (!deps.state || !deps.state.showMorseCapsules || screenMorseHitsDet.length === 0) {
+        return null;
+      }
+      let best = null;
+      let bestDist = 1e9;
+      for (let i = 0; i < screenMorseHitsDet.length; i++) {
+        const h = screenMorseHitsDet[i];
+        const d = Math.hypot(mx - h.x, my - h.y);
+        if (d <= h.r && d < bestDist) {
+          bestDist = d;
+          best = h.peak;
+        }
+      }
+      return best;
     }
 
     function brickCoversRoi(nd, liveRoi) {
@@ -3905,8 +4748,12 @@ def get_nodal_surfaces_js() -> str:
       setHoveredMorse,
       getHoveredMorse: () => hoveredMorseObj,
       resolveAntinodeThreshold,
+      resolveDetectorMorseThreshold,
+      getPeakMorseMatch,
       renderWulffVortices,
       renderDetectorVortices,
+      renderDetectorMorseExtrema,
+      findNearestDetectorMorsePeak,
       requestNodalUpdate,
       scheduleRoiRefresh,
       uploadAndSetRefMtz,
